@@ -1,0 +1,109 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: production-redis-cluster
+# ------------------------------------
+# Multi-replica gateway running behind a load balancer, every replica
+# coordinating via Redis (cluster KV + pub/sub for delivery and
+# cancellation fan-out). Designed for kubernetes Deployment with N
+# replicas where any replica can answer any session.
+#
+# What's different from production-single-redis:
+#   - delivery + cancellation buses are pinned to the cluster's pub/sub
+#     primitive so server-initiated messages reach the right replica.
+#   - cluster.pool_size raised — more concurrent connections survive a
+#     thundering-herd reconnect.
+#   - each replica writes its audit trail to a host-mounted path; ship
+#     that path to a central SIEM with a filebeat/vector/fluentbit
+#     sidecar so the trail is greppable across all N pods.
+#
+# Required env vars:
+#   MCPG_OIDC_CLIENT_ID, MCPG_OIDC_CLIENT_SECRET   — IdP credentials
+#   MCPG_REDIS_URL                                  — rediss:// preferred
+
+gateway:
+  server:
+    bind_address: "0.0.0.0:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    allowed_origins:
+      - "https://gateway.example.com"
+    request_timeout_ms: 30000
+    session_idle_timeout_ms: 900000
+    shutdown_timeout_ms: 60000  # extra room for in-flight SSE drain
+
+cluster:
+  # Use a TLS scheme: set MCPG_REDIS_URL to a `rediss://…` URL. The boot
+  # guard refuses a plaintext `redis://` coordinator unless
+  # `allow_insecure_transport: true`. Pass the password out-of-URL.
+  kind: redis
+  url: "${env.MCPG_REDIS_URL}"
+  password: "${env.MCPG_REDIS_PASSWORD}"
+  key_prefix: "mcpg:prod"
+  pool_size: 32
+
+# `delivery` and `cancellation` are intentionally omitted — when their
+# `bus` is unset they inherit the cluster's pub/sub primitive (Redis
+# pub-sub here), which is what we want so a `notifications/cancelled`
+# published on replica-A reaches the active SSE stream on replica-B.
+# Set `mcp.configurations.delivery.bus.kind: memory` (or similar
+# in-process variant) only when you explicitly want single-replica
+# behaviour despite a cluster.
+
+governance:
+  access:
+    oidc_oauth:
+      providers:
+        - issuer: "https://example.okta.com"
+          audiences: ["mcpg-gateway"]
+          verification:
+            kind: oidc_jwks
+            allowed_algs: ["RS256"]
+  # Audit is required (the gateway refuses to start if no sink serves
+  # traffic). The built-in local-file sink writes JSON Lines, hash-chained
+  # per spec §9.12, to `path`. Each replica writes its own file — mount
+  # `path` on a host volume and forward it to a central SIEM (filebeat /
+  # vector / fluentbit) so the trail is greppable across all pods.
+  audit:
+    enabled: true
+    required: true
+    on_failure: fail_closed
+    sinks:
+      - kind: dev.mcpg.builtin.audit.local-file
+        config:
+          path: "/var/log/mcpg/audit.log"
+
+mcp:
+  capabilities:
+    tools:
+      - name: api.account.lookup
+        description: Look up an account by id via the corporate accounts API.
+        governance:
+          minimum_trust: verified
+        retry:
+          max_attempts: 3
+          initial_backoff_ms: 200
+        backend:
+          kind: http
+          url: "https://accounts.internal.example.com/v1/accounts/${arguments.account_id}"
+          method: get
+          timeout_ms: 5000
+          headers:
+            Authorization: "Bearer ${env.ACCOUNTS_API_TOKEN}"
+          expected_status_codes: [200]
+
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }
+  metrics:
+    sinks:
+      - kind: dev.mcpg.observability.prometheus
+        config: { path: "/metrics", bind: "0.0.0.0:9090" }
+  traces:
+    enabled: true
+    service_name: "mcpg-gateway"
+    sinks:
+      - kind: dev.mcpg.observability.otlp
+        config: { url: "http://otel-collector.observability.svc.cluster.local:4318" }

@@ -1,0 +1,220 @@
+[package]
+name = "mcpg"
+version = "0.1.0-beta.15"
+license = "Apache-2.0"
+edition = "2024"
+description = "MCPG gateway — the governed MCP endpoint. Binary: `mcpg`."
+
+
+# Flagship crate — takes the bare `mcpg` name. Binary defaults to the
+# crate name via `src/main.rs`, so `cargo install mcpg` puts `mcpg` on
+# PATH. Peer tools are qualified (`mcpg-cloud`, `mcpg-plugin`,
+# `mcpg-sdk`) — same naming shape as nginx / kubectl / cargo.
+
+[features]
+default = ["governance-quotas"]
+wasm-plugins = ["mcpg-plugin-host/wasm"]
+# CP-attached build: pulls in `mcpg-control-plane-client` so the gateway
+# can register with a Control Plane on boot, push per-tool-call metrics
+# over the agent Channel, and apply ConfigUpdates pushed from the CP.
+# Off by default — flagship `mcpg` builds stay lean. Operators opt in
+# via `cargo build --features cp-attached`.
+cp-attached = ["dep:mcpg-control-plane-client"]
+# S3-compatible content store (AWS S3, MinIO, R2, B2, Wasabi, …).
+# Pulls aws-sdk-s3 + aws-config; off by default to keep flagship
+# builds lean. Enable via `cargo build --features s3-content-store`.
+s3-content-store = ["dep:mcpg-plugin-storage-s3"]
+# Quota-gate runtime enforcement (rate limits / budgets / concurrency
+# caps). ON by default: operators ship with the gate compiled in; an
+# empty `governance.quotas:` block keeps it inert at runtime. The
+# `governance.quotas:` schema still parses + validates unconditionally
+# so configs don't break either way; the feature only gates the
+# dispatch-pipeline enforcement loop. Strip with
+# `cargo build --no-default-features` for a build that explicitly
+# cannot enforce quotas.
+governance-quotas = []
+
+[dependencies]
+anyhow = "1.0.98"
+arc-swap = "1"
+async-trait = "0.1"
+axum = { version = "0.8.6", features = ["json"] }
+base64 = "0.22"
+bytes = "1"
+cel = "0.13.0"
+chrono = { version = "0.4.42", features = ["clock", "serde"] }
+dashmap = "6"
+figment = { version = "0.10.19", features = ["env", "yaml"] }
+futures = "0.3"
+jsonschema = "0.28"
+jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"] }
+schemars = { version = "0.8", default-features = false, features = ["derive", "preserve_order"] }
+mcpg-cluster-api = { git = "https://github.com/mcpg-dev/mcpg-cluster-api", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+# Host-side content-store + response-cache surface shared with the LLM
+# backend plugins (the provider clients themselves are runtime-loaded
+# cdylibs and are NOT linked here).
+mcpg-backend-llm-shared = { git = "https://github.com/mcpg-dev/mcpg-backend-llm-shared", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+# Shared HTTP-over-reqwest core for the network backend plugins; the
+# gateway links it directly for the SSRF resolution guard (`safe_dns`).
+mcpg-plugin-backend-net-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-net-core", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-mcp-client = { git = "https://github.com/mcpg-dev/mcpg-mcp-client", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-mcp-wire = { git = "https://github.com/mcpg-dev/mcpg-mcp-wire", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-sensitive = { git = "https://github.com/mcpg-dev/mcpg-sensitive", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-expr = { git = "https://github.com/mcpg-dev/mcpg-expr", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-tunnel-proto = { git = "https://github.com/mcpg-dev/mcpg-tunnel-proto", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-tunnel-agent = { git = "https://github.com/mcpg-dev/mcpg-tunnel-agent", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-glob = { git = "https://github.com/mcpg-dev/mcpg-glob", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+# `static-firstparty` enables the `HostHandle::from_services` path used at
+# boot to install the unified host surface on statically linked first-party
+# plugins — the gateway never goes through the FFI vtable for its own
+# builtins.
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", features = ["static-firstparty"] }
+mcpg-plugin-storage-builtin = { git = "https://github.com/mcpg-dev/mcpg-plugin-storage-builtin", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-plugin-storage-s3 = { git = "https://github.com/mcpg-dev/mcpg-plugin-storage-s3", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", optional = true }
+# The only backend linked into the binary: the mock fixture the quickstart
+# templates bind, so `mcpg config init` → boot → `tools/call` works with no
+# artefact to build. It carries no transport machinery (no client stack) and
+# only materialises when a binding names `kind: mock`.
+# Observability plugins compiled in so FirstPartyRegistrar can register
+# them statically when the operator opts in via
+# `observability.{traces,metrics}.sinks[].kind`. `default-features = false`
+# disables `cdylib-export` so multiple plugins linked together don't all
+# re-export `mcpg_plugin_register` (linker collision).
+# The OIDC VERIFICATION LIBRARY (config types the gateway's own schema
+# re-exports, the SSRF guard config validation calls, the resolver the
+# authorization server builds on). The plugin-ABI wrapper is a separate
+# crate — the gateway links the library, not the plugin.
+mcpg-plugin-identity-oidc-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-identity-oidc-core", tag = "v0.1.0-beta.10", version = "=0.1.0-beta.10" }
+# CP-attached integration: optional dep gated by the `cp-attached`
+# feature so the flagship `mcpg` build stays lean.
+mcpg-control-plane-client = { git = "https://github.com/mcpg-dev/mcpg-control-plane-client", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", optional = true }
+# License claims + offline verification: the standalone plugin load
+# gate runs in every build, so this is NOT optional.
+mcpg-control-plane-license = { git = "https://github.com/mcpg-dev/mcpg-control-plane-license", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+# State-dir conventions for the composition flags + `mcpg status` — the
+# paths-only slice of cli-core (dirs only; none of the login/HTTP stack).
+mcpg-cli-core = { git = "https://github.com/mcpg-dev/mcpg-cli-core", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", default-features = false, features = ["paths"] }
+# Subcommand routing for the consolidated `mcpg-config` bin (the gateway
+# binary itself keeps its hand-rolled argv handling).
+clap = { version = "4", features = ["derive", "wrap_help"] }
+metrics = "0.24"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+serde_yaml = "0.9"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+async-stream = "0.3"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+tower = "0.5.2"
+tower-http = { version = "0.6.11", features = ["trace", "timeout", "catch-panic"] }
+uuid = { version = "1.23.2", features = ["serde", "v4"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# rustls + rustls-pemfile + rustls-pki-types for the custom
+# `ServerConfig` we hand to `RustlsConfig::from_config` — needed to
+# wire `WebPkiClientVerifier` for mTLS. Pulled in directly even
+# though axum-server already depends on rustls so we control the
+# version explicitly; the aws-lc-rs crypto provider matches the rest
+# of the workspace (jsonwebtoken).
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+# Mozilla trust anchors for the outbound tunnel dial (`mcpg --tunnel` to a
+# public relay); a self-hosted relay's private CA loads from MCPG_TUNNEL_CA.
+webpki-roots = "0.26"
+# tokio-rustls's `TlsStream` is what axum-server's `RustlsAcceptor`
+# returns; we reach into it for `peer_certificates()` after the
+# handshake. Pinned to match axum-server 0.7's transitive version.
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
+# x509-parser for SubjectAltName / DN / validity extraction off the
+# accepted client cert (rustls's own verifier doesn't expose extensions).
+x509-parser = "0.16"
+hex = "0.4"
+hmac-sha256 = "1.1.14"
+sha2 = "0.10"
+# BLAKE3 for canonical error-message hashing — operators correlate via
+# local logs by hash, the literal string is never shipped over the wire
+# to the CP.
+blake3 = "1"
+# ChaCha20-Poly1305 AEAD for the encrypted-inline `requestState`
+# encoding. Pure-Rust, RustCrypto-blessed, no platform-specific
+# dependencies — sized right for the small (~100-byte)
+# pipeline-resumption payloads MCPG mints.
+chacha20poly1305 = "0.10"
+parking_lot = "0.12"
+subtle = "2"
+tokio-util = "0.7"
+time = { version = "0.3.47", features = ["formatting"] }
+url = "2.5.8"
+# `mcpg dev --plugin <path>` writes a synthesised plugin-config YAML to a
+# per-run tempdir before delegating into the normal MCPG_CONFIG boot
+# path; tempfile auto-cleans the file when the gateway exits.
+tempfile = "3"
+
+# Fast global allocator on glibc-linux (the primary container / production
+# target). Under the concurrent tools/call hot path the gateway allocates
+# heavily (JSON (de)serialize, metrics), and glibc malloc's per-arena locks
+# contend across cores; mimalloc cuts that (~15% throughput, measured).
+# Target-gated so the musl / windows / darwin release lanes never build or link
+# it and keep the system allocator — no cross-platform build-matrix risk.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
+# `--control-plane` supervises a child `mcpg-control-plane`; PR_SET_PDEATHSIG
+# makes the KERNEL reap it if this process dies without running destructors
+# (SIGKILL, a closed terminal killing the process group), which `kill_on_drop`
+# alone cannot cover.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Backend plugins are runtime-loaded cdylibs in production; the in-tree
+# tests build the Runtime directly (bypassing the plugin loader), so the
+# runtime's #[cfg(test)] fallback constructs them statically here. Dev-only
+# ⇒ the release `mcpg` binary links none of them (nor their client stacks,
+# e.g. sqlx). The exception is the mock fixture, a real dependency above.
+mcpg-plugin-backend-sql = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sql", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-http = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-http", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+# The version req keeps this dev-dep in the published manifest as a git+tag
+# reference: the in-src runtime tests compile against the mock backend, so a
+# standalone build needs it — unlike the rest of these, which only the
+# non-shipping tests/ directory uses.
+mcpg-plugin-backend-mock = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-mock", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-soap = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-soap", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-ldap = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-ldap", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-mssql = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-mssql", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-amqp = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-amqp", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-email = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-email", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-sftp = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sftp", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-command = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-command", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-openapi = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-openapi", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-transform-jsonata = { git = "https://github.com/mcpg-dev/mcpg-plugin-transform-jsonata", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+wiremock = "0.6"
+# rcgen synthesises CA + leaf cert pairs for the TLS-info extraction
+# unit tests without standing up a real PKI.
+rcgen = "0.14"
+# The license-gate tests mint real Ed25519-signed tokens to exercise
+# admit/refuse paths; production verification only needs the public key
+# (via mcpg-control-plane-license), so the signing side stays dev-only.
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+rand = "0.8"
+# tower's `util` (ServiceExt::oneshot) drives the router in transport
+# unit tests; production only needs the core Service trait.
+tower = { version = "0.5.2", features = ["util"] }
+# tokio's `test-util` (mock clock: `start_paused` + `tokio::time::advance`)
+# is used by the secret-rotation / debounce e2e tests. It is NOT part of
+# the `["full"]` set on the main [dependencies] tokio, and we don't want it
+# in production builds — dev-only here (Cargo unifies features for test
+# builds, leaving the release `mcpg` build untouched).
+tokio = { version = "1.52.3", features = ["test-util"] }
+
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+result_large_err = "allow"
+large_enum_variant = "allow"

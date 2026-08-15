@@ -1,0 +1,44 @@
+# MCPG conformance test config — M1 baseline (OPT-IN smoke only).
+#
+# NOT the run.sh default — config-everything.yaml is (it carries the full
+# fixture catalog). Use this one explicitly for a lifecycle-only smoke:
+#   MCPG_CONFIG=.../config-baseline.yaml bash run.sh <version>
+#
+# Minimal config: just enough to boot MCPG as an HTTP MCP server
+# on 127.0.0.1:8787/mcp. No fixture tools / prompts / resources
+# defined. Lifecycle / initialize / negotiation scenarios pass, but
+# fixture-coupled scenarios (tools-call-*, resources-read-*,
+# prompts-get-*) fail by design — the catalog lives in
+# config-everything.yaml.
+#
+# Versions: this config is shared between both protocol revisions.
+# Version selection happens per-request (via `Mcp-Protocol-Version`
+# header or `_meta.io.modelcontextprotocol/protocolVersion`); the
+# conformance suite drives this via its `--spec-version` flag.
+
+gateway:
+  # The injected mock cdylib is built locally and unsigned; the
+  # conformance suite exercises the wire, not the signature gate.
+  plugin_registry:
+    default_signature_policy: disabled
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    # The whole suite fires from one IP (localhost) with no auth — the
+    # per-IP ANONYMOUS rate limit is the wrong guard here and started
+    # tripping mid-suite when the pinned suite's request volume crept
+    # up (429s failed dns-rebinding-protection + prompts-get-with-image,
+    # runs 27399867315 + local repro). 0 disables, exactly the
+    # documented "single-IP load testing" case; the limiter's own
+    # behaviour is covered by gateway integration tests, not this lane.
+    anonymous_rate_limit_per_min: 0
+
+mcp:
+  capabilities: {}
+  configurations:
+    request_state:
+      # Fixed 32-byte ChaCha20-Poly1305 key (base64) so MRTR
+      # resumption tests don't lose state across requests within
+      # one conformance run. Repro-friendly: deterministic.
+      encryption_key: "MDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiY2NkZGVlZmY="

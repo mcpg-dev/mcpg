@@ -1,0 +1,108 @@
+gateway:
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+    # Bootstrap: provision_jobs table. Jobs start as 'pending' and
+    # flip to 'completed' when an external worker finishes the work.
+    - name: jobs.init_schema
+      title: "Initialize jobs schema"
+      description: "Create the provision_jobs table."
+      annotations: { idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.JOBS_DB_PATH}?mode=rwc"
+        query:
+          sql: |
+            CREATE TABLE IF NOT EXISTS provision_jobs (
+              id         INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id    INTEGER NOT NULL,
+              status     TEXT NOT NULL DEFAULT 'pending',
+              created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+          row_mode: affected_rows
+          timeout_ms: 2000
+
+    # Simulate the "worker" that flips a job to completed. In a real
+    # deployment this tool wouldn't exist — some other system
+    # finishes the work. Here it lets a client demonstrate the
+    # await-matches path by calling this tool from a second
+    # connection (or after the jobs.provision call times out its
+    # poll budget, you can call this and re-run jobs.provision).
+    - name: jobs.mark_completed
+      title: "Mark job completed (test helper)"
+      description: "Flip the latest job for :user_id to status 'completed'."
+      annotations: { idempotent: true }
+      input_schema:
+        type: object
+        required: [user_id]
+        properties:
+          user_id: { type: integer, minimum: 1 }
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.JOBS_DB_PATH}?mode=rwc"
+        query:
+          sql: |
+            UPDATE provision_jobs
+            SET status = 'completed'
+            WHERE id = (
+              SELECT id FROM provision_jobs
+              WHERE user_id = :user_id
+              ORDER BY id DESC LIMIT 1
+            )
+          params: [user_id]
+          row_mode: affected_rows
+          timeout_ms: 2000
+
+    # The awaited binding. The trigger INSERTs a fresh pending job,
+    # then the check loops until status == 'completed'.
+    - name: jobs.provision
+      title: "Provision a user (fire-and-wait)"
+      description: >
+        Kick off a provision job and block until it's marked
+        complete. Returns the job row on success, or a Timeout
+        error after 30 seconds.
+      input_schema:
+        type: object
+        required: [user_id]
+        properties:
+          user_id: { type: integer, minimum: 1 }
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.JOBS_DB_PATH}?mode=rwc"
+        # The main query is a schema-required stub — the await loop
+        # takes over at dispatch time and bypasses it.
+        query:
+          sql: "SELECT 1"
+          row_mode: scalar
+        await:
+          trigger:
+            sql: "INSERT INTO provision_jobs (user_id) VALUES (:user_id)"
+            params: [user_id]
+          check:
+            sql: |
+              SELECT status
+              FROM provision_jobs
+              WHERE user_id = :user_id
+              ORDER BY id DESC
+              LIMIT 1
+            params: [user_id]
+          # CEL predicate: see `row` (first check row, or null) and
+          # `arguments` (caller args, e.g. arguments.user_id).
+          predicate: 'row.status == "completed"'
+          poll_interval_ms: 500
+          timeout_ms: 30000

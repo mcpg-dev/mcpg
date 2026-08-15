@@ -1,0 +1,53 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8801"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: dd.monitors.list
+        title: "List monitors"
+        description: "List monitors"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://api.datadoghq.com/api/v1/monitor"
+          method: get
+          headers:
+            DD-API-KEY: "${env.DD_API_KEY}"
+            DD-APPLICATION-KEY: "${env.DD_APP_KEY}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: dd.slo.status
+        title: "SLO history"
+        description: "SLO history"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [slo_id, from_ts, to_ts]
+          properties:
+            slo_id: { type: string }
+            from_ts: { type: integer }
+            to_ts: { type: integer }
+        backend:
+          kind: http
+          url: "https://api.datadoghq.com/api/v1/slo/${arguments.slo_id}/history"
+          method: get
+          headers:
+            DD-API-KEY: "${env.DD_API_KEY}"
+            DD-APPLICATION-KEY: "${env.DD_APP_KEY}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

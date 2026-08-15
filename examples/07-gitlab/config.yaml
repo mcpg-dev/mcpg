@@ -1,0 +1,70 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8793"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: gl.projects.list
+        title: "List projects"
+        description: "List projects"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://gitlab.com/api/v4/projects"
+          method: get
+          headers:
+            PRIVATE-TOKEN: "${env.GITLAB_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: gl.mr.list
+        title: "List merge requests"
+        description: "List merge requests"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [project_id]
+          properties:
+            project_id: { type: string }
+        backend:
+          kind: http
+          url: "https://gitlab.com/api/v4/projects/${arguments.project_id}/merge_requests"
+          method: get
+          headers:
+            PRIVATE-TOKEN: "${env.GITLAB_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: gl.issue.create
+        title: "Create an issue"
+        description: "Create an issue"
+        input_schema:
+          type: object
+          required: [project_id, title]
+          properties:
+            project_id: { type: string }
+            title: { type: string }
+        backend:
+          kind: http
+          url: "https://gitlab.com/api/v4/projects/${arguments.project_id}/issues"
+          method: post
+          headers:
+            PRIVATE-TOKEN: "${env.GITLAB_TOKEN}"
+            Content-Type: "application/json"
+          timeout_ms: 10000
+          expected_status_codes: [200, 201]
+          require_json_response: true
+          max_response_bytes: 524288

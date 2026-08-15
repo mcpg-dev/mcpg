@@ -1,0 +1,85 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: dev-single-node
+# ---------------------------
+# Local development on a laptop. Two bindings — a `mock` that answers from
+# config alone and an `http` that calls a real endpoint — so `tools/list`
+# returns something and `tools/call` exercises both a canned and a live
+# path. stderr JSON logs for `tail -f`-able debugging, audit on
+# (built-in local-file sink at ./mcpg-audit.log — point it at a
+# tmpfs/scratch mount if the host disk is read-only), no auth
+# (anonymous identity is acceptable on loopback).
+#
+# Boot:  MCPG_CONFIG=dev-single-node.yaml mcpg
+# Test:  curl http://127.0.0.1:8787/health
+
+gateway:
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    # Loopback is the only listener — leave allowed_origins empty so the
+    # browser preflight check is the operator's concern only when they
+    # explicitly cross-origin.
+    allowed_origins: []
+
+# Single-node backend is the default; declared explicitly here for
+# operator clarity. Multi-replica deploys swap this for `redis` / `nats`.
+cluster:
+  kind: single_node
+
+# Anonymous identity is fine for `127.0.0.1` only. Production deploys
+# replace this with `governance.access.oidc_oauth` (see
+# production-single-redis.yaml).
+
+# Every backend is a plugin, including `mock`. The gateway links none of them
+# in, so a binding's `kind` only resolves once the matching artefact is
+# declared here — declaring it is what makes `kind: mock` / `kind: http`
+# available. Pin the tag to the release you run.
+plugins:
+  - id: dev.mcpg.backend.mock
+    class: backend
+    source:
+      oci: "ghcr.io/mcpg-dev/source-code/plugins/backend-mock:0.0.1-alpha.10"
+  - id: dev.mcpg.backend.http
+    class: backend
+    source:
+      oci: "ghcr.io/mcpg-dev/source-code/plugins/backend-http:0.0.1-alpha.10"
+
+mcp:
+  capabilities:
+    tools:
+      - name: dev.mock.echo
+        description: Echo a JSON value back as the tool result. Useful for
+          verifying the gateway is reachable end-to-end.
+        # Bindings default to a `header_asserted` trust floor. This file
+        # configures no identity source, so anonymous callers would be
+        # below that floor and the tool would be filtered out of
+        # `tools/list` — spell the floor out to match the posture.
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          response: { ok: true, source: "dev-single-node" }
+
+      - name: dev.http.get
+        description: Fetch a URL and return the response body. Shows a real
+          outbound call next to the canned mock above.
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: http
+          url: "https://example.com/"
+          method: GET
+
+# Stderr JSON logs (the default), no metrics or traces. Audit defaults
+# to required + the built-in local-file sink, which writes
+# `./mcpg-audit.log` in the gateway's working directory. Drop a tmpfs
+# mount over that file (or set the sink's `config.path`) if the host
+# disk is read-only.
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }

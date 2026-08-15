@@ -1,0 +1,26 @@
+[package]
+name = "mcpg-example-tool-gate-hello"
+version = "0.1.0-dev.0"
+license.workspace = true
+edition = "2024"
+description = "Canonical reference plugin — single-entity ToolGate authored via the unified declare_plugin! macro."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Default to both paths so workspace `cargo build` produces a
+# working OCI-distributable cdylib AND keeps `register_static()`
+# compilable for embedded use. Real plugin crates typically
+# pick ONE default (cdylib for distribution; static-firstparty
+# for in-house gateway builds); this reference enables both so
+# new authors see how the feature interplay works.
+default = ["cdylib-export", "static-firstparty"]
+cdylib-export = ["mcpg-plugin-sdk/cdylib-export"]
+static-firstparty = ["mcpg-plugin-sdk/static-firstparty"]
+
+[dependencies]
+mcpg-plugin-protocol = { path = "../../../libs/plugin-protocol" }
+mcpg-plugin-sdk = { path = "../../../libs/plugin-sdk" }
+serde_json = "1"

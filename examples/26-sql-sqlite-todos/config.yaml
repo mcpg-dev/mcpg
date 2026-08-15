@@ -1,0 +1,142 @@
+gateway:
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+    # Ensure the todos table exists. Runs whenever an agent invokes
+    # the tool — CREATE TABLE IF NOT EXISTS makes it idempotent.
+    - name: todos.init_schema
+      title: "Initialize schema"
+      description: "Create the todos table if it doesn't exist."
+      annotations: { idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TODOS_DB_PATH}?mode=rwc"
+        query:
+          sql: |
+            CREATE TABLE IF NOT EXISTS todos (
+              id        INTEGER PRIMARY KEY AUTOINCREMENT,
+              title     TEXT NOT NULL,
+              done      INTEGER NOT NULL DEFAULT 0,
+              created   TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+          row_mode: affected_rows
+          timeout_ms: 2000
+
+    # Insert a todo. `affected_rows` returns `{"rows_affected": 1}`.
+    - name: todos.create
+      title: "Create a todo"
+      description: "Insert a new todo item. Returns affected row count."
+      annotations: { idempotent: false }
+      input_schema:
+        type: object
+        required: [title]
+        properties:
+          title: { type: string, minLength: 1, maxLength: 200 }
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TODOS_DB_PATH}?mode=rwc"
+        query:
+          sql: "INSERT INTO todos (title) VALUES (:title)"
+          params: [title]
+          row_mode: affected_rows
+          timeout_ms: 2000
+
+    # List all todos. `row_mode: many` returns a JSON array of rows.
+    # `max_rows` guards against accidental unbounded payloads.
+    - name: todos.list
+      title: "List todos"
+      description: "Return every todo item ordered by most-recent first."
+      annotations: { read_only: true, idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TODOS_DB_PATH}?mode=rwc"
+        query:
+          sql: "SELECT id, title, done, created FROM todos ORDER BY id DESC"
+          row_mode: many
+          max_rows: 500
+          timeout_ms: 2000
+        schema:
+          derive: input
+
+    # Count pending items. `row_mode: scalar` returns just the first
+    # column of the first row, unwrapped.
+    - name: todos.count_open
+      title: "Count open todos"
+      description: "Return the number of todos that are not yet done."
+      annotations: { read_only: true, idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TODOS_DB_PATH}?mode=rwc"
+        query:
+          sql: "SELECT COUNT(*) FROM todos WHERE done = 0"
+          row_mode: scalar
+          timeout_ms: 2000
+
+    # Mark a todo complete. `param_exprs` clamps the id to a positive
+    # integer server-side — the operator-supplied clamp overrides the
+    # caller so a hostile client can't sneak a negative id past it.
+    - name: todos.complete
+      title: "Mark a todo complete"
+      description: "Set `done = 1` on the named todo."
+      annotations: { idempotent: true }
+      input_schema:
+        type: object
+        required: [id]
+        properties:
+          id: { type: integer, minimum: 1 }
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TODOS_DB_PATH}?mode=rwc"
+        query:
+          sql: "UPDATE todos SET done = 1 WHERE id = :safe_id"
+          params: [safe_id]
+          param_exprs:
+            # Clamp to positive. If the caller supplied id <= 0, this
+            # maps it to 0 which matches no row — better than failing.
+            safe_id: "arguments.id > 0 ? arguments.id : 0"
+          row_mode: affected_rows
+          timeout_ms: 2000
+
+    # Delete all completed todos (batch write). Useful demonstration
+    # of a write with no placeholder params.
+    - name: todos.purge_completed
+      title: "Purge completed todos"
+      description: "Delete every row where done = 1."
+      annotations: { idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TODOS_DB_PATH}?mode=rwc"
+        query:
+          sql: "DELETE FROM todos WHERE done = 1"
+          row_mode: affected_rows
+          timeout_ms: 2000

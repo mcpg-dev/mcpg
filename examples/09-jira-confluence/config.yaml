@@ -1,0 +1,52 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8795"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: jira.issue.get
+        title: "Get a Jira issue"
+        description: "Get a Jira issue"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [key]
+          properties:
+            key: { type: string }
+        backend:
+          kind: http
+          url: "https://example.atlassian.net/rest/api/3/issue/${arguments.key}"
+          method: get
+          headers:
+            Authorization: "Basic ${env.ATLASSIAN_BASIC_AUTH}"
+            Accept: "application/json"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: confluence.page.get
+        title: "Get a Confluence page"
+        description: "Get a Confluence page"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [page_id]
+          properties:
+            page_id: { type: string }
+        backend:
+          kind: http
+          url: "https://example.atlassian.net/wiki/rest/api/content/${arguments.page_id}"
+          method: get
+          headers:
+            Authorization: "Basic ${env.ATLASSIAN_BASIC_AUTH}"
+            Accept: "application/json"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

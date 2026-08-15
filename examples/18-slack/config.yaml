@@ -1,0 +1,50 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8804"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: slack.conversations.list
+        title: "List channels"
+        description: "List channels"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://slack.com/api/conversations.list"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.SLACK_BOT_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: slack.chat.post
+        title: "Post a message"
+        description: "Arguments form the JSON body (channel, text, ...)"
+        input_schema:
+          type: object
+          required: [channel, text]
+          properties:
+            channel: { type: string }
+            text: { type: string }
+        backend:
+          kind: http
+          url: "https://slack.com/api/chat.postMessage"
+          method: post
+          headers:
+            Authorization: "Bearer ${env.SLACK_BOT_TOKEN}"
+            Content-Type: "application/json; charset=utf-8"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

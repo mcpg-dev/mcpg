@@ -1,0 +1,48 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8809"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: shop.products.list
+        title: "List products"
+        description: "List products"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://${env.SHOPIFY_STORE}.myshopify.com/admin/api/2024-07/products.json"
+          method: get
+          headers:
+            X-Shopify-Access-Token: "${env.SHOPIFY_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: shop.orders.list
+        title: "List orders"
+        description: "List orders"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://${env.SHOPIFY_STORE}.myshopify.com/admin/api/2024-07/orders.json"
+          method: get
+          headers:
+            X-Shopify-Access-Token: "${env.SHOPIFY_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

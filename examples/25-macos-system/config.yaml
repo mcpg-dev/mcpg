@@ -1,0 +1,79 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8811"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: mac.shortcuts.list
+        title: "List Shortcuts"
+        description: "List Shortcuts"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: command
+          command: shortcuts
+          args:
+            - "list"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: mac.open.url
+        title: "Open URL in default browser"
+        description: "Open URL in default browser"
+        annotations: { idempotent: true }
+        input_schema:
+          type: object
+          required: [url]
+          properties:
+            url: { type: string }
+        backend:
+          kind: command
+          command: open
+          args:
+            - "${arguments.url}"
+          timeout_ms: 5000
+          max_output_bytes: 65536
+
+      - name: mac.notify
+        title: "Show a notification"
+        description: "Show a notification"
+        input_schema:
+          type: object
+          required: [title, body]
+          properties:
+            title: { type: string }
+            body: { type: string }
+        backend:
+          kind: command
+          command: osascript
+          args:
+            - "-e"
+            - 'display notification "${arguments.body}" with title "${arguments.title}"'
+          timeout_ms: 5000
+          max_output_bytes: 65536
+
+      - name: mac.screencapture
+        title: "Screenshot entire screen"
+        description: "Screenshot entire screen"
+        annotations: { read_only: true }
+        input_schema:
+          type: object
+          required: [output_path]
+          properties:
+            output_path: { type: string }
+        backend:
+          kind: command
+          command: screencapture
+          args:
+            - "-x"
+            - "${arguments.output_path}"
+          timeout_ms: 15000
+          max_output_bytes: 65536

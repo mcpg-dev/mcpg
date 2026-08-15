@@ -1,0 +1,76 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8792"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: gh.issues.list
+        title: "List issues"
+        description: "List issues"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [owner, repo]
+          properties:
+            owner: { type: string }
+            repo:  { type: string }
+            state: { type: string, enum: [open, closed, all], default: open }
+        backend:
+          kind: http
+          url: "https://api.github.com/repos/${arguments.owner}/${arguments.repo}/issues"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GITHUB_TOKEN}"
+            Accept: "application/vnd.github+json"
+            X-GitHub-Api-Version: "2022-11-28"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: gh.issue.create
+        title: "Create issue"
+        description: "Arguments (title, body, labels) form the JSON body."
+        input_schema:
+          type: object
+          required: [owner, repo, title]
+          properties:
+            owner: { type: string }
+            repo:  { type: string }
+            title: { type: string }
+            body:  { type: string, default: "" }
+        backend:
+          kind: http
+          url: "https://api.github.com/repos/${arguments.owner}/${arguments.repo}/issues"
+          method: post
+          headers:
+            Authorization: "Bearer ${env.GITHUB_TOKEN}"
+            Accept: "application/vnd.github+json"
+            Content-Type: "application/json"
+          timeout_ms: 10000
+          expected_status_codes: [200, 201]
+          require_json_response: true
+          max_response_bytes: 524288
+
+    resource_templates:
+      - name: gh.issue
+        title: "Issue as resource template"
+        description: "Issue as resource template"
+        uri_template: "github://{owner}/{repo}/issues/{number}"
+        mime_type: "application/json"
+        backend:
+          kind: http
+          url: "https://api.github.com/repos/${arguments.owner}/${arguments.repo}/issues/${arguments.number}"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GITHUB_TOKEN}"
+            Accept: "application/vnd.github+json"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

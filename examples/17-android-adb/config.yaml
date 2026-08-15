@@ -1,0 +1,73 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8803"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: adb.devices
+        title: "List devices"
+        description: "List devices"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: command
+          command: adb
+          args:
+            - "devices"
+            - "-l"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: adb.logcat.tail
+        title: "Last 200 lines of logcat"
+        description: "Last 200 lines of logcat"
+        annotations: { read_only: true }
+        input_schema:
+          type: object
+          required: [serial]
+          properties:
+            serial: { type: string }
+        backend:
+          kind: command
+          command: adb
+          args:
+            - "-s"
+            - "${arguments.serial}"
+            - "logcat"
+            - "-d"
+            - "-t"
+            - "200"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: adb.tap
+        title: "Tap coordinates"
+        description: "Tap coordinates"
+        input_schema:
+          type: object
+          required: [serial, x, y]
+          properties:
+            serial: { type: string }
+            x: { type: integer }
+            y: { type: integer }
+        backend:
+          kind: command
+          command: adb
+          args:
+            - "-s"
+            - "${arguments.serial}"
+            - "shell"
+            - "input"
+            - "tap"
+            - "${arguments.x}"
+            - "${arguments.y}"
+          timeout_ms: 15000
+          max_output_bytes: 65536

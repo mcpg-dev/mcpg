@@ -1,0 +1,49 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8800"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: gf.dashboards.search
+        title: "Search dashboards"
+        description: "Search dashboards"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties:
+            query: { type: string, default: "" }
+        backend:
+          kind: http
+          url: "https://example.grafana.net/api/search?query=${arguments.query}"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GRAFANA_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: gf.dashboard.get
+        title: "Dashboard by UID"
+        description: "Dashboard by UID"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [uid]
+          properties:
+            uid: { type: string }
+        backend:
+          kind: http
+          url: "https://example.grafana.net/api/dashboards/uid/${arguments.uid}"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GRAFANA_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

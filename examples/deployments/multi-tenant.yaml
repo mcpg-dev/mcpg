@@ -1,0 +1,111 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: multi-tenant
+# ------------------------
+# A single gateway serving multiple tenants identified by their OIDC
+# subject claim. Per-tenant rate limiting via the rate-limit plugin
+# (CEL-keyed by tenant id), and a binding `governance.allow_if` rule
+# that gates a sensitive binding to only members of `tenant_admins`.
+#
+# This is *application-layer* multi-tenancy: every tenant lands at the
+# same `bind_address` and is resolved by their token. Subdomain-based
+# routing (different host -> different gateway) is handled by your
+# reverse proxy / ingress, not in this YAML.
+#
+# Required env vars: same as production-single-redis.yaml.
+
+gateway:
+  server:
+    bind_address: "0.0.0.0:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    allowed_origins:
+      - "https://gateway.example.com"
+    request_timeout_ms: 30000
+    session_idle_timeout_ms: 900000
+    # Per-tenant concurrent-session cap (keyed by resolved tenant id).
+    # 0 = unlimited; 100 is a starting point — raise per SLA tier.
+    max_sessions_per_tenant: 100
+
+cluster:
+  # Use a TLS scheme — set MCPG_REDIS_URL to a `rediss://…` URL. The boot
+  # guard refuses a plaintext `redis://` coordinator (it carries all tenant
+  # state) unless `allow_insecure_transport: true`. Supply the password
+  # out-of-URL via the `password` field, not embedded in the URL.
+  kind: redis
+  url: "${env.MCPG_REDIS_URL}"
+  password: "${env.MCPG_REDIS_PASSWORD}"
+  key_prefix: "mcpg:multi-tenant"
+  pool_size: 16
+
+governance:
+  access:
+    oidc_oauth:
+      providers:
+        - issuer: "https://example.okta.com"
+          audiences: ["mcpg-gateway"]
+          verification:
+            kind: oidc_jwks
+            allowed_algs: ["RS256"]
+  audit:
+    enabled: true
+    required: true
+    on_failure: fail_closed
+    sinks:
+      - kind: dev.mcpg.builtin.audit.local-file
+        config: { path: "/var/log/mcpg/audit.log" }
+
+# Tool-gate plugins enforced before every dispatch. The rate-limit
+# plugin's default `per_principal` scope keys its bucket on the
+# principal id so each tenant gets their own budget. Adjust
+# `default_limit` per your SLA tier. Layout D'' P4 flattened the plugin
+# list — entries live directly under `plugins:` (no `entries:` wrapper,
+# no `enabled:` toggle).
+plugins:
+  - id: dev.mcpg.rate-limit
+    class: tool_gate
+    source:
+      oci: "ghcr.io/mcpg-dev/source-code/plugins/rate-limit:1.0.0"
+    config:
+      # per_principal scope (the default) keys the bucket on the
+      # authenticated principal; unauthenticated requests fall back
+      # to the session id.
+      default_limit: 600
+      default_window_ms: 60000
+      default_burst: 50
+
+mcp:
+  capabilities:
+    tools:
+      - name: api.tenant.lookup
+        description: Per-tenant lookup. Available to every authenticated
+          caller — rate-limited per tenant by the tool-gate above.
+        backend:
+          kind: http
+          url: "https://internal/api/tenants/${identity.subject_id}"
+          method: get
+          timeout_ms: 5000
+          expected_status_codes: [200]
+      - name: api.admin.tenant.delete
+        description: Tenant deletion — restricted to tenant_admins group
+          via the binding's allow_if. Posts to the upstream's
+          delete-by-id endpoint.
+        governance:
+          allow_if: '"tenant_admins" in identity.groups'
+        backend:
+          kind: http
+          url: "https://internal/api/tenants/${arguments.tenant_id}/delete"
+          method: post
+          timeout_ms: 10000
+          expected_status_codes: [200, 204]
+
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }
+  metrics:
+    sinks:
+      - kind: dev.mcpg.observability.prometheus
+        config: { path: "/metrics", bind: "0.0.0.0:9090" }

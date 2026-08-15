@@ -1,0 +1,105 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: production-single-redis
+# -----------------------------------
+# Single-instance production gateway with Redis-backed cluster
+# primitives (so capability state survives restarts and the gateway can
+# be cleanly upgraded behind a load balancer's drain). OIDC auth in
+# front, file audit sink behind. One illustrative HTTP binding with
+# retry + governance — replace with your tools.
+#
+# Required env vars:
+#   MCPG_OIDC_CLIENT_SECRET   — OIDC client secret for token verification
+#   MCPG_REDIS_URL            — e.g. rediss://gateway-cache.internal:6380
+#
+# Boot:  MCPG_CONFIG=production-single-redis.yaml mcpg
+
+gateway:
+  server:
+    bind_address: "0.0.0.0:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    # Listed origins MUST be exhaustive — wildcard is rejected.
+    allowed_origins:
+      - "https://gateway.example.com"
+    # TLS is terminated at this listener. For LB-terminated TLS, drop the
+    # `tls:` block and set the listener to plain HTTP behind the LB.
+    tls:
+      cert_path: "/etc/mcpg/certs/server.crt"
+      key_path: "/etc/mcpg/certs/server.key"
+    request_timeout_ms: 30000
+    session_idle_timeout_ms: 900000
+    shutdown_timeout_ms: 30000
+
+# Redis backs all cluster primitives (KV / pub-sub / leader election).
+# Each capability that opts into the cluster (sessions, tasks, …)
+# inherits the connection from this block — operators don't need to
+# re-declare per-capability override blocks unless they want to deviate.
+# Use a TLS scheme: set MCPG_REDIS_URL to a `rediss://…` URL. The boot
+# guard refuses a plaintext `redis://` coordinator unless
+# `allow_insecure_transport: true`. Pass the password out-of-URL.
+cluster:
+  kind: redis
+  url: "${env.MCPG_REDIS_URL}"
+  password: "${env.MCPG_REDIS_PASSWORD}"
+  key_prefix: "mcpg:prod"
+  pool_size: 8
+
+# Governance umbrella (Layout D''): identity + authorization + audit
+# co-located so the tool-call lifecycle reads as one block.
+governance:
+  # Inbound OIDC: the gateway validates Bearer tokens against the IdP's
+  # JWKS. `providers` is a list — add another entry to accept tokens
+  # from multiple issuers.
+  access:
+    oidc_oauth:
+      providers:
+        - issuer: "https://example.okta.com"
+          audiences: ["mcpg-gateway"]
+          verification:
+            kind: oidc_jwks
+            allowed_algs: ["RS256"]
+  # Compliance audit is required (gateway refuses to start if no sink
+  # serves traffic). Built-in local-file sink writes hash-chained JSON
+  # Lines to `path` — point a SIEM forwarder (filebeat, vector,
+  # fluentbit) at the file.
+  audit:
+    enabled: true
+    required: true
+    on_failure: fail_closed
+    sinks:
+      - kind: dev.mcpg.builtin.audit.local-file
+        config: { path: "/var/log/mcpg/audit.log" }
+
+# Demonstrative binding — replace with your own.
+mcp:
+  capabilities:
+    tools:
+      - name: api.account.lookup
+        description: Look up an account by id via the corporate accounts API.
+        governance:
+          minimum_trust: verified
+        retry:
+          max_attempts: 3
+          initial_backoff_ms: 200
+          retry_on_status_codes: [429, 502, 503, 504]
+          retry_on_transport_error: true
+        backend:
+          kind: http
+          url: "https://accounts.internal.example.com/v1/accounts/${arguments.account_id}"
+          method: get
+          timeout_ms: 5000
+          headers:
+            Authorization: "Bearer ${env.ACCOUNTS_API_TOKEN}"
+          expected_status_codes: [200]
+
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }
+  metrics:
+    sinks:
+      - kind: dev.mcpg.observability.prometheus
+        config: { path: "/metrics", bind: "0.0.0.0:9090" }

@@ -1,0 +1,66 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8810"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: ha.states
+        title: "Entity states snapshot"
+        description: "Entity states snapshot"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "http://homeassistant.local:8123/api/states"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.HA_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: ha.state.get
+        title: "Single entity state"
+        description: "Single entity state"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [entity_id]
+          properties:
+            entity_id: { type: string }
+        backend:
+          kind: http
+          url: "http://homeassistant.local:8123/api/states/${arguments.entity_id}"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.HA_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+    resource_templates:
+      - name: ha.entity
+        title: "Entity as resource template"
+        description: "Entity as resource template"
+        uri_template: "ha://entity/{entity_id}"
+        mime_type: "application/json"
+        backend:
+          kind: http
+          url: "http://homeassistant.local:8123/api/states/${arguments.entity_id}"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.HA_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

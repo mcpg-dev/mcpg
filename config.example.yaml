@@ -1,0 +1,1115 @@
+feature_flags:
+  debug_tools_enabled: true
+
+debug:
+  tools:
+    command_profiles:
+      default_command_probe:
+        command: printf
+        args:
+          - mcpg-debug-command\n
+        timeout_ms: 2000
+        max_output_bytes: 4096
+      default_command_json_call:
+        command: cat
+        args: []
+        timeout_ms: 2000
+        max_output_bytes: 4096
+    network_profiles:
+      default_network_probe:
+        url: http://127.0.0.1:8787/health
+        timeout_ms: 2000
+        max_response_bytes: 4096
+        expected_status_codes:
+          - 200
+        require_json_response: false
+        headers:
+          Authorization: Bearer local-debug-token
+    bindings:
+      command_probe_profile: default_command_probe
+      network_probe_profile: default_network_probe
+      network_json_call_profile: default_network_probe
+    exposure:
+      command_probe: true
+      network_probe: true
+      network_json_call: false
+      operational_overview_prompt: true
+      runtime_overview_resource: true
+mcp:
+  capabilities:
+    tools:
+      - name: weather.get_forecast
+        title: Weather Forecast
+        description: Retrieve a weather forecast for a given location.
+        backend:
+          kind: http
+          url: http://localhost:9000/api/forecast
+          method: post
+          timeout_ms: 5000
+          max_response_bytes: 8192
+          expected_status_codes:
+            - 200
+          require_json_response: true
+          headers:
+            Authorization: Bearer weather-api-token
+        input_schema:
+          type: object
+          properties:
+            location:
+              type: string
+              description: City name or coordinates
+            days:
+              type: integer
+              minimum: 1
+              maximum: 14
+          required:
+            - location
+        governance:
+          minimum_trust: header_asserted
+          allow_if: 'principal_id != ""'
+
+      # --- Dynamic expressions in binding config fields ---
+      # Use ${...} to embed CEL expressions in URL, header values, and command args.
+      # Available variables: $arguments, $context, $tool_name, $env
+      #
+      # Examples:
+      #   url: "https://api.example.com/v1/users/${arguments.user_id}/profile"
+      #   headers:
+      #     X-Request-Source: "${context.transport}-gateway"
+      #     Authorization: "Bearer ${env.API_TOKEN}"
+      #
+      # Static strings (no ${}) are passed through unchanged.
+      # env.* references are resolved at startup; all others at call time.
+
+      - name: users.get_profile
+        title: User Profile
+        description: Fetch a user profile by ID with dynamic URL routing.
+        backend:
+          kind: http
+          url: "http://localhost:9000/api/users/${arguments.user_id}/profile"
+          method: get
+          timeout_ms: 5000
+          max_response_bytes: 8192
+          expected_status_codes: [200]
+          require_json_response: true
+          headers:
+            Authorization: "Bearer ${env.USER_SERVICE_TOKEN}"
+            X-Request-Source: "${context.transport}-gateway"
+        input_schema:
+          type: object
+          properties:
+            user_id:
+              type: string
+          required:
+            - user_id
+        governance:
+          minimum_trust: header_asserted
+      - name: system.run_diagnostic
+        title: System Diagnostic
+        description: Run a diagnostic command and return structured output.
+        backend:
+          kind: command
+          command: /usr/local/bin/diagnostic
+          args:
+            - --format=json
+          timeout_ms: 10000
+          max_output_bytes: 16384
+          require_json_stdout: true
+        governance:
+          minimum_trust: header_asserted
+      - name: search.query
+        title: Search Query
+        description: Query the search index with a given term.
+        backend:
+          kind: http
+          url: http://localhost:9001/search
+          method: get
+          timeout_ms: 3000
+          max_response_bytes: 4096
+          expected_status_codes:
+            - 200
+        governance:
+          minimum_trust: unauthenticated
+      - name: orders.search
+        title: Search Orders
+        description: Search orders via NATS-backed worker.
+        backend:
+          kind: nats
+          url: nats://127.0.0.1:4222
+          # credentials_path: /etc/mcpg/nats.creds
+          subject: mcpg.exec.request.tools.orders-search
+          timeout_ms: 5000
+          max_response_bytes: 65536
+        governance:
+          minimum_trust: header_asserted
+      # --- SQL binding ---
+      # Dispatches a tool call to a prepared SQL statement against Postgres,
+      # MySQL/MariaDB, or SQLite. The connection URL is the sole credential
+      # surface — operators route secrets through the gateway's `${env.*}`
+      # interpolator (future `vault:…` / `aws-sm:…` schemes land at the
+      # same interpolator, not here), so no cleartext secret lives in YAML.
+      # Full feature surface: docs/bindings.md#sql-binding.
+      - name: orders.lookup_by_tenant
+        title: Lookup Orders by Tenant
+        description: Return recent orders for a tenant.
+        backend:
+          kind: sql
+          driver: postgres
+          url: "postgres://app:${env.ORDERS_DB_PW}@db:5432/orders"
+          pool:
+            max_connections: 10
+            min_idle: 1
+          query:
+            sql: "SELECT id, total, placed_at FROM orders WHERE tenant_id = :tenant ORDER BY placed_at DESC LIMIT :effective_limit"
+            params: ["tenant", "effective_limit"]
+            param_exprs:
+              # Server-side cap: clamp caller's `limit` to 200. `param_exprs`
+              # override caller values of the same name, so the cap is not
+              # spoofable by the client.
+              effective_limit: "arguments.limit < 200 ? arguments.limit : 200"
+            row_mode: many
+            timeout_ms: 3000
+            progress_heartbeat_ms: 1000
+          schema:
+            derive: input
+          session_vars:
+            app.current_tenant: "${identity.tenant}"
+        governance:
+          minimum_trust: header_asserted
+
+      # Streaming response shape (P4.4). `row_mode: stream` wraps the
+      # first `max_rows` rows in {rows, next_cursor, truncated} so
+      # clients can iterate large result sets. The `stream:` block
+      # declares the keyset key — the plugin auto-binds last-row
+      # values to `:_after_<col>` placeholders on continuation calls,
+      # and emits an HMAC-bound `next_cursor` token in the response.
+      # Cursor tokens are stateless: any gateway instance can decode
+      # and resume them so long as `stream.signing_key_env` names a
+      # shared secret across the cluster. Without an env var the
+      # plugin falls back to a per-process random key (single-node
+      # only — multi-node continuation calls would fail verification).
+      - name: orders.stream_by_tenant
+        title: Stream Orders
+        description: Return orders as a paged stream envelope.
+        backend:
+          kind: sql
+          driver: postgres
+          url: "postgres://app:${env.ORDERS_DB_PW}@db:5432/orders"
+          query:
+            sql: |
+              SELECT id, total, placed_at FROM orders
+              WHERE tenant_id = :tenant AND id > :_after_id
+              ORDER BY id
+              LIMIT 500
+            params: ["tenant"]
+            row_mode: stream
+            max_rows: 500
+            stream:
+              cursor_columns: ["id"]
+              initial: { id: 0 }
+              # signing_key_env: ORDERS_STREAM_KEY  # uncomment for cluster deploys
+        governance:
+          minimum_trust: header_asserted
+
+      # Fire-and-wait binding (P3.3). Fires the optional trigger once,
+      # then polls `check` on `poll_interval_ms` and returns the check
+      # row when the CEL `predicate` evaluates true — or a Timeout
+      # error at `timeout_ms`. CEL sees `row` (check's first row or
+      # null when empty) and `arguments` (caller args).
+      - name: jobs.await_provision
+        title: Wait for Provision Job
+        description: Submit a provision job and block until it's done.
+        backend:
+          kind: sql
+          driver: postgres
+          url: "postgres://app:${env.ORDERS_DB_PW}@db:5432/orders"
+          query:
+            # The sql backend requires a `query` block even when `await`
+            # drives the call; the await loop takes over at dispatch
+            # time. `SELECT 1` is a harmless no-op stub.
+            sql: "SELECT 1"
+            row_mode: scalar
+          await:
+            trigger:
+              sql: "INSERT INTO provision_jobs (user_id) VALUES (:u)"
+              params: [u]
+            check:
+              sql: "SELECT status FROM provision_jobs WHERE user_id = :u ORDER BY id DESC LIMIT 1"
+              params: [u]
+            predicate: 'row.status == "completed"'
+            poll_interval_ms: 2000
+            timeout_ms: 120000
+        governance:
+          minimum_trust: header_asserted
+
+      # Transactional pipeline (P4.1 — config surface). `sql_tx` groups
+      # nested statements under a single pinned-connection transaction
+      # on the referenced SQL binding's pool. Executor wire-up is a
+      # follow-up; the YAML is stable today.
+      - name: orders.charge_flow
+        title: Place Order (Transactional)
+        description: Deduct inventory and record the order atomically.
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 5000
+          steps:
+            - id: charge_flow
+              kind: sql_tx
+              backend: orders.lookup_by_tenant               # any registered SQL backend
+              steps:
+                - id: deduct_inventory
+                  sql: "UPDATE inventory SET qty = qty - 1 WHERE id = :id"
+                  params: [id]
+                - id: record_order
+                  sql: "INSERT INTO orders (user_id, item_id) VALUES (:u, :i)"
+                  params: [u, i]
+
+      # --- Mock bindings for development and testing ---
+      # Mock bindings return configurable fixture responses without external services.
+      # Use them for local development, integration testing, and replay-fixture scenarios.
+      - name: dev.echo
+        title: Dev Echo
+        description: Returns a fixed fixture response for development testing.
+        backend:
+          kind: mock
+          response:
+            status: ok
+            items:
+              - id: item-1
+                label: First item
+              - id: item-2
+                label: Second item
+        input_schema:
+          type: object
+          properties:
+            query:
+              type: string
+      - name: dev.error_scenario
+        title: Dev Error Scenario
+        description: Simulates an upstream error for testing error-handling paths.
+        backend:
+          kind: mock
+          response: null
+          error: true
+          error_message: "simulated upstream timeout"
+
+      # --- Pipeline bindings ---
+      # Pipelines chain multiple steps into a single tool invocation.
+      # Steps execute sequentially; each step can reference prior outputs via CEL.
+
+      - name: orders.enrich_and_validate
+        title: Enrich and Validate Order
+        description: >
+          Pipeline that fetches an order, enriches it with inventory data,
+          applies a validation gate, and returns the combined result.
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 15000
+          steps:
+            - kind: http
+              id: fetch_order
+              url: http://localhost:9000/api/orders
+              method: post
+              timeout_ms: 5000
+              max_response_bytes: 8192
+              expected_status_codes: [200]
+              require_json_response: true
+            - kind: http
+              id: enrich_inventory
+              url: http://localhost:9001/api/inventory/check
+              method: post
+              timeout_ms: 5000
+              max_response_bytes: 8192
+              expected_status_codes: [200]
+              require_json_response: true
+              input_transform: '{"order_id": steps.fetch_order.id, "items": steps.fetch_order.items}'
+            - kind: cel_gate
+              id: validate_stock
+              expression: 'steps.enrich_inventory.all_in_stock == true'
+              error_message: "One or more items are out of stock"
+            - kind: transform
+              id: build_response
+              expression: '{"order": steps.fetch_order, "inventory": steps.enrich_inventory, "validated": true}'
+        governance:
+          minimum_trust: header_asserted
+
+      # --- Pipeline with elicitation (human-in-the-loop) ---
+      # This pipeline suspends and asks the client for confirmation before proceeding.
+      # The initial tools/call returns 202 Accepted, and the server sends an
+      # elicitation/create request via SSE. The client responds, and the pipeline resumes.
+
+      - name: orders.place_with_confirmation
+        title: Place Order with Confirmation
+        description: >
+          Pipeline that validates an order, asks the user for confirmation
+          via elicitation, and then places the order.
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 120000
+          steps:
+            - kind: mock
+              id: validate_order
+              response:
+                order_id: "ORD-001"
+                total: 149.99
+                items: ["Widget A", "Widget B"]
+                valid: true
+            - kind: elicitation
+              id: confirm_order
+              message: >
+                Please confirm your order:
+                Total: $149.99
+                Items: Widget A, Widget B
+                Do you want to proceed?
+              requested_schema:
+                type: object
+                properties:
+                  confirmed:
+                    type: boolean
+                    description: Whether the user confirms the order
+                required:
+                  - confirmed
+              timeout_ms: 60000
+            - kind: cel_gate
+              id: check_confirmation
+              expression: 'steps.confirm_order.confirmed == true'
+              error_message: "Order cancelled by user"
+            - kind: mock
+              id: place_order
+              response:
+                status: placed
+                order_id: "ORD-001"
+                confirmation_number: "CONF-12345"
+        governance:
+          minimum_trust: verified
+
+      # --- Pipeline with sampling (LLM request) ---
+      # This pipeline asks the client to run an LLM completion as part of a tool chain.
+
+      - name: content.summarize_and_translate
+        title: Summarize and Translate
+        description: >
+          Pipeline that fetches content, asks the client's LLM to summarize it,
+          and returns the summary.
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: mock
+              id: fetch_content
+              response:
+                title: "MCP Gateway Architecture"
+                body: "MCPG is a Model Context Protocol Gateway that sits between MCP clients and downstream systems..."
+            - kind: sampling
+              id: summarize
+              messages:
+                - role: user
+                  content: "Summarize the following text in 2-3 sentences: {{ steps.fetch_content.body }}"
+              max_tokens: 256
+              timeout_ms: 30000
+            - kind: transform
+              id: build_result
+              expression: '{"title": steps.fetch_content.title, "summary": steps.summarize}'
+        governance:
+          minimum_trust: header_asserted
+
+    resources:
+      # SQL-backed resource (P2.1). The gateway dispatches `resources/read`
+      # through the SQL binding's `execute()` with the requested URI in
+      # `arguments.uri`. `row_mode: resource_contents` auto-wraps the
+      # SELECTed `uri`/`text`(/`blob`)/`mime_type` columns as the MCP
+      # `{"contents": [...]}` payload — no hand-written JSON aggregation.
+      - name: sqldoc.readme
+        title: README
+        description: The project README, served from Postgres.
+        uri: "sqldoc://readme"
+        mime_type: text/markdown
+        backend:
+          kind: sql
+          driver: postgres
+          url: "postgres://app:${env.ORDERS_DB_PW}@db:5432/orders"
+          query:
+            sql: "SELECT uri, text, mime_type FROM docs WHERE uri = :uri"
+            params: ["uri"]
+            row_mode: resource_contents
+            timeout_ms: 1000
+        governance:
+          minimum_trust: unauthenticated
+
+    resource_templates:
+      # SQL-backed resource template (P2.2). `uri_template` variables
+      # are captured from the requested URI and flow into `arguments`
+      # under their declared names, so the placeholder binding picks
+      # them up like any other `:name` slot. Works with the same
+      # `row_mode: resource_contents` wrapper — one template, many
+      # concrete URIs, one SQL query.
+      - name: sqldoc.page
+        title: Doc Page
+        description: Any documentation page by slug, served from Postgres.
+        uri_template: "sqldoc://{slug}"
+        mime_type: text/markdown
+        backend:
+          kind: sql
+          driver: postgres
+          url: "postgres://app:${env.ORDERS_DB_PW}@db:5432/orders"
+          query:
+            # `:slug` binds the template variable extracted from the
+            # requested URI; `:uri` is the resolved full URI that the
+            # gateway always injects into `arguments`.
+            sql: "SELECT uri, text, mime_type FROM docs WHERE slug = :slug"
+            params: ["slug"]
+            row_mode: resource_contents
+            timeout_ms: 1000
+        governance:
+          minimum_trust: unauthenticated
+
+      # SQL-backed dynamic resource listing (P2.3). Attach `list_query`
+      # to a `kind: resource_template` binding so `resources/list`
+      # enumerates concrete URIs backed by live rows. Only `:cursor`
+      # and `:page_size` placeholders are plugin-bound — any other
+      # `:name` in list_query.sql is rejected at startup. Pick a
+      # monotonic, indexed cursor column for keyset mode.
+      - name: sqldoc.all_pages
+        title: All Doc Pages
+        description: Every documentation page the SQL-backed resource template can serve.
+        uri_template: "sqldoc://{slug}"
+        mime_type: text/markdown
+        backend:
+          kind: sql
+          driver: postgres
+          url: "postgres://app:${env.ORDERS_DB_PW}@db:5432/orders"
+          query:
+            sql: "SELECT uri, text, mime_type FROM docs WHERE slug = :slug"
+            params: ["slug"]
+            row_mode: resource_contents
+          list_query:
+            sql: |
+              SELECT uri, title AS name, snippet AS description, mime_type
+              FROM docs
+              WHERE (:cursor IS NULL OR id > CAST(:cursor AS BIGINT))
+              ORDER BY id
+              LIMIT :page_size
+            mode: keyset
+            cursor_column: id
+            page_size: 100
+        governance:
+          minimum_trust: unauthenticated
+
+    # --- Resource binding with watch config (subscription-based change detection) ---
+    # resources:
+    #   - name: config.app_settings
+    #     description: Application configuration
+    #     uri: "config://app/settings"
+    #     mime_type: application/json
+    #     backend:
+    #       kind: http
+    #       url: https://api.example.com/config
+    #       method: get
+    #       timeout_ms: 5000
+    #     watch:                              # enables resources/subscribe for this binding
+    #       strategy:
+    #         type: poll                      # poll | nats_topic | kafka_topic | webhook
+    #         interval_ms: 30000
+    #
+    #     # Watch strategy alternatives:
+    #     #   NATS topic — react to messages on a NATS subject:
+    #     #   watch:
+    #     #     strategy:
+    #     #       type: nats_topic
+    #     #       subject: "config.changed"
+    #     #
+    #     #   Kafka topic — consume from a Kafka topic:
+    #     #   watch:
+    #     #     strategy:
+    #     #       type: kafka_topic
+    #     #       topic: "config-change-events"
+    #     #       group_id: "mcpg-watcher"    # default: mcpg-resource-watcher
+    #     #
+    #     #   Webhook — 3rd party POSTs to /webhooks/resource-updated/{token}:
+    #     #   watch:
+    #     #     strategy:
+    #     #       type: webhook
+    #     #       token: "abc123secret"       # routing key in URL path
+  # --- NATS connection ---
+  # T3-8 follow-up (2026-05-04): NATS connection params live on the
+  # binding itself (see `bindings[].url` / `bindings[].credentials_path`
+  # above). There is no separate top-level `nats:` block.
+gateway:
+  server:
+    bind_address: 127.0.0.1:8787
+    health_path: /health
+    mcp_path: /mcp
+    allowed_origins:
+      - http://localhost:3000
+    replay_window_limit: 16
+    session_idle_timeout_ms: 900000
+
+  # --- Sessions / subscriptions / delivery ---
+  # Layout #4 Slice B1 (2026-05-06) moved the runtime-emergent state
+  # blocks under `mcp.configurations.<x>`. Operators tune persistence
+  # (`store:` / `bus:`) and constraints (max-per-session, idle
+  # timeouts) there; the items themselves are created by clients at
+  # runtime. Capability `store:` / `bus:` defaults to `kind: cluster`
+  # (the cluster backend's primitive); the only other accepted
+  # override kinds are the in-process primitives `kind: memory` and
+  # (store only) `kind: file`. `redis` / `nats` are NOT valid override
+  # kinds — for shared redis/nats-backed capability state set the
+  # top-level `cluster.kind: redis | nats` and capabilities inherit it
+  # (via the default `kind: cluster`). See
+  # `mcp.configurations.{sessions,subscriptions,delivery,cancellation,pipelines}`.
+
+observability:
+  enabled: true
+  logs:
+    enabled: true
+    level: info
+    sinks:
+      - kind: stderr
+        config:
+          format: json
+  metrics:
+    enabled: true
+    sinks:
+      # Opt into the Prometheus exporter via the
+      # `dev.mcpg.observability.prometheus` plugin id (the
+      # legacy `kind: prometheus` shorthand is gone).
+      - kind: dev.mcpg.observability.prometheus
+        config:
+          # Optional `namespace` prefix (`<ns>_<metric>`).
+          # namespace: mcpg
+          # Static labels added to every series.
+          # global_labels:
+          #   env: production
+  # traces:
+  #   enabled: true
+  #   service_name: mcpg
+  #   propagate_context: true
+  #   sinks:
+  #     # Opt into OTLP via the
+  #     # `dev.mcpg.observability.otlp` plugin id (the legacy
+  #     # `kind: otlp` shorthand is gone).
+  #     - kind: dev.mcpg.observability.otlp
+  #       config:
+  #         url: http://otel-collector:4317
+  #         service_name: mcpg
+  #         service_version: "1.0.0"
+  #         resource_attributes:
+  #           deployment.environment: prod
+# Layout D'' P2: audit lives under `governance.audit:` (was top-level
+# `audit:` pre-D''; before that, `observability.audit:`).
+# Compliance-grade event sink fan-out (spec §9.12). Default ships the
+# built-in local-file sink at `./mcpg-audit.log`; operators replace
+# the `sinks:` list to pipe audit events to CloudTrail / Datadog
+# Audit / SIEM. Listing the kind enables it; omitting it disables
+# (the legacy `disable_builtins` toggle is gone).
+governance:
+  audit:
+    enabled: true
+    required: true        # gateway refuses to start with no sinks
+    on_failure: fail_closed
+    emit_tool_call_allowed: true
+    emit_tool_call_completed: true
+    sinks:
+      - kind: dev.mcpg.builtin.audit.local-file
+        config:
+          path: ./mcpg-audit.log
+      # - kind: dev.acme.audit.cloudtrail
+      #   config:
+      #     arn: arn:aws:cloudtrail:us-east-1:123:trail/mcpg
+  policy:
+    tool_access:
+      default_minimum_trust: header_asserted
+      cel_allow_if: 'tool_name == "mcpg.runtime.snapshot" && trust_level == "header_asserted"'
+      rules:
+        - tool_name: mcpg.runtime.snapshot
+          minimum_trust: header_asserted
+          cel_allow_if: 'principal_id == "user-1"'
+# governance:
+#   access:
+#     jwks:
+#       url: https://auth.example.com/.well-known/jwks.json
+#       issuer: https://auth.example.com/
+#       audience: mcpg
+#       header_name: authorization
+
+# --- OIDC/OAuth Enterprise Identity (M16) ---
+# Use instead of 'jwks' for enterprise bearer-token federation.
+# Supports OIDC discovery, JWKS-backed JWT verification, and
+# OAuth token introspection for opaque tokens.
+# Cannot be configured simultaneously with 'jwks'.
+#
+# governance:
+#   access:
+#     oidc_oauth:
+#         token_source:
+#           kind: authorization_bearer   # or custom_header
+#         providers:
+#           # OIDC provider with JWKS-based JWT verification
+#           - issuer: https://login.example.com/
+#             discovery_uri: https://login.example.com/.well-known/openid-configuration
+#             audiences:
+#               - mcpg
+#             verification:
+#               kind: oidc_jwks
+#               allowed_algs:
+#                 - RS256
+#               refresh_interval_secs: 300
+#               timeout_ms: 2000
+#               max_staleness_secs: 3600
+#             claim_mappings:
+#               subject_claim: sub
+#               group_claim_paths:
+#                 - groups
+#                 - realm_access.roles
+#               role_claim_paths:
+#                 - roles
+#               scope_claim_paths:
+#                 - scope
+#                 - scp
+#               attribute_claim_mappings:
+#                 email: email
+#                 department: department
+#             clock_skew_secs: 60
+#
+#           # OAuth provider with opaque-token introspection
+#           - issuer: https://oauth.example.com/
+#             audiences:
+#               - mcpg
+#             verification:
+#               kind: oauth_introspection
+#               introspection_url: https://oauth.example.com/introspect
+#               client_id: mcpg
+#               client_secret_ref: env:MCPG_INTROSPECTION_SECRET
+#               timeout_ms: 2000
+#             claim_mappings:
+#               subject_claim: sub
+#               group_claim_paths:
+#                 - groups
+#               scope_claim_paths:
+#                 - scope
+#
+#           # Hybrid provider (JWT first, introspection fallback)
+#           - issuer: https://hybrid.example.com/
+#             audiences:
+#               - mcpg
+#             verification:
+#               kind: hybrid
+#               allowed_algs:
+#                 - RS256
+#               refresh_interval_secs: 300
+#               timeout_ms: 2000
+#               max_staleness_secs: 3600
+#               introspection_url: https://hybrid.example.com/introspect
+#               client_id: mcpg
+#               client_secret_ref: env:MCPG_HYBRID_SECRET
+#               introspection_timeout_ms: 2000
+#
+# --- OAuth 2.1 Protected Resource Metadata (RFC 9728, T6-01) ---
+# When governance.access is configured, MCPG auto-serves GET /.well-known/oauth-protected-resource
+# with authorization_servers derived from OIDC provider issuers.
+# Use resource_metadata for explicit control:
+#
+#   resource_metadata:
+#     resource: https://gateway.example.com/mcp
+#     authorization_servers:
+#       - https://auth.example.com/
+#     scopes_supported:
+#       - openid
+#       - tools
+#     bearer_methods_supported:
+#       - header
+
+# --- Redis configuration ---
+# Redis is wired through `cluster.kind: redis` only. There is no separate
+# top-level `redis:` block (T3-8, 2026-05-04). Example:
+# cluster:
+#   kind: redis
+#   url: redis://127.0.0.1:6379
+#   key_prefix: "mcpg:cluster:"
+
+# --- Delivery bus ---
+# The delivery bus routes server-initiated messages (elicitation,
+# sampling, deferred results) to the MCPG instance holding the
+# client's active SSE stream. Configured under
+# `mcp.configurations.delivery.bus:` (or omitted to inherit
+# `kind: cluster`, which delegates to the cluster backend's
+# primitive).
+#
+# - `bus: { kind: cluster }` — uses the cluster backend's bus
+#   primitive (Redis pub/sub when `cluster.kind: redis`; NATS
+#   Core when `cluster.kind: nats`; in-process when
+#   `cluster.kind: single-node-builtin`).
+# - `bus: { kind: memory }` — explicit in-process; only correct on
+#   single-instance deploys.
+#
+# Multi-instance deploys with pipeline / elicitation / sampling
+# bindings need a non-memory delivery bus so the gateway holding
+# the client SSE stream can be reached by the gateway that
+# triggered the suspension. Today that means
+# `cluster.kind: redis` or `cluster.kind: nats`.
+
+# ---------------------------------------------------------------------------
+# Plugins — Runtime Extension System
+# ---------------------------------------------------------------------------
+# Plugins extend the gateway with custom logic at three points in the
+# request lifecycle:
+#
+#   tool-gate   — Pre/post dispatch evaluation (allow, deny, challenge).
+#                 Short-circuits on first deny/challenge in chain.
+#                 Allow metadata is merged across plugins (e.g. payment receipts).
+#   transform   — Pre/post argument/result transformation (no short-circuit).
+#                 Errors are logged and skipped; each transform sees previous output.
+#   identity    — Identity resolution from request headers/tokens.
+#                 First "resolved" wins; "none" falls through to next plugin.
+#
+# Two tiers:
+#   native  — Compiled Rust cdylib (.so). Dynamically loaded at boot via
+#             libloading + abi_stable (ABI v1) — this is the PRIMARY path:
+#             all backends and most gates / transforms / identity providers /
+#             sinks ship as runtime-loaded native cdylibs (the `mcpg` binary
+#             hard-wires no backend). Artifacts are SHA-256 + optional
+#             Ed25519-signature verified before load. `inline_dispatch: true`
+#             opts a trusted, bounded plugin into the zero-ferry fast path.
+#   wasm    — WebAssembly Component Model (.wasm) — sandboxed, metered.
+#             Requires building the gateway with `--features wasm-plugins`.
+#             Per-entry sandbox limits: memory_mb, fuel (instruction budget),
+#             timeout_ms (wall-clock).
+#
+# Registration + evaluation order follows the `plugins:` array order.
+# Within a class the chain evaluates in that order:
+#   tool_gate          — pre runs before dispatch (first deny/challenge wins),
+#                        post runs after; Allow metadata merges across plugins.
+#   transform          — each sees the previous plugin's output (no short-circuit).
+#   identity_provider  — first Resolved wins; None falls through.
+# There are NO hidden built-ins ahead of the list: payment (mpp/x402/ucp/acp)
+# and guardrails are ordinary cdylib tool_gate plugins configured via
+# `plugins:` like everything else — the old top-level `payment:` block and the
+# per-binding `payment:` sugar were REMOVED (author the plugin's typed config,
+# incl. its `tools` map, directly under the entry's `config:`).
+#
+# Layout D'' P4: `plugins:` is a flat array. The pre-D'' wrapper
+# (`plugins.enabled` / `plugins.plugin_dir` / `plugins.entries[]`) is
+# gone — an empty array is the kill switch, and per-entry `source.path`
+# replaces the global `plugin_dir`. Per-entry `granted_capabilities:`
+# replaces the old top-level `plugins.capability_grants:` map.
+#
+# Plugin-entry shape (all fields; only `id` is required):
+#   - id: my-alias                # operator alias, unique within plugins[]
+#     ref: dev.mcpg.policy.cedar   # (opt) artifact manifest id when the alias differs,
+#                                  #       or to run one artifact under several aliases
+#     kind: native                 # native (default) | wasm
+#     class: tool_gate             # snake_case PluginClass (see list below)
+#     source: { path: ./plugins/libX.so }        # exactly one of path | oci
+#     # source: { oci: ghcr.io/mcpg-dev/plugins/cedar:1.0.0 }   # OCI artifact (pulled at boot)
+#     config: { ... }              # plugin-specific (the per-plugin blocks below)
+#     enforce: true                # false ⇒ shadow mode: evaluate + log but override deny/challenge → allow
+#     disabled: false              # true ⇒ parsed + validated but NOT loaded (keep config, toggle off)
+#     inline_dispatch: false       # true ⇒ zero-ferry fast path; ONLY for trusted, bounded, non-blocking slots
+#     signature:                   # (opt) content hash + verify policy + trusted keys
+#       sha256: "…"                #   pin the artifact's content hash
+#       policy: enforce            #   enforce | warn | disabled (else inherits gateway.plugin_registry default)
+#       trusted_keys: [{ id: release-2026, pem: "-----BEGIN PUBLIC KEY-----\n…" }]
+#     ffi_limits: { lifecycle_ms: 1000, control_ms: 5000, data_ms: 30000, max_payload_bytes: 262144 }  # (opt, native)
+#     limits: { memory_mb: 64, fuel: 10000000, timeout_ms: 100 }   # (opt, wasm sandbox)
+#     granted_capabilities:        # (opt) typed host caps this plugin may invoke
+#       - network_outbound
+#       - { type: secrets_read, schemes: [vault, aws-sm] }
+#       - { type: filesystem_read, paths: ["/etc/myapp/"] }
+#     observability:               # (opt) per-plugin sink routing — see docs/observability/sink-redirection.yaml
+#       traces: { enabled: false }
+#
+# class — the 21 PluginClass values (snake_case; legacy hyphenated forms are rejected):
+#   tool_gate · transform · identity_provider · backend · watch_strategy
+#   http_route · audit_sink · log_sink · telemetry_sink · metrics_sink
+#   store · cache · secret_provider · config_provider · policy_engine
+#   cluster · transport · catalog_provider · credential_issuer
+#   approval_notifier · content_store
+#
+# ===========================================================================
+# PLUGIN CATALOG — every first-party plugin, its id / class / artifact, and
+# the config it accepts. All samples are COMMENTED: uncomment, point
+# `source.path` at your built `.so` (or use `source.oci:`), set `config:`.
+# This catalog is the full "what can MCPG do and how do I wire it" reference.
+# ===========================================================================
+#
+# plugins:
+#
+#   # ───────────────────────── BACKENDS (class: backend) ─────────────────────
+#   # Load the cdylib here; put the PER-CALL config in each tool/resource
+#   # binding's `backend: { kind: <x>, ... }` block (see mcp.capabilities above).
+#   # `url`/`headers`/`api_key` fields accept `cred://` references.
+#   #   http     kind: http      | url, method=post, timeout_ms=2000, headers{}, expected_status_codes=[200], max_response_bytes=4096
+#   #   command  kind: command   | command, args[] (CEL), timeout_ms=2000, max_output_bytes=4096, require_json_stdout=false
+#   #   grpc     kind: grpc      | url, service, method, timeout_ms=2000, max_response_bytes=65536, headers{}
+#   #   graphql  kind: graphql   | url, operation, timeout_ms=2000, max_response_bytes=65536, headers{}
+#   #   nats     kind: nats      | url, subject, timeout_ms=2000, max_response_bytes=65536, credentials_path?
+#   #   kafka    kind: kafka     | bootstrap_servers, group_id, request_topic, response_topic, timeout_ms=10000, sasl_*?
+#   #   sql      kind: sql       | driver (postgres|mysql|mariadb|sqlite), url, query{mode}, pool{}, auth{}, cache{}, await{}
+#   #   mock     kind: mock      | response{}, delay_ms=0, error=false, passthrough=false
+#   #   LLM      kind: <provider>.<op>  | api_key, model, prompt{}, sampling{}, tools{}, retry{}, timeout_ms=60000, cache{}, budget{}
+#   #            providers/ops: openai|azure_openai|anthropic|gemini|compat .chat ; openai|gemini|compat .embedding ; openai|stability .image
+#   - id: dev.mcpg.backend.http
+#     class: backend
+#     source: { path: ./plugins/libmcpg_plugin_backend_http.so }
+#   # - id: dev.mcpg.backend.command   # libmcpg_plugin_backend_command.so
+#   # - id: dev.mcpg.backend.grpc      # libmcpg_plugin_backend_grpc.so
+#   # - id: dev.mcpg.backend.graphql   # libmcpg_plugin_backend_graphql.so
+#   # - id: dev.mcpg.backend.nats      # libmcpg_plugin_backend_nats.so
+#   # - id: dev.mcpg.backend.kafka     # libmcpg_plugin_backend_kafka.so
+#   # - id: dev.mcpg.backend.sql       # libmcpg_plugin_backend_sql.so
+#   # - id: dev.mcpg.backend.mock      # libmcpg_plugin_backend_mock.so
+#   # - id: dev.mcpg.backend.llm.openai     # libmcpg_plugin_backend_llm_openai.so  (openai.chat|embedding|image, azure_openai.chat)
+#   # - id: dev.mcpg.backend.llm.anthropic  # libmcpg_plugin_backend_llm_anthropic.so  (anthropic.chat)
+#   # - id: dev.mcpg.backend.llm.gemini     # libmcpg_plugin_backend_llm_gemini.so  (gemini.chat|embedding)
+#   # - id: dev.mcpg.backend.llm.compat     # libmcpg_plugin_backend_llm_compat.so  (compat.chat|embedding — vLLM/Groq/LocalAI/…)
+#   # - id: dev.mcpg.backend.llm.stability  # libmcpg_plugin_backend_llm_stability.so  (stability.image)
+#
+#   # ────────────────── TOOL GATES (class: tool_gate) ──────────────────
+#   # Pre/post-dispatch allow / deny / challenge / pending-approval.
+#   - id: dev.mcpg.rate-limit
+#     class: tool_gate
+#     source: { path: ./plugins/libmcpg_plugin_reliability_rate_limit.so }
+#     config:
+#       default_limit: 100               # requests per window for unmatched tools
+#       default_window_ms: 60000         # window length (ms)
+#       default_burst: null              # (opt) extra tokens above steady rate
+#       cleanup_interval_ms: 300000      # expired-counter sweep interval
+#       rules:                           # (opt) per-tool overrides
+#         - tools: ["billing.*"]         # glob patterns
+#           limit: 10
+#           scope: per_principal         # per_principal | per_tool | per_principal_tool | per_session | global
+#   - id: dev.mcpg.circuit-breaker
+#     class: tool_gate
+#     source: { path: ./plugins/libmcpg_plugin_reliability_circuit_breaker.so }
+#     config:
+#       failure_threshold: 5             # consecutive failures to trip open
+#       cooldown_ms: 30000               # open → half-open delay
+#       half_open_max_inflight: 1        # probes allowed while half-open
+#       failure_status_codes: [500, 502, 503, 504]   # statuses counted as failures (default 500–599)
+#       # per_tool: [{ tools: ["flaky.*"], failure_threshold: 3, cooldown_ms: 10000 }]
+#   - id: dev.mcpg.response-cache
+#     class: tool_gate
+#     source: { path: ./plugins/libmcpg_plugin_reliability_response_cache.so }
+#     config:
+#       default_ttl_ms: 300000           # default cached-result TTL
+#       max_entries: 10000               # cache capacity
+#       cache_scope: shared              # shared | per_identity
+#       # per_tool: [{ tools: ["catalog.*"], ttl_ms: 3600000 }]
+#   - id: dev.mcpg.ip-allowlist
+#     class: tool_gate
+#     source: { path: ./plugins/libmcpg_plugin_security_ip_allowlist.so }
+#     config:
+#       allow: ["10.0.0.0/8", "::1/128"]   # CIDR allowlist (required)
+#       ip_header: x-forwarded-for          # header carrying the client IP
+#       tools: []                           # glob patterns to gate; [] = all tools
+#   - id: dev.mcpg.guardrails
+#     class: tool_gate
+#     source: { path: ./plugins/libmcpg_plugin_security_guardrails.so }
+#     config:
+#       pre_execution:                   # external HTTP guardrail hooks before dispatch
+#         - name: pii-scan
+#           url: https://guardrails.internal/scan
+#           timeout_ms: 2000
+#           on_error: deny               # deny | allow
+#           allow_mutation: false        # may the hook rewrite arguments?
+#           tools: ["*"]                 # glob patterns this hook applies to
+#           trigger_cel: "true"          # only invoke when this CEL is true
+#       post_execution: []               # same shape, runs on results
+#       apply_to_non_tool_surfaces: false
+#       allow_private_backends: false    # permit callouts to private/loopback IPs (dev only)
+#   - id: dev.mcpg.tool-gate-slack-approval
+#     class: tool_gate
+#     source: { path: ./plugins/libmcpg_plugin_tool_gate_slack_approval.so }
+#     config:
+#       default_channel: "#mcp-approvals"   # required
+#       bot_token_env: SLACK_BOT_TOKEN      # env var holding xoxb- token
+#       signing_secret_env: SLACK_SIGNING_SECRET
+#       default_deadline_ms: 600000
+#       interactive_path: /slack/interactive
+#       # rules: [{ tool_pattern: "prod\\..*", channel: "#prod-approvals", deadline_secs: 300 }]
+#   - id: dev.mcpg.audit                 # observability audit tool-gate (distinct from the built-in local-file sink)
+#     class: tool_gate
+#     source: { path: ./plugins/libmcpg_plugin_observability_audit.so }
+#     config:
+#       sink: { kind: stdout }           # stdout (default) | { kind: file, path }
+#                                        # the file sink never rotates and enforces no
+#                                        # size limit — rotate `path` externally (logrotate)
+#       include_arguments: false
+#       include_arguments_hash: true
+#       include_results: false
+#       include_result_summary: true
+#       buffer_size: 8192
+#       # tools_filter: ["sensitive.*"]
+#   - id: dev.mcpg.call-logger
+#     class: tool_gate
+#     source: { path: ./plugins/libmcpg_plugin_observability_call_logger.so }
+#     config:
+#       sample_rate: 1.0                 # [0.0–1.0]
+#       log_arguments: true
+#       log_results: true
+#       max_argument_bytes: 16384
+#       max_result_bytes: 65536
+#       redact_fields: ["password", "token"]
+#   - id: dev.mcpg.webhook
+#     class: tool_gate
+#     source: { path: ./plugins/libmcpg_plugin_integration_webhook.so }
+#     config:
+#       endpoints:
+#         - url: https://hooks.internal/mcp
+#           events: ["tool.call.completed"]
+#           headers: { Authorization: "${cred://webhook-token}" }
+#       max_retries: 3
+#       retry_backoff_ms: 1000
+#       timeout_ms: 5000
+#       buffer_size: 1024
+#   # - id: dev.mcpg.testing.hello-native  # libmcpg_plugin_testing_hello_native.so — reference no-op gate (no config)
+#
+#   # ── PAYMENT tool-gates (per-tool payment gating; config holds a `tools` map) ──
+#   - id: dev.mcpg.payment.mpp
+#     class: tool_gate
+#     source: { path: ./plugins/libmcpg_plugin_payment_mpp.so }
+#     config:
+#       enabled: true
+#       secret_key_env: MPP_SECRET_KEY   # required — env var holding the HMAC secret
+#       realm: mcpg-gateway
+#       recipient: "acct:platform"       # default recipient
+#       challenge_timeout_seconds: 300
+#       # REQUIRED to accept payments: Ed25519 settlement-authority public
+#       # key (hex). The credential's payload.signature must verify against
+#       # it. Unset ⇒ gate FAILS CLOSED (denies all paid calls). Echoing the
+#       # 402 challenge back never grants access.
+#       settlement_public_key: "<64-hex-char ed25519 pubkey>"
+#       # allow_unverified: false        # INSECURE dev-only: skip proof check
+#       tools:
+#         ai.premium_query: { charge: "0.10", currency: USDC }
+#   # - id: dev.mcpg.payment.x402   # libmcpg_plugin_payment_x402.so | facilitator_url, facilitator_api_key_env, settlement_currency=USD, max_order_ttl_ms=600000
+#   # - id: dev.mcpg.payment.ucp    # libmcpg_plugin_payment_ucp.so  | currency (req), discovery_endpoint?, checkout_timeout_ms=60000, tax_rules[]
+#   # - id: dev.mcpg.payment.acp    # libmcpg_plugin_payment_acp.so  | tools{merchant_base_url, auth_token_env,…}, default_api_version, session_ttl_ms=3600000
+#
+#   # ────────────────── POLICY ENGINES (class: policy_engine) ──────────────────
+#   - id: dev.mcpg.policy.cedar
+#     class: policy_engine
+#     source: { path: ./plugins/libmcpg_plugin_policy_cedar.so }
+#     config:
+#       policies: |                      # Cedar DSL (inline) — or set policy_uri for a remote bundle
+#         permit(principal, action, resource);
+#       # policy_uri: https://policies.internal/cedar.bundle
+#       skip_missing_policies: false
+#   # - id: dev.mcpg.policy.opa     # libmcpg_plugin_policy_opa.so  | opa_url? (else embedded WASM), entrypoint=data.mcpg.allow, policies? (Rego)
+#   # - id: dev.mcpg.policy.casbin  # libmcpg_plugin_policy_casbin.so | model (CONF, req), policy? (CSV) or policy_uri?, skip_missing_policies=false
+#
+#   # ────────────────── TRANSFORMS (class: transform) ──────────────────
+#   - id: dev.mcpg.masking
+#     kind: wasm                         # masking ships as a Wasm component (build --features wasm-plugins)
+#     class: transform
+#     source: { path: ./plugins/masking.wasm }
+#     limits: { memory_mb: 16, fuel: 5000000, timeout_ms: 50 }
+#     config:
+#       redact_pii: true                 # auto-detect + redact email / phone / SSN
+#       cache_masks: false
+#       rules:                           # (opt) explicit field masking
+#         - path_pattern: "$.card_*"     # JSONPath glob
+#           mask_char: "*"
+#           preserve_edges: true
+#
+#   # ────────────── IDENTITY PROVIDERS (class: identity_provider) ──────────────
+#   # First Resolved wins; resolution.trust_level = verified | header_asserted.
+#   - id: dev.mcpg.identity.oidc
+#     class: identity_provider
+#     source: { path: ./plugins/libmcpg_plugin_identity_oidc.so }
+#     config:
+#       providers:                       # ≥1 issuer
+#         - issuer: https://auth.example.com
+#           audiences: ["mcpg"]
+#           verification:                # JWKS | OauthIntrospection | Hybrid
+#             jwks: { refresh_interval_secs: 3600, allowed_algs: ["RS256"], allow_hmac: false }
+#           claim_mappings: { subject_claim: sub, role_claim_paths: ["realm_access.roles"] }
+#           clock_skew_secs: 60
+#       token_source: { kind: authorization }   # bearer extraction
+#   # - id: dev.mcpg.identity.api-key  # libmcpg_plugin_identity_api_key.so | token_sources[], keys[], resolution{trust_level=verified}
+#   # - id: dev.mcpg.identity.basic    # libmcpg_plugin_identity_basic.so   | users[], username_case=insensitive, resolution{}
+#   # - id: dev.mcpg.identity.mtls     # libmcpg_plugin_identity_mtls.so    | sources[] (xfcc|dn_string|custom_header), extraction{mode}, identities{}
+#   # - id: dev.mcpg.identity.workload # libmcpg_plugin_identity_workload.so| trust_domain, bundle{file|workload_api}, sources[], mode=trust|allowlist
+#
+#   # ────────────── CREDENTIAL ISSUERS (class: credential_issuer) ──────────────
+#   # Resolve `cred://<target>` references used by backends.
+#   - id: dev.mcpg.credential.static
+#     class: credential_issuer
+#     source: { path: ./plugins/libmcpg_plugin_credential_static.so }
+#     config:
+#       targets:                         # keyed by cred:// target path
+#         my-api-key:
+#           value: "${cred://env/MY_API_KEY}"   # single value (or `parts: {…}` for multi-part)
+#           ttl_seconds: 3600
+#           authorize: any               # any | {roles:[…]} | {groups:[…]} | {subjects:[…]}
+#   # - id: dev.mcpg.credential.oauth-client-credentials  # …oauth_client_credentials.so | providers{token_url, client_id, client_secret (cred://), scopes[], refresh_buffer_ms=60000}
+#   # - id: dev.mcpg.credential.vault-dynamic-db          # …vault_dynamic_db.so | url, auth{token|approle}, db_mount=database, targets{vault_role, identity_mapping, max_cache_ttl_ms}
+#
+#   # ────────────── SECRET PROVIDER (class: secret_provider) ──────────────
+#   # Resolves `vault://path#field` references.
+#   - id: dev.mcpg.secret.vault
+#     class: secret_provider
+#     source: { path: ./plugins/libmcpg_plugin_secret_vault.so }
+#     config:
+#       url: https://vault.example:8200
+#       auth: { method: kubernetes, role: mcpg }   # token | approle | userpass | kubernetes
+#       kv_mount: "secret/"
+#       default_field: value
+#       watch: { strategy: poll, poll_interval_ms: 30000 }   # poll | native (Vault 1.13+)
+#
+#   # ────────────── OBSERVABILITY SINKS ──────────────
+#   # Referenced from observability.{logs,metrics,traces}.sinks[].kind by id.
+#   - id: dev.mcpg.observability.prometheus
+#     class: metrics_sink
+#     source: { path: ./plugins/libmcpg_plugin_observability_prometheus.so }
+#     config:
+#       namespace: ""                    # metric-name prefix ("" = none)
+#       global_labels: { env: prod }
+#   - id: dev.mcpg.observability.otlp
+#     class: trace_sink                  # also usable as a log_sink
+#     source: { path: ./plugins/libmcpg_plugin_observability_otlp.so }
+#     config:
+#       url: http://otel-collector:4317  # OTLP gRPC endpoint ("" = degraded/no-export)
+#       service_name: mcpg
+#       batch_export_timeout_ms: 10000
+#
+#   # ────────────── APPROVAL NOTIFIER ──────────────
+#   # The Slack approval plugin above (class: tool_gate) also surfaces
+#   # human-approval prompts; pair it with the gateway's approval state machine.
+#
+# ── Plugins selected via DEDICATED top-level blocks (not plugins[]) ──
+#   cluster (class: cluster)        — chosen by `cluster: { kind: redis|nats|consul|etcd, ... }`:
+#       dev.mcpg.cluster.redis   | url, key_prefix="mcpg:cluster:", lease_ttl_ms=30000, peer_ttl_ms=60000
+#       dev.mcpg.cluster.nats    | servers[], jetstream{…}, node{id}, lease{default_ttl_sec=30}
+#       dev.mcpg.cluster.consul  | address, service_name, token?, kv_prefix="mcpg/"
+#       dev.mcpg.cluster.etcd    | endpoints[], key_prefix="/mcpg/", event_ttl_secs=60, auth?
+#   content_store (class: content_store) — chosen by `storage.providers[].kind`:
+#       dev.mcpg.storage.builtin | in_process{max_bytes=256MiB} | file_system{root, max_bytes=8GiB}
+#       dev.mcpg.storage.s3      | bucket, region, prefix, endpoint_url?, force_path_style?, max_bytes=256MiB
+#   cache (class: cache)            — chosen per-binding via `cache: { kind: redis, ... }`:
+#       dev.mcpg.cache.redis     | url, key_prefix="mcpg", connection{pool_size=16}, auth?, tls?
+#   catalog_provider (class: catalog_provider) — chosen via the `catalog:` chain (builtin must be first):
+#       dev.mcpg.catalog.builtin | tools{<id>:{metadata, hide}}, defaults{hide_unknown}, global_defaults{}
+#
+# Validation (config load): id non-empty + unique; kind ∈ {native, wasm};
+# class ∈ the 21 PluginClass values; source declares exactly one of path|oci.
+# The artifact at `source.path` is loaded + hash/signature-verified at BOOT
+# (not at config-validate), so this file validates even before the .so exists.
+#
+# Plugin chain evaluation:
+#   tool-gate:  pre_dispatch runs before tool execution; first deny/challenge wins
+#               post_dispatch runs after; first deny wins
+#               Allow decisions accumulate metadata (merged across plugins)
+#   transform:  pre runs on arguments before dispatch; post runs on result after
+#               No short-circuit; errors logged and skipped
+#   identity:   First Resolved() wins; None falls through; Invalid logged + skipped
+#
+# Metrics: every tool-gate evaluation emits mcpg_plugin_evaluations_total
+# with labels: plugin_id, phase (pre/post), decision (allow/deny/challenge/error)
+# Slow evaluations (>50ms) trigger a warning log.
+#
+# Plugin CLI extension:
+#   mcpg plugin <command> [options]
+#   Delegates to `mcpg-plugin` binary on PATH.
+#   Install with: cargo install mcpg-plugin-sdk
+#   Available commands: new, build, test, sign, hash, verify, list, publish

@@ -1,0 +1,102 @@
+gateway:
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+    # Bootstrap + seed the docs table. Run once before using the
+    # resource template below.
+    - name: docs.seed
+      title: "Seed docs"
+      description: "Create the docs table and insert 5 sample rows."
+      annotations: { idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.DOCS_DB_PATH}?mode=rwc"
+        query:
+          sql: |
+            CREATE TABLE IF NOT EXISTS docs (
+              id         INTEGER PRIMARY KEY AUTOINCREMENT,
+              slug       TEXT NOT NULL UNIQUE,
+              title      TEXT NOT NULL,
+              body       TEXT NOT NULL,
+              mime_type  TEXT NOT NULL DEFAULT 'text/markdown',
+              updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+          row_mode: affected_rows
+          timeout_ms: 2000
+
+    - name: docs.seed_rows
+      title: "Seed sample rows"
+      description: "Idempotent INSERT OR IGNORE of 5 docs."
+      annotations: { idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.DOCS_DB_PATH}?mode=rwc"
+        query:
+          sql: |
+            INSERT OR IGNORE INTO docs (slug, title, body) VALUES
+              ('readme',      'README',       '# Welcome'),
+              ('quickstart',  'Quickstart',   '# Quickstart'),
+              ('api',         'API reference','# API'),
+              ('faq',         'FAQ',          '# FAQ'),
+              ('changelog',   'Changelog',    '# CHANGELOG')
+          row_mode: affected_rows
+          timeout_ms: 2000
+
+    resource_templates:
+    # Resource template: `docs://{slug}` maps to one row's body.
+    # `row_mode: resource_contents` auto-wraps the SELECTed uri/text
+    # /mime_type columns into the MCP `{contents: [...]}` payload.
+    - name: docs.read
+      title: "Doc page (read)"
+      description: "Read one doc by slug."
+      uri_template: "docs://{slug}"
+      mime_type: "text/markdown"
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.DOCS_DB_PATH}?mode=rwc"
+        query:
+          sql: |
+            SELECT
+              'docs://' || slug AS uri,
+              body               AS text,
+              mime_type          AS mime_type
+            FROM docs
+            WHERE slug = :slug
+          params: [slug]
+          row_mode: resource_contents
+          timeout_ms: 2000
+        # `list_query` (P2.3) makes `resources/list` enumerate the
+        # concrete URIs backed by live rows. Keyset pagination: the
+        # plugin binds `:cursor` and `:page_size` — any other
+        # placeholder is rejected at startup.
+        list_query:
+          sql: |
+            SELECT
+              'docs://' || slug AS uri,
+              title             AS name,
+              substr(body, 1, 60) AS description,
+              mime_type
+            FROM docs
+            WHERE (:cursor IS NULL OR id > CAST(:cursor AS INTEGER))
+            ORDER BY id
+            LIMIT :page_size
+          mode: keyset
+          cursor_column: id
+          page_size: 3

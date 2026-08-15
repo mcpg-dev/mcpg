@@ -1,0 +1,76 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8797"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: k8s.get.pods
+        title: "List pods in a namespace"
+        description: "List pods in a namespace"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties:
+            namespace: { type: string, default: "default" }
+        backend:
+          kind: command
+          command: kubectl
+          args:
+            - "get"
+            - "pods"
+            - "-n"
+            - "${arguments.namespace}"
+            - "-o"
+            - "json"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: k8s.describe.pod
+        title: "Describe a pod"
+        description: "Describe a pod"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [name]
+          properties:
+            name: { type: string }
+            namespace: { type: string, default: "default" }
+        backend:
+          kind: command
+          command: kubectl
+          args:
+            - "describe"
+            - "pod"
+            - "${arguments.name}"
+            - "-n"
+            - "${arguments.namespace}"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: k8s.logs
+        title: "Tail last 200 lines of a pod"
+        description: "Tail last 200 lines of a pod"
+        annotations: { read_only: true }
+        input_schema:
+          type: object
+          required: [pod]
+          properties:
+            pod: { type: string }
+            namespace: { type: string, default: "default" }
+        backend:
+          kind: command
+          command: kubectl
+          args:
+            - "logs"
+            - "${arguments.pod}"
+            - "-n"
+            - "${arguments.namespace}"
+            - "--tail"
+            - "200"
+          timeout_ms: 15000
+          max_output_bytes: 65536

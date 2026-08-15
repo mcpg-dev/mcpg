@@ -1,0 +1,68 @@
+# Managed by the release pipeline — changes made here are overwritten.
+#
+# Publishes the @mcpg-dev/cli npm suite from published release artifacts:
+# every binary is downloaded from a GitHub Release of its own repository,
+# so npm serves exactly what the releases attested. Fires when this
+# repository publishes a Release, and by hand for re-runs or backfills.
+#
+# Publishing needs the repository variable OSS_NPM_PUBLISH set 'true' and
+# the NPM_TOKEN secret; without them the run assembles and dry-packs only.
+
+name: Publish npm suite
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "suite version (default: latest release)"
+        type: string
+        default: ""
+      dry_run:
+        description: "assemble + pack only, no publish"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # npm --provenance
+
+concurrency:
+  group: publish-npm-suite
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          scope: "@mcpg-dev"
+      - name: Assemble + publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          DRY=true
+          if [ "${{ vars.OSS_NPM_PUBLISH }}" = "true" ] \
+            && [ -n "${NODE_AUTH_TOKEN:-}" ] \
+            && [ "${{ inputs.dry_run }}" != "true" ]; then
+            DRY=false
+          else
+            echo "::notice::dry run (gates unset or dry_run requested)"
+          fi
+          DRY_RUN="$DRY" bash .github/scripts/publish-npm-suite.sh
+      - name: Upload packages (inspection)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: npm-suite-packages
+          path: dist-npm/*.tgz
+          if-no-files-found: ignore
+          retention-days: 3

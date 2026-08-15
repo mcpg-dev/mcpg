@@ -1,0 +1,894 @@
+# MCPG conformance "everything-server" config — M2.
+#
+# This is the customer-facing pattern: MCPG fronting a set of tools,
+# prompts, and resources defined entirely in YAML. Every fixture
+# the upstream conformance suite expects is wired via one of the
+# real MCPG backend kinds (Mock with passthrough, Pipeline with
+# sampling / elicitation / transform steps). No external services
+# are required beyond MCPG itself.
+#
+# Tool/prompt/resource names + payloads mirror the typescript-sdk
+# reference everythingServer.ts at the snapshot recorded in
+# conformance/README.md.
+#
+# Run via:
+#   MCPG_CONFIG=config-everything.yaml ./run.sh both
+
+gateway:
+  # The injected mock cdylib is built locally and unsigned; the
+  # conformance suite exercises the wire, not the signature gate.
+  plugin_registry:
+    default_signature_policy: disabled
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    # The whole suite fires from one IP (localhost) with no auth — the
+    # per-IP ANONYMOUS rate limit is the wrong guard here and started
+    # tripping mid-suite when the pinned suite's request volume crept
+    # up (429s failed dns-rebinding-protection + prompts-get-with-image,
+    # runs 27399867315 + local repro). 0 disables, exactly the
+    # documented "single-IP load testing" case; the limiter's own
+    # behaviour is covered by gateway integration tests, not this lane.
+    anonymous_rate_limit_per_min: 0
+
+governance:
+  # The conformance suite is an anonymous client (no auth header).
+  # Lower the default-trust gate to `unauthenticated` so every
+  # tool / resource / prompt is reachable without bolting on an
+  # access plugin. Production deployments override this per-binding
+  # in `governance.minimum_trust` on each binding.
+  policy:
+    tool_access:
+      default_minimum_trust: unauthenticated
+
+mcp:
+  capabilities:
+    # ---------------------------------------------------------------
+    # TOOLS
+    # ---------------------------------------------------------------
+    tools:
+      # ── Static content via Mock passthrough ─────────────────────
+
+      - name: test_simple_text
+        description: Tests simple text content response
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            content:
+              - type: text
+                text: "This is a simple text response for testing."
+
+      - name: test_image_content
+        description: Tests image content response
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            content:
+              - type: image
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+                mimeType: image/png
+
+      - name: test_audio_content
+        description: Tests audio content response
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            content:
+              - type: audio
+                data: "UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAAB9AAACABAAZGF0YQIAAAA="
+                mimeType: audio/wav
+
+      - name: test_embedded_resource
+        description: Tests embedded resource content response
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            content:
+              - type: resource
+                resource:
+                  uri: "test://embedded-resource"
+                  mimeType: text/plain
+                  text: "This is an embedded resource content."
+
+      - name: test_multiple_content_types
+        description: Tests response with multiple content types (text, image, resource)
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            content:
+              - type: text
+                text: "Multiple content types test:"
+              - type: image
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+                mimeType: image/png
+              - type: resource
+                resource:
+                  uri: "test://mixed-content-resource"
+                  mimeType: application/json
+                  text: '{"test":"data","value":123}'
+
+      - name: test_error_handling
+        description: Tests error response handling
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            isError: true
+            content:
+              - type: text
+                text: "This tool intentionally returns an error for testing"
+
+      - name: json_schema_2020_12_tool
+        description: "Tool with JSON Schema 2020-12 features for conformance testing (SEP-1613)"
+        input_schema:
+          type: object
+          properties:
+            name:
+              type: string
+            address:
+              type: object
+              properties:
+                street:
+                  type: string
+                city:
+                  type: string
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            content:
+              - type: text
+                text: "JSON Schema 2020-12 tool called"
+
+      # ── Server-initiated requests via Pipeline ──────────────────
+
+      - name: test_sampling
+        description: Tests server-initiated sampling (LLM completion request)
+        input_schema:
+          type: object
+          properties:
+            prompt:
+              type: string
+              description: The prompt to send to the LLM
+          required: [prompt]
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: sampling
+              id: llm_call
+              messages:
+                - role: user
+                  content: "${arguments.prompt}"
+              max_tokens: 100
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "LLM response: " + string(steps.llm_call.content.text)
+
+      - name: test_elicitation
+        description: Tests server-initiated elicitation (user input request)
+        input_schema:
+          type: object
+          properties:
+            message:
+              type: string
+              description: The message to show the user
+          required: [message]
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: elicitation
+              id: ask_user
+              message: "${arguments.message}"
+              requested_schema:
+                type: object
+                properties:
+                  response:
+                    type: string
+                    description: "User's response"
+                required: [response]
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "User response: action=" + string(steps.ask_user.action) + ", content=" + string(steps.ask_user.content)
+
+      - name: test_elicitation_sep1034_defaults
+        description: Tests elicitation with default values per SEP-1034
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: elicitation
+              id: form_with_defaults
+              message: "Please review and update the form fields with defaults"
+              requested_schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    description: User name
+                    default: "John Doe"
+                  age:
+                    type: integer
+                    description: User age
+                    default: 30
+                  score:
+                    type: number
+                    description: User score
+                    default: 95.5
+                  status:
+                    type: string
+                    description: User status
+                    enum: [active, inactive, pending]
+                    default: active
+                  verified:
+                    type: boolean
+                    description: Verification status
+                    default: true
+                required: []
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "Elicitation completed: action=" + string(steps.form_with_defaults.action) + ", content=" + string(steps.form_with_defaults.content)
+
+      - name: test_elicitation_sep1330_enums
+        description: Tests elicitation with enum schema improvements per SEP-1330
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: elicitation
+              id: enum_form
+              message: "Please select options from the enum fields"
+              requested_schema:
+                type: object
+                properties:
+                  untitledSingle:
+                    type: string
+                    description: Select one option
+                    enum: [option1, option2, option3]
+                  titledSingle:
+                    type: string
+                    description: Select one option with titles
+                    oneOf:
+                      - const: value1
+                        title: First Option
+                      - const: value2
+                        title: Second Option
+                      - const: value3
+                        title: Third Option
+                  legacyEnum:
+                    type: string
+                    description: "Select one option (legacy)"
+                    enum: [opt1, opt2, opt3]
+                    enumNames: [Option One, Option Two, Option Three]
+                  untitledMulti:
+                    type: array
+                    description: Select multiple options
+                    minItems: 1
+                    maxItems: 3
+                    items:
+                      type: string
+                      enum: [option1, option2, option3]
+                  titledMulti:
+                    type: array
+                    description: Select multiple options with titles
+                    minItems: 1
+                    maxItems: 3
+                    items:
+                      anyOf:
+                        - const: value1
+                          title: First Choice
+                        - const: value2
+                          title: Second Choice
+                        - const: value3
+                          title: Third Choice
+                required: []
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "Elicitation completed: action=" + string(steps.enum_form.action) + ", content=" + string(steps.enum_form.content)
+
+      # ── DRAFT-2026 MRTR fixtures ────────────────────────────────
+      # These tool names are hardcoded by conformance@0.2.0-alpha.0's
+      # `input-required-result-*.ts` scenarios; the upstream
+      # everythingServer.ts doesn't ship them, so we add them here.
+      # Each uses a Pipeline with a single suspending step pinned to
+      # a known correlation_token (the scenarios assert on it
+      # verbatim, e.g. `inputRequests["user_name"]`).
+
+      - name: test_input_required_result_elicitation
+        description: MRTR — emit elicitation/create with key `user_name`
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: elicitation
+              id: ask_user_name
+              correlation_token: user_name
+              message: "Please enter your name"
+              requested_schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    description: "User name"
+                required: [name]
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "Hello, " + string(steps.ask_user_name.content.name) + "!"
+
+      - name: test_input_required_result_sampling
+        description: MRTR — emit sampling/createMessage with key `summary`
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: sampling
+              id: ask_model
+              correlation_token: summary
+              messages:
+                - role: user
+                  content: "Generate a one-sentence summary."
+              max_tokens: 100
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "LLM said: " + string(steps.ask_model.content.text)
+
+      - name: test_input_required_result_list_roots
+        description: MRTR — emit roots/list with key `roots`
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: roots_list
+              id: ask_roots
+              correlation_token: roots
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "Got roots: " + string(steps.ask_roots.roots)
+
+      - name: test_input_required_result_request_state
+        description: MRTR — exercise requestState round-trip
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: elicitation
+              id: ask_user_name
+              correlation_token: user_name
+              message: "Please enter your name (request-state round-trip)"
+              requested_schema:
+                type: object
+                properties:
+                  name: { type: string }
+                required: [name]
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "Hello, " + string(steps.ask_user_name.content.name) + "!"
+
+      - name: test_input_required_result_tampered_state
+        description: MRTR — same as request_state; MCPG rejects tampered tokens via codec
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: elicitation
+              id: ask_user_name
+              correlation_token: user_name
+              message: "Please enter your name (tampered-state probe)"
+              requested_schema:
+                type: object
+                properties:
+                  name: { type: string }
+                required: [name]
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "Hello, " + string(steps.ask_user_name.content.name) + "!"
+
+      - name: test_input_required_result_capabilities
+        description: >-
+          MRTR — capability-aware pruning (SEP-2322). Offers an
+          elicitation step AND a sampling step. The elicitation step
+          is marked skip_if_unsupported, so a client that advertises
+          sampling but not elicitation skips straight to the sampling
+          suspension instead of failing the pipeline.
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: elicitation
+              id: ask_user_name
+              correlation_token: user_name
+              message: "Capability-check probe"
+              skip_if_unsupported: true
+              requested_schema:
+                type: object
+                properties:
+                  name: { type: string }
+                required: [name]
+              timeout_ms: 30000
+            - kind: sampling
+              id: summarize
+              correlation_token: summary
+              skip_if_unsupported: true
+              messages:
+                - role: user
+                  content: "Generate a short greeting"
+              max_tokens: 50
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "Pipeline completed with provided inputs"
+
+      - name: test_input_required_result_multi_round
+        description: MRTR — two-round elicitation (first_name then last_name)
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: elicitation
+              id: ask_first_name
+              correlation_token: first_name
+              message: "What's your first name?"
+              requested_schema:
+                type: object
+                properties:
+                  first_name: { type: string }
+                required: [first_name]
+              timeout_ms: 30000
+            - kind: elicitation
+              id: ask_last_name
+              correlation_token: last_name
+              message: "What's your last name?"
+              requested_schema:
+                type: object
+                properties:
+                  last_name: { type: string }
+                required: [last_name]
+              timeout_ms: 30000
+            - kind: transform
+              id: build_text
+              expression: |
+                "Hello, " + string(steps.ask_first_name.content.first_name) + " " + string(steps.ask_last_name.content.last_name) + "!"
+
+      - name: test_input_required_result_multiple_inputs
+        description: >-
+          MRTR multi-entry (SEP-2322). A single `gather` step emits
+          elicitation + sampling + roots/list together in one
+          InputRequiredResult; the pipeline resumes once the client
+          returns all three answers in one inputResponses map.
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: gather
+              id: gather_all
+              inputs:
+                - kind: elicitation
+                  correlation_token: user_name
+                  message: "What is your name?"
+                  requested_schema:
+                    type: object
+                    properties:
+                      name: { type: string }
+                    required: [name]
+                - kind: sampling
+                  correlation_token: greeting
+                  messages:
+                    - role: user
+                      content: "Generate a greeting"
+                  max_tokens: 50
+                - kind: roots
+                  correlation_token: client_roots
+            - kind: transform
+              id: render
+              expression: |
+                "Gathered all inputs: " + string(steps.gather_all.output.user_name.content.name)
+
+      # ── Notification-emitting tools (M4.D) ──────────────────────
+
+      - name: test_tool_with_logging
+        description: Tests tool that emits log messages during execution
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 30000
+          steps:
+            - kind: log
+              id: phase_start
+              level: info
+              logger: tool.test_tool_with_logging
+              data: "Tool execution started"
+            - kind: log
+              id: phase_middle
+              level: info
+              logger: tool.test_tool_with_logging
+              data: "Tool processing data"
+            - kind: log
+              id: phase_done
+              level: info
+              logger: tool.test_tool_with_logging
+              data: "Tool execution completed"
+            - kind: transform
+              id: render
+              expression: |
+                "Tool with logging executed successfully"
+
+      - name: test_tool_with_progress
+        description: Tests tool that reports progress notifications
+        input_schema:
+          type: object
+          properties: {}
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 30000
+          steps:
+            - kind: progress
+              id: phase_0
+              progress: 0.0
+              total: 100.0
+              message: "Completed step 0 of 100"
+            - kind: progress
+              id: phase_50
+              progress: 50.0
+              total: 100.0
+              message: "Completed step 50 of 100"
+            - kind: progress
+              id: phase_100
+              progress: 100.0
+              total: 100.0
+              message: "Completed step 100 of 100"
+            - kind: transform
+              id: render
+              # The reference everything-server returns the progress
+              # token as text. Stub a placeholder when the client
+              # didn't send one (the pipeline still produces output).
+              expression: |
+                "progress notifications emitted"
+
+      # ── Deferred follow-ups ─────────────────────────────────────
+      #
+      # `test_reconnection` — SEP-1699 mid-call SSE disconnect.
+      #
+      # `test_input_required_result_multiple_inputs` — multi-entry
+      #   inputRequests (3 different kinds in one suspension). MCPG
+      #   today emits single-entry MRTR (LIMITATIONS item 4).
+
+    # ---------------------------------------------------------------
+    # PROMPTS
+    # ---------------------------------------------------------------
+    prompts:
+      - name: test_simple_prompt
+        title: Simple Test Prompt
+        description: A simple prompt without arguments
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          response:
+            messages:
+              - role: user
+                content:
+                  type: text
+                  text: "This is a simple prompt for testing."
+
+      - name: test_prompt_with_arguments
+        title: Prompt With Arguments
+        description: A prompt with required arguments
+        prompt_arguments:
+          - name: arg1
+            description: First test argument
+            required: true
+          - name: arg2
+            description: Second test argument
+            required: true
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 5000
+          steps:
+            - kind: transform
+              id: render
+              expression: |
+                {
+                  "messages": [
+                    {
+                      "role": "user",
+                      "content": {
+                        "type": "text",
+                        "text": "Prompt with arguments: arg1='" + string(arguments.arg1) + "', arg2='" + string(arguments.arg2) + "'"
+                      }
+                    }
+                  ]
+                }
+
+      - name: test_prompt_with_embedded_resource
+        title: Prompt With Embedded Resource
+        description: A prompt that includes an embedded resource
+        prompt_arguments:
+          - name: resourceUri
+            description: URI of the resource to embed
+            required: true
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 5000
+          steps:
+            - kind: transform
+              id: render
+              expression: |
+                {
+                  "messages": [
+                    {
+                      "role": "user",
+                      "content": {
+                        "type": "resource",
+                        "resource": {
+                          "uri": string(arguments.resourceUri),
+                          "mimeType": "text/plain",
+                          "text": "Embedded resource content for testing."
+                        }
+                      }
+                    },
+                    {
+                      "role": "user",
+                      "content": {
+                        "type": "text",
+                        "text": "Please process the embedded resource above."
+                      }
+                    }
+                  ]
+                }
+
+      - name: test_prompt_with_image
+        title: Prompt With Image
+        description: A prompt that includes image content
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          response:
+            messages:
+              - role: user
+                content:
+                  type: image
+                  data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+                  mimeType: image/png
+              - role: user
+                content:
+                  type: text
+                  text: "Please analyze the image above."
+
+      # MRTR — prompts/get with suspending step. Tests that the
+      # non-tool-request MRTR path works on `prompts/get`. Whether the
+      # modern handler's prompts/get arm honours pipeline suspension
+      # is what this exercises.
+      - name: test_input_required_result_prompt
+        title: MRTR Prompt — input required
+        description: Prompt that suspends for elicitation/create
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 60000
+          steps:
+            - kind: elicitation
+              id: ask_context
+              correlation_token: user_name
+              message: "What context should the prompt use?"
+              requested_schema:
+                type: object
+                properties:
+                  context: { type: string }
+                required: [context]
+              timeout_ms: 30000
+            - kind: transform
+              id: render
+              expression: |
+                {
+                  "messages": [
+                    {
+                      "role": "user",
+                      "content": {
+                        "type": "text",
+                        "text": "Prompt context: " + string(steps.ask_context.output.content.context)
+                      }
+                    }
+                  ]
+                }
+
+    # ---------------------------------------------------------------
+    # RESOURCES
+    # ---------------------------------------------------------------
+    resources:
+      - name: static-text
+        title: Static Text Resource
+        description: A static text resource for testing
+        uri: "test://static-text"
+        mime_type: text/plain
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          response:
+            contents:
+              - uri: "test://static-text"
+                mimeType: text/plain
+                text: "This is the content of the static text resource."
+
+      - name: static-binary
+        title: Static Binary Resource
+        description: A static binary resource (image) for testing
+        uri: "test://static-binary"
+        mime_type: image/png
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          response:
+            contents:
+              - uri: "test://static-binary"
+                mimeType: image/png
+                blob: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+
+      - name: watched-resource
+        title: Watched Resource
+        description: A resource that auto-updates every 3 seconds
+        uri: "test://watched-resource"
+        mime_type: text/plain
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          response:
+            contents:
+              - uri: "test://watched-resource"
+                mimeType: text/plain
+                text: "Watched resource content"
+
+    resource_templates:
+      - name: template-resource
+        title: Resource Template
+        description: A resource template with parameter substitution
+        uri_template: "test://template/{id}/data"
+        mime_type: application/json
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 5000
+          steps:
+            - kind: transform
+              id: render
+              expression: |
+                {
+                  "contents": [
+                    {
+                      "uri": string(arguments.uri),
+                      "mimeType": "application/json",
+                      "text": "{\"id\":\"" + string(arguments.id) + "\",\"templateTest\":true,\"data\":\"Data for ID: " + string(arguments.id) + "\"}"
+                    }
+                  ]
+                }
+
+  configurations:
+    request_state:
+      encryption_key: "MDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiY2NkZGVlZmY="

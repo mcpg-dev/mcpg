@@ -1,0 +1,76 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8791"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: aws.r53.zones.list
+        title: "List hosted zones"
+        description: "List hosted zones"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: command
+          command: aws
+          args:
+            - "route53"
+            - "list-hosted-zones"
+            - "--output"
+            - "json"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: aws.r53.records.list
+        title: "List records in a zone"
+        description: "List records in a zone"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [zone_id]
+          properties:
+            zone_id: { type: string }
+        backend:
+          kind: command
+          command: aws
+          args:
+            - "route53"
+            - "list-resource-record-sets"
+            - "--hosted-zone-id"
+            - "${arguments.zone_id}"
+            - "--output"
+            - "json"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: aws.s3.list
+        title: "List S3 objects"
+        description: "List S3 objects"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [bucket]
+          properties:
+            bucket: { type: string }
+            prefix: { type: string, default: "" }
+        backend:
+          kind: command
+          command: aws
+          args:
+            - "s3api"
+            - "list-objects-v2"
+            - "--bucket"
+            - "${arguments.bucket}"
+            - "--prefix"
+            - "${arguments.prefix}"
+            - "--output"
+            - "json"
+          timeout_ms: 20000
+          max_output_bytes: 65536

@@ -1,0 +1,15 @@
+schema: mcpg.dev/plugin/v1
+id: dev.mcpg.example.host-handle-demo
+name: mcpg-example-host-handle-demo
+description: |
+  Canonical reference plugin demonstrating the plugin → host
+  pattern end-to-end. A Backend that stores
+  HostHandle on Self at make() time and, on every execute(), opens
+  a span, records a histogram + counter, resolves a secret and
+  config snapshot from operator-supplied URIs, and emits an audit
+  event on notable outcomes. Intended as the copy-paste starting
+  point for plugin authors adopting HostHandle.
+class: backend
+runtime: native-cdylib-v1
+protocol_version: '1.0'
+required_capabilities: []

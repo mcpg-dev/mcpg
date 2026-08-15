@@ -1,0 +1,298 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: mcp-apps
+# --------------------
+# Demonstrates SEP-1865 "MCP Apps" support in two postures:
+#   1. PROXY — front Apps-capable tools/servers: passthrough +
+#      capability advertisement + (under federation) `ui://` resourceUri
+#      rewriting + a tighten-only CSP/permission policy. The `ui/*`
+#      postMessage protocol runs host<->iframe and never reaches MCPG.
+#   2. TEMPLATED — the gateway AUTHORS the UI: each
+#      `mcp.configurations.apps.registry` entry mints a `ui://mcpg/<id>`
+#      resource from a declarative binding; the gateway ships one
+#      reviewed HTML shell per `kind`, so you write no HTML.
+#
+# Guide: https://mcpg.dev/docs/guides/mcp-apps
+#
+# Every binding here carries `governance.minimum_trust: unauthenticated`:
+# this is a loopback demo with no identity source, and the default floor
+# (`header_asserted`) would hide the tools from `tools/list`. Production
+# deploys configure `governance.access` and drop the overrides.
+#
+# Boot:  MCPG_CONFIG=mcp-apps.yaml mcpg
+# Test:  curl http://127.0.0.1:8787/health
+
+gateway:
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    allowed_origins: []
+
+cluster:
+  kind: single_node
+
+# The `mock` backend behind every binding below is a plugin; the gateway links
+# none in, so this entry is what makes `kind: mock` resolve.
+plugins:
+  - id: dev.mcpg.backend.mock
+    class: backend
+    source:
+      oci: "ghcr.io/mcpg-dev/source-code/plugins/backend-mock:0.0.1-alpha.10"
+
+mcp:
+  capabilities:
+    # ── A UI-enabled tool + the ui:// resource it renders into ──
+    #
+    # The tool carries `_meta.ui.resourceUri` pointing at a `ui://`
+    # resource. A host that supports Apps preloads that resource and
+    # renders the tool's result inside the sandboxed iframe. `_meta.ui`
+    # is set via the binding's `descriptor_meta` (free-form `_meta` that
+    # MCPG stamps onto the tool descriptor verbatim).
+    tools:
+      - name: analytics.chart
+        description: Return sales data; renders as an interactive chart.
+        descriptor_meta:
+          ui:
+            # The UI resource the host renders this tool's result into.
+            resourceUri: "ui://analytics/chart"
+            # Who sees the tool. ["model","app"] (the default) = both the
+            # model and the in-iframe app may call it. ["app"] would hide
+            # it from the model's tools/list (the HOST enforces this;
+            # MCPG still lists it — visibility is a hint, not a gateway
+            # boundary, and app-initiated calls run the full pipeline).
+            visibility: ["model", "app"]
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          response:
+            content:
+              - { type: text, text: '{"q1": 100, "q2": 140}' }
+
+      # ── Data tools backing the TEMPLATED apps (registry, below) ──
+      #
+      # Templated apps re-enter the gateway via ordinary `tools/call`, so
+      # each app's `data_tool` / row-action `tool` is a normal tool. These
+      # mocks use `passthrough` so their `structuredContent` reaches the
+      # shell verbatim and the apps render real rows in a host.
+      - name: crm.list
+        description: List CRM accounts.
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            content: [{ type: text, text: "3 accounts" }]
+            structuredContent:
+              items:
+                - { id: "1", name: "Acme Corp", tier: Gold, balance: 12450.50, email: "ap@acme.example", active: true }
+                - { id: "2", name: "Globex", tier: Silver, balance: 830.00, email: "ar@globex.example", active: true }
+                - { id: "3", name: "Initech", tier: Bronze, balance: -15.25, email: "billing@initech.example", active: false }
+      - name: crm.get
+        description: Fetch one CRM account.
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            content: [{ type: text, text: "Acme Corp" }]
+            structuredContent: { id: "1", name: "Acme Corp", tier: Gold, balance: 12450.50, email: "ap@acme.example", active: true }
+      - name: crm.create
+        description: Create a CRM account.
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            content: [{ type: text, text: "Account created." }]
+            structuredContent: { ok: true }
+      - name: fin.revenue
+        description: Revenue by region.
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          passthrough: true
+          response:
+            content: [{ type: text, text: "revenue" }]
+            structuredContent:
+              items:
+                - { region: NA, amount: 42000 }
+                - { region: EMEA, amount: 31500 }
+                - { region: APAC, amount: 18750 }
+                - { region: LATAM, amount: 9200 }
+
+    resources:
+      # The interactive UI resource. MUST use the `ui://` scheme and the
+      # `text/html;profile=mcp-app` mime type (both load-bearing — they
+      # tell the host this is a UI resource). `_meta.ui` carries the
+      # iframe security envelope (CSP origins + requested permissions).
+      - name: analytics.chart.ui
+        description: Interactive chart UI for analytics.chart.
+        uri: "ui://analytics/chart"
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: mock
+          response:
+            contents:
+              - uri: "ui://analytics/chart"
+                mimeType: "text/html;profile=mcp-app"
+                text: "<!doctype html><html><body><canvas id=c></canvas></body></html>"
+                _meta:
+                  ui:
+                    # Origins the host folds into the iframe CSP. The
+                    # operator policy below INTERSECTS these (never
+                    # widens them) before they reach the host.
+                    csp:
+                      connectDomains: ["https://api.analytics.example.com"]
+                      resourceDomains: ["https://cdn.example.com"]
+                    # iframe permissions the app requests. Any not in
+                    # `allowed_permissions` below is stripped on egress.
+                    permissions:
+                      clipboardWrite: {}
+
+  # ── Pull UI tools from a federated upstream ──
+  #
+  # When MCPG fronts an Apps-capable upstream, it must (a) advertise the
+  # Apps capability UPSTREAM so the server emits its UI tools (see
+  # `configurations.apps.federate_upstream`), and (b) rewrite each
+  # federated tool's `_meta.ui.resourceUri` + the `ui://` resource URIs
+  # so they stay consistent under the gateway's naming prefix. MCPG keeps
+  # the `ui://` scheme and namespaces by federation name, e.g.
+  # `ui://srv/widget` -> `ui://partner/srv/widget`. Both are automatic.
+  federations:
+    - name: partner
+      upstream:
+        url: "https://partner.example.com/mcp"
+      naming:
+        tool_prefix: "partner."
+        resource_uri_prefix: "mcp://partner/"
+      import:
+        resources: true
+
+  configurations:
+    # ── MCP Apps (io.modelcontextprotocol/ui) ──
+    apps:
+      # Master switch. Lights up the DOWNSTREAM capability advertisement
+      # (server/discover + legacy initialize) AND the egress CSP /
+      # permission policy below. Default false. NOTE: even when false,
+      # `_meta.ui` still passes through unchanged on descriptors — only
+      # the advertisement + policy are gated.
+      enabled: true
+
+      # Advertise the Apps capability on MCPG's OUTGOING (client->upstream)
+      # initialize so federated servers emit their UI tools. A
+      # spec-compliant upstream withholds UI tools unless the client
+      # claims this capability. Defaults to `enabled`; set explicitly to
+      # pull UI tools from upstreams while NOT advertising to your own
+      # clients.
+      federate_upstream: true
+
+      # Reject (vs sanitize) a response whose `_meta.ui` escapes the
+      # policy below. Default false = narrow + log, never reject. Turn on
+      # in locked-down deployments to fail loud on a misbehaving upstream.
+      strict: false
+
+      # CSP upper bound. Each axis is INTERSECTED with the upstream's
+      # declared `_meta.ui.csp` (tighten-only — MCPG can never widen what
+      # the host will honour):
+      #   - ["*"] on an axis  => impose no bound (upstream passes through).
+      #   - an OMITTED upstream axis => left omitted (host applies its own
+      #     restrictive default: frame-src 'none', base-uri 'self').
+      #   - otherwise          => set intersection (e.g. upstream ["*"] ∩
+      #                           ["api.example.com"] = ["api.example.com"]).
+      csp_policy:
+        connect_domains: ["https://api.analytics.example.com", "https://api.partner.example.com"]
+        resource_domains: ["*"]
+        frame_domains: ["self"]
+        base_uri_domains: ["self"]
+
+      # iframe permissions MCPG will let through; any `_meta.ui.permissions`
+      # key outside this list is stripped on egress. Default: all four
+      # (camera, microphone, geolocation, clipboard_write). Here we drop
+      # camera/microphone/geolocation and allow only clipboard write.
+      allowed_permissions: [clipboard_write]
+
+      # If set, a `_meta.ui.domain` (the dedicated sandbox origin an app
+      # requests) outside this list is dropped — the host falls back to
+      # its default sandbox origin. Omit to allow any domain. An EMPTY
+      # list is rejected at boot (it would drop every domain).
+      allowed_domains: ["trusted-apps.example.com"]
+
+      # ── TEMPLATED apps ──
+      #
+      # Each entry mints `ui://mcpg/<id>`. The gateway ships the reviewed
+      # HTML for the chosen `kind`; you supply only the binding below.
+      # Requires `enabled: true` (above). Columns/fields are derived from
+      # the data tool's input/output schema when omitted; explicit config
+      # always wins. Guide: https://mcpg.dev/docs/guides/mcp-apps
+      registry:
+        # Read-only table over crm.list, with a per-row action that
+        # re-enters the gateway as crm.get(id=<row id>).
+        - id: customers
+          kind: table
+          title: Customers
+          description: CRM accounts and balances.
+          data_tool: crm.list
+          rows_path: $.items
+          columns:
+            - { field: $.name, header: Name }
+            - { field: $.tier, header: Tier, format: badge }
+            - { field: $.balance, header: Balance, format: currency, align: end }
+          row_actions:
+            - { id: open, label: Open, tool: crm.get, arg_map: { id: $.id } }
+          primary_action: open
+
+        # Spec-sheet view of one account (crm.get).
+        - id: account
+          kind: detail
+          title: Account
+          data_tool: crm.get
+          fields:
+            - { field: $.name, label: Name }
+            - { field: $.email, label: Email }
+            - { field: $.balance, label: Balance, format: currency }
+            - { field: $.active, label: Active }
+
+        # Create form. uiSchema groups/widgets shape the inputs; Submit
+        # calls crm.create via tools/call (the full plugin pipeline runs).
+        - id: new-account
+          kind: form
+          title: New account
+          description: Provision a CRM account.
+          data_tool: crm.create
+          fields:
+            - { field: name, label: Name }
+            - { field: email, label: Email }
+            - { field: tier, label: Tier }
+            - { field: notes, label: Notes }
+          ui_schema:
+            groups:
+              - { label: Identity, fields: [name, email] }
+              - { label: Plan, fields: [tier] }
+              - { label: Other, fields: [notes] }
+            widgets:
+              tier: { widget: select }
+              notes: { widget: textarea, help: "Optional internal notes." }
+
+        # Zero-network bar chart over fin.revenue (no tiles, no CSP delta).
+        - id: revenue
+          kind: chart
+          title: Revenue by region
+          data_tool: fin.revenue
+          rows_path: $.items
+          columns:
+            - { field: $.region, header: Region }
+            - { field: $.amount, header: Amount, format: currency }
+
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }

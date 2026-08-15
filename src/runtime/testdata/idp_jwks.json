@@ -1,0 +1,12 @@
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "kid": "ema-test-key",
+      "use": "sig",
+      "alg": "RS256",
+      "n": "x_LcT4rPqKK4sGvAdhuT9epnWWCEgkhkjhbbBeKi6Bw4vHeK8kgpiQenZ7328Hj8eZyIV9m5k2Tuaw-J1Om3SlyGU-PbUMnlzIZd_zagbq0T2D3fX_pUOSnE4cRIf3oGXzgGZ8twkG0IWO_N_iMsxS1vzgqTzU6W1WYzCC70YKIkSo5e8D2KE15WKsJEy86ZFyTqXl8FX2InxySXrAGISHtVKZDpGpm6w5evyb_tgzwrQ1rVMk0nEgm-dfPq0vuEZEIGv8vtdp2XJHxp2BU9Roxq5x2u2ZAq6gdGT8WN0x7VBiKsafk5-9FIxagVrdy5sD3S5tdTM3ZBCD6Dyii1lw",
+      "e": "AQAB"
+    }
+  ]
+}

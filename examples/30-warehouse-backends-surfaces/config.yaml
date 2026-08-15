@@ -1,0 +1,95 @@
+gateway:
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+# Load the DuckDB backend plugin artifact (top-level `plugins:` is a flat
+# list). The same binding kind serves tools, resources, prompts, pipeline
+# steps, and child tools — only the capability list + `surface:` differ.
+plugins:
+  - id: dev.mcpg.backend.duckdb
+    class: backend
+    source: { oci: "oci://ghcr.io/mcpg-dev/plugins/backend-duckdb:protocol-1" }
+
+# Default-on annotation hygiene for read-only warehouse bindings: declaring
+# annotations per binding lets MCP clients treat the call as side-effect-free
+# (and not an open-world action). This is the zero-code path to read-only /
+# openWorldHint defaults — set it on every warehouse read.
+governance:
+  child_invoke:
+    enforce_gates: true
+
+mcp:
+  capabilities:
+    tools:
+      # A read-only warehouse query exposed as a tool, with the
+      # read_only / open_world annotation defaults clients should see.
+      - name: warehouse.region_revenue
+        title: "Region revenue"
+        description: "Total revenue by region from the in-memory warehouse."
+        annotations: { read_only: true, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            min_revenue: { type: integer, default: 0 }
+          additionalProperties: false
+        backend:
+          kind: duckdb
+          database: ":memory:"
+          read_only: true
+          init_sql:
+            - "CREATE TABLE region_totals (region VARCHAR, revenue INTEGER)"
+            - "INSERT INTO region_totals VALUES ('emea', 1200), ('amer', 900), ('apac', 600)"
+          statement: "SELECT region, revenue FROM region_totals WHERE revenue >= ? ORDER BY revenue DESC"
+          params: ["arguments.min_revenue"]
+
+      # A `pipeline` binding whose first step is a warehouse query feeding a
+      # transform step. The DuckDB step uses the `duckdb` step discriminator —
+      # the same tag as the top-level binding and the dispatch kind.
+      - name: warehouse.top_region
+        title: "Top region (pipeline)"
+        description: "Run the warehouse query, then surface the single top region."
+        annotations: { read_only: true, open_world: false }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 30000
+          steps:
+            - id: load
+              kind: duckdb
+              database: ":memory:"
+              read_only: true
+              init_sql:
+                - "CREATE TABLE region_totals (region VARCHAR, revenue INTEGER)"
+                - "INSERT INTO region_totals VALUES ('emea', 1200), ('amer', 900), ('apac', 600)"
+              statement: "SELECT region, revenue FROM region_totals ORDER BY revenue DESC"
+              input_transform: "${arguments}"
+            - id: top
+              kind: transform
+              expression: "{ 'top_region': steps.load.response.rows[0] }"
+
+    resources:
+      # The same DuckDB backend as a resource. `surface: resource` reshapes
+      # successful rows into the `resources/read` {contents:[...]} body; the
+      # static `uri:` is emitted verbatim on the content entry.
+      - name: warehouse.regions
+        title: "Region totals (resource)"
+        description: "All region totals, read as a JSON resource."
+        uri: "duckdb://warehouse/regions"
+        mime_type: "application/json"
+        annotations: { read_only: true }
+        backend:
+          kind: duckdb
+          database: ":memory:"
+          read_only: true
+          surface: resource
+          uri: "duckdb://warehouse/regions"
+          init_sql:
+            - "CREATE TABLE region_totals (region VARCHAR, revenue INTEGER)"
+            - "INSERT INTO region_totals VALUES ('emea', 1200), ('amer', 900), ('apac', 600)"
+          statement: "SELECT region, revenue FROM region_totals ORDER BY revenue DESC"

@@ -1,0 +1,91 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8802"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: ios.sim.list
+        title: "List simulators"
+        description: "List simulators"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: command
+          command: xcrun
+          args:
+            - "simctl"
+            - "list"
+            - "devices"
+            - "--json"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: ios.sim.boot
+        title: "Boot a simulator"
+        description: "Boot a simulator"
+        annotations: { idempotent: true }
+        input_schema:
+          type: object
+          required: [device_udid]
+          properties:
+            device_udid: { type: string }
+        backend:
+          kind: command
+          command: xcrun
+          args:
+            - "simctl"
+            - "boot"
+            - "${arguments.device_udid}"
+          timeout_ms: 30000
+          max_output_bytes: 65536
+
+      - name: ios.sim.screenshot
+        title: "Screenshot"
+        description: "Screenshot"
+        annotations: { read_only: true }
+        input_schema:
+          type: object
+          required: [device_udid, output_path]
+          properties:
+            device_udid: { type: string }
+            output_path: { type: string }
+        backend:
+          kind: command
+          command: xcrun
+          args:
+            - "simctl"
+            - "io"
+            - "${arguments.device_udid}"
+            - "screenshot"
+            - "${arguments.output_path}"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: ios.sim.openurl
+        title: "Open a URL on the simulator"
+        description: "Open a URL on the simulator"
+        annotations: { idempotent: true }
+        input_schema:
+          type: object
+          required: [device_udid, url]
+          properties:
+            device_udid: { type: string }
+            url: { type: string }
+        backend:
+          kind: command
+          command: xcrun
+          args:
+            - "simctl"
+            - "openurl"
+            - "${arguments.device_udid}"
+            - "${arguments.url}"
+          timeout_ms: 15000
+          max_output_bytes: 65536

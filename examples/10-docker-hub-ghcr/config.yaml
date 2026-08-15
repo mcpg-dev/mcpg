@@ -1,0 +1,71 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8796"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: dh.repos.list
+        title: "List Docker Hub repos for a namespace"
+        description: "List Docker Hub repos for a namespace"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [namespace]
+          properties:
+            namespace: { type: string }
+        backend:
+          kind: http
+          url: "https://hub.docker.com/v2/namespaces/${arguments.namespace}/repositories"
+          method: get
+          headers:
+            Authorization: "JWT ${env.DOCKERHUB_JWT}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: dh.tags.list
+        title: "List tags for a repo"
+        description: "List tags for a repo"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [namespace, repo]
+          properties:
+            namespace: { type: string }
+            repo: { type: string }
+        backend:
+          kind: http
+          url: "https://hub.docker.com/v2/repositories/${arguments.namespace}/${arguments.repo}/tags"
+          method: get
+          headers:
+            Authorization: "JWT ${env.DOCKERHUB_JWT}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: ghcr.packages.user
+        title: "List GHCR packages for authed user"
+        description: "List GHCR packages for authed user"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://api.github.com/user/packages?package_type=container"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GITHUB_TOKEN}"
+            Accept: "application/vnd.github+json"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

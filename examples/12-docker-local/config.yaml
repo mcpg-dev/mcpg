@@ -1,0 +1,67 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8798"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: docker.ps
+        title: "List containers"
+        description: "List containers"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: command
+          command: docker
+          args:
+            - "ps"
+            - "-a"
+            - "--format"
+            - "{{json .}}"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: docker.logs
+        title: "Last 200 lines of a container"
+        description: "Last 200 lines of a container"
+        annotations: { read_only: true }
+        input_schema:
+          type: object
+          required: [container]
+          properties:
+            container: { type: string }
+        backend:
+          kind: command
+          command: docker
+          args:
+            - "logs"
+            - "--tail"
+            - "200"
+            - "${arguments.container}"
+          timeout_ms: 15000
+          max_output_bytes: 65536
+
+      - name: docker.stop
+        title: "Stop a container"
+        description: "Stop a container"
+        annotations: { idempotent: true }
+        input_schema:
+          type: object
+          required: [container]
+          properties:
+            container: { type: string }
+        backend:
+          kind: command
+          command: docker
+          args:
+            - "stop"
+            - "${arguments.container}"
+          timeout_ms: 20000
+          max_output_bytes: 65536

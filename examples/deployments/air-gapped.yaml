@@ -1,0 +1,99 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: air-gapped
+# ----------------------
+# Zero-outbound deployment: no OCI plugin pulls, no remote OIDC
+# discovery, no remote storage, no remote audit sink. Everything that
+# would normally call out (plugin loader, JWKS refresh, OTel collector)
+# is either disabled or pointed at a local artefact / file.
+#
+# Use case: secured networks where the gateway must run with the
+# operator's pre-staged plugin tree + local IdP only.
+#
+# Required env vars: none (the example assumes pre-staged paths).
+# Required filesystem layout (illustrative):
+#   /opt/mcpg/plugins/    — OCI artefacts unpacked locally; plugin
+#                           entries reference them via `source.path`
+#   /etc/mcpg/jwks.json   — pre-staged static JWKS
+#   /var/log/mcpg/audit.log — writable file for the local-file audit sink
+#   /var/lib/mcpg/storage — file-backed content store
+
+gateway:
+  server:
+    bind_address: "0.0.0.0:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    allowed_origins:
+      - "https://gateway.internal"
+    request_timeout_ms: 30000
+    session_idle_timeout_ms: 900000
+
+# Single-node backend avoids the network deps of redis / nats. If
+# the air-gapped network has its own redis the operator can swap to
+# `cluster.kind: redis` with an internal URL.
+cluster:
+  kind: single_node
+
+governance:
+  # Static JWKS — the gateway never calls the IdP's discovery endpoint.
+  # `keys_json` is the raw JWK Set string (`{"keys":[…]}`); load it from
+  # disk via the secret-provider plugin if you'd rather keep it out of
+  # the YAML.
+  access:
+    jwks:
+      keys_json: '{"keys":[]}'   # replace with your IdP's pre-staged JWKS
+      issuer: "https://idp.internal"
+      audience: "mcpg-gateway"
+  audit:
+    enabled: true
+    required: true
+    on_failure: fail_closed
+    sinks:
+      - kind: dev.mcpg.builtin.audit.local-file
+        config:
+          path: "/var/log/mcpg/audit.log"
+
+# File-backed content store — no S3, no remote storage.
+storage:
+  providers:
+    - id: default
+      kind: file_system
+      config:
+        root: "/var/lib/mcpg/storage"
+        max_bytes: 268435456  # 256 MiB
+
+# Plugin tree pre-staged on disk. Layout D'' P4 flattened
+# `plugins.entries` to a top-level array — operators write entries
+# directly here with `source.path: "/opt/mcpg/plugins/<plugin>.zip"`.
+# An empty array is the smallest air-gapped wedge; populate as plugins
+# get pre-staged.
+# `mock` is a plugin like any other — the gateway links no backend in, so the
+# binding below only resolves because this entry declares it. Air-gapped sites
+# mirror the artefact locally; see the OCI mirror notes in this file's README.
+plugins:
+  - id: dev.mcpg.backend.mock
+    class: backend
+    source:
+      oci: "ghcr.io/mcpg-dev/source-code/plugins/backend-mock:0.0.1-alpha.10"
+
+mcp:
+  capabilities:
+    tools:
+      - name: dev.mock.echo
+        description: Local mock binding — no outbound calls.
+        backend:
+          kind: mock
+          response: { ok: true, source: "air-gapped" }
+
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: file
+        config:
+          path: "/var/log/mcpg/gateway.log"
+          format: json
+  metrics:
+    sinks:
+      - kind: dev.mcpg.observability.prometheus
+        config: { path: "/metrics", bind: "127.0.0.1:9090" }

@@ -1,0 +1,69 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8790"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: netlify.sites.list
+        title: "List sites"
+        description: "List sites"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://api.netlify.com/api/v1/sites"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.NETLIFY_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: netlify.deploys.list
+        title: "List deploys for a site"
+        description: "List deploys for a site"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [site_id]
+          properties:
+            site_id: { type: string }
+        backend:
+          kind: http
+          url: "https://api.netlify.com/api/v1/sites/${arguments.site_id}/deploys"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.NETLIFY_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: netlify.forms.list
+        title: "List forms on a site"
+        description: "List forms on a site"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [site_id]
+          properties:
+            site_id: { type: string }
+        backend:
+          kind: http
+          url: "https://api.netlify.com/api/v1/sites/${arguments.site_id}/forms"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.NETLIFY_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

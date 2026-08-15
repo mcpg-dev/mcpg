@@ -1,0 +1,146 @@
+gateway:
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+    # Bootstrap: inventory + orders tables. UNIQUE on orders.user_id
+    # makes the "duplicate order" failure deterministic so we can
+    # demonstrate rollback.
+    - name: inv.init_schema
+      title: "Initialize schema"
+      description: "Create inventory and orders tables."
+      annotations: { idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TX_DB_PATH}?mode=rwc"
+        query:
+          sql: |
+            CREATE TABLE IF NOT EXISTS inv (
+              id  INTEGER PRIMARY KEY,
+              qty INTEGER NOT NULL
+            );
+          row_mode: affected_rows
+          timeout_ms: 2000
+
+    - name: inv.seed_inventory
+      title: "Seed inventory"
+      description: "Insert one item with qty=5 if missing."
+      annotations: { idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TX_DB_PATH}?mode=rwc"
+        query:
+          sql: "INSERT OR IGNORE INTO inv (id, qty) VALUES (1, 5)"
+          row_mode: affected_rows
+          timeout_ms: 2000
+
+    - name: orders.init_schema
+      title: "Initialize orders"
+      description: "Create orders table with UNIQUE on user_id."
+      annotations: { idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TX_DB_PATH}?mode=rwc"
+        query:
+          sql: |
+            CREATE TABLE IF NOT EXISTS orders (
+              id      INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER UNIQUE,
+              item_id INTEGER
+            );
+          row_mode: affected_rows
+          timeout_ms: 2000
+
+    # Read-only binding the sql_tx step references by name. Its
+    # `query` body is a no-op — the tx machinery bypasses it — but
+    # the binding has to exist so `plugin.begin_transaction` can
+    # reach its pool.
+    - name: orders.db
+      title: "Orders DB (pool anchor)"
+      description: "Sentinel binding whose pool backs the sql_tx step."
+      annotations: { read_only: true, idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TX_DB_PATH}?mode=rwc"
+        query:
+          sql: "SELECT 1"
+          row_mode: scalar
+          timeout_ms: 2000
+
+    # Verifier binding: read the current qty after a tx.
+    - name: inv.read_qty
+      title: "Read inventory qty"
+      description: "Return qty for item id=1."
+      annotations: { read_only: true, idempotent: true }
+      input_schema:
+        type: object
+        properties: {}
+        additionalProperties: false
+      backend:
+        kind: sql
+        driver: sqlite
+        url: "sqlite:${env.TX_DB_PATH}?mode=rwc"
+        query:
+          sql: "SELECT qty FROM inv WHERE id = 1"
+          row_mode: scalar
+          timeout_ms: 2000
+
+    # The pipeline: transactional "place order" flow.
+    # sql_tx wraps two nested statements in one transaction — a
+    # constraint violation on the INSERT rolls back the UPDATE.
+    - name: orders.place
+      title: "Place order (transactional)"
+      description: >
+        Deduct inventory and record the order atomically. Fails
+        safely if the user already has an order on file (unique
+        constraint) — the inventory decrement rolls back.
+      input_schema:
+        type: object
+        required: [user_id, item_id]
+        properties:
+          user_id: { type: integer, minimum: 1 }
+          item_id: { type: integer, minimum: 1, default: 1 }
+        additionalProperties: false
+      backend:
+        kind: pipeline
+        pipeline_timeout_ms: 5000
+        steps:
+          - id: charge_flow
+            kind: sql_tx
+            backend: orders.db
+            steps:
+              - id: deduct
+                sql: "UPDATE inv SET qty = qty - 1 WHERE id = :item_id"
+                params: [item_id]
+                row_mode: affected_rows
+              - id: record
+                sql: |
+                  INSERT INTO orders (user_id, item_id)
+                  VALUES (:user_id, :item_id)
+                params: [user_id, item_id]
+                row_mode: affected_rows

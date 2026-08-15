@@ -1,0 +1,30 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8794"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: linear.viewer
+        title: "Fetch viewer (sanity check)"
+        description: "Fetch viewer (sanity check)"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://api.linear.app/graphql"
+          method: post
+          headers:
+            Authorization: "${env.LINEAR_TOKEN}"
+            Content-Type: "application/json"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

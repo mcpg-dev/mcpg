@@ -1,0 +1,48 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8806"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: gmail.messages.list
+        title: "List Gmail messages"
+        description: "List Gmail messages"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties:
+            q: { type: string, default: "" }
+        backend:
+          kind: http
+          url: "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: calendar.events.list
+        title: "List calendar events"
+        description: "List calendar events"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties:
+            calendar_id: { type: string, default: "primary" }
+        backend:
+          kind: http
+          url: "https://www.googleapis.com/calendar/v3/calendars/${arguments.calendar_id}/events"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

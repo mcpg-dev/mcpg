@@ -1,0 +1,92 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: namecom.domain.list
+        title: "List domains"
+        description: "List all domains in the account."
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://api.name.com/v4/domains"
+          method: get
+          headers:
+            Authorization: "Basic ${env.NAMECOM_BASIC_AUTH}"
+            Accept: "application/json"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: namecom.record.list
+        title: "List DNS records"
+        description: "List DNS records for the given zone."
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [zone]
+          properties:
+            zone: { type: string, description: "Apex domain" }
+        backend:
+          kind: http
+          url: "https://api.name.com/v4/domains/${arguments.zone}/records"
+          method: get
+          headers:
+            Authorization: "Basic ${env.NAMECOM_BASIC_AUTH}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: namecom.record.create
+        title: "Create a DNS record"
+        description: "Create a new DNS record. Arguments form the JSON body."
+        annotations: { idempotent: false }
+        input_schema:
+          type: object
+          required: [zone, host, type, answer, ttl]
+          properties:
+            zone:   { type: string }
+            host:   { type: string }
+            type:   { type: string, enum: [A, AAAA, CNAME, MX, TXT, SRV, CAA, NS] }
+            answer: { type: string }
+            ttl:    { type: integer, minimum: 300, default: 3600 }
+        backend:
+          kind: http
+          url: "https://api.name.com/v4/domains/${arguments.zone}/records"
+          method: post
+          headers:
+            Authorization: "Basic ${env.NAMECOM_BASIC_AUTH}"
+            Content-Type: "application/json"
+          timeout_ms: 10000
+          expected_status_codes: [200, 201]
+          require_json_response: true
+          max_response_bytes: 524288
+
+    resource_templates:
+      - name: namecom.zone.records
+        title: "Records (as resource template)"
+        description: "Resource-template view over a zone's records."
+        uri_template: "namecom://{zone}/records"
+        mime_type: "application/json"
+        backend:
+          kind: http
+          url: "https://api.name.com/v4/domains/${arguments.zone}/records"
+          method: get
+          headers:
+            Authorization: "Basic ${env.NAMECOM_BASIC_AUTH}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

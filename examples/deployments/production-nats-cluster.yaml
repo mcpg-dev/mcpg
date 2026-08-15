@@ -1,0 +1,95 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: production-nats-cluster
+# -----------------------------------
+# NATS JetStream variant of production-redis-cluster — every replica
+# coordinates via a NATS cluster (KV bucket for state, JetStream for
+# the pub/sub bus). Pick this when your platform already runs NATS for
+# other services; pick redis-cluster when it doesn't.
+#
+# Required env vars:
+#   MCPG_OIDC_CLIENT_ID, MCPG_OIDC_CLIENT_SECRET   — IdP credentials
+#   MCPG_NATS_URL                                   — nats://… or tls://…
+
+gateway:
+  server:
+    bind_address: "0.0.0.0:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    allowed_origins:
+      - "https://gateway.example.com"
+    request_timeout_ms: 30000
+    session_idle_timeout_ms: 900000
+    shutdown_timeout_ms: 60000
+
+cluster:
+  # The nats plugin takes a `servers` list + `node` + `jetstream`, not a
+  # single `url`/`bucket`. TLS is REQUIRED by default — use a `tls://`
+  # server URL; a plaintext `nats://` link needs both
+  # `tls: { require_tls: false }` and `allow_insecure_transport: true`.
+  kind: nats
+  servers:
+    - "${env.MCPG_NATS_URL}"   # tls://nats.svc:4222
+  node:
+    id: "${env.HOSTNAME}"      # unique per replica
+  tls:
+    ca_cert: "/etc/mcpg/certs/nats-ca.pem"  # omit for system roots
+  jetstream:
+    replicas: 3
+    storage: file
+    state_bucket: "mcpg-prod"
+
+# `delivery` and `cancellation` inherit the cluster's pub/sub by default
+# (NATS subject-based fan-out here) — no override needed.
+
+governance:
+  access:
+    oidc_oauth:
+      providers:
+        - issuer: "https://example.okta.com"
+          audiences: ["mcpg-gateway"]
+          verification:
+            kind: oidc_jwks
+            allowed_algs: ["RS256"]
+  # Required audit. Each replica writes hash-chained JSON Lines to a
+  # host-mounted `path`; forward it to a central SIEM so the trail is
+  # greppable across all pods.
+  audit:
+    enabled: true
+    required: true
+    on_failure: fail_closed
+    sinks:
+      - kind: dev.mcpg.builtin.audit.local-file
+        config:
+          path: "/var/log/mcpg/audit.log"
+
+mcp:
+  capabilities:
+    tools:
+      - name: api.account.lookup
+        description: Look up an account by id via the corporate accounts API.
+        governance:
+          minimum_trust: verified
+        backend:
+          kind: http
+          url: "https://accounts.internal.example.com/v1/accounts/${arguments.account_id}"
+          method: get
+          timeout_ms: 5000
+          expected_status_codes: [200]
+
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }
+  metrics:
+    sinks:
+      - kind: dev.mcpg.observability.prometheus
+        config: { path: "/metrics", bind: "0.0.0.0:9090" }
+  traces:
+    enabled: true
+    service_name: "mcpg-gateway"
+    sinks:
+      - kind: dev.mcpg.observability.otlp
+        config: { url: "http://otel-collector.observability.svc.cluster.local:4318" }

@@ -1,0 +1,97 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8788"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: cf.zones.list
+        title: "List zones"
+        description: "List zones in the account."
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://api.cloudflare.com/client/v4/zones"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.CF_API_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: cf.dns.list
+        title: "List DNS records"
+        description: "List DNS records for a zone."
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [zone_id]
+          properties:
+            zone_id: { type: string }
+        backend:
+          kind: http
+          url: "https://api.cloudflare.com/client/v4/zones/${arguments.zone_id}/dns_records"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.CF_API_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: cf.dns.create
+        title: "Create a DNS record"
+        description: "Arguments form the JSON body (except zone_id which is in the path)."
+        annotations: { idempotent: false }
+        input_schema:
+          type: object
+          required: [zone_id, type, name, content]
+          properties:
+            zone_id: { type: string }
+            type:    { type: string, enum: [A, AAAA, CNAME, MX, TXT, SRV, CAA] }
+            name:    { type: string }
+            content: { type: string }
+            ttl:     { type: integer, default: 1 }
+            proxied: { type: boolean, default: false }
+        backend:
+          kind: http
+          url: "https://api.cloudflare.com/client/v4/zones/${arguments.zone_id}/dns_records"
+          method: post
+          headers:
+            Authorization: "Bearer ${env.CF_API_TOKEN}"
+            Content-Type: "application/json"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: cf.cache.purge_all
+        title: "Purge all cache"
+        description: "Purge the entire zone cache."
+        annotations: { destructive: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [zone_id]
+          properties:
+            zone_id: { type: string }
+            purge_everything: { type: boolean, default: true }
+        backend:
+          kind: http
+          url: "https://api.cloudflare.com/client/v4/zones/${arguments.zone_id}/purge_cache"
+          method: post
+          headers:
+            Authorization: "Bearer ${env.CF_API_TOKEN}"
+            Content-Type: "application/json"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

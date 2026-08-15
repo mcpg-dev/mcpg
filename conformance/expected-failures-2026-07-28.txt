@@ -1,0 +1,15 @@
+# 2026-07-28 conformance scenarios for features the gateway has not
+# implemented yet. run.sh treats a run whose ONLY failures are listed
+# here as PASS (see the allowlist block in run.sh) — every implemented
+# scenario stays guarded. REMOVE a line when its feature lands; a line
+# that no longer fails shows up in the run log as allowlisted-but-green
+# noise and should also be removed.
+#
+# EMPTY since 2026-06-12: the full DRAFT suite passes (93/93 checks).
+# The previous 11 entries (caching + input-required-result-*) turned
+# out to be per-IP anonymous rate-limit casualties once the suite's
+# request volume grew — with `anonymous_rate_limit_per_min: 0` in the
+# conformance configs (single-IP synthetic client; the limiter has its
+# own integration tests) every scenario passes on merit, including the
+# input-required-result family the elicitation/sampling work
+# implemented.

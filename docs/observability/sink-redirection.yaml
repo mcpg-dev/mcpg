@@ -1,0 +1,139 @@
+# Per-plugin observability sink redirection — worked example
+# (Phase 6c-23 / 6c-26).
+#
+# This file is a documentation snippet, not a runnable config. Copy
+# the relevant `plugins[*]` blocks into your real config.
+# The full operator-facing reference for these fields lives at
+# `apps/gateway/docs/configuration.md` under "Per-plugin
+# observability override".
+#
+# Demonstrated patterns:
+#
+#   1. Compliance carve-out — route audit logs ONLY to a SIEM sink.
+#   2. Silence a noisy plugin's traces while keeping its other signals.
+#   3. Boost log verbosity for one plugin without touching the global
+#      level filter.
+#   4. Tee — keep default routing AND mirror to a debug sink.
+#   5. Disable a chatty plugin's metrics entirely.
+#   6. Target the gateway-internal `core` pseudo-id.
+
+# -- Global observability — every plugin's events flow through these
+#    sinks UNLESS overridden by a per-plugin block below. ----------
+observability:
+  enabled: true
+  logs:
+    enabled: true
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }
+      # External sinks operators commonly install:
+      # - kind: dev.acme.elastic
+      # - kind: dev.mcpg.observability.otlp
+      #   config: { endpoint: "https://otel.acme.internal/v1/logs" }
+  metrics:
+    enabled: true
+    sinks:
+      - kind: dev.mcpg.observability.prometheus
+  traces:
+    enabled: true
+    service_name: mcpg-prod
+    sinks:
+      - kind: dev.mcpg.observability.otlp
+        config: { endpoint: "https://otel.acme.internal/v1/traces" }
+
+# `plugins:` is a flat list of plugin entries (the pre-D'' `enabled:`
+# + `entries:` wrapper was removed). Per-plugin observability is the
+# `observability:` field on each entry.
+plugins:
+  # ---------------------------------------------------------------
+  # Pattern 1 — compliance carve-out.
+  # `dev.mcpg.policy.cedar` emits audit-grade decision logs that
+  # MUST land inside the SIEM and MUST NOT leak to stdout / OTel.
+  # `mode: replace` skips the global sink list entirely; only the
+  # `sinks: [...]` plugins receive these events.
+  # ---------------------------------------------------------------
+  - id: dev.mcpg.policy.cedar
+    # ... policy-cedar's own config (paths, model, etc.) ...
+    observability:
+      logs:
+        enabled: true
+        level: info
+        mode: replace
+        sinks:
+          - dev.acme.siem            # MUST be a registered log sink
+      # metrics + traces unset → inherit globals.
+
+  # ---------------------------------------------------------------
+  # Pattern 2 — silence a plugin's traces.
+  # Kafka binding emits a span per message. In high-volume
+  # deploys this overwhelms the trace pipeline. Drop them at the
+  # bridge; logs and metrics from this plugin still flow normally.
+  # ---------------------------------------------------------------
+  - id: dev.mcpg.backend.kafka
+    observability:
+      traces:
+        enabled: false
+
+  # ---------------------------------------------------------------
+  # Pattern 3 — boost a plugin's log verbosity.
+  # Debugging an OpenAI binding edge-case: capture every retry +
+  # token-budget event without flipping the GLOBAL log level
+  # (which would flood every other plugin too).
+  # ---------------------------------------------------------------
+  - id: dev.mcpg.backend.llm.openai
+    observability:
+      logs:
+        enabled: true
+        level: debug                   # below the global `info` floor
+
+  # ---------------------------------------------------------------
+  # Pattern 4 — tee.
+  # Guardrails events should still reach default routing AND a
+  # dedicated debug archive sink (e.g. for after-the-fact replay).
+  # `mode: tee` = global sinks ∪ per-plugin sinks (deduped).
+  # ---------------------------------------------------------------
+  - id: dev.mcpg.guardrails
+    observability:
+      logs:
+        enabled: true
+        mode: tee
+        sinks:
+          - dev.acme.debug-archive
+
+  # ---------------------------------------------------------------
+  # Pattern 5 — drop a plugin's metrics.
+  # Rate-limit plugin emits per-key counters which can blow up
+  # Prometheus cardinality. Drop them at the bridge if the
+  # operator doesn't need per-key visibility.
+  # ---------------------------------------------------------------
+  - id: dev.mcpg.rate-limit
+    observability:
+      metrics:
+        enabled: false
+
+  # ---------------------------------------------------------------
+  # Pattern 6 — target the `core` pseudo-id.
+  # Every event that doesn't resolve to a registered plugin
+  # attributes to `core` (gateway internals: runtime, transports,
+  # etc.). Operators can shape its routing the same way.
+  # ---------------------------------------------------------------
+  - id: core
+    observability:
+      traces:
+        enabled: true
+        mode: replace
+        sinks:
+          - dev.mcpg.observability.otlp
+          # core spans go ONLY to OTel — useful when you want plugin
+          # spans to fan out widely but want to keep gateway-internal
+          # spans isolated to the OTel pipeline.
+
+# -- Validation guarantees (see app::validate_per_plugin_sink_ids) -
+# Boot REFUSES with an aggregated error when:
+#   - mode = replace | tee with empty sinks list
+#   - mode = inherit with non-empty sinks list (silently ignored —
+#     refuse rather than confuse)
+#   - sinks[] references an id not registered for the matching
+#     signal (a log sink id under metrics.sinks fails — sink-kind
+#     crossover is a typo, not a feature)

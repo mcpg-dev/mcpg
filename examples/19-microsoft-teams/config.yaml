@@ -1,0 +1,49 @@
+# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
+gateway:
+  server:
+    bind_address: "127.0.0.1:8805"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+
+mcp:
+  capabilities:
+    tools:
+      - name: graph.me
+        title: "Who am I"
+        description: "Who am I"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties: {}
+          additionalProperties: false
+        backend:
+          kind: http
+          url: "https://graph.microsoft.com/v1.0/me"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.MS_GRAPH_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: teams.channel.list
+        title: "List channels of a team"
+        description: "List channels of a team"
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          required: [team_id]
+          properties:
+            team_id: { type: string }
+        backend:
+          kind: http
+          url: "https://graph.microsoft.com/v1.0/teams/${arguments.team_id}/channels"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.MS_GRAPH_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288

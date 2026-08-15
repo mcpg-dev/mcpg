@@ -1,0 +1,764 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>mcpg app</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  body { margin: 0; padding: 12px; font-size: 14px; }
+  h2.title { font-size: 17px; margin: 0 0 4px; }
+  p.desc { opacity: 0.75; margin: 0 0 12px; }
+  h3.group { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.6; margin: 16px 0 6px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: start; padding: 6px 10px; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+  th { font-weight: 600; opacity: 0.75; }
+  td.end, th.end { text-align: end; }
+  tr.row[data-primary] { cursor: pointer; }
+  button.action, button.primary { font: inherit; padding: 4px 10px; margin-inline-end: 6px; border-radius: 6px; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; cursor: pointer; }
+  button.primary { background: color-mix(in srgb, currentColor 12%, transparent); font-weight: 600; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; background: color-mix(in srgb, currentColor 12%, transparent); font-size: 12px; }
+  .empty, .msg { opacity: 0.6; padding: 24px 8px; }
+  ul.list { list-style: none; margin: 0; padding: 0; }
+  li.item { padding: 10px 6px; border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+  li.item[data-primary] { cursor: pointer; }
+  li.item .item-title { font-weight: 600; }
+  li.item .subline { opacity: 0.7; font-size: 13px; }
+  dl.detail { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+  dl.detail dt { font-weight: 600; opacity: 0.7; }
+  dl.detail dd { margin: 0; }
+  .field { display: flex; flex-direction: column; gap: 3px; margin-bottom: 10px; max-width: 480px; }
+  .field label { font-weight: 600; opacity: 0.8; }
+  .field .help { font-size: 12px; opacity: 0.6; }
+  .field input, .field textarea, .field select { font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); background: transparent; color: inherit; }
+  .field.inline { flex-direction: row; align-items: center; gap: 8px; }
+  .prompt { max-width: 480px; }
+  .actions { margin-top: 14px; }
+</style>
+</head>
+<body>
+<noscript>This MCP app requires JavaScript.</noscript>
+<div id="mcpg-root"><div class="msg">Loading…</div></div>
+
+<!-- The gateway injects the compiled binding here as a JSON data island. -->
+<!--MCPG_APP_CONFIG-->
+
+<script>
+(() => {
+  "use strict";
+  // ── read the gateway-injected config (JSON data island; never eval'd) ──
+  let CFG = {};
+  try {
+    const elc = document.getElementById("mcpg-app-config");
+    if (elc) CFG = Object.freeze(JSON.parse(elc.textContent || "{}"));
+  } catch (_e) { /* leave CFG empty → render the empty state */ }
+  window.MCPG_APP = CFG;
+
+  const root = document.getElementById("mcpg-root");
+  const KIND = CFG.kind || "table";
+  const cols = Array.isArray(CFG.columns) ? CFG.columns : [];
+  const fields = Array.isArray(CFG.fields) ? CFG.fields : [];
+  const actions = Array.isArray(CFG.row_actions) ? CFG.row_actions : [];
+  const uiSchema = (CFG.ui_schema && typeof CFG.ui_schema === "object") ? CFG.ui_schema : {};
+  const widgets = (uiSchema.widgets && typeof uiSchema.widgets === "object") ? uiSchema.widgets : {};
+
+  // ── tiny JSON-path reader ($.a.b / a.b) over an object ──
+  function pluck(obj, path) {
+    if (obj == null || !path) return undefined;
+    const parts = String(path).replace(/^\$\.?/, "").split(".").filter(Boolean);
+    let cur = obj;
+    for (const p of parts) { if (cur == null) return undefined; cur = cur[p]; }
+    return cur;
+  }
+  function fmt(v, format) {
+    if (v == null) return "";
+    if (format === "currency" && typeof v === "number") { try { return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD" }).format(v); } catch (_e) {} }
+    if (format === "number" && typeof v === "number") { try { return new Intl.NumberFormat().format(v); } catch (_e) {} }
+    if (format === "date") { const d = new Date(v); if (!isNaN(d)) return d.toLocaleDateString(); }
+    if (typeof v === "boolean") return v ? "Yes" : "No";
+    if (typeof v === "object") { try { return JSON.stringify(v); } catch (_e) { return String(v); } }
+    return String(v);
+  }
+  function safeHref(v) {
+    if (/^\s*\/\//.test(v)) return null;
+    try { const u = new URL(v, "https://invalid.example"); if (u.protocol === "http:" || u.protocol === "https:" || u.protocol === "mailto:") return u.href; } catch (_e) {}
+    return null;
+  }
+  function el(tag, attrs, text) {
+    const n = document.createElement(tag);
+    if (attrs) for (const k in attrs) { if (attrs[k] != null) n.setAttribute(k, attrs[k]); }
+    if (text != null) n.textContent = text;   // textContent only — never innerHTML for data
+    return n;
+  }
+
+  // ── safe expression interpreter (no eval/Function) for visible_if /
+  //    required_if / compute. Grammar: ternary, ||, &&, !, comparisons,
+  //    parens, dotted idents (resolved against ctx), string/number/bool/null.
+  function evalExpr(src, ctx) {
+    if (src == null) return undefined;
+    let s = String(src).trim();
+    const m = s.match(/^\$\{([\s\S]*)\}$/);   // unwrap ${ … } if present
+    if (m) s = m[1].trim();
+    let i = 0;
+    const ws = () => { while (i < s.length && /\s/.test(s[i])) i++; };
+    function peek(t) { ws(); return s.startsWith(t, i); }
+    function eat(t) { ws(); if (s.startsWith(t, i)) { i += t.length; return true; } return false; }
+    function primary() {
+      ws();
+      if (eat("(")) { const v = ternary(); eat(")"); return v; }
+      if (eat("!")) { return !truthy(primary()); }
+      // string literal
+      const q = s[i];
+      if (q === "'" || q === '"') {
+        i++; let out = "";
+        while (i < s.length && s[i] !== q) { if (s[i] === "\\") { i++; } out += s[i++]; }
+        i++; return out;
+      }
+      // number
+      const num = /^-?\d+(\.\d+)?/.exec(s.slice(i));
+      if (num) { i += num[0].length; return parseFloat(num[0]); }
+      // identifier / dotted path / keyword
+      const id = /^[A-Za-z_$][\w$.]*/.exec(s.slice(i));
+      if (id) {
+        i += id[0].length;
+        if (id[0] === "true") return true;
+        if (id[0] === "false") return false;
+        if (id[0] === "null") return null;
+        return pluck(ctx, id[0]);
+      }
+      return undefined;
+    }
+    function cmp() {
+      let l = primary();
+      ws();
+      for (const op of ["==", "!=", "<=", ">=", "<", ">"]) {
+        if (peek(op)) { eat(op); const r = primary();
+          if (op === "==") return l == r; if (op === "!=") return l != r;
+          if (op === "<=") return l <= r; if (op === ">=") return l >= r;
+          if (op === "<") return l < r; return l > r;
+        }
+      }
+      return l;
+    }
+    function and() { let l = cmp(); while (eat("&&")) { const r = cmp(); l = truthy(l) && truthy(r); } return l; }
+    function or() { let l = and(); while (eat("||")) { const r = and(); l = truthy(l) || truthy(r); } return l; }
+    function ternary() { const c = or(); if (eat("?")) { const a = ternary(); eat(":"); const b = ternary(); return truthy(c) ? a : b; } return c; }
+    try { return ternary(); } catch (_e) { return undefined; }
+  }
+  function truthy(v) { return !(v == null || v === false || v === "" || v === 0); }
+
+  // ── host bridge: best-effort across SEP-1865 / OpenAI / mcp-ui hosts ──
+  function callTool(name, params) {
+    if (!name) return;
+    try { if (window.openai && typeof window.openai.callTool === "function") { window.openai.callTool(name, params || {}); return; } } catch (_e) {}
+    try { parent.postMessage({ type: "tool", payload: { toolName: name, params: params || {} } }, "*"); } catch (_e) {}
+  }
+  function rowsFromResult(result) {
+    if (!result) return null;
+    const sc = result.structuredContent != null ? result.structuredContent : result;
+    if (Array.isArray(sc)) return sc;
+    if (sc && typeof sc === "object") {
+      const path = CFG.rows_path ? String(CFG.rows_path).replace(/^\$\.?/, "") : null;
+      if (path) { const v = pluck(sc, path); if (Array.isArray(v)) return v; }
+      for (const k of ["items", "rows", "data", "results"]) { if (Array.isArray(sc[k])) return sc[k]; }
+    }
+    return null;
+  }
+  function objFromResult(result) {
+    if (!result) return null;
+    const sc = result.structuredContent != null ? result.structuredContent : result;
+    if (Array.isArray(sc)) return sc[0] || null;
+    return (sc && typeof sc === "object") ? sc : null;
+  }
+  function mapArgs(action, scope) {
+    const params = {}; const map = (action && action.arg_map) || {};
+    for (const k in map) params[k] = pluck(scope || {}, map[k]);
+    return params;
+  }
+  function fireAction(action, scope) {
+    if (!action) return;
+    if (action.confirm && !confirm(action.confirm)) return;
+    callTool(action.tool, mapArgs(action, scope));
+  }
+
+  // ── cell rendering (shared by table/list) ──
+  function cellNode(c, row) {
+    const raw = pluck(row, c.field);
+    const val = fmt(raw, c.format);
+    if (c.format === "badge") return el("span", { class: "badge" }, val);
+    if (c.format === "link" && raw != null && raw !== "") {
+      const href = safeHref(String(raw));
+      if (href) { const a = el("a", { href: href }, val); a.target = "_blank"; a.rel = "noopener noreferrer"; return a; }
+    }
+    return document.createTextNode(val);
+  }
+  function visibleCols() {
+    // visible_if on a column hides it only if false for EVERY row is hard to
+    // know here; we evaluate against an empty ctx so a constant-false hides it.
+    return cols.filter((c) => c.visible_if == null || evalExpr(c.visible_if, {}) !== false);
+  }
+
+  // ── renderers ──
+  function renderTable(rows) {
+    root.replaceChildren();
+    header();
+    if (!rows || rows.length === 0) { root.appendChild(el("div", { class: "empty" }, "No items.")); return; }
+    const vc = visibleCols();
+    const table = el("table"), thead = el("thead"), htr = el("tr");
+    for (const c of vc) htr.appendChild(el("th", { class: c.align === "end" ? "end" : null }, c.header || c.field));
+    if (actions.length) htr.appendChild(el("th", null, ""));
+    thead.appendChild(htr); table.appendChild(thead);
+    const tbody = el("tbody");
+    for (const row of rows) {
+      const tr = el("tr", { class: "row" });
+      if (CFG.primary_action) tr.setAttribute("data-primary", "1");
+      for (const c of vc) { const td = el("td", { class: c.align === "end" ? "end" : null }); td.appendChild(cellNode(c, row)); tr.appendChild(td); }
+      if (actions.length) tr.appendChild(rowActionCell(row));
+      if (CFG.primary_action) { const pa = actions.find((a) => a.id === CFG.primary_action); if (pa) tr.addEventListener("click", () => fireAction(pa, row)); }
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody); root.appendChild(table);
+  }
+  function rowActionCell(row) {
+    const td = el("td");
+    for (const a of actions) {
+      const b = el("button", { class: "action", type: "button" }, a.label || a.id);
+      b.addEventListener("click", (ev) => { ev.stopPropagation(); fireAction(a, row); });
+      td.appendChild(b);
+    }
+    return td;
+  }
+  function renderList(rows) {
+    root.replaceChildren();
+    header();
+    if (!rows || rows.length === 0) { root.appendChild(el("div", { class: "empty" }, "No items.")); return; }
+    const vc = visibleCols();
+    const ul = el("ul", { class: "list" });
+    for (const row of rows) {
+      const li = el("li", { class: "item" });
+      if (CFG.primary_action) li.setAttribute("data-primary", "1");
+      if (vc[0]) li.appendChild(el("div", { class: "item-title" }, fmt(pluck(row, vc[0].field), vc[0].format)));
+      for (const c of vc.slice(1)) li.appendChild(el("div", { class: "subline" }, (c.header ? c.header + ": " : "") + fmt(pluck(row, c.field), c.format)));
+      if (actions.length) { const wrap = el("div", { class: "actions" }); for (const a of actions) { const b = el("button", { class: "action", type: "button" }, a.label || a.id); b.addEventListener("click", (ev) => { ev.stopPropagation(); fireAction(a, row); }); wrap.appendChild(b); } li.appendChild(wrap); }
+      if (CFG.primary_action) { const pa = actions.find((a) => a.id === CFG.primary_action); if (pa) li.addEventListener("click", () => fireAction(pa, row)); }
+      ul.appendChild(li);
+    }
+    root.appendChild(ul);
+  }
+  function renderDetail(obj) {
+    root.replaceChildren();
+    header();
+    if (!obj) { root.appendChild(el("div", { class: "empty" }, "No data.")); return; }
+    const dl = el("dl", { class: "detail" });
+    const list = fields.length ? fields : cols.map((c) => ({ field: c.field, label: c.header, format: c.format }));
+    for (const f of list) {
+      const w = widgets[f.field];
+      if (w && w.visible_if != null && evalExpr(w.visible_if, obj) === false) continue;
+      dl.appendChild(el("dt", null, (w && w.label) || f.label || f.field));
+      dl.appendChild(el("dd", null, fmt(pluck(obj, f.field), f.format)));
+    }
+    root.appendChild(dl);
+    if (actions.length) { const wrap = el("div", { class: "actions" }); for (const a of actions) { const b = el("button", { class: "action", type: "button" }, a.label || a.id); b.addEventListener("click", () => fireAction(a, obj)); wrap.appendChild(b); } root.appendChild(wrap); }
+  }
+  function renderConfirmation(ctx) {
+    root.replaceChildren();
+    const box = el("div", { class: "prompt" });
+    box.appendChild(el("h2", { class: "title" }, CFG.title || "Confirm"));
+    if (CFG.description) box.appendChild(el("p", { class: "desc" }, CFG.description));
+    const wrap = el("div", { class: "actions" });
+    const pa = actions.find((a) => a.id === CFG.primary_action) || actions[0];
+    const ok = el("button", { class: "primary", type: "button" }, (pa && pa.label) || "Confirm");
+    ok.addEventListener("click", () => { if (pa) callTool(pa.tool, mapArgs(pa, ctx || objFromResult(LAST_RESULT) || {})); });
+    const cancel = el("button", { class: "action", type: "button" }, "Cancel");
+    cancel.addEventListener("click", () => { try { if (window.openai && window.openai.requestClose) window.openai.requestClose(); } catch (_e) {} });
+    wrap.appendChild(ok); wrap.appendChild(cancel); box.appendChild(wrap);
+    root.appendChild(box);
+  }
+  function renderSelection(rows) {
+    root.replaceChildren();
+    header();
+    if (!rows || rows.length === 0) { root.appendChild(el("div", { class: "empty" }, "No items.")); return; }
+    const idField = CFG.id_field || "$.id";
+    const vc = visibleCols();
+    const ul = el("ul", { class: "list" });
+    const chosen = new Set();
+    for (const row of rows) {
+      const id = pluck(row, idField);
+      const li = el("li", { class: "item field inline" });
+      const cb = el("input", { type: "checkbox" });
+      cb.addEventListener("change", () => { if (cb.checked) chosen.add(id); else chosen.delete(id); SELECTION_STATE = Array.from(chosen); });
+      const label = vc[0] ? fmt(pluck(row, vc[0].field), vc[0].format) : String(id);
+      li.appendChild(cb); li.appendChild(el("span", null, label));
+      ul.appendChild(li);
+    }
+    root.appendChild(ul);
+    const pa = actions.find((a) => a.id === CFG.primary_action) || actions[0];
+    const wrap = el("div", { class: "actions" });
+    const submit = el("button", { class: "primary", type: "button" }, (pa && pa.label) || "Submit");
+    submit.addEventListener("click", () => { if (pa) callTool(pa.tool, { ids: Array.from(chosen) }); });
+    wrap.appendChild(submit); root.appendChild(wrap);
+  }
+
+  function renderCode(result) {
+    root.replaceChildren();
+    header();
+    const obj = objFromResult(result);
+    let text = "";
+    if (typeof result === "string") text = result;
+    else if (obj && typeof obj === "object") {
+      if (typeof obj.text === "string") text = obj.text;
+      else if (typeof obj.content === "string") text = obj.content;
+      else if (typeof obj.code === "string") text = obj.code;
+      else { try { text = JSON.stringify(obj, null, 2); } catch (_e) { text = String(obj); } }
+    }
+    const pre = el("pre", { class: "code" });
+    pre.style.cssText = "overflow:auto; padding:10px; border-radius:6px; background:color-mix(in srgb, currentColor 6%, transparent); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre;";
+    pre.textContent = text;   // textContent only — no highlighter, no innerHTML
+    root.appendChild(pre);
+  }
+
+  function renderChart(rows) {
+    root.replaceChildren();
+    header();
+    if (!rows || rows.length === 0) { root.appendChild(el("div", { class: "empty" }, "No data.")); return; }
+    const labelCol = cols[0];
+    const valueCol = cols.find((c) => c.format === "number" || c.format === "currency") || cols[1] || cols[0];
+    const data = rows.map((r) => ({ label: labelCol ? fmt(pluck(r, labelCol.field), labelCol.format) : "", value: Number(pluck(r, valueCol && valueCol.field)) || 0 }));
+    const max = Math.max(1, ...data.map((d) => d.value));
+    const W = 560, barH = 22, gap = 8, padL = 120;
+    const H = data.length * (barH + gap) + gap;
+    const NS = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H); svg.setAttribute("width", "100%"); svg.setAttribute("height", H);
+    data.forEach((d, i) => {
+      const y = gap + i * (barH + gap);
+      const w = Math.round((W - padL - 60) * (d.value / max));
+      const lbl = document.createElementNS(NS, "text");
+      lbl.setAttribute("x", padL - 8); lbl.setAttribute("y", y + barH * 0.7); lbl.setAttribute("text-anchor", "end");
+      lbl.setAttribute("font-size", "12"); lbl.setAttribute("fill", "currentColor"); lbl.textContent = d.label;
+      const rect = document.createElementNS(NS, "rect");
+      rect.setAttribute("x", padL); rect.setAttribute("y", y); rect.setAttribute("width", Math.max(1, w)); rect.setAttribute("height", barH);
+      rect.setAttribute("rx", "3"); rect.setAttribute("fill", "currentColor"); rect.setAttribute("opacity", "0.55");
+      const val = document.createElementNS(NS, "text");
+      val.setAttribute("x", padL + w + 6); val.setAttribute("y", y + barH * 0.7); val.setAttribute("font-size", "12"); val.setAttribute("fill", "currentColor");
+      val.textContent = fmt(d.value, valueCol && valueCol.format);
+      svg.appendChild(lbl); svg.appendChild(rect); svg.appendChild(val);
+    });
+    root.appendChild(svg);
+  }
+
+  // ── map (plot = zero-network default; raster_tiles = opt-in img tiles) ──
+  function mapPoints(rows, m) {
+    const out = [];
+    if (m.geojson_path) {
+      const sc = LAST_RESULT && (LAST_RESULT.structuredContent != null ? LAST_RESULT.structuredContent : LAST_RESULT);
+      const fc = pluck(sc, m.geojson_path);
+      const feats = fc && Array.isArray(fc.features) ? fc.features : [];
+      for (const f of feats) {
+        const g = f.geometry;
+        if (g && g.type === "Point" && Array.isArray(g.coordinates)) {
+          out.push({ lng: Number(g.coordinates[0]), lat: Number(g.coordinates[1]), label: (f.properties && (f.properties[m.label_field] || f.properties.name)) || "", row: f });
+        }
+      }
+    } else {
+      for (const r of rows) {
+        const lat = Number(pluck(r, m.lat_field)), lng = Number(pluck(r, m.lng_field));
+        if (!isNaN(lat) && !isNaN(lng)) out.push({ lat, lng, label: m.label_field ? fmt(pluck(r, m.label_field)) : "", row: r });
+      }
+    }
+    return out;
+  }
+  function onMarker(p, m) {
+    const acts = CFG.row_actions || [];
+    const act = acts.find((a) => a.id === (m.select_action || CFG.primary_action)) || acts[0];
+    if (act) fireAction(act, p.row);
+  }
+  function renderMap(rows) {
+    root.replaceChildren(); header();
+    const m = CFG.map || {};
+    const pts = mapPoints(rows, m);
+    if (!pts.length) { root.appendChild(el("div", { class: "empty" }, "No locations.")); return; }
+    if (m.mode === "raster_tiles" && m.tile_url) renderRasterMap(pts, m);
+    else renderPlotMap(pts, m);
+  }
+  function renderPlotMap(pts, m) {
+    const W = 560, H = 360, pad = 28, NS = "http://www.w3.org/2000/svg";
+    const lats = pts.map((p) => p.lat), lngs = pts.map((p) => p.lng);
+    let minLa = Math.min(...lats), maxLa = Math.max(...lats), minLo = Math.min(...lngs), maxLo = Math.max(...lngs);
+    if (minLa === maxLa) { minLa -= 0.01; maxLa += 0.01; } if (minLo === maxLo) { minLo -= 0.01; maxLo += 0.01; }
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H); svg.setAttribute("width", "100%"); svg.setAttribute("height", H);
+    svg.style.cssText = "border:1px solid color-mix(in srgb, currentColor 15%, transparent); border-radius:6px;";
+    const x = (lo) => pad + (lo - minLo) / (maxLo - minLo) * (W - 2 * pad);
+    const y = (la) => pad + (maxLa - la) / (maxLa - minLa) * (H - 2 * pad);
+    for (const p of pts) {
+      const c = document.createElementNS(NS, "circle");
+      c.setAttribute("cx", x(p.lng)); c.setAttribute("cy", y(p.lat)); c.setAttribute("r", "6");
+      c.setAttribute("fill", "currentColor"); c.setAttribute("opacity", "0.65"); c.style.cursor = "pointer";
+      c.addEventListener("click", () => onMarker(p, m));
+      svg.appendChild(c);
+      if (p.label) { const t = document.createElementNS(NS, "text"); t.setAttribute("x", x(p.lng) + 9); t.setAttribute("y", y(p.lat) + 4); t.setAttribute("font-size", "11"); t.setAttribute("fill", "currentColor"); t.textContent = p.label; svg.appendChild(t); }
+    }
+    root.appendChild(svg);
+  }
+  function renderRasterMap(pts, m) {
+    const W = 560, H = 360, TS = 256;
+    const lats = pts.map((p) => p.lat), lngs = pts.map((p) => p.lng);
+    const minLa = Math.min(...lats), maxLa = Math.max(...lats), minLo = Math.min(...lngs), maxLo = Math.max(...lngs);
+    const cLat = (minLa + maxLa) / 2, cLng = (minLo + maxLo) / 2;
+    const lon2x = (lo, z) => (lo + 180) / 360 * Math.pow(2, z);
+    const lat2y = (la, z) => { const r = la * Math.PI / 180; return (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * Math.pow(2, z); };
+    let zoom = 2;
+    for (let z = 18; z >= 2; z--) { const dx = Math.abs(lon2x(maxLo, z) - lon2x(minLo, z)) * TS, dy = Math.abs(lat2y(minLa, z) - lat2y(maxLa, z)) * TS; if (dx <= W - 40 && dy <= H - 40) { zoom = z; break; } }
+    const n = Math.pow(2, zoom);
+    const originX = lon2x(cLng, zoom) * TS - W / 2, originY = lat2y(cLat, zoom) * TS - H / 2;
+    const container = el("div");
+    container.style.cssText = "position:relative; width:" + W + "px; max-width:100%; height:" + H + "px; overflow:hidden; border-radius:6px; border:1px solid color-mix(in srgb, currentColor 15%, transparent);";
+    const x0 = Math.floor(originX / TS), x1 = Math.floor((originX + W) / TS), y0 = Math.floor(originY / TS), y1 = Math.floor((originY + H) / TS);
+    for (let tx = x0; tx <= x1; tx++) for (let ty = y0; ty <= y1; ty++) {
+      if (ty < 0 || ty >= n) continue;
+      const wx = ((tx % n) + n) % n;
+      const url = String(m.tile_url).replace("{z}", zoom).replace("{x}", wx).replace("{y}", ty);
+      const img = el("img", { src: url, loading: "lazy", alt: "" });
+      img.referrerPolicy = "no-referrer";
+      img.style.cssText = "position:absolute; width:" + TS + "px; height:" + TS + "px; left:" + (tx * TS - originX) + "px; top:" + (ty * TS - originY) + "px;";
+      container.appendChild(img);
+    }
+    for (const p of pts) {
+      const px = lon2x(p.lng, zoom) * TS - originX, py = lat2y(p.lat, zoom) * TS - originY;
+      const dot = el("div"); dot.title = p.label || "";
+      dot.style.cssText = "position:absolute; width:12px; height:12px; border-radius:50%; background:#e11; border:2px solid #fff; transform:translate(-50%,-50%); cursor:pointer; left:" + px + "px; top:" + py + "px;";
+      dot.addEventListener("click", () => onMarker(p, m));
+      container.appendChild(dot);
+    }
+    root.appendChild(container);
+  }
+
+  // ── media / capture kinds ──
+  function submitTool(payload) { if (CFG.data_tool) callTool(CFG.data_tool, payload); }
+
+  function renderSignature() {
+    root.replaceChildren();
+    const box = el("div");
+    box.appendChild(el("h2", { class: "title" }, CFG.title || "Signature"));
+    if (CFG.description) box.appendChild(el("p", { class: "desc" }, CFG.description));
+    const cv = el("canvas"); cv.width = 480; cv.height = 180;
+    cv.style.cssText = "max-width:100%; border:1px solid color-mix(in srgb,currentColor 30%,transparent); border-radius:6px; touch-action:none; display:block;";
+    const ctx = cv.getContext("2d"); ctx.lineWidth = 2; ctx.lineCap = "round"; ctx.strokeStyle = "#111";
+    let drawing = false, last = null;
+    const pos = (e) => { const r = cv.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+    cv.addEventListener("pointerdown", (e) => { drawing = true; last = pos(e); });
+    cv.addEventListener("pointermove", (e) => { if (!drawing) return; const p = pos(e); ctx.beginPath(); ctx.moveTo(last.x, last.y); ctx.lineTo(p.x, p.y); ctx.stroke(); last = p; });
+    window.addEventListener("pointerup", () => { drawing = false; });
+    box.appendChild(cv);
+    const acts = el("div", { class: "actions" });
+    const submit = el("button", { class: "primary", type: "button" }, "Submit");
+    submit.addEventListener("click", () => submitTool({ image: cv.toDataURL("image/png") }));
+    const clear = el("button", { class: "action", type: "button" }, "Clear");
+    clear.addEventListener("click", () => ctx.clearRect(0, 0, cv.width, cv.height));
+    acts.appendChild(submit); acts.appendChild(clear); box.appendChild(acts);
+    root.appendChild(box);
+  }
+
+  function renderFileUpload() {
+    root.replaceChildren();
+    const box = el("div");
+    box.appendChild(el("h2", { class: "title" }, CFG.title || "Upload"));
+    if (CFG.description) box.appendChild(el("p", { class: "desc" }, CFG.description));
+    const input = el("input", { type: "file", multiple: "true" });
+    box.appendChild(input);
+    const acts = el("div", { class: "actions" });
+    const submit = el("button", { class: "primary", type: "button" }, "Upload");
+    submit.addEventListener("click", async () => {
+      const files = [];
+      for (const f of Array.from(input.files || [])) {
+        const data = await new Promise((res) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(",").pop()); r.readAsDataURL(f); });
+        files.push({ name: f.name, type: f.type, size: f.size, data: data });
+      }
+      submitTool({ files: files });
+    });
+    acts.appendChild(submit); box.appendChild(acts);
+    root.appendChild(box);
+  }
+
+  function renderCamera() {
+    root.replaceChildren();
+    const box = el("div");
+    box.appendChild(el("h2", { class: "title" }, CFG.title || "Camera"));
+    const video = el("video", { autoplay: "true", playsinline: "true" }); video.muted = true;
+    video.style.cssText = "max-width:100%; border-radius:6px; background:#000;";
+    box.appendChild(video);
+    const acts = el("div", { class: "actions" });
+    const cap = el("button", { class: "primary", type: "button" }, "Capture");
+    acts.appendChild(cap); box.appendChild(acts); root.appendChild(box);
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { box.appendChild(el("div", { class: "msg" }, "Camera unavailable.")); return; }
+    navigator.mediaDevices.getUserMedia({ video: true }).then((stream) => {
+      video.srcObject = stream;
+      cap.addEventListener("click", () => {
+        const c = el("canvas"); c.width = video.videoWidth || 640; c.height = video.videoHeight || 480;
+        c.getContext("2d").drawImage(video, 0, 0, c.width, c.height);
+        submitTool({ image: c.toDataURL("image/jpeg", 0.9) });
+      });
+    }).catch(() => { box.appendChild(el("div", { class: "msg" }, "Camera permission denied.")); });
+  }
+
+  function renderAudioRecorder() {
+    root.replaceChildren();
+    const box = el("div");
+    box.appendChild(el("h2", { class: "title" }, CFG.title || "Record audio"));
+    const acts = el("div", { class: "actions" });
+    const rec = el("button", { class: "primary", type: "button" }, "Record");
+    const audioEl = el("audio", { controls: "true" }); audioEl.style.cssText = "display:block; margin-top:10px;";
+    acts.appendChild(rec); box.appendChild(acts); box.appendChild(audioEl); root.appendChild(box);
+    if (!navigator.mediaDevices || !window.MediaRecorder) { box.appendChild(el("div", { class: "msg" }, "Recording unavailable.")); return; }
+    let mr = null, chunks = [], recording = false;
+    rec.addEventListener("click", async () => {
+      if (!recording) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          mr = new MediaRecorder(stream); chunks = [];
+          mr.ondataavailable = (e) => chunks.push(e.data);
+          mr.onstop = () => {
+            const blob = new Blob(chunks, { type: mr.mimeType }); audioEl.src = URL.createObjectURL(blob);
+            const r = new FileReader(); r.onload = () => submitTool({ audio: { type: mr.mimeType, data: String(r.result).split(",").pop() } }); r.readAsDataURL(blob);
+            stream.getTracks().forEach((t) => t.stop());
+          };
+          mr.start(); recording = true; rec.textContent = "Stop";
+        } catch (_e) { box.appendChild(el("div", { class: "msg" }, "Microphone permission denied.")); }
+      } else { if (mr) mr.stop(); recording = false; rec.textContent = "Record"; }
+    });
+  }
+
+  function mediaUrlFrom(obj) {
+    if (!obj) return null;
+    const f = (CFG.fields && CFG.fields[0]) || cols[0];
+    if (f) { const v = pluck(obj, f.field); if (typeof v === "string") return v; }
+    for (const k of ["url", "src", "href", "uri"]) if (typeof obj[k] === "string") return obj[k];
+    return null;
+  }
+  function renderMediaPlayer(obj) {
+    root.replaceChildren(); header();
+    const o = Array.isArray(obj) ? obj[0] : obj;
+    const url = mediaUrlFrom(o); const href = url ? safeHref(url) : null;
+    if (!href) { root.appendChild(el("div", { class: "empty" }, "No media.")); return; }
+    const isVideo = /\.(mp4|webm|ogg|mov)(\?|$)/i.test(href);
+    const m = el(isVideo ? "video" : "audio", { controls: "true", src: href });
+    m.style.cssText = "max-width:100%; width:100%;";
+    root.appendChild(m);
+  }
+  function renderGallery(rows) {
+    root.replaceChildren(); header();
+    if (!rows || !rows.length) { root.appendChild(el("div", { class: "empty" }, "No images.")); return; }
+    const urlCol = cols.find((c) => c.format === "link") || cols[0];
+    const grid = el("div"); grid.style.cssText = "display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:8px;";
+    for (const r of rows) {
+      const raw = urlCol ? pluck(r, urlCol.field) : null; const href = raw ? safeHref(String(raw)) : null;
+      if (!href) continue;
+      const img = el("img", { src: href, loading: "lazy", alt: "" }); img.referrerPolicy = "no-referrer";
+      img.style.cssText = "width:100%; aspect-ratio:1; object-fit:cover; border-radius:6px; cursor:pointer;";
+      if (CFG.primary_action) { const pa = (CFG.row_actions || []).find((a) => a.id === CFG.primary_action); if (pa) img.addEventListener("click", () => fireAction(pa, r)); }
+      grid.appendChild(img);
+    }
+    root.appendChild(grid);
+  }
+
+  // ── App-Provided Tools (read-only client state surfaced to the agent) ──
+  const appTools = Array.isArray(CFG.app_tools) ? CFG.app_tools : [];
+  let SELECTION_STATE = [];
+  let FORM_DRAFT = {};
+  function readAppToolSource(source) {
+    if (source === "selection") return { ids: SELECTION_STATE };
+    if (source === "visible_rows") return { rows: rowsFromResult(LAST_RESULT) || [] };
+    if (source === "form_draft") return { draft: FORM_DRAFT };
+    return null;   // map_viewport etc. — not available in this shell
+  }
+  function registerAppTools() {
+    if (!appTools.length) return;
+    const decls = appTools.map((t) => ({ name: t.name, description: t.description, inputSchema: { type: "object", additionalProperties: false } }));
+    // experimental, best-effort across host APIs — no-op if unsupported
+    try { if (window.openai && typeof window.openai.registerTools === "function") window.openai.registerTools(decls); } catch (_e) {}
+    try { parent.postMessage({ type: "ui/register-tools", tools: decls }, "*"); } catch (_e) {}
+  }
+
+  // ── async tool call (for dynamic enum sourcing); degrades when the host
+  //    has no request/response bridge ──
+  async function callToolAsync(name, params) {
+    try { if (window.openai && typeof window.openai.callTool === "function") return await window.openai.callTool(name, params || {}); } catch (_e) {}
+    return null;
+  }
+  function extractRows(res) {
+    if (!res) return [];
+    const sc = res.structuredContent != null ? res.structuredContent : res;
+    if (Array.isArray(sc)) return sc;
+    if (sc && typeof sc === "object") { for (const k of ["items", "rows", "data", "results"]) if (Array.isArray(sc[k])) return sc[k]; }
+    return [];
+  }
+
+  // ── form (uiSchema-driven) ──
+  function widgetSpec(f) {
+    const w = widgets[f.field] || {};
+    let kind = w.widget;
+    if (!kind) {
+      const fmtv = f.format;
+      if (fmtv === "number" || fmtv === "currency") kind = "number";
+      else if (fmtv === "date") kind = "date";
+      else kind = "text";
+    }
+    return { kind: kind, label: w.label || f.label || f.field, help: w.help, placeholder: w.placeholder, visible_if: w.visible_if, required_if: w.required_if, enum_from: w.enum_from };
+  }
+  function makeInput(spec) {
+    const k = spec.kind;
+    if (k === "textarea" || k === "markdown" || k === "json") { const t = el("textarea", { rows: 4, placeholder: spec.placeholder }); return { node: t, read: () => k === "json" ? tryJson(t.value) : t.value }; }
+    if (k === "toggle") { const c = el("input", { type: "checkbox" }); return { node: c, read: () => c.checked, inline: true }; }
+    if (k === "number" || k === "currency") { const n = el("input", { type: "number", step: k === "currency" ? "0.01" : "any", placeholder: spec.placeholder }); return { node: n, read: () => n.value === "" ? null : Number(n.value) }; }
+    if (k === "select" || k === "multiselect") {
+      const sel = el("select"); if (k === "multiselect") sel.multiple = true;
+      if (spec.enum_from && spec.enum_from.tool) {
+        // dynamic enum sourcing — options from a sibling tool (via the
+        // host's request/response bridge); degrades to empty if unsupported.
+        callToolAsync(spec.enum_from.tool, spec.enum_from.args || {}).then((res) => {
+          for (const r of extractRows(res)) {
+            const v = pluck(r, spec.enum_from.value_field);
+            sel.appendChild(el("option", { value: String(v == null ? "" : v) }, fmt(pluck(r, spec.enum_from.label_field))));
+          }
+        });
+      }
+      return { node: sel, read: () => k === "multiselect" ? Array.from(sel.selectedOptions).map((o) => o.value) : sel.value };
+    }
+    if (k === "array") {
+      const wrap = el("div"); const inputs = [];
+      const addBtn = el("button", { type: "button", class: "action" }, "+ Add");
+      function addRow(val) {
+        const row = el("div", { class: "field inline" });
+        const inp = el("input", { type: "text" }); if (val != null) inp.value = val;
+        const rm = el("button", { type: "button", class: "action" }, "−");
+        rm.addEventListener("click", () => { wrap.removeChild(row); const idx = inputs.indexOf(inp); if (idx >= 0) inputs.splice(idx, 1); });
+        row.appendChild(inp); row.appendChild(rm); wrap.insertBefore(row, addBtn); inputs.push(inp);
+      }
+      addBtn.addEventListener("click", () => addRow(""));
+      wrap.appendChild(addBtn); addRow("");
+      return { node: wrap, read: () => inputs.map((i) => i.value).filter((v) => v !== "") };
+    }
+    const typeMap = { date: "date", datetime: "datetime-local", slider: "range", color: "color", hidden: "hidden" };
+    const inp = el("input", { type: typeMap[k] || "text", placeholder: spec.placeholder });
+    return { node: inp, read: () => inp.value };
+  }
+  function tryJson(s) { try { return JSON.parse(s); } catch (_e) { return s; } }
+  function orderedFields() {
+    if (Array.isArray(uiSchema.order) && uiSchema.order.length) {
+      const byName = {}; for (const f of fields) byName[f.field] = f;
+      const out = []; for (const name of uiSchema.order) { if (byName[name]) out.push(byName[name]); }
+      for (const f of fields) { if (!uiSchema.order.includes(f.field)) out.push(f); }
+      return out;
+    }
+    return fields;
+  }
+  function renderForm() {
+    root.replaceChildren();
+    const form = el("form");
+    if (CFG.title) form.appendChild(el("h2", { class: "title" }, CFG.title));
+    if (CFG.description) form.appendChild(el("p", { class: "desc" }, CFG.description));
+    const draft = {};
+    FORM_DRAFT = draft;   // exposed read-only via the form_draft app-tool source
+    const items = [];
+    const groups = Array.isArray(uiSchema.groups) && uiSchema.groups.length
+      ? uiSchema.groups
+      : [{ label: null, fields: orderedFields().map((f) => f.field) }];
+    const byName = {}; for (const f of fields) byName[f.field] = f;
+    for (const grp of groups) {
+      if (grp.label) form.appendChild(el("h3", { class: "group" }, grp.label));
+      for (const name of (grp.fields || [])) {
+        const f = byName[name]; if (!f) continue;
+        const spec = widgetSpec(f);
+        const wrap = el("div", { class: spec.kind === "toggle" ? "field inline" : "field" });
+        wrap.appendChild(el("label", null, spec.label));
+        const input = makeInput(spec);
+        input.node.addEventListener("input", () => { draft[f.field] = input.read(); reevaluate(); });
+        input.node.addEventListener("change", () => { draft[f.field] = input.read(); reevaluate(); });
+        wrap.appendChild(input.node);
+        if (spec.help) wrap.appendChild(el("div", { class: "help" }, spec.help));
+        form.appendChild(wrap);
+        items.push({ f, spec, wrap, input });
+      }
+    }
+    const submit = el("button", { class: "primary", type: "submit" }, "Submit");
+    form.appendChild(submit);
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const payload = {};
+      for (const it of items) { if (it.wrap.hidden) continue; const v = it.input.read(); if (v !== "" && v != null) payload[it.f.field] = v; }
+      if (CFG.data_tool) callTool(CFG.data_tool, payload);
+    });
+    function reevaluate() {
+      for (const it of items) {
+        if (it.spec.visible_if != null) it.wrap.hidden = evalExpr(it.spec.visible_if, draft) === false;
+        if (it.spec.required_if != null) it.input.node.required = evalExpr(it.spec.required_if, draft) === true;
+      }
+    }
+    root.appendChild(form);
+    reevaluate();
+  }
+
+  function header() {
+    if (KIND === "form" || KIND === "confirmation") return;
+    if (CFG.title) root.appendChild(el("h2", { class: "title" }, CFG.title));
+    if (CFG.description) root.appendChild(el("p", { class: "desc" }, CFG.description));
+  }
+
+  // ── data ingest + dispatch ──
+  let LAST_RESULT = null;
+  function renderData(result) {
+    LAST_RESULT = result;
+    if (KIND === "detail" || KIND === "key_value") return renderDetail(objFromResult(result));
+    if (KIND === "confirmation") return renderConfirmation(objFromResult(result));
+    if (KIND === "code_viewer") return renderCode(result);
+    if (KIND === "media_player") return renderMediaPlayer(objFromResult(result));
+    const rows = rowsFromResult(result) || [];
+    if (KIND === "list") return renderList(rows);
+    if (KIND === "selection") return renderSelection(rows);
+    if (KIND === "chart") return renderChart(rows);
+    if (KIND === "map") return renderMap(rows);
+    if (KIND === "image_gallery") return renderGallery(rows);
+    return renderTable(rows);
+  }
+
+  if (KIND === "form") {
+    renderForm();
+  } else if (KIND === "confirmation") {
+    renderConfirmation(null);
+  } else if (KIND === "signature_pad") {
+    renderSignature();
+  } else if (KIND === "file_upload") {
+    renderFileUpload();
+  } else if (KIND === "camera_capture") {
+    renderCamera();
+  } else if (KIND === "audio_recorder") {
+    renderAudioRecorder();
+  } else {
+    try { if (window.openai && window.openai.toolOutput) { renderData(window.openai.toolOutput); } else { renderData(null); } } catch (_e) { renderData(null); }
+  }
+
+  window.addEventListener("message", (ev) => {
+    if (ev.source && ev.source !== window.parent) return;   // only the host frame
+    const d = ev && ev.data; if (!d || typeof d !== "object") return;
+    if (d.type === "ui/notifications/tool-result" || d.type === "tool-result" || d.toolOutput || d.structuredContent || d.result) {
+      renderData(d.result || d.toolOutput || d);
+    }
+  });
+
+  // register read-only App-Provided Tools + answer host tool-call requests
+  // (experimental; host-bridge-dependent, no-op when unsupported)
+  registerAppTools();
+  window.addEventListener("message", (ev) => {
+    if (ev.source && ev.source !== window.parent) return;
+    const d = ev && ev.data; if (!d || typeof d !== "object") return;
+    if ((d.type === "ui/tool-call" || d.type === "tool-call") && typeof d.name === "string") {
+      const t = appTools.find((x) => x.name === d.name);
+      if (t) { try { parent.postMessage({ type: "ui/tool-result", id: d.id, name: d.name, result: readAppToolSource(t.source) }, "*"); } catch (_e) {} }
+    }
+  });
+})();
+</script>
+</body>
+</html>
