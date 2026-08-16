@@ -284,6 +284,32 @@ Every field on the root `AppConfig`, alphabetised. Click a type to jump to its p
 
 Every type reachable from `AppConfig`, alphabetised. Field tables show type, default, and the field's `///` doc-comment summary.
 
+### `AauthResourceMetadataConfig`
+
+AAuth resource metadata (`/.well-known/aauth-resource.json`, draft-hardt-oauth-aauth-protocol "Resource Metadata"). Field names follow the spec so an operator can paste a spec-shaped document; unrecognized spec fields ride through `extra` verbatim.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `accept_signature_algs` | array&lt;string&gt; | (see type) | Exactly the fully-specified JWS algorithms the verifier accepts. Defaults to what `dev.mcpg.identity.aauth` implements. |
+| `access_mode` | string | `"agent-token"` | The credential flow agents should expect. Defaults to `agent-token` (identity-based access — what `dev.mcpg.identity.aauth` verifies); set `person-token` when the plugin's person-token mode is the primary credential. |
+| `additional_signature_components` | array&lt;string&gt; |  | Covered components agents MUST include beyond the profile's base set. Mirror the identity plugin's `additional_covered_components`. |
+| `insecure_dev_mode` | boolean |  | Development escape hatch for the revocation endpoint's outbound person-server key fetch: admit `http://` and private addresses. NEVER set in production. |
+| `issuer` | string |  | The gateway's AAuth server identifier — HTTPS scheme+host only, no port/path/trailing slash, lowercase (e.g. `https://gw.example`). MUST match the origin the document is fetched from. |
+| `resource_token_ttl_secs` | integer | `300` | Resource-token lifetime, seconds (protocol ceiling 300). |
+| `scope_descriptions` | map&lt;string, string&gt; |  | Scope values this resource grants, each with a Markdown description the person server shows at consent. A resource token may only request scopes declared here (plus the standard OpenID identity scopes); tool `required_scopes` should name values from this map. |
+| `signature_window` | integer (optional) |  | Signature validity window advertised to agents, seconds. Mirror the identity plugin's `signature_window_secs` when overriding the 60 s default. |
+| `signing_key` | [`AauthSigningKeyConfig`](#aauthsigningkeyconfig) (optional) |  | The Ed25519 key that signs resource tokens (`aa-resource+jwt`); its public half is published at `jwks_uri`. Required for `access_mode: auth-token`, unused otherwise. |
+
+### `AauthSigningKeyConfig`
+
+Where the AAuth resource signing key comes from — exactly one source.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `ephemeral` | boolean |  | Generate a fresh key at every start. Development only: tokens minted before a restart cannot be verified after it. |
+| `seed` | string (optional) |  | The seed inline as unpadded base64url (typically `${env.X}`). |
+| `seed_file` | string (optional) |  | File holding the 32-byte Ed25519 seed — raw bytes or base64url text. |
+
 ### `AccessConfig`
 
 | Field | Type | Default | Summary |
@@ -585,6 +611,7 @@ Tool annotation hints configurable per binding. Maps to MCP `ToolAnnotations`.
 | --- | --- | --- | --- |
 | `allow_if` | string (optional) |  |  |
 | `minimum_trust` | [`TrustLevelConfig`](#trustlevelconfig) | `"header_asserted"` |  |
+| `required_scopes` | array&lt;string&gt; |  | Scopes the caller's credential MUST carry to invoke this binding (OAuth `scope`, or an AAuth auth token's `scope`). A caller short of them is answered with the step-up challenge naming the missing scopes (`WWW-Authenticate … error="insufficient_scope"`; for an AAuth person or auth-token caller, `AAuth-Requirement: requirement=auth-token` carrying a resource token). Empty (the default) means no scope requirement. |
 
 ### `BackendIconConfig`
 
@@ -1764,6 +1791,7 @@ A named schema entry in the registry. Exactly one source must be provided.
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
+| `aauth_resource_metadata` | [`AauthResourceMetadataConfig`](#aauthresourcemetadataconfig) (optional) |  | AAuth resource metadata. When set, the gateway serves the document at `/.well-known/aauth-resource.json` and attaches the `AAuth-Requirement: requirement=agent-token` challenge (plus `Accept-Signature-Scheme` / `Accept-Signature-Alg`) to authentication-required 401 responses, so AAuth-capable agents can discover that signing with an agent token would succeed. Pair with the `dev.mcpg.identity.aauth` identity plugin, which does the verifying. |
 | `access_log` | boolean | `true` | Emit the per-request access log (`request received` / `request completed` INFO events, one pair per request). Default `true` (the gateway logs every request's lifecycle). Set `false` to suppress the access log on latency/throughput-sensitive deployments: it removes two structured-log events — and their field formatting + sink write — from every request. Audit events, error/warn logs, metrics, and traces are unaffected. Leave `true` unless request-level access logging is provided elsewhere (an ingress/sidecar) or not required. |
 | `allow_private_backends` | boolean | `false` | Allow outbound connections to private/loopback/link-local IPs. Default `false` enables the DNS rebinding guard. Set `true` for container-network deployments where backends live on RFC 1918. |
 | `allowed_origins` | array&lt;string&gt; | `[]` |  |
@@ -2237,6 +2265,7 @@ Type: array&lt;string&gt; | [`TaggedVariableCompletionSource`](#taggedvariableco
   - `topic`: string
 
 - **`webhook`** — Receive webhook POSTs from 3rd-party systems. MCPG exposes `/webhooks/resource-updated/{token}` and triggers `notifications/resources/updated` when a POST is received.
+  - `previous_tokens`: array&lt;string&gt;
   - `token`: string
 
 - **`sql_polling`** — SQL polling watch — `dev.mcpg.watch.sql_polling` plugin runs a scalar tracking query on a cadence and emits an event when the returned scalar advances. Spec mirrors the `[bindings.sql]` shape (`driver`, `url`, optional `pool` / `session_vars`, required `query` block, `interval_ms`); see the SQL binding plugin docs for the full field list. Pass-through here keeps the spec the single source of truth in the plugin crate.

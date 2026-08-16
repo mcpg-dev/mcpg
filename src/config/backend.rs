@@ -386,6 +386,15 @@ pub struct BackendGovernanceConfig {
     pub minimum_trust: TrustLevelConfig,
     #[serde(default)]
     pub allow_if: Option<String>,
+    /// Scopes the caller's credential MUST carry to invoke this binding
+    /// (OAuth `scope`, or an AAuth auth token's `scope`). A caller short of
+    /// them is answered with the step-up challenge naming the missing scopes
+    /// (`WWW-Authenticate … error="insufficient_scope"`; for an AAuth person
+    /// or auth-token caller, `AAuth-Requirement: requirement=auth-token`
+    /// carrying a resource token). Empty (the default) means no scope
+    /// requirement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_scopes: Vec<String>,
 }
 
 impl Default for BackendGovernanceConfig {
@@ -393,6 +402,7 @@ impl Default for BackendGovernanceConfig {
         Self {
             minimum_trust: default_binding_minimum_trust(),
             allow_if: None,
+            required_scopes: Vec::new(),
         }
     }
 }
@@ -449,6 +459,17 @@ impl BackendGovernanceConfig {
         {
             return Err(anyhow::anyhow!(
                 "{}.governance.allow_if must not be empty when provided",
+                path
+            ));
+        }
+        if self
+            .required_scopes
+            .iter()
+            .any(|s| s.trim().is_empty() || s.contains(char::is_whitespace))
+        {
+            return Err(anyhow::anyhow!(
+                "{}.governance.required_scopes entries must be non-empty scope values without \
+                 whitespace",
                 path
             ));
         }

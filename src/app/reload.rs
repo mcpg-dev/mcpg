@@ -336,6 +336,7 @@ pub(crate) async fn reload_with_config(
 
     new_runtime.set_content_stores(content_stores.clone());
     new_runtime.set_ema_authorization_server(build_ema_authorization_server(&new_config)?);
+    new_runtime.set_aauth_resource(crate::app::auth_wiring::build_aauth_resource(&new_config)?);
     #[cfg(feature = "governance-quotas")]
     new_runtime.set_quota_gate(quota_gate.clone());
     new_runtime.set_idempotency_store(new_idempotency_store.clone());

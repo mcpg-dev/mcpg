@@ -60,6 +60,10 @@ pub(crate) struct ToolPolicyContext {
     pub groups: Vec<String>,
     pub scopes: Vec<String>,
     pub attributes: std::collections::BTreeMap<String, String>,
+    /// The party that vouched for the principal (token `iss`). Together with
+    /// `principal_id` it is the identifier for issuers whose subjects are
+    /// only unique within the issuer (AAuth person servers, `allow_any_issuer`).
+    pub issuer: Option<String>,
 }
 
 impl ToolPolicyContext {
@@ -68,6 +72,7 @@ impl ToolPolicyContext {
             tool_name: tool_name.to_owned(),
             trust_level: request_context.identity.trust_level(),
             principal_id: request_context.identity.principal_id().map(str::to_owned),
+            issuer: request_context.identity.issuer().map(str::to_owned),
             auth_provider: request_context.identity.auth_provider().map(str::to_owned),
             identity_kind: request_context.identity.label().to_owned(),
             roles: request_context.identity.roles().to_vec(),
@@ -99,6 +104,7 @@ impl ToolPolicyContext {
             tool_name: tool_name.to_owned(),
             trust_level,
             principal_id: identity.subject_id.clone(),
+            issuer: identity.issuer.clone(),
             auth_provider: identity.auth_provider.clone(),
             identity_kind: identity.kind.clone(),
             roles: identity.roles.clone(),
@@ -123,6 +129,7 @@ impl ToolPolicyContext {
         use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         self.auth_provider.hash(&mut hasher);
+        self.issuer.hash(&mut hasher);
         self.identity_kind.hash(&mut hasher);
         let mut roles = self.roles.clone();
         roles.sort_unstable();
@@ -727,6 +734,13 @@ fn build_policy_identity_map(ctx: &ToolPolicyContext) -> CelValue {
             None => CelValue::Null,
         },
     );
+    map.insert(
+        CelKey::String("issuer".to_owned().into()),
+        match &ctx.issuer {
+            Some(i) => CelValue::String(i.clone().into()),
+            None => CelValue::Null,
+        },
+    );
 
     // Claims — the key RBAC/ABAC fields
     let roles_cel: Vec<CelValue> = ctx
@@ -1192,6 +1206,7 @@ mod tests {
             trust_level: RequestTrustLevel::Verified,
             principal_id: Some("user-1".to_owned()),
             auth_provider: None,
+            issuer: None,
             identity_kind: "verified".to_owned(),
             roles: Vec::new(),
             groups: Vec::new(),
@@ -1211,6 +1226,7 @@ mod tests {
             trust_level: RequestTrustLevel::Unauthenticated,
             principal_id: None,
             auth_provider: None,
+            issuer: None,
             identity_kind: "anonymous".to_owned(),
             roles: Vec::new(),
             groups: Vec::new(),
@@ -1236,6 +1252,7 @@ mod tests {
             trust_level: RequestTrustLevel::Verified,
             principal_id: Some("user-1".to_owned()),
             auth_provider: Some("oidc".to_owned()),
+            issuer: None,
             identity_kind: "verified".to_owned(),
             roles: vec!["viewer".to_owned()],
             groups: Vec::new(),
@@ -1286,6 +1303,7 @@ mod tests {
             trust_level: RequestTrustLevel::Verified,
             principal_id: Some("user-1".to_owned()),
             auth_provider: Some("oidc".to_owned()),
+            issuer: None,
             identity_kind: "verified".to_owned(),
             roles: roles.into_iter().map(str::to_owned).collect(),
             groups: groups.into_iter().map(str::to_owned).collect(),
@@ -1295,6 +1313,33 @@ mod tests {
                 .map(|(k, v)| (k.to_owned(), v.to_owned()))
                 .collect(),
         }
+    }
+
+    /// `identity.issuer` is the token `iss` — with `subject_id` it is THE
+    /// identifier for issuers whose subjects are only unique within the
+    /// issuer (AAuth person servers, `allow_any_issuer` agents), and the
+    /// only way to pin a tool to one issuing party.
+    #[test]
+    fn cel_policy_reads_identity_issuer() {
+        let policy = CelToolAccessPolicy::compile(
+            r#"identity.issuer == "https://ps.example" && identity.attributes["aauth.token_type"] == "person""#
+                .to_owned(),
+            "test".to_owned(),
+        )
+        .unwrap();
+        let mut ctx = verified_context_with_claims(
+            vec![],
+            vec![],
+            vec![],
+            vec![("aauth.token_type", "person")],
+        );
+        ctx.issuer = Some("https://ps.example".to_owned());
+        assert!(policy.evaluate(&ctx).unwrap());
+        ctx.issuer = Some("https://other.example".to_owned());
+        assert!(!policy.evaluate(&ctx).unwrap());
+        // Absent issuer is null, never an unbound-variable error.
+        ctx.issuer = None;
+        assert!(!policy.evaluate(&ctx).unwrap());
     }
 
     #[test]
@@ -1390,6 +1435,7 @@ mod tests {
             trust_level: RequestTrustLevel::Unauthenticated,
             principal_id: None,
             auth_provider: None,
+            issuer: None,
             identity_kind: "anonymous".to_owned(),
             roles: Vec::new(),
             groups: Vec::new(),

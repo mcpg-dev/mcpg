@@ -18,6 +18,7 @@ impl GatewayRuntime {
             tool_name: tool_name.to_owned(),
             trust_level,
             principal_id: identity.subject_id.clone(),
+            issuer: None,
             auth_provider: None,
             identity_kind: identity.kind.clone(),
             roles: identity.roles.clone(),

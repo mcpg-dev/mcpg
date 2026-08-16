@@ -134,6 +134,16 @@ impl AdminService {
         rt.binding_summaries().into_iter().find(|b| b.name == name)
     }
 
+    /// GET /admin/v1/watches
+    ///
+    /// Async where its neighbours are not: the watcher table lives inside the
+    /// engine's control loop, so reading it is a round-trip on that loop
+    /// rather than a field access.
+    pub async fn list_watches(&self) -> Vec<crate::runtime::watch_engine::WatchSnapshot> {
+        let rt = self.runtime.load();
+        rt.watch_engine.list_watches().await
+    }
+
     /// GET /admin/v1/runtime
     pub fn runtime_info(&self) -> RuntimeInfoResponse {
         let rt = self.runtime.load();
@@ -538,6 +548,7 @@ impl AdminService {
             tool_name: tool_name.to_owned(),
             trust_level,
             principal_id: identity.subject_id.clone(),
+            issuer: None,
             auth_provider: None,
             identity_kind: identity.kind.clone(),
             roles: identity.roles.clone(),

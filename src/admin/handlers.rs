@@ -92,6 +92,13 @@ pub async fn list_plugins(State(svc): State<SharedAdmin>) -> impl IntoResponse {
     Json(svc.list_plugins())
 }
 
+/// Lists every running resource watcher: its URI, strategy, and subscriber
+/// count. A watcher exists only while something is subscribed, so an empty
+/// list means no subscriptions rather than no configuration.
+pub async fn list_watches(State(svc): State<SharedAdmin>) -> impl IntoResponse {
+    Json(serde_json::json!({ "watches": svc.list_watches().await }))
+}
+
 /// Disable a registered plugin. The plugin stays loaded but is
 /// skipped during chain evaluation and binding / watch lookups
 /// until [`enable_plugin`] is called.

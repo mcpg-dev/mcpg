@@ -42,7 +42,12 @@ pub enum WatchStrategy {
     /// Externally triggered via webhook — the engine registers a token and
     /// the HTTP handler calls `WatchCommand::ExternalNotify` when a POST
     /// arrives on `/webhooks/resource-updated/{token}`.
-    Webhook { token: String },
+    Webhook {
+        token: String,
+        /// Superseded tokens still accepted, so a rotation does not drop
+        /// events while senders are re-registered.
+        previous_tokens: Vec<String>,
+    },
     /// Delegate to a `WatchStrategyPlugin` looked up by `kind` (e.g.
     /// `"nats_topic"`, `"kafka_topic"`). The `spec` is passed verbatim
     /// to the plugin's `watch(...)` call.
@@ -57,6 +62,15 @@ pub enum WatchStrategy {
 struct WatchHandle {
     cancel: CancellationToken,
     subscriber_count: usize,
+    strategy: &'static str,
+}
+
+/// One running watcher, as reported by the admin API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WatchSnapshot {
+    pub uri: String,
+    pub strategy: &'static str,
+    pub subscriber_count: usize,
 }
 
 /// Resolves a subscribed URI with no static `watch:` config to a
@@ -78,6 +92,10 @@ pub enum WatchCommand {
     /// Report how many watchers are running.
     CountWatchers {
         reply: tokio::sync::oneshot::Sender<usize>,
+    },
+    /// Report every running watcher, for the admin API.
+    ListWatchers {
+        reply: tokio::sync::oneshot::Sender<Vec<WatchSnapshot>>,
     },
     /// Shut down all watchers.
     Shutdown,
@@ -131,11 +149,28 @@ impl WatchEngine {
     ) -> Self {
         let (command_tx, command_rx) = mpsc::channel(128);
 
-        // Build the webhook token → URI reverse map.
-        let mut tokens = HashMap::new();
+        // Build the webhook token → URI reverse map. A superseded token routes
+        // exactly like the live one until the operator drops it.
+        let mut tokens: HashMap<String, String> = HashMap::new();
         for (uri, config) in &watch_configs {
-            if let WatchStrategy::Webhook { token } = &config.strategy {
-                tokens.insert(token.clone(), uri.clone());
+            if let WatchStrategy::Webhook {
+                token,
+                previous_tokens,
+            } = &config.strategy
+            {
+                for candidate in std::iter::once(token).chain(previous_tokens) {
+                    if let Some(claimed) = tokens.insert(candidate.clone(), uri.clone())
+                        && claimed != *uri
+                    {
+                        // Silently remapping one resource's webhook onto
+                        // another is worse than either outcome, so say so.
+                        warn!(
+                            claimed_by = %claimed,
+                            now = %uri,
+                            "watch: webhook token is claimed by two resources; the later one wins"
+                        );
+                    }
+                }
             }
         }
 
@@ -211,6 +246,22 @@ impl WatchEngine {
         answer.await.unwrap_or(0)
     }
 
+    /// Every running watcher, ordered by URI. Empty once the engine has shut
+    /// down, which is indistinguishable from "nothing subscribed" — both mean
+    /// no watcher is running.
+    pub async fn list_watches(&self) -> Vec<WatchSnapshot> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        if self
+            .command_tx
+            .send(WatchCommand::ListWatchers { reply })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        answer.await.unwrap_or_default()
+    }
+
     /// Externally notify that a resource has changed (webhook / admin).
     pub async fn notify_resource_changed(&self, uri: &str) {
         let _ = self
@@ -264,6 +315,7 @@ async fn watch_engine_loop(
                     let handle = WatchHandle {
                         cancel: cancel.clone(),
                         subscriber_count: 1,
+                        strategy: strategy_name(&config.strategy),
                     };
 
                     let sub_store = subscription_store.clone();
@@ -284,6 +336,12 @@ async fn watch_engine_loop(
                     });
 
                     active_watches.insert(uri.clone(), handle);
+                    metrics::gauge!("mcpg_watch_active_watchers").set(active_watches.len() as f64);
+                    metrics::counter!(
+                        "mcpg_watch_watchers_started_total",
+                        "strategy" => strategy_name(&config.strategy),
+                    )
+                    .increment(1);
                     info!(uri = %uri, strategy = strategy_name(&config.strategy), "watch: watcher started");
                 } else {
                     debug!(uri = %uri, "watch: no config for resource, ignoring subscribe");
@@ -295,6 +353,8 @@ async fn watch_engine_loop(
                     if handle.subscriber_count == 0 {
                         handle.cancel.cancel();
                         active_watches.remove(&uri);
+                        metrics::gauge!("mcpg_watch_active_watchers")
+                            .set(active_watches.len() as f64);
                         info!(uri = %uri, "watch: watcher stopped (no subscribers)");
                     } else {
                         debug!(uri = %uri, subscribers = handle.subscriber_count, "watch: subscriber removed");
@@ -319,6 +379,13 @@ async fn watch_engine_loop(
                     compiled,
                     &EventContext::default(),
                 );
+                let strategy = active_watches
+                    .get(&uri)
+                    .map(|h| h.strategy)
+                    .unwrap_or("external");
+                metrics::counter!("mcpg_watch_fired_total", "strategy" => strategy).increment(1);
+                metrics::counter!("mcpg_watch_notifications_sent_total", "strategy" => strategy)
+                    .increment(count as u64);
                 if count > 0 {
                     info!(uri = %uri, subscriber_count = count, "watch: external notify delivered");
                 } else {
@@ -338,6 +405,20 @@ async fn watch_engine_loop(
             }
             WatchCommand::CountWatchers { reply } => {
                 let _ = reply.send(active_watches.len());
+            }
+            WatchCommand::ListWatchers { reply } => {
+                let mut snapshot: Vec<WatchSnapshot> = active_watches
+                    .iter()
+                    .map(|(uri, handle)| WatchSnapshot {
+                        uri: uri.clone(),
+                        strategy: handle.strategy,
+                        subscriber_count: handle.subscriber_count,
+                    })
+                    .collect();
+                // Stable order: the admin API is read by humans and by diffing
+                // scripts, and a HashMap iteration order is neither.
+                snapshot.sort_by(|a, b| a.uri.cmp(&b.uri));
+                let _ = reply.send(snapshot);
             }
             WatchCommand::Shutdown => break,
         }
@@ -531,6 +612,11 @@ fn notify_subscribers_filtered(
             let program = match compiled_program {
                 Some(p) => p,
                 None => {
+                    // Fails OPEN: every subscriber is notified, which is the
+                    // one path here with a confidentiality consequence. The
+                    // counter exists so it can be alerted on rather than
+                    // noticed in a log.
+                    metrics::counter!("mcpg_watch_filter_fallback_total").increment(1);
                     warn!(uri = %uri, "notification filter: CEL program not compiled, falling back to fan-out");
                     let subscribers = subscription_store.subscribers_for(uri);
                     let jsonrpc_message = build_resource_updated_message(uri);
@@ -886,6 +972,11 @@ async fn run_poll_watcher(
         let body = match resource_fetcher(&uri) {
             Some(b) => b,
             None => {
+                // A failed read leaves the baseline untouched, so a broken
+                // upstream is silence rather than a fire. The counter is the
+                // only way to tell that apart from a resource that is simply
+                // not changing.
+                metrics::counter!("mcpg_watch_poll_failures_total").increment(1);
                 debug!(uri = %uri, "poll: resource fetch returned None, skipping");
                 continue;
             }
@@ -922,6 +1013,9 @@ async fn run_poll_watcher(
                 compiled_filter_program.as_deref(),
                 &EventContext::default(),
             );
+            metrics::counter!("mcpg_watch_fired_total", "strategy" => "poll").increment(1);
+            metrics::counter!("mcpg_watch_notifications_sent_total", "strategy" => "poll")
+                .increment(count as u64);
             if count > 0 {
                 info!(
                     uri = %uri,
@@ -1008,6 +1102,7 @@ mod tests {
                 // store handle it holds is a precise liveness probe.
                 strategy: WatchStrategy::Webhook {
                     token: "t".to_owned(),
+                    previous_tokens: Vec::new(),
                 },
                 notification_filter: None,
                 compiled_filter_program: None,
@@ -1092,6 +1187,7 @@ mod tests {
                 uri: "file:///config.yaml".to_owned(),
                 strategy: WatchStrategy::Webhook {
                     token: "abc123".to_owned(),
+                    previous_tokens: vec!["superseded".to_owned()],
                 },
                 notification_filter: None,
                 compiled_filter_program: None,
@@ -1114,12 +1210,74 @@ mod tests {
             Arc::new(|_| None),
         );
 
+        // The rotation window: a superseded token routes to the same resource
+        // as the live one, so senders re-registering after the deploy keep
+        // working instead of 404ing until someone notices.
+        assert_eq!(
+            engine.resolve_webhook_token("superseded"),
+            Some(&"file:///config.yaml".to_owned()),
+            "a previous token must still resolve during rotation"
+        );
+
         assert_eq!(
             engine.resolve_webhook_token("abc123"),
             Some(&"file:///config.yaml".to_owned())
         );
         assert_eq!(engine.resolve_webhook_token("nonexistent"), None);
-        assert_eq!(engine.webhook_tokens().len(), 1);
+        // One webhook resource, two live routes into it: the current token and
+        // the one it superseded. The poll resource contributes none.
+        assert_eq!(engine.webhook_tokens().len(), 2);
+
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_watches_reports_running_watchers_only() {
+        let mut configs = HashMap::new();
+        for (uri, interval) in [("res://a", 60_000u64), ("res://b", 60_000)] {
+            configs.insert(
+                uri.to_owned(),
+                WatchConfig {
+                    uri: uri.to_owned(),
+                    strategy: WatchStrategy::Poll {
+                        interval_ms: interval,
+                    },
+                    notification_filter: None,
+                    compiled_filter_program: None,
+                },
+            );
+        }
+        let engine = WatchEngine::start(
+            configs,
+            Arc::new(KvBackedSubscriptionStore::new_in_memory(100)),
+            Arc::new(|_, _| {}),
+            Arc::new(|_| None),
+        );
+
+        // Configured but unsubscribed: no watcher runs, so nothing is listed.
+        assert!(engine.list_watches().await.is_empty());
+
+        engine.notify_subscribe("res://b").await;
+        engine.notify_subscribe("res://a").await;
+        engine.notify_subscribe("res://a").await;
+
+        let listed = engine.list_watches().await;
+        assert_eq!(listed.len(), 2);
+        // Sorted by URI regardless of subscribe order.
+        assert_eq!(listed[0].uri, "res://a");
+        assert_eq!(listed[0].strategy, "poll");
+        assert_eq!(listed[0].subscriber_count, 2);
+        assert_eq!(listed[1].uri, "res://b");
+        assert_eq!(listed[1].subscriber_count, 1);
+
+        engine.notify_unsubscribe("res://b").await;
+        let listed = engine.list_watches().await;
+        assert_eq!(
+            listed.len(),
+            1,
+            "a watcher with no subscribers is torn down"
+        );
+        assert_eq!(listed[0].uri, "res://a");
 
         engine.shutdown().await;
     }
@@ -1162,7 +1320,8 @@ mod tests {
         );
         assert_eq!(
             strategy_name(&WatchStrategy::Webhook {
-                token: "x".to_owned()
+                token: "x".to_owned(),
+                previous_tokens: Vec::new(),
             }),
             "webhook"
         );

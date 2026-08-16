@@ -2169,6 +2169,7 @@ async fn mcp_origin_is_rejected_when_not_allowed() {
                 anonymous_rate_limit_burst: 0,
                 trust_proxy_ip: false,
                 trust_subject_header: false,
+                aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
                 relax_request_id_uniqueness: false,
                 unary_json_fast_path: false,
@@ -5517,7 +5518,7 @@ const TEST_PRM_URL: &str = "https://gateway.example.com/.well-known/oauth-protec
 #[test]
 fn t6_02_www_authenticate_header_added_on_401() {
     let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
     let www_auth = response.headers().get(header::WWW_AUTHENTICATE);
     assert!(www_auth.is_some());
     let value = www_auth.unwrap().to_str().unwrap();
@@ -5529,14 +5530,226 @@ fn t6_02_www_authenticate_header_added_on_401() {
 #[test]
 fn t6_02_www_authenticate_header_not_added_when_auth_disabled() {
     let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let response = with_www_authenticate_challenge(response, false, TEST_PRM_URL);
+    let response = with_www_authenticate_challenge(response, false, TEST_PRM_URL, None);
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
+}
+
+/// With AAuth resource metadata configured, a 401 additionally carries the
+/// protocol's challenge alongside `WWW-Authenticate` — the two headers are
+/// independent. Which requirement depends on `access_mode`: an identity-only
+/// resource asks for an agent token; a resource that authorizes on the
+/// person asks for a person token. Non-401 responses stay clean.
+#[test]
+fn aauth_challenge_rides_401_when_configured() {
+    let identity_only = crate::runtime::aauth_resource::AauthResource::from_config(
+        &crate::config::AauthResourceMetadataConfig {
+            issuer: "https://gateway.example.com".into(),
+            access_mode: "agent-token".into(),
+            accept_signature_algs: vec!["Ed25519".into(), "ES256".into()],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let ch = |identity| response::AauthChallenge {
+        resource: &identity_only,
+        identity,
+    };
+    let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, Some(ch(None)));
+    assert!(response.headers().get(header::WWW_AUTHENTICATE).is_some());
+    assert_eq!(
+        response.headers().get("aauth-requirement").unwrap(),
+        "requirement=agent-token"
+    );
+    assert_eq!(
+        response.headers().get("accept-signature-scheme").unwrap(),
+        "jwt"
+    );
+    assert_eq!(
+        response.headers().get("accept-signature-alg").unwrap(),
+        "Ed25519, ES256"
+    );
+
+    let ok = axum::http::StatusCode::OK.into_response();
+    let ok = with_www_authenticate_challenge(ok, true, TEST_PRM_URL, Some(ch(None)));
+    assert!(ok.headers().get("aauth-requirement").is_none());
+
+    // A bare authorization 403 for an AUTHENTICATED caller is not a
+    // re-authentication signal; the AAuth challenge (like the Bearer one)
+    // stays off it and the status is untouched.
+    let verified = crate::runtime::RequestIdentity::Verified {
+        subject_id: "user-1".into(),
+        issuer: "https://idp.example".into(),
+        auth_provider: "oidc".into(),
+        source: "test".into(),
+        roles: vec![],
+        groups: vec![],
+        scopes: vec![],
+        attributes: Default::default(),
+    };
+    let forbidden = axum::http::StatusCode::FORBIDDEN.into_response();
+    let forbidden =
+        with_www_authenticate_challenge(forbidden, true, TEST_PRM_URL, Some(ch(Some(&verified))));
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    assert!(forbidden.headers().get("aauth-requirement").is_none());
+
+    // An UNAUTHENTICATED caller refused at the trust floor is a policy 403 in
+    // mcpg's model; at a declared AAuth resource it becomes the protocol's
+    // 401 challenge, so the agent learns which credential to bring.
+    let anon = crate::runtime::RequestIdentity::Anonymous {
+        source: "test".into(),
+    };
+    let floor = axum::http::StatusCode::FORBIDDEN.into_response();
+    let floor = with_www_authenticate_challenge(floor, true, TEST_PRM_URL, Some(ch(Some(&anon))));
+    assert_eq!(floor.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        floor.headers().get("aauth-requirement").unwrap(),
+        "requirement=agent-token"
+    );
+
+    // A person-authorizing resource challenges for a person token.
+    let person_mode = crate::runtime::aauth_resource::AauthResource::from_config(
+        &crate::config::AauthResourceMetadataConfig {
+            issuer: "https://gateway.example.com".into(),
+            access_mode: "person-token".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
+    let response = with_www_authenticate_challenge(
+        response,
+        true,
+        TEST_PRM_URL,
+        Some(response::AauthChallenge {
+            resource: &person_mode,
+            identity: None,
+        }),
+    );
+    assert_eq!(
+        response.headers().get("aauth-requirement").unwrap(),
+        "requirement=person-token"
+    );
+}
+
+/// An AAuth person caller denied for insufficient scope at an `auth-token`
+/// resource is stepped up: the SEP-2350 403 becomes the AAuth `401` with
+/// `requirement=auth-token` carrying a resource token for the missing scopes.
+/// A non-AAuth caller keeps the plain 403 step-up.
+#[test]
+fn aauth_step_up_mints_resource_token_on_scope_denial() {
+    use crate::runtime::aauth_resource::{
+        ATTR_AGENT_JKT, ATTR_EXP, ATTR_JTI, ATTR_PS, ATTR_TOKEN_TYPE,
+    };
+    let mut scope_descriptions = std::collections::BTreeMap::new();
+    scope_descriptions.insert("tools:write".to_owned(), "Write tools".to_owned());
+    let resource = crate::runtime::aauth_resource::AauthResource::from_config(
+        &crate::config::AauthResourceMetadataConfig {
+            issuer: "https://gateway.example.com".into(),
+            access_mode: "auth-token".into(),
+            scope_descriptions,
+            signing_key: Some(crate::config::AauthSigningKeyConfig {
+                ephemeral: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut attributes = std::collections::BTreeMap::new();
+    attributes.insert(ATTR_TOKEN_TYPE.to_owned(), "person".to_owned());
+    attributes.insert(ATTR_JTI.to_owned(), "pt-9".to_owned());
+    attributes.insert(ATTR_PS.to_owned(), "https://ps.example".to_owned());
+    attributes.insert(
+        ATTR_AGENT_JKT.to_owned(),
+        "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k".to_owned(),
+    );
+    attributes.insert(
+        ATTR_EXP.to_owned(),
+        (mcpg_aauth_core::now_unix() + 600).to_string(),
+    );
+    let person = crate::runtime::RequestIdentity::Verified {
+        subject_id: "8f14e45fceea167a5a36dedd4bea2543".into(),
+        issuer: "https://ps.example".into(),
+        auth_provider: "aauth".into(),
+        source: "identity_plugin:verified".into(),
+        roles: vec![],
+        groups: vec![],
+        scopes: vec![],
+        attributes,
+    };
+
+    let mut denied = axum::http::StatusCode::FORBIDDEN.into_response();
+    denied.headers_mut().insert(
+        HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
+        HeaderValue::from_static("tools:write"),
+    );
+    let stepped = with_www_authenticate_challenge(
+        denied,
+        true,
+        TEST_PRM_URL,
+        Some(response::AauthChallenge {
+            resource: &resource,
+            identity: Some(&person),
+        }),
+    );
+    assert_eq!(stepped.status(), StatusCode::UNAUTHORIZED);
+    let req = stepped
+        .headers()
+        .get("aauth-requirement")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        req.starts_with("requirement=auth-token; resource-token=\""),
+        "{req}"
+    );
+    let token = req
+        .trim_start_matches("requirement=auth-token; resource-token=\"")
+        .trim_end_matches('"');
+    let decoded = mcpg_aauth_core::jwt::decode(token).unwrap();
+    assert_eq!(decoded.payload["scope"], "tools:write");
+    assert_eq!(decoded.payload["aud"], "https://ps.example");
+    assert_eq!(decoded.payload["presented_jti"], "pt-9");
+    // The internal scope hint never reaches the wire.
+    assert!(stepped.headers().get(INSUFFICIENT_SCOPE_HEADER).is_none());
+
+    // A non-AAuth caller: plain SEP-2350 step-up, status untouched.
+    let mut denied = axum::http::StatusCode::FORBIDDEN.into_response();
+    denied.headers_mut().insert(
+        HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
+        HeaderValue::from_static("tools:write"),
+    );
+    let anon = crate::runtime::RequestIdentity::Anonymous {
+        source: "test".into(),
+    };
+    let plain = with_www_authenticate_challenge(
+        denied,
+        true,
+        TEST_PRM_URL,
+        Some(response::AauthChallenge {
+            resource: &resource,
+            identity: Some(&anon),
+        }),
+    );
+    assert_eq!(plain.status(), StatusCode::FORBIDDEN);
+    assert!(plain.headers().get("aauth-requirement").is_none());
+    assert!(
+        plain
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("insufficient_scope")
+    );
 }
 
 #[test]
 fn t6_02_www_authenticate_not_added_on_200() {
     let response = axum::http::StatusCode::OK.into_response();
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 }
 
@@ -5550,7 +5763,7 @@ fn t4_07_www_authenticate_includes_insufficient_scope_hint() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("tools.call sampling.read"),
     );
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
     let value = response
         .headers()
         .get(header::WWW_AUTHENTICATE)
@@ -5579,7 +5792,7 @@ fn auth09_insufficient_scope_403_carries_step_up_challenge() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("payments.write"),
     );
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let value = response
         .headers()
@@ -5606,7 +5819,7 @@ fn auth09_insufficient_scope_403_carries_step_up_challenge() {
 #[test]
 fn auth09_bare_403_gets_no_challenge() {
     let response = axum::http::StatusCode::FORBIDDEN.into_response();
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 }
@@ -5621,11 +5834,11 @@ fn auth04_403_not_conflated_into_401() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("admin.read"),
     );
-    let forbidden = with_www_authenticate_challenge(forbidden, true, TEST_PRM_URL);
+    let forbidden = with_www_authenticate_challenge(forbidden, true, TEST_PRM_URL, None);
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
 
     let unauth = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let unauth = with_www_authenticate_challenge(unauth, true, TEST_PRM_URL);
+    let unauth = with_www_authenticate_challenge(unauth, true, TEST_PRM_URL, None);
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
     // The unauthenticated challenge does not name a specific scope.
     let unauth_value = unauth
@@ -5645,7 +5858,7 @@ fn t4_07_insufficient_scope_header_stripped_even_on_non_401() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("tools.call"),
     );
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
     assert!(
         response
             .headers()

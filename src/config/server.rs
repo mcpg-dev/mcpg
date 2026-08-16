@@ -87,6 +87,15 @@ pub struct ServerConfig {
     /// authenticates the caller and injects this header.
     #[serde(default)]
     pub trust_subject_header: bool,
+    /// AAuth resource metadata. When set, the gateway serves the document at
+    /// `/.well-known/aauth-resource.json` and attaches the
+    /// `AAuth-Requirement: requirement=agent-token` challenge (plus
+    /// `Accept-Signature-Scheme` / `Accept-Signature-Alg`) to
+    /// authentication-required 401 responses, so AAuth-capable agents can
+    /// discover that signing with an agent token would succeed. Pair with the
+    /// `dev.mcpg.identity.aauth` identity plugin, which does the verifying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aauth_resource_metadata: Option<AauthResourceMetadataConfig>,
     /// Re-validate tool arguments against the tool's inputSchema after a
     /// tool_gate / transform plugin rewrites them. When false (default)
     /// only the caller's original arguments are validated. Opt-in
@@ -234,6 +243,7 @@ impl Default for ServerConfig {
             anonymous_rate_limit_burst: default_anonymous_rate_limit_burst(),
             trust_proxy_ip: false,
             trust_subject_header: false,
+            aauth_resource_metadata: None,
             revalidate_mutated_tool_arguments: false,
             relax_request_id_uniqueness: false,
             unary_json_fast_path: false,
@@ -252,6 +262,220 @@ impl Default for ServerConfig {
             allow_private_backends: false,
             health_check: HealthCheckConfig::default(),
         }
+    }
+}
+
+/// AAuth resource metadata (`/.well-known/aauth-resource.json`,
+/// draft-hardt-oauth-aauth-protocol "Resource Metadata"). Field names follow
+/// the spec so an operator can paste a spec-shaped document; unrecognized
+/// spec fields ride through `extra` verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct AauthResourceMetadataConfig {
+    /// The gateway's AAuth server identifier — HTTPS scheme+host only, no
+    /// port/path/trailing slash, lowercase (e.g. `https://gw.example`). MUST
+    /// match the origin the document is fetched from.
+    pub issuer: String,
+    /// The credential flow agents should expect. Defaults to `agent-token`
+    /// (identity-based access — what `dev.mcpg.identity.aauth` verifies);
+    /// set `person-token` when the plugin's person-token mode is the primary
+    /// credential.
+    #[serde(default = "default_aauth_access_mode")]
+    pub access_mode: String,
+    /// Signature validity window advertised to agents, seconds. Mirror the
+    /// identity plugin's `signature_window_secs` when overriding the 60 s
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_window: Option<u64>,
+    /// Covered components agents MUST include beyond the profile's base set.
+    /// Mirror the identity plugin's `additional_covered_components`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_signature_components: Vec<String>,
+    /// Exactly the fully-specified JWS algorithms the verifier accepts.
+    /// Defaults to what `dev.mcpg.identity.aauth` implements.
+    #[serde(default = "default_aauth_accept_signature_algs")]
+    pub accept_signature_algs: Vec<String>,
+    /// Scope values this resource grants, each with a Markdown description
+    /// the person server shows at consent. A resource token may only request
+    /// scopes declared here (plus the standard OpenID identity scopes); tool
+    /// `required_scopes` should name values from this map.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scope_descriptions: std::collections::BTreeMap<String, String>,
+    /// The Ed25519 key that signs resource tokens (`aa-resource+jwt`); its
+    /// public half is published at `jwks_uri`. Required for
+    /// `access_mode: auth-token`, unused otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<AauthSigningKeyConfig>,
+    /// Resource-token lifetime, seconds (protocol ceiling 300).
+    #[serde(default = "default_aauth_resource_token_ttl_secs")]
+    pub resource_token_ttl_secs: u64,
+    /// Development escape hatch for the revocation endpoint's outbound
+    /// person-server key fetch: admit `http://` and private addresses.
+    /// NEVER set in production.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub insecure_dev_mode: bool,
+    /// Any further spec fields (`name`, `description`, `documentation_uri`,
+    /// `logo_uri`, …) — published verbatim.
+    #[serde(default, flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Where the AAuth resource signing key comes from — exactly one source.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AauthSigningKeyConfig {
+    /// File holding the 32-byte Ed25519 seed — raw bytes or base64url text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_file: Option<std::path::PathBuf>,
+    /// The seed inline as unpadded base64url (typically `${env.X}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<String>,
+    /// Generate a fresh key at every start. Development only: tokens minted
+    /// before a restart cannot be verified after it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
+}
+
+pub(crate) fn default_aauth_resource_token_ttl_secs() -> u64 {
+    300
+}
+
+impl Default for AauthResourceMetadataConfig {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            access_mode: default_aauth_access_mode(),
+            signature_window: None,
+            additional_signature_components: Vec::new(),
+            accept_signature_algs: default_aauth_accept_signature_algs(),
+            scope_descriptions: std::collections::BTreeMap::new(),
+            signing_key: None,
+            resource_token_ttl_secs: default_aauth_resource_token_ttl_secs(),
+            insecure_dev_mode: false,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
+pub(crate) fn default_aauth_access_mode() -> String {
+    "agent-token".to_owned()
+}
+
+pub(crate) fn default_aauth_accept_signature_algs() -> Vec<String> {
+    vec!["Ed25519".to_owned(), "ES256".to_owned()]
+}
+
+impl AauthResourceMetadataConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let iss = self.issuer.trim();
+        if mcpg_aauth_core::ident::validate_server_identifier(iss, self.insecure_dev_mode).is_err()
+        {
+            return Err(anyhow::anyhow!(
+                "server.aauth_resource_metadata.issuer must be an AAuth server identifier — \
+                 https scheme + lowercase host only, no port/path/trailing slash \
+                 (got {iss:?}; insecure_dev_mode admits http:// and a port)"
+            ));
+        }
+        if self.access_mode.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "server.aauth_resource_metadata.access_mode must not be empty"
+            ));
+        }
+        if self.accept_signature_algs.is_empty() {
+            return Err(anyhow::anyhow!(
+                "server.aauth_resource_metadata.accept_signature_algs must not be empty — the \
+                 list states exactly what the verifier accepts"
+            ));
+        }
+        if !matches!(
+            self.access_mode.as_str(),
+            "agent-token" | "person-token" | "auth-token" | "session-token"
+        ) {
+            return Err(anyhow::anyhow!(
+                "server.aauth_resource_metadata.access_mode must be one of agent-token, \
+                 person-token, auth-token, session-token (got {:?})",
+                self.access_mode
+            ));
+        }
+        if self.access_mode == "auth-token" && self.signing_key.is_none() {
+            return Err(anyhow::anyhow!(
+                "server.aauth_resource_metadata.access_mode `auth-token` requires `signing_key` \
+                 (resource tokens are signed; set seed_file / seed, or ephemeral: true for \
+                 development)"
+            ));
+        }
+        if let Some(k) = &self.signing_key {
+            let sources = usize::from(k.seed_file.is_some())
+                + usize::from(k.seed.is_some())
+                + usize::from(k.ephemeral);
+            if sources != 1 {
+                return Err(anyhow::anyhow!(
+                    "server.aauth_resource_metadata.signing_key needs exactly one of seed_file, \
+                     seed, ephemeral"
+                ));
+            }
+        }
+        if self.resource_token_ttl_secs == 0 || self.resource_token_ttl_secs > 300 {
+            return Err(anyhow::anyhow!(
+                "server.aauth_resource_metadata.resource_token_ttl_secs must be 1..=300"
+            ));
+        }
+        for (scope, desc) in &self.scope_descriptions {
+            if scope.trim().is_empty() || scope.contains(char::is_whitespace) {
+                return Err(anyhow::anyhow!(
+                    "server.aauth_resource_metadata.scope_descriptions has an invalid scope \
+                     value {scope:?} (non-empty, no whitespace)"
+                ));
+            }
+            if desc.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "server.aauth_resource_metadata.scope_descriptions[{scope:?}] needs a \
+                     description"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The document served at `/.well-known/aauth-resource.json`.
+    pub fn document(&self) -> serde_json::Value {
+        let mut doc = serde_json::Map::new();
+        doc.insert("issuer".into(), self.issuer.clone().into());
+        doc.insert("access_mode".into(), self.access_mode.clone().into());
+        if let Some(w) = self.signature_window {
+            doc.insert("signature_window".into(), w.into());
+        }
+        if !self.additional_signature_components.is_empty() {
+            doc.insert(
+                "additional_signature_components".into(),
+                self.additional_signature_components
+                    .iter()
+                    .map(|s| serde_json::Value::from(s.as_str()))
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+        }
+        doc.insert(
+            "accept_signature_algs".into(),
+            self.accept_signature_algs
+                .iter()
+                .map(|s| serde_json::Value::from(s.as_str()))
+                .collect::<Vec<_>>()
+                .into(),
+        );
+        if !self.scope_descriptions.is_empty() {
+            doc.insert(
+                "scope_descriptions".into(),
+                self.scope_descriptions
+                    .iter()
+                    .map(|(k, v)| (k.clone(), serde_json::Value::from(v.as_str())))
+                    .collect::<serde_json::Map<_, _>>()
+                    .into(),
+            );
+        }
+        for (k, v) in &self.extra {
+            doc.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        serde_json::Value::Object(doc)
     }
 }
 
@@ -507,6 +731,74 @@ fn default_anonymous_rate_limit_burst() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aauth_metadata_validates_issuer_shape() {
+        let ok = AauthResourceMetadataConfig {
+            issuer: "https://gw.example".into(),
+            access_mode: default_aauth_access_mode(),
+            accept_signature_algs: default_aauth_accept_signature_algs(),
+            ..Default::default()
+        };
+        ok.validate().unwrap();
+
+        for bad in [
+            "http://gw.example",     // not https
+            "https://gw.example/",   // trailing slash
+            "https://gw.example:88", // port
+            "https://GW.example",    // uppercase
+            "",
+        ] {
+            let cfg = AauthResourceMetadataConfig {
+                issuer: bad.into(),
+                access_mode: default_aauth_access_mode(),
+                accept_signature_algs: default_aauth_accept_signature_algs(),
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn aauth_metadata_document_shape() {
+        let mut extra = serde_json::Map::new();
+        extra.insert("name".into(), serde_json::json!("Example Gateway"));
+        let cfg = AauthResourceMetadataConfig {
+            issuer: "https://gw.example".into(),
+            access_mode: default_aauth_access_mode(),
+            signature_window: Some(90),
+            additional_signature_components: vec!["content-digest".into()],
+            accept_signature_algs: default_aauth_accept_signature_algs(),
+            extra,
+            ..Default::default()
+        };
+        let doc = cfg.document();
+        assert_eq!(doc["issuer"], "https://gw.example");
+        assert_eq!(doc["access_mode"], "agent-token");
+        assert_eq!(doc["signature_window"], 90);
+        assert_eq!(doc["additional_signature_components"][0], "content-digest");
+        assert_eq!(doc["accept_signature_algs"][0], "Ed25519");
+        assert_eq!(doc["accept_signature_algs"][1], "ES256");
+        assert_eq!(doc["name"], "Example Gateway");
+    }
+
+    /// The spec-shaped YAML parses: field names match the wire document, and
+    /// unknown spec fields ride through `extra` verbatim.
+    #[test]
+    fn aauth_metadata_accepts_spec_shaped_input() {
+        let cfg: AauthResourceMetadataConfig = serde_json::from_value(serde_json::json!({
+            "issuer": "https://gw.example",
+            "access_mode": "agent-token",
+            "additional_signature_components": ["content-digest"],
+            "documentation_uri": "https://gw.example/docs",
+        }))
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.document()["documentation_uri"],
+            "https://gw.example/docs"
+        );
+    }
 
     fn base_tls() -> TlsConfig {
         TlsConfig {

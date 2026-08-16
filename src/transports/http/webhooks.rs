@@ -41,6 +41,7 @@ pub(crate) async fn webhook_resource_updated_handler(
             // truncate token in logs so a leaked log
             // line does not expose the full routing key.
             let token_hint: String = token.chars().take(8).collect();
+            metrics::counter!("mcpg_watch_webhook_rejected_total").increment(1);
             tracing::debug!(token_hint = %token_hint, "webhook: unknown token");
             return (
                 axum::http::StatusCode::NOT_FOUND,

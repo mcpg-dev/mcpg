@@ -1,6 +1,6 @@
 [package]
 name = "mcpg"
-version = "0.1.0-beta.15"
+version = "0.1.0-beta.16"
 license = "Apache-2.0"
 edition = "2024"
 description = "MCPG gateway — the governed MCP endpoint. Binary: `mcpg`."
@@ -49,30 +49,31 @@ futures = "0.3"
 jsonschema = "0.28"
 jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"] }
 schemars = { version = "0.8", default-features = false, features = ["derive", "preserve_order"] }
-mcpg-cluster-api = { git = "https://github.com/mcpg-dev/mcpg-cluster-api", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-cluster-api = { git = "https://github.com/mcpg-dev/mcpg-cluster-api", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
 # Host-side content-store + response-cache surface shared with the LLM
 # backend plugins (the provider clients themselves are runtime-loaded
 # cdylibs and are NOT linked here).
-mcpg-backend-llm-shared = { git = "https://github.com/mcpg-dev/mcpg-backend-llm-shared", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-backend-llm-shared = { git = "https://github.com/mcpg-dev/mcpg-backend-llm-shared", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
 # Shared HTTP-over-reqwest core for the network backend plugins; the
 # gateway links it directly for the SSRF resolution guard (`safe_dns`).
-mcpg-plugin-backend-net-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-net-core", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-mcp-client = { git = "https://github.com/mcpg-dev/mcpg-mcp-client", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-mcp-wire = { git = "https://github.com/mcpg-dev/mcpg-mcp-wire", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-sensitive = { git = "https://github.com/mcpg-dev/mcpg-sensitive", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-expr = { git = "https://github.com/mcpg-dev/mcpg-expr", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-tunnel-proto = { git = "https://github.com/mcpg-dev/mcpg-tunnel-proto", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-tunnel-agent = { git = "https://github.com/mcpg-dev/mcpg-tunnel-agent", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-glob = { git = "https://github.com/mcpg-dev/mcpg-glob", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-plugin-backend-net-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-net-core", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-aauth-core = { git = "https://github.com/mcpg-dev/mcpg-aauth-core", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-mcp-client = { git = "https://github.com/mcpg-dev/mcpg-mcp-client", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-mcp-wire = { git = "https://github.com/mcpg-dev/mcpg-mcp-wire", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-sensitive = { git = "https://github.com/mcpg-dev/mcpg-sensitive", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-expr = { git = "https://github.com/mcpg-dev/mcpg-expr", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-tunnel-proto = { git = "https://github.com/mcpg-dev/mcpg-tunnel-proto", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-tunnel-agent = { git = "https://github.com/mcpg-dev/mcpg-tunnel-agent", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-glob = { git = "https://github.com/mcpg-dev/mcpg-glob", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
 # `static-firstparty` enables the `HostHandle::from_services` path used at
 # boot to install the unified host surface on statically linked first-party
 # plugins — the gateway never goes through the FFI vtable for its own
 # builtins.
-mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", features = ["static-firstparty"] }
-mcpg-plugin-storage-builtin = { git = "https://github.com/mcpg-dev/mcpg-plugin-storage-builtin", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
-mcpg-plugin-storage-s3 = { git = "https://github.com/mcpg-dev/mcpg-plugin-storage-s3", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", optional = true }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14", features = ["static-firstparty"] }
+mcpg-plugin-storage-builtin = { git = "https://github.com/mcpg-dev/mcpg-plugin-storage-builtin", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
+mcpg-plugin-storage-s3 = { git = "https://github.com/mcpg-dev/mcpg-plugin-storage-s3", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14", optional = true }
 # The only backend linked into the binary: the mock fixture the quickstart
 # templates bind, so `mcpg config init` → boot → `tools/call` works with no
 # artefact to build. It carries no transport machinery (no client stack) and
@@ -86,16 +87,16 @@ mcpg-plugin-storage-s3 = { git = "https://github.com/mcpg-dev/mcpg-plugin-storag
 # re-exports, the SSRF guard config validation calls, the resolver the
 # authorization server builds on). The plugin-ABI wrapper is a separate
 # crate — the gateway links the library, not the plugin.
-mcpg-plugin-identity-oidc-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-identity-oidc-core", tag = "v0.1.0-beta.10", version = "=0.1.0-beta.10" }
+mcpg-plugin-identity-oidc-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-identity-oidc-core", tag = "v0.1.0-beta.11", version = "=0.1.0-beta.11" }
 # CP-attached integration: optional dep gated by the `cp-attached`
 # feature so the flagship `mcpg` build stays lean.
-mcpg-control-plane-client = { git = "https://github.com/mcpg-dev/mcpg-control-plane-client", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", optional = true }
+mcpg-control-plane-client = { git = "https://github.com/mcpg-dev/mcpg-control-plane-client", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14", optional = true }
 # License claims + offline verification: the standalone plugin load
 # gate runs in every build, so this is NOT optional.
-mcpg-control-plane-license = { git = "https://github.com/mcpg-dev/mcpg-control-plane-license", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+mcpg-control-plane-license = { git = "https://github.com/mcpg-dev/mcpg-control-plane-license", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14" }
 # State-dir conventions for the composition flags + `mcpg status` — the
 # paths-only slice of cli-core (dirs only; none of the login/HTTP stack).
-mcpg-cli-core = { git = "https://github.com/mcpg-dev/mcpg-cli-core", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13", default-features = false, features = ["paths"] }
+mcpg-cli-core = { git = "https://github.com/mcpg-dev/mcpg-cli-core", tag = "v0.1.0-beta.14", version = "=0.1.0-beta.14", default-features = false, features = ["paths"] }
 # Subcommand routing for the consolidated `mcpg-config` bin (the gateway
 # binary itself keeps its hand-rolled argv handling).
 clap = { version = "4", features = ["derive", "wrap_help"] }
@@ -176,22 +177,22 @@ libc = "0.2"
 # runtime's #[cfg(test)] fallback constructs them statically here. Dev-only
 # ⇒ the release `mcpg` binary links none of them (nor their client stacks,
 # e.g. sqlx). The exception is the mock fixture, a real dependency above.
-mcpg-plugin-backend-sql = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sql", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
-mcpg-plugin-backend-http = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-http", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-sql = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sql", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
+mcpg-plugin-backend-http = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-http", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
 # The version req keeps this dev-dep in the published manifest as a git+tag
 # reference: the in-src runtime tests compile against the mock backend, so a
 # standalone build needs it — unlike the rest of these, which only the
 # non-shipping tests/ directory uses.
-mcpg-plugin-backend-mock = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-mock", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
-mcpg-plugin-backend-soap = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-soap", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
-mcpg-plugin-backend-ldap = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-ldap", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
-mcpg-plugin-backend-mssql = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-mssql", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
-mcpg-plugin-backend-amqp = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-amqp", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
-mcpg-plugin-backend-email = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-email", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
-mcpg-plugin-backend-sftp = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sftp", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
-mcpg-plugin-backend-command = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-command", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
-mcpg-plugin-backend-openapi = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-openapi", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
-mcpg-plugin-transform-jsonata = { git = "https://github.com/mcpg-dev/mcpg-plugin-transform-jsonata", tag = "v0.1.0-alpha.15", version = "=0.1.0-alpha.15" }
+mcpg-plugin-backend-mock = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-mock", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
+mcpg-plugin-backend-soap = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-soap", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
+mcpg-plugin-backend-ldap = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-ldap", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
+mcpg-plugin-backend-mssql = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-mssql", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
+mcpg-plugin-backend-amqp = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-amqp", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
+mcpg-plugin-backend-email = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-email", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
+mcpg-plugin-backend-sftp = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sftp", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
+mcpg-plugin-backend-command = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-command", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
+mcpg-plugin-backend-openapi = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-openapi", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
+mcpg-plugin-transform-jsonata = { git = "https://github.com/mcpg-dev/mcpg-plugin-transform-jsonata", tag = "v0.1.0-alpha.16", version = "=0.1.0-alpha.16" }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 wiremock = "0.6"

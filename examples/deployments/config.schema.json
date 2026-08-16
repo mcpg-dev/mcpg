@@ -2,6 +2,106 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "additionalProperties": false,
   "definitions": {
+    "AauthResourceMetadataConfig": {
+      "additionalProperties": true,
+      "description": "AAuth resource metadata (`/.well-known/aauth-resource.json`, draft-hardt-oauth-aauth-protocol \"Resource Metadata\"). Field names follow the spec so an operator can paste a spec-shaped document; unrecognized spec fields ride through `extra` verbatim.",
+      "properties": {
+        "accept_signature_algs": {
+          "default": [
+            "Ed25519",
+            "ES256"
+          ],
+          "description": "Exactly the fully-specified JWS algorithms the verifier accepts. Defaults to what `dev.mcpg.identity.aauth` implements.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "access_mode": {
+          "default": "agent-token",
+          "description": "The credential flow agents should expect. Defaults to `agent-token` (identity-based access — what `dev.mcpg.identity.aauth` verifies); set `person-token` when the plugin's person-token mode is the primary credential.",
+          "type": "string"
+        },
+        "additional_signature_components": {
+          "description": "Covered components agents MUST include beyond the profile's base set. Mirror the identity plugin's `additional_covered_components`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "insecure_dev_mode": {
+          "description": "Development escape hatch for the revocation endpoint's outbound person-server key fetch: admit `http://` and private addresses. NEVER set in production.",
+          "type": "boolean"
+        },
+        "issuer": {
+          "description": "The gateway's AAuth server identifier — HTTPS scheme+host only, no port/path/trailing slash, lowercase (e.g. `https://gw.example`). MUST match the origin the document is fetched from.",
+          "type": "string"
+        },
+        "resource_token_ttl_secs": {
+          "default": 300,
+          "description": "Resource-token lifetime, seconds (protocol ceiling 300).",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "scope_descriptions": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Scope values this resource grants, each with a Markdown description the person server shows at consent. A resource token may only request scopes declared here (plus the standard OpenID identity scopes); tool `required_scopes` should name values from this map.",
+          "type": "object"
+        },
+        "signature_window": {
+          "description": "Signature validity window advertised to agents, seconds. Mirror the identity plugin's `signature_window_secs` when overriding the 60 s default.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "signing_key": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AauthSigningKeyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Ed25519 key that signs resource tokens (`aa-resource+jwt`); its public half is published at `jwks_uri`. Required for `access_mode: auth-token`, unused otherwise."
+        }
+      },
+      "required": [
+        "issuer"
+      ],
+      "type": "object"
+    },
+    "AauthSigningKeyConfig": {
+      "additionalProperties": false,
+      "description": "Where the AAuth resource signing key comes from — exactly one source.",
+      "properties": {
+        "ephemeral": {
+          "description": "Generate a fresh key at every start. Development only: tokens minted before a restart cannot be verified after it.",
+          "type": "boolean"
+        },
+        "seed": {
+          "description": "The seed inline as unpadded base64url (typically `${env.X}`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seed_file": {
+          "description": "File holding the 32-byte Ed25519 seed — raw bytes or base64url text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "AccessConfig": {
       "additionalProperties": false,
       "properties": {
@@ -1038,6 +1138,13 @@
             }
           ],
           "default": "header_asserted"
+        },
+        "required_scopes": {
+          "description": "Scopes the caller's credential MUST carry to invoke this binding (OAuth `scope`, or an AAuth auth token's `scope`). A caller short of them is answered with the step-up challenge naming the missing scopes (`WWW-Authenticate … error=\"insufficient_scope\"`; for an AAuth person or auth-token caller, `AAuth-Requirement: requirement=auth-token` carrying a resource token). Empty (the default) means no scope requirement.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "type": "object"
@@ -5241,6 +5348,17 @@
     "ServerConfig": {
       "additionalProperties": false,
       "properties": {
+        "aauth_resource_metadata": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AauthResourceMetadataConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "AAuth resource metadata. When set, the gateway serves the document at `/.well-known/aauth-resource.json` and attaches the `AAuth-Requirement: requirement=agent-token` challenge (plus `Accept-Signature-Scheme` / `Accept-Signature-Alg`) to authentication-required 401 responses, so AAuth-capable agents can discover that signing with an agent token would succeed. Pair with the `dev.mcpg.identity.aauth` identity plugin, which does the verifying."
+        },
         "access_log": {
           "default": true,
           "description": "Emit the per-request access log (`request received` / `request completed` INFO events, one pair per request). Default `true` (the gateway logs every request's lifecycle). Set `false` to suppress the access log on latency/throughput-sensitive deployments: it removes two structured-log events — and their field formatting + sink write — from every request. Audit events, error/warn logs, metrics, and traces are unaffected. Leave `true` unless request-level access logging is provided elsewhere (an ingress/sidecar) or not required.",
@@ -6698,6 +6816,13 @@
         {
           "description": "Receive webhook POSTs from 3rd-party systems. MCPG exposes `/webhooks/resource-updated/{token}` and triggers `notifications/resources/updated` when a POST is received.",
           "properties": {
+            "previous_tokens": {
+              "description": "Tokens still accepted while senders migrate to `token`.\n\nA sender is re-registered out of band and cannot be switched at the same instant the gateway is, so rotating a single token drops every event in between. Carrying the old value here keeps both live for one deploy: promote the new token, re-register senders, then empty this list.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "token": {
               "default": "",
               "description": "Shared secret token that must appear in the URL path. If empty, a random UUID-v4 is generated on startup.",

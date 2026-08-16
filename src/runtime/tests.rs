@@ -3052,7 +3052,10 @@ fn build_watch_configs_maps_each_strategy_variant() {
     let mut webhook = sample_binding_mock("webhook");
     webhook.uri = Some("r://webhook".into());
     webhook.watch = Some(ResourceWatchConfig {
-        strategy: WatchStrategyConfig::Webhook { token: "t1".into() },
+        strategy: WatchStrategyConfig::Webhook {
+            token: "t1".into(),
+            previous_tokens: vec!["t0".into()],
+        },
         notification_filter: None,
     });
 
@@ -3106,8 +3109,12 @@ fn build_watch_configs_maps_each_strategy_variant() {
         other => panic!("expected Poll, got {other:?}"),
     }
     match &configs["r://webhook"].strategy {
-        watch_engine::WatchStrategy::Webhook { token } => {
+        watch_engine::WatchStrategy::Webhook {
+            token,
+            previous_tokens,
+        } => {
             assert_eq!(token, "t1");
+            assert_eq!(previous_tokens, &vec!["t0".to_owned()]);
         }
         other => panic!("expected Webhook, got {other:?}"),
     }

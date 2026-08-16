@@ -107,6 +107,20 @@ impl GatewayRuntime {
         self.ema_authorization_server = server;
     }
 
+    /// The AAuth resource role, when `server.aauth_resource_metadata` is set.
+    pub fn aauth_resource(&self) -> Option<&crate::runtime::aauth_resource::AauthResource> {
+        self.aauth_resource.as_deref()
+    }
+
+    /// Install the AAuth resource role. Called once right after construction
+    /// (and after each config-reload rebuild), before the runtime is shared.
+    pub fn set_aauth_resource(
+        &mut self,
+        resource: Option<std::sync::Arc<crate::runtime::aauth_resource::AauthResource>>,
+    ) {
+        self.aauth_resource = resource;
+    }
+
     pub fn backend_health(&self) -> &backend_health::BackendHealthMap {
         &self.backend_health
     }

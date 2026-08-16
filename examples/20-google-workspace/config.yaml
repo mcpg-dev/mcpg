@@ -1,4 +1,3 @@
-# Auto-generated sample — rebuilt T19-01 for correct mcpg schema.
 gateway:
   server:
     bind_address: "127.0.0.1:8806"
@@ -9,14 +8,20 @@ gateway:
 mcp:
   capabilities:
     tools:
+      # Every argument of an `http` binding also travels on the wire —
+      # to the query string on GET, to the JSON body on POST. Google
+      # rejects parameters and body fields it does not know, so each
+      # schema below carries only real API fields, and anything the
+      # operator fixes (calendar id, user id) stays in the URL.
       - name: gmail.messages.list
         title: "List Gmail messages"
-        description: "List Gmail messages"
+        description: "List message ids in the authenticated user's mailbox."
         annotations: { read_only: true, idempotent: true }
         input_schema:
           type: object
           properties:
-            q: { type: string, default: "" }
+            q: { type: string }
+            maxResults: { type: integer, default: 25 }
         backend:
           kind: http
           url: "https://gmail.googleapis.com/gmail/v1/users/me/messages"
@@ -28,17 +33,42 @@ mcp:
           require_json_response: true
           max_response_bytes: 524288
 
+      - name: gmail.messages.send
+        title: "Send a Gmail message"
+        description: "Send a base64url-encoded RFC 2822 message."
+        annotations: { read_only: false, idempotent: false }
+        input_schema:
+          type: object
+          properties:
+            raw:
+              type: string
+              description: "base64url-encoded RFC 2822 message"
+          required: [raw]
+        backend:
+          kind: http
+          url: "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+          method: post
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 15000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 65536
+
       - name: calendar.events.list
         title: "List calendar events"
-        description: "List calendar events"
+        description: "List upcoming events on the primary calendar."
         annotations: { read_only: true, idempotent: true }
         input_schema:
           type: object
           properties:
-            calendar_id: { type: string, default: "primary" }
+            timeMin: { type: string, description: "RFC 3339 lower bound" }
+            maxResults: { type: integer, default: 25 }
+            singleEvents: { type: boolean, default: true }
+            orderBy: { type: string, default: "startTime" }
         backend:
           kind: http
-          url: "https://www.googleapis.com/calendar/v3/calendars/${arguments.calendar_id}/events"
+          url: "https://www.googleapis.com/calendar/v3/calendars/primary/events"
           method: get
           headers:
             Authorization: "Bearer ${env.GOOGLE_TOKEN}"
@@ -46,3 +76,228 @@ mcp:
           expected_status_codes: [200]
           require_json_response: true
           max_response_bytes: 524288
+
+      - name: calendar.events.create
+        title: "Create a calendar event"
+        description: "Insert an event on the primary calendar."
+        annotations: { read_only: false, idempotent: false }
+        input_schema:
+          type: object
+          properties:
+            summary: { type: string }
+            description: { type: string }
+            start:
+              type: object
+              properties:
+                dateTime: { type: string, description: "RFC 3339" }
+                timeZone: { type: string }
+            end:
+              type: object
+              properties:
+                dateTime: { type: string, description: "RFC 3339" }
+                timeZone: { type: string }
+          required: [summary, start, end]
+        backend:
+          kind: http
+          url: "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+          method: post
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 15000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 65536
+
+      - name: drive.files.list
+        title: "List Drive files"
+        description: "List files the caller's credential can see."
+        annotations: { read_only: true, idempotent: true }
+        input_schema:
+          type: object
+          properties:
+            q:
+              type: string
+              description: "Drive query, e.g. \"'<folder-id>' in parents and trashed = false\""
+            pageSize: { type: integer, default: 50 }
+            orderBy: { type: string, default: "modifiedTime desc" }
+            fields:
+              type: string
+              default: "nextPageToken,files(id,name,mimeType,modifiedTime,size)"
+        backend:
+          kind: http
+          url: "https://www.googleapis.com/drive/v3/files"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+
+      - name: docs.documents.create
+        title: "Create a Google Doc"
+        description: "Create an empty document with the given title."
+        annotations: { read_only: false, idempotent: false }
+        input_schema:
+          type: object
+          properties:
+            title: { type: string }
+          required: [title]
+        backend:
+          kind: http
+          url: "https://docs.googleapis.com/v1/documents"
+          method: post
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 15000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 262144
+
+    resources:
+      # A watch re-reads its own binding and compares a SHA-256 of the
+      # result, so `fields` is what decides which changes are visible
+      # and `orderBy` is what keeps an unchanged response byte-stable.
+      # A resource takes no caller arguments, so the whole Google query
+      # lives in the URL; the binding merges it with the generated one.
+      - name: drive.folder.contents
+        title: "Drive folder contents"
+        description: >-
+          One folder's listing. Fires when a file is added, renamed,
+          trashed, or edited — md5Checksum moves on a content change.
+        uri: "drive://folder/reports"
+        mime_type: application/json
+        backend:
+          kind: http
+          url: "https://www.googleapis.com/drive/v3/files?q=%27FOLDER_ID%27+in+parents+and+trashed+%3D+false&orderBy=name&fields=files(id,name,mimeType,modifiedTime,md5Checksum)"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+        watch:
+          strategy:
+            type: poll
+            interval_ms: 60000
+
+      # 404 is an expected status, not a failure: a hard delete turns the
+      # body into an error document, which moves the hash and fires the
+      # notification instead of erroring the watch.
+      - name: drive.file.metadata
+        title: "Drive file metadata"
+        description: >-
+          One file. Fires on a content edit, a rename, a trash, or a
+          permanent delete.
+        uri: "drive://file/contract"
+        mime_type: application/json
+        backend:
+          kind: http
+          url: "https://www.googleapis.com/drive/v3/files/FILE_ID?fields=id,name,trashed,modifiedTime,version,md5Checksum"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200, 404]
+          require_json_response: true
+          max_response_bytes: 65536
+        watch:
+          strategy:
+            type: poll
+            interval_ms: 30000
+
+      # revisionId is the cheapest possible change signal: it is one
+      # opaque string, and Docs moves it on every edit.
+      - name: docs.document.revision
+        title: "Google Doc revision"
+        description: "One document. Fires on any edit."
+        uri: "docs://document/handbook"
+        mime_type: application/json
+        backend:
+          kind: http
+          url: "https://docs.googleapis.com/v1/documents/DOCUMENT_ID?fields=documentId,title,revisionId"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 16384
+        watch:
+          strategy:
+            type: poll
+            interval_ms: 30000
+
+      # showDeleted keeps a cancellation visible as a status change
+      # rather than as a silent disappearance. nextSyncToken is left out
+      # of `fields` because it moves on every read.
+      - name: calendar.events.recent
+        title: "Recently updated calendar events"
+        description: >-
+          The primary calendar. Fires when an event is created,
+          updated, or cancelled.
+        uri: "calendar://primary/events"
+        mime_type: application/json
+        backend:
+          kind: http
+          url: "https://www.googleapis.com/calendar/v3/calendars/primary/events?orderBy=updated&showDeleted=true&maxResults=50&fields=items(id,summary,status,updated)"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+        watch:
+          strategy:
+            type: poll
+            interval_ms: 120000
+
+      # Per-subscriber scoping: a mailbox watch must not fan out to
+      # every session subscribed to this gateway.
+      - name: gmail.unread
+        title: "Unread Gmail"
+        description: "Fires when unread mail arrives or is read."
+        uri: "gmail://me/unread"
+        mime_type: application/json
+        backend:
+          kind: http
+          url: "https://gmail.googleapis.com/gmail/v1/users/me/messages?q=is:unread&fields=messages/id"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 262144
+        watch:
+          strategy:
+            type: poll
+            interval_ms: 60000
+          notification_filter:
+            scope: subject_id
+
+      # Google's own push channel. Renew it out of band: Drive expires a
+      # channel within 24 h and nothing here re-registers it.
+      - name: drive.folder.pushed
+        title: "Drive folder (push)"
+        description: >-
+          The same folder, driven by Drive push notifications instead of
+          a poll cadence.
+        uri: "drive://folder/reports-push"
+        mime_type: application/json
+        backend:
+          kind: http
+          url: "https://www.googleapis.com/drive/v3/files?q=%27FOLDER_ID%27+in+parents+and+trashed+%3D+false&orderBy=name&fields=files(id,name,mimeType,modifiedTime,md5Checksum)"
+          method: get
+          headers:
+            Authorization: "Bearer ${env.GOOGLE_TOKEN}"
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 524288
+        watch:
+          strategy:
+            type: webhook
+            token: "${env.DRIVE_WEBHOOK_TOKEN}"

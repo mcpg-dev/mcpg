@@ -386,6 +386,7 @@ pub async fn build_from_sources(
 
     // Embedded EMA authorization server (governance.access.authorization_server).
     runtime.set_ema_authorization_server(build_ema_authorization_server(&config)?);
+    runtime.set_aauth_resource(crate::app::auth_wiring::build_aauth_resource(&config)?);
 
     // Install the runtime quota gate so the
     // dispatch hook can reach it. `None` (no `governance.quotas:`

@@ -35,7 +35,7 @@ pub(crate) use crate::{
     transports::{http, stdio},
 };
 
-pub use auth_wiring::build_ema_authorization_server;
+pub use auth_wiring::{build_aauth_resource, build_ema_authorization_server};
 pub use boot::{build, build_from_config, build_from_sources};
 pub(crate) use reload::reapply_config;
 pub use reload::{reload_config, reload_config_from_yaml};

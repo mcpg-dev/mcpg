@@ -60,6 +60,15 @@ pub enum WatchStrategyConfig {
         /// If empty, a random UUID-v4 is generated on startup.
         #[serde(default)]
         token: String,
+        /// Tokens still accepted while senders migrate to `token`.
+        ///
+        /// A sender is re-registered out of band and cannot be switched at
+        /// the same instant the gateway is, so rotating a single token drops
+        /// every event in between. Carrying the old value here keeps both
+        /// live for one deploy: promote the new token, re-register senders,
+        /// then empty this list.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        previous_tokens: Vec<String>,
     },
     /// SQL polling watch — `dev.mcpg.watch.sql_polling` plugin runs a
     /// scalar tracking query on a cadence and emits an event when the

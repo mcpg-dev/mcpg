@@ -118,8 +118,8 @@ pub use quotas::{
 };
 pub use schema::SchemaEntry;
 pub use server::{
-    ClientCertMode, ServerConfig, TlsConfig, TransportMode, TunnelConfig, TunnelExposure,
-    TunnelFederationConfig, TunnelTrustMode,
+    AauthResourceMetadataConfig, AauthSigningKeyConfig, ClientCertMode, ServerConfig, TlsConfig,
+    TransportMode, TunnelConfig, TunnelExposure, TunnelFederationConfig, TunnelTrustMode,
 };
 pub use source::ConfigSource;
 pub use storage::{
@@ -718,6 +718,9 @@ impl AppConfig {
         )?;
         if let Some(ref tls) = server.tls {
             tls.validate()?;
+        }
+        if let Some(ref aauth) = server.aauth_resource_metadata {
+            aauth.validate()?;
         }
         if let Some(ref tunnel) = server.tunnel {
             tunnel.validate()?;

@@ -94,6 +94,27 @@ pub fn build_ema_authorization_server(
     Ok(Some(std::sync::Arc::new(server)))
 }
 
+/// Build the AAuth resource role when `server.aauth_resource_metadata` is
+/// configured. Public so the integration-test harness can wire it the same
+/// way boot and reload do.
+pub fn build_aauth_resource(
+    config: &AppConfig,
+) -> Result<Option<std::sync::Arc<crate::runtime::aauth_resource::AauthResource>>> {
+    let Some(ref meta) = config.gateway.server.aauth_resource_metadata else {
+        return Ok(None);
+    };
+    let resource = crate::runtime::aauth_resource::AauthResource::from_config(meta)?;
+    if resource.can_mint() && !config.cluster.is_single_node() {
+        tracing::warn!(
+            "server.aauth_resource_metadata under a multi-node cluster: revocations and \
+             person-token presentations are tracked per replica; exposure is bounded by the \
+             AAuth token lifetimes (auth tokens ≤ 1 h)"
+        );
+    }
+    info!(resource = ?resource, "AAuth resource role initialized");
+    Ok(Some(std::sync::Arc::new(resource)))
+}
+
 pub(crate) fn build_oidc_resolver(
     config: &AppConfig,
 ) -> Result<Option<crate::runtime::oidc::OidcOAuthResolver>> {

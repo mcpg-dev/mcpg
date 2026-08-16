@@ -296,6 +296,7 @@ fn test_http_binding(name: &str, allow_if: Option<&str>) -> BackendConfig {
         governance: BackendGovernanceConfig {
             minimum_trust: TrustLevelConfig::HeaderAsserted,
             allow_if: allow_if.map(|s| s.to_owned()),
+            required_scopes: Vec::new(),
         },
         retry: None,
         content_storage: None,
@@ -479,6 +480,7 @@ fn build_tool_access_policy_config_injects_binding_governance_rules() {
                         governance: BackendGovernanceConfig {
                             minimum_trust: TrustLevelConfig::HeaderAsserted,
                             allow_if: Some("principal_id == \"user-2\"".to_owned()),
+                            required_scopes: Vec::new(),
                         },
                         retry: None,
                         content_storage: None,

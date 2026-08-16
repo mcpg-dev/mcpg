@@ -33,7 +33,7 @@ pub(crate) async fn build_full_request_context(
         peer_ip,
     )
     .await?;
-    enrich_identity_via_plugins(
+    let ctx = enrich_identity_via_plugins(
         ctx,
         headers,
         runtime.plugin_registry(),
@@ -41,7 +41,42 @@ pub(crate) async fn build_full_request_context(
         method,
         path,
     )
-    .await
+    .await?;
+    enforce_aauth_resource_state(ctx, runtime).await
+}
+
+/// The gateway's AAuth resource role, applied after the identity chain: a
+/// credential its issuer revoked at our revocation endpoint is refused
+/// (401 + `Signature-Error: error=invalid_jwt`, the code the identity plugin
+/// uses for a config-listed revocation), and a verified person token is
+/// remembered so a later auth-token step-up can name it.
+async fn enforce_aauth_resource_state(
+    ctx: RequestContext,
+    runtime: &crate::runtime::GatewayRuntime,
+) -> Result<RequestContext, Response> {
+    let Some(resource) = runtime.aauth_resource() else {
+        return Ok(ctx);
+    };
+    if resource.is_revoked(&ctx.identity) {
+        tracing::warn!(
+            request_id = %ctx.request_id.as_str(),
+            issuer = ?ctx.identity.issuer(),
+            "AAuth credential revoked by its issuer, rejecting with 401"
+        );
+        let event = mcpg_plugin_host::audit_events::auth_failed_event(
+            "aauth",
+            "credential revoked by its issuer",
+            ctx.request_id.as_str(),
+            "http",
+        );
+        let _ = runtime.plugin_registry().emit_audit_event(&event).await;
+        return Err(invalid_token_response_with_headers(
+            &ctx.request_id,
+            &[("signature-error".to_owned(), "error=invalid_jwt".to_owned())],
+        ));
+    }
+    resource.record_identity(&ctx.identity);
+    Ok(ctx)
 }
 
 pub(crate) async fn build_request_context(
@@ -291,7 +326,11 @@ async fn enrich_identity_via_plugins(
         // that as "no credential" would fail open to anonymous and leave no
         // audit record, so it is refused the same way a bad bearer is on the
         // transport cascade above.
-        mcpg_plugin_host::ChainIdentityOutcome::Rejected { plugin_id, reason } => {
+        mcpg_plugin_host::ChainIdentityOutcome::Rejected {
+            plugin_id,
+            reason,
+            response_headers,
+        } => {
             tracing::warn!(
                 request_id = %ctx.request_id.as_str(),
                 plugin_id = %plugin_id,
@@ -305,7 +344,10 @@ async fn enrich_identity_via_plugins(
                 "http",
             );
             let _ = registry.emit_audit_event(&event).await;
-            return Err(invalid_token_response(&ctx.request_id));
+            return Err(invalid_token_response_with_headers(
+                &ctx.request_id,
+                &response_headers,
+            ));
         }
     }
 
@@ -394,7 +436,19 @@ fn build_header_or_anonymous_identity(
 /// §5.1) plus the standard `WWW-Authenticate: Bearer` challenge and the
 /// gateway request-id echo header.
 fn invalid_token_response(request_id: &GatewayRequestId) -> Response {
-    let resp = (
+    invalid_token_response_with_headers(request_id, &[])
+}
+
+/// As [`invalid_token_response`], additionally attaching plugin-supplied
+/// diagnostic headers — e.g. AAuth's `Signature-Error` (the machine-readable
+/// error channel) and `Accept-Signature-Scheme` / `Accept-Signature-Alg`
+/// (what WOULD succeed). Header names/values that fail HTTP validation are
+/// dropped individually rather than failing the response.
+fn invalid_token_response_with_headers(
+    request_id: &GatewayRequestId,
+    extra_headers: &[(String, String)],
+) -> Response {
+    let mut resp = (
         axum::http::StatusCode::UNAUTHORIZED,
         [(
             axum::http::header::WWW_AUTHENTICATE,
@@ -412,6 +466,14 @@ fn invalid_token_response(request_id: &GatewayRequestId) -> Response {
         })),
     )
         .into_response();
+    for (name, value) in extra_headers {
+        if let (Ok(n), Ok(v)) = (
+            axum::http::HeaderName::try_from(name.as_str()),
+            axum::http::HeaderValue::try_from(value.as_str()),
+        ) {
+            resp.headers_mut().append(n, v);
+        }
+    }
     with_request_id_header(resp, request_id)
 }
 

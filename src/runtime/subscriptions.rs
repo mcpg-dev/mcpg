@@ -447,6 +447,7 @@ mod tests {
                 // so the engine's watcher table is the only thing under test.
                 strategy: WatchStrategy::Webhook {
                     token: "t".to_owned(),
+                    previous_tokens: Vec::new(),
                 },
                 notification_filter: None,
                 compiled_filter_program: None,

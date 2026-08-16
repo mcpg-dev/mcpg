@@ -1,3 +1,4 @@
+pub mod aauth_resource;
 pub mod approvals;
 pub mod authorization_server;
 pub mod backend_health;
@@ -811,6 +812,10 @@ pub struct GatewayRuntime {
     /// (`governance.access.authorization_server`). Installed via
     /// [`Self::set_ema_authorization_server`] after construction.
     ema_authorization_server: Option<std::sync::Arc<authorization_server::AuthorizationServer>>,
+    /// The gateway's AAuth resource role (`server.aauth_resource_metadata`):
+    /// resource-token minting, revocation state, discovery endpoints.
+    /// Installed via [`Self::set_aauth_resource`] after construction.
+    aauth_resource: Option<std::sync::Arc<aauth_resource::AauthResource>>,
     pipeline_store: std::sync::Arc<dyn pipeline_store::PipelineStore>,
     task_store: std::sync::Arc<dyn task_store::TaskStore>,
     delivery_bus: Arc<dyn DeliveryBus>,

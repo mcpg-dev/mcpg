@@ -1136,6 +1136,7 @@ impl GatewayRuntime {
             jwt_verifier,
             oidc_resolver,
             ema_authorization_server: None,
+            aauth_resource: None,
             pipeline_store,
             task_store,
             delivery_bus: Arc::clone(&delivery_bus),

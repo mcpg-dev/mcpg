@@ -34,6 +34,7 @@ pub fn admin_router(service: AdminService) -> Router {
         )
         .route("/bindings", get(handlers::list_bindings))
         .route("/bindings/{id}", get(handlers::get_binding))
+        .route("/watches", get(handlers::list_watches))
         .route("/plugins", get(handlers::list_plugins))
         .route("/plugins/{id}", get(handlers::get_plugin))
         .route("/plugins/{id}/disable", post(handlers::disable_plugin))

@@ -200,9 +200,9 @@ pub(crate) fn build_tool_access_policy_config(config: &AppConfig) -> ToolAccessP
         })
         .collect::<Vec<_>>();
 
-    // Inject binding governance rules. Per-binding scope requirements are
-    // expressed through `policy.tool_access.rules[].required_scopes`, not
-    // the binding block, so bindings carry no scope requirement here.
+    // Inject binding governance rules — trust floor, CEL guard, and the
+    // binding's own scope requirement (a central rule cannot name a bound
+    // surface, so this is where a bound tool's scopes are declared).
     for (kind, binding) in config.all_bindings() {
         // Every surface is gated under the key that surface names it by, and
         // for resources that key is the URI, not the binding name — both
@@ -220,7 +220,7 @@ pub(crate) fn build_tool_access_policy_config(config: &AppConfig) -> ToolAccessP
                 tool_name: key,
                 minimum_trust: map_trust_level(binding.governance.minimum_trust),
                 cel_allow_if: binding.governance.allow_if.clone(),
-                required_scopes: Vec::new(),
+                required_scopes: binding.governance.required_scopes.clone(),
             });
         }
     }

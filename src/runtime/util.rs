@@ -59,8 +59,12 @@ pub(crate) fn build_watch_configs(
             WatchStrategyConfig::Poll { interval_ms } => watch_engine::WatchStrategy::Poll {
                 interval_ms: *interval_ms,
             },
-            WatchStrategyConfig::Webhook { token } => watch_engine::WatchStrategy::Webhook {
+            WatchStrategyConfig::Webhook {
+                token,
+                previous_tokens,
+            } => watch_engine::WatchStrategy::Webhook {
                 token: token.clone(),
+                previous_tokens: previous_tokens.clone(),
             },
             WatchStrategyConfig::NatsTopic { subject } => watch_engine::WatchStrategy::Plugin {
                 kind: "nats_topic".into(),

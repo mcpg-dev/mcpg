@@ -221,11 +221,28 @@ pub(crate) fn resource_metadata_url(config: &crate::config::AppConfig) -> String
 /// [`resource_metadata_url`]). The internal scope header is always
 /// stripped, even on paths that mint no challenge, so it never reaches the
 /// wire.
+///
+/// `aauth` additionally mints the AAuth challenge on 401s: the protocol's
+/// `AAuth-Requirement: requirement=agent-token` (asking specifically for an
+/// AAuth agent token) plus `Accept-Signature-Scheme` / `Accept-Signature-Alg`
+/// so the agent can select a scheme and algorithm before signing.
+/// `AAuth-Requirement` and `WWW-Authenticate` are independent fields — the
+/// draft is explicit that a response MAY carry both. Existing AAuth headers
+/// (e.g. a plugin-minted `Signature-Error` path) are left untouched.
 pub(crate) fn with_www_authenticate_challenge(
-    mut response: Response,
+    response: Response,
     auth_enabled: bool,
     resource_metadata: &str,
+    aauth: Option<AauthChallenge<'_>>,
 ) -> Response {
+    // The scope hint is read here (before it is stripped below) so the AAuth
+    // step-up can name the scopes the caller lacks.
+    let scope_hint = response
+        .headers()
+        .get(HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER))
+        .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
+        .filter(|s| !s.is_empty());
+    let mut response = with_aauth_challenge(response, aauth, scope_hint.as_deref());
     // Lift the scope hint regardless of status so it is always stripped.
     let insufficient_scope = response
         .headers_mut()
@@ -273,6 +290,136 @@ pub(crate) fn with_www_authenticate_challenge(
         response
             .headers_mut()
             .insert(axum::http::header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+/// What the AAuth challenge needs: the resource role (its `access_mode`,
+/// accepted algorithms, and — in `auth-token` mode — the signing key that
+/// mints the resource token a step-up carries) and the caller's identity,
+/// when one was resolved.
+#[derive(Clone, Copy)]
+pub(crate) struct AauthChallenge<'a> {
+    pub resource: &'a crate::runtime::aauth_resource::AauthResource,
+    pub identity: Option<&'a crate::runtime::RequestIdentity>,
+}
+
+/// Attach the AAuth challenge the gateway's `access_mode` calls for.
+///
+/// - Unauthenticated `401`: `requirement=agent-token` for an identity-only
+///   resource, `requirement=person-token` where the resource authorizes on
+///   the person (`person-token` / `auth-token` modes) — plus the
+///   `Accept-Signature-Scheme` / `Accept-Signature-Alg` capability statements.
+/// - An AAuth person or auth-token caller denied for insufficient scope, at
+///   an `auth-token` resource: `requirement=auth-token` carrying a resource
+///   token for the scopes it holds plus the ones it lacks. This is answered
+///   as a `401`, the status the AAuth deferred-response state machine acts
+///   on for that requirement (a `403` is terminal "denied" to an AAuth agent);
+///   non-AAuth callers keep the SEP-2350 `403` step-up untouched.
+///
+/// A response already carrying `aauth-requirement` is left alone.
+fn with_aauth_challenge(
+    mut response: Response,
+    aauth: Option<AauthChallenge<'_>>,
+    scope_hint: Option<&str>,
+) -> Response {
+    use crate::runtime::aauth_resource::{AauthTokenType, MintRefusal};
+
+    let Some(challenge) = aauth else {
+        return response;
+    };
+    if response.headers().contains_key("aauth-requirement") {
+        return response;
+    }
+    let cfg = challenge.resource.config();
+    let status = response.status();
+    let aauth_caller = challenge.identity.and_then(AauthTokenType::of);
+
+    // Step-up: an AAuth caller that authenticated but lacks scope.
+    let scope_denied = status == axum::http::StatusCode::FORBIDDEN && scope_hint.is_some();
+    if (scope_denied || status == axum::http::StatusCode::UNAUTHORIZED)
+        && cfg.access_mode == "auth-token"
+        && challenge.resource.can_mint()
+        && let Some(identity) = challenge.identity
+        && matches!(
+            aauth_caller,
+            Some(AauthTokenType::Person | AauthTokenType::Auth)
+        )
+    {
+        let mut scopes: Vec<String> = identity.scopes().to_vec();
+        if let Some(hint) = scope_hint {
+            for s in hint.split_whitespace() {
+                if !scopes.iter().any(|h| h == s) {
+                    scopes.push(s.to_owned());
+                }
+            }
+        }
+        // Only scopes this resource declares can be requested; unknown
+        // ones (a tool naming a scope outside `scope_descriptions`) are
+        // dropped rather than failing the challenge.
+        scopes.retain(|s| cfg.scope_descriptions.contains_key(s));
+        let requirement = if scopes.is_empty() {
+            None
+        } else {
+            match challenge
+                .resource
+                .mint_resource_token(identity, &scopes, None)
+            {
+                Ok(token) => Some(format!(
+                    "requirement=auth-token; resource-token={}",
+                    mcpg_aauth_core::sfv::serialize_string(&token)
+                )),
+                Err(MintRefusal::PersonTokenRequired) => {
+                    Some("requirement=person-token".to_owned())
+                }
+                Err(_) => None,
+            }
+        };
+        if let Some(value) = requirement
+            && let Ok(v) = HeaderValue::from_str(&value)
+        {
+            *response.status_mut() = axum::http::StatusCode::UNAUTHORIZED;
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static("aauth-requirement"), v);
+            return response;
+        }
+    }
+
+    // An unauthenticated caller refused at the trust floor: mcpg answers
+    // that with a policy 403, but at a declared AAuth resource the caller
+    // needs the protocol's 401 challenge to learn what credential to bring
+    // (a 403 is terminal "denied" to an AAuth agent), and 401 is the correct
+    // status for "no credential" under RFC 9110 too. Authenticated callers
+    // (any verified identity) keep their 403.
+    let unauthenticated = challenge
+        .identity
+        .map(|i| i.trust_level() < crate::runtime::RequestTrustLevel::Verified)
+        .unwrap_or(true);
+    let floor_denial = status == axum::http::StatusCode::FORBIDDEN
+        && scope_hint.is_none()
+        && unauthenticated
+        && aauth_caller.is_none();
+    if floor_denial {
+        *response.status_mut() = axum::http::StatusCode::UNAUTHORIZED;
+    } else if status != axum::http::StatusCode::UNAUTHORIZED {
+        return response;
+    }
+    let requirement = match cfg.access_mode.as_str() {
+        "person-token" | "auth-token" => "requirement=person-token",
+        _ => "requirement=agent-token",
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("aauth-requirement"),
+        HeaderValue::from_static(requirement),
+    );
+    headers.insert(
+        HeaderName::from_static("accept-signature-scheme"),
+        HeaderValue::from_static("jwt"),
+    );
+    if let Ok(algs) = HeaderValue::from_str(&cfg.accept_signature_algs.join(", ")) {
+        headers.insert(HeaderName::from_static("accept-signature-alg"), algs);
     }
     response
 }

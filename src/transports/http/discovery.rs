@@ -6,6 +6,297 @@
 
 use super::*;
 
+/// AAuth resource metadata (draft-hardt-oauth-aauth-protocol).
+///
+/// Serves the operator-declared document at
+/// `GET /.well-known/aauth-resource.json`, letting an AAuth agent that knows
+/// only this gateway's hostname learn the credential flow (`access_mode`),
+/// the signature window, any extra covered components, exactly which
+/// signature algorithms the verifier accepts, the scopes it grants, and the
+/// endpoints of its resource role (`jwks_uri`, `authorization_endpoint`,
+/// `revocation_endpoint`) — before its first signed call.
+pub(crate) async fn aauth_resource_metadata_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Response {
+    let runtime = state.runtime.load();
+    let Some(resource) = runtime.aauth_resource() else {
+        // The route is only mounted when configured; a config reload that
+        // removed the block still answers coherently.
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "aauth resource metadata not configured",
+            })),
+        )
+            .into_response();
+    };
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "public, max-age=300")],
+        Json(resource.metadata_document()),
+    )
+        .into_response()
+}
+
+/// The resource's JWKS at `GET /.well-known/aauth-jwks.json` — the public
+/// half of the key that signs resource tokens. Person servers verify our
+/// resource tokens against it (discovered through `aauth-resource.json`).
+pub(crate) async fn aauth_jwks_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Response {
+    let runtime = state.runtime.load();
+    let Some(resource) = runtime.aauth_resource() else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "public, max-age=300")],
+        Json(resource.jwks_document().clone()),
+    )
+        .into_response()
+}
+
+/// AAuth authorization endpoint (`POST /aauth/authorize`).
+///
+/// An agent that holds a person token for this gateway asks for a resource
+/// token naming the `scope` it wants; it takes that token to its person
+/// server, which returns an auth token the agent then signs with. The
+/// request MUST be signed with a person token — a caller presenting only an
+/// agent token (or nothing) is answered `401` with
+/// `AAuth-Requirement: requirement=person-token`.
+pub(crate) async fn aauth_authorize_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    let runtime = state.runtime.load();
+    let Some(resource) = runtime.aauth_resource() else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    let (parts, body) = req.into_parts();
+    let body = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let tls_info = parts
+        .extensions
+        .get::<crate::transports::tls::TlsInfoArc>()
+        .cloned();
+    let trust_subject_header = state.config.load().gateway.server.trust_subject_header;
+    let ctx = match crate::transports::http_request_context(
+        &parts.headers,
+        &runtime,
+        tls_info,
+        trust_subject_header,
+        &parts.method,
+        parts.uri.path_and_query().map(|pq| pq.as_str()),
+        None,
+    )
+    .await
+    {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp,
+    };
+
+    // The protocol requires a person token here. Anything else is told so.
+    let is_person = matches!(
+        crate::runtime::aauth_resource::AauthTokenType::of(&ctx.identity),
+        Some(crate::runtime::aauth_resource::AauthTokenType::Person)
+    );
+    if !is_person {
+        return aauth_problem(
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid_request",
+            "the authorization endpoint requires a person token presented via Signature-Key",
+            &[("aauth-requirement", "requirement=person-token")],
+        );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct AuthorizeBody {
+        scope: String,
+        #[serde(default)]
+        account: Option<String>,
+    }
+    let parsed: AuthorizeBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(e) => {
+            return aauth_problem(
+                axum::http::StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("body must be JSON with a `scope` string: {e}"),
+                &[],
+            );
+        }
+    };
+    let scopes: Vec<String> = parsed.scope.split_whitespace().map(str::to_owned).collect();
+    if scopes.is_empty() {
+        return aauth_problem(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "`scope` must name at least one scope value",
+            &[],
+        );
+    }
+    match resource.mint_resource_token(&ctx.identity, &scopes, parsed.account.as_deref()) {
+        Ok(token) => (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({ "resource_token": token })),
+        )
+            .into_response(),
+        Err(crate::runtime::aauth_resource::MintRefusal::UnknownScope(s)) => aauth_problem(
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            &format!("scope {s:?} is not one this resource grants (see scope_descriptions)"),
+            &[],
+        ),
+        Err(crate::runtime::aauth_resource::MintRefusal::PersonTokenRequired) => aauth_problem(
+            axum::http::StatusCode::UNAUTHORIZED,
+            "invalid_request",
+            "a verified person token is required before a resource token can be issued",
+            &[("aauth-requirement", "requirement=person-token")],
+        ),
+        Err(crate::runtime::aauth_resource::MintRefusal::NoSigningKey) => aauth_problem(
+            axum::http::StatusCode::NOT_FOUND,
+            "invalid_request",
+            "this resource does not issue resource tokens (no signing key configured)",
+            &[],
+        ),
+    }
+}
+
+/// AAuth revocation endpoint (`POST /aauth/revoke`).
+///
+/// A person server (or access server) tells this resource that a token it
+/// issued is revoked, by `(iss, jti)`, in a request signed as itself. Only
+/// the issuer of a token may revoke it. Answers `200` whether or not the
+/// token was ever seen — a revocation that arrives before the token does
+/// must not be lost — and denies every later request presenting it.
+pub(crate) async fn aauth_revoke_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    req: axum::extract::Request,
+) -> Response {
+    let runtime = state.runtime.load();
+    let Some(resource) = runtime.aauth_resource() else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    let (parts, body) = req.into_parts();
+    let body = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let headers: Vec<(String, String)> = parts
+        .headers
+        .iter()
+        .filter_map(|(n, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (n.as_str().to_owned(), v.to_owned()))
+        })
+        .collect();
+    let authority = parts
+        .headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| {
+            let lowered = h.trim().to_ascii_lowercase();
+            lowered
+                .strip_suffix(":443")
+                .map(str::to_owned)
+                .unwrap_or(lowered)
+        })
+        .unwrap_or_default();
+    let query = parts
+        .uri
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    match resource
+        .verify_revocation(
+            parts.method.as_str(),
+            &authority,
+            parts.uri.path(),
+            &query,
+            &headers,
+            &body,
+        )
+        .await
+    {
+        Ok((iss, jti)) => {
+            // Keep the entry for the longest token lifetime the protocol
+            // allows to be outstanding under this issuer.
+            let until =
+                mcpg_aauth_core::now_unix() + mcpg_aauth_core::tokens::AGENT_TOKEN_MAX_TTL_SECS;
+            resource.revoke(&iss, &jti, until);
+            tracing::info!(iss = %iss, jti = %jti, "AAuth token revoked by its issuer");
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CACHE_CONTROL, "no-store")],
+                Json(serde_json::json!({ "revoked": true })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let mut sig_error = format!("error={}", e.code.as_str());
+            if let Some(required) = &e.required_input {
+                let refs: Vec<&str> = required.iter().map(|s| s.as_str()).collect();
+                sig_error.push_str(&format!(
+                    ", required_input={}",
+                    mcpg_aauth_core::sfv::serialize_string_list(&refs)
+                ));
+            }
+            let mut extra: Vec<(&str, String)> = vec![("signature-error", sig_error)];
+            if e.code == mcpg_aauth_core::sig::SigErrorCode::UnsupportedScheme {
+                extra.push(("accept-signature-scheme", "jwks_uri".to_owned()));
+            }
+            let extra_refs: Vec<(&str, &str)> =
+                extra.iter().map(|(n, v)| (*n, v.as_str())).collect();
+            aauth_problem(
+                axum::http::StatusCode::UNAUTHORIZED,
+                e.code.as_str(),
+                &e.detail,
+                &extra_refs,
+            )
+        }
+    }
+}
+
+/// An RFC 9457 problem response in the AAuth error shape (`error` + `detail`
+/// members) with any extra headers.
+fn aauth_problem(
+    status: axum::http::StatusCode,
+    error: &str,
+    detail: &str,
+    extra_headers: &[(&str, &str)],
+) -> Response {
+    let mut resp = (
+        status,
+        Json(serde_json::json!({
+            "error": error,
+            "detail": detail,
+            "status": status.as_u16(),
+        })),
+    )
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/problem+json"),
+    );
+    resp.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    for (name, value) in extra_headers {
+        if let (Ok(n), Ok(v)) = (
+            axum::http::HeaderName::try_from(*name),
+            axum::http::HeaderValue::try_from(*value),
+        ) {
+            resp.headers_mut().append(n, v);
+        }
+    }
+    resp
+}
+
 /// OAuth 2.1 Protected Resource Metadata (RFC 9728).
 ///
 /// Returns JSON document at `GET /.well-known/oauth-protected-resource` that lets

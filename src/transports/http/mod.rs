@@ -65,8 +65,10 @@ mod validate;
 mod webhooks;
 
 pub(crate) use discovery::{
-    oauth_authorization_server_metadata_handler, oauth_protected_resource_handler,
-    oauth_token_handler, served_registry_list_handler, served_registry_version_handler,
+    aauth_authorize_handler, aauth_jwks_handler, aauth_resource_metadata_handler,
+    aauth_revoke_handler, oauth_authorization_server_metadata_handler,
+    oauth_protected_resource_handler, oauth_token_handler, served_registry_list_handler,
+    served_registry_version_handler,
 };
 pub(crate) use identity::{build_full_request_context, lift_idempotency_key_header};
 pub(crate) use probes::{health_handler, metrics_handler, readiness_handler, runtime_handler};
@@ -277,6 +279,30 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
             .route(
                 "/.well-known/oauth-protected-resource/{*resource_path}",
                 get(oauth_protected_resource_handler),
+            );
+    }
+
+    // AAuth resource metadata (draft-hardt-oauth-aauth-protocol). Mounted
+    // only when `server.aauth_resource_metadata` is configured; the same
+    // config drives the `AAuth-Requirement: requirement=agent-token`
+    // challenge on authentication-required 401s.
+    if config.gateway.server.aauth_resource_metadata.is_some() {
+        router = router
+            .route(
+                "/.well-known/aauth-resource.json",
+                get(aauth_resource_metadata_handler),
+            )
+            .route(
+                crate::runtime::aauth_resource::JWKS_PATH,
+                get(aauth_jwks_handler),
+            )
+            .route(
+                crate::runtime::aauth_resource::AUTHORIZE_PATH,
+                post(aauth_authorize_handler),
+            )
+            .route(
+                crate::runtime::aauth_resource::REVOKE_PATH,
+                post(aauth_revoke_handler),
             );
     }
 
@@ -896,6 +922,14 @@ async fn finish_response(
         modern_tools_call_session,
     } = dispatch;
     let auth_enabled = config.governance.access.is_enabled();
+    // The AAuth challenge context: the resource role plus the caller — an
+    // AAuth caller short on scope is stepped up with a resource token.
+    let aauth_challenge = runtime
+        .aauth_resource()
+        .map(|resource| response::AauthChallenge {
+            resource,
+            identity: Some(&request_context.identity),
+        });
     // SEP-2567/2575: a 2026-07-28 server MUST NOT surface `Mcp-Session-Id`
     // on the wire. The synthetic operational session still exists
     // internally (clustering / MRTR resume / delivery re-keying) but is
@@ -971,6 +1005,7 @@ async fn finish_response(
                         map_gateway_response(response),
                         auth_enabled,
                         &resource_metadata_url(config),
+                        aauth_challenge,
                     );
                     return resp;
                 }
@@ -1011,6 +1046,7 @@ async fn finish_response(
                         map_gateway_response(response),
                         auth_enabled,
                         &resource_metadata_url(config),
+                        aauth_challenge,
                     );
                     return with_session_id_header(resp, session_id_for_header.as_deref());
                 }
@@ -1036,6 +1072,7 @@ async fn finish_response(
                         map_gateway_response(response),
                         auth_enabled,
                         &resource_metadata_url(config),
+                        aauth_challenge,
                     ),
                 };
                 return with_session_id_header(resp, session_id_for_header.as_deref());
@@ -1119,6 +1156,7 @@ async fn finish_response(
                 map_gateway_response(response),
                 auth_enabled,
                 &resource_metadata_url(config),
+                aauth_challenge,
             );
             let resp = with_session_id_header(resp, session_id_for_header.as_deref());
             wire.apply_protocol_version_header(resp)

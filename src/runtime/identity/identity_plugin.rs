@@ -86,7 +86,10 @@ impl IdentityProviderPlugin for JwtIdentityPlugin {
                 },
             },
             JwtVerificationResult::None => IdentityResolution::None,
-            JwtVerificationResult::Invalid(reason) => IdentityResolution::Invalid { reason },
+            JwtVerificationResult::Invalid(reason) => IdentityResolution::Invalid {
+                reason,
+                response_headers: Vec::new(),
+            },
         }
     }
 }
