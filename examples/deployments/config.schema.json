@@ -5394,6 +5394,13 @@
           "default": "127.0.0.1:8787",
           "type": "string"
         },
+        "browser_redirect_url": {
+          "description": "Browser hand-off for the MCP endpoint. When set, a plain browser NAVIGATION to the MCP path — method GET or HEAD, `Accept` includes `text/html` and does not include `text/event-stream` — is answered with `303 See Other` to exactly this URL, before identity or any other processing. No conformant MCP client matches: JSON-RPC rides POST, and SSE GETs send `text/event-stream`, so the redirect only claims requests that today dead-end in a 405/406. The value is served literally — request data never enters the Location header. Typical target: a hosted inspector pre-filled with this gateway's URL. Must be `http`/`https`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "completion_rate_limit_per_sec": {
           "default": null,
           "description": "Per-session rate limit on `completion/complete` requests (cap per second). `None` disables. Guards against broken autocomplete UIs.",

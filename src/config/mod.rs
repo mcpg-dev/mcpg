@@ -722,6 +722,16 @@ impl AppConfig {
         if let Some(ref aauth) = server.aauth_resource_metadata {
             aauth.validate()?;
         }
+        if let Some(ref raw) = server.browser_redirect_url {
+            let parsed = url::Url::parse(raw)
+                .map_err(|e| anyhow::anyhow!("server.browser_redirect_url is not a URL: {e}"))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                anyhow::bail!(
+                    "server.browser_redirect_url must be http or https (got scheme {:?})",
+                    parsed.scheme()
+                );
+            }
+        }
         if let Some(ref tunnel) = server.tunnel {
             tunnel.validate()?;
         }

@@ -87,6 +87,18 @@ pub struct ServerConfig {
     /// authenticates the caller and injects this header.
     #[serde(default)]
     pub trust_subject_header: bool,
+    /// Browser hand-off for the MCP endpoint. When set, a plain browser
+    /// NAVIGATION to the MCP path — method GET or HEAD, `Accept` includes
+    /// `text/html` and does not include `text/event-stream` — is answered
+    /// with `303 See Other` to exactly this URL, before identity or any
+    /// other processing. No conformant MCP client matches: JSON-RPC rides
+    /// POST, and SSE GETs send `text/event-stream`, so the redirect only
+    /// claims requests that today dead-end in a 405/406. The value is
+    /// served literally — request data never enters the Location header.
+    /// Typical target: a hosted inspector pre-filled with this gateway's
+    /// URL. Must be `http`/`https`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_redirect_url: Option<String>,
     /// AAuth resource metadata. When set, the gateway serves the document at
     /// `/.well-known/aauth-resource.json` and attaches the
     /// `AAuth-Requirement: requirement=agent-token` challenge (plus
@@ -243,6 +255,7 @@ impl Default for ServerConfig {
             anonymous_rate_limit_burst: default_anonymous_rate_limit_burst(),
             trust_proxy_ip: false,
             trust_subject_header: false,
+            browser_redirect_url: None,
             aauth_resource_metadata: None,
             revalidate_mutated_tool_arguments: false,
             relax_request_id_uniqueness: false,

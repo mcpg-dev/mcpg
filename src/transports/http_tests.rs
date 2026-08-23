@@ -2169,6 +2169,7 @@ async fn mcp_origin_is_rejected_when_not_allowed() {
                 anonymous_rate_limit_burst: 0,
                 trust_proxy_ip: false,
                 trust_subject_header: false,
+                browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
                 relax_request_id_uniqueness: false,

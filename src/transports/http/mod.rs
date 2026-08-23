@@ -1421,6 +1421,28 @@ async fn mcp_get_handler(
 ) -> Response {
     let runtime = state.runtime.load();
     let config = state.config.load();
+    // Browser hand-off, BEFORE identity and every other gate: a plain
+    // navigation (GET/HEAD, Accept has text/html and not text/event-stream)
+    // 303s to the configured literal URL. Anonymous browsers are the point,
+    // the Location carries no request data, and the request class it claims
+    // is otherwise a guaranteed 405/406 — so the pre-auth surface gets
+    // simpler here, not wider. `Vary: Accept` keeps a shared cache from
+    // serving the redirect to an SSE client.
+    if let Some(ref url) = config.gateway.server.browser_redirect_url {
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if accept.contains("text/html") && !accept.contains(SSE_ACCEPT) {
+            metrics::counter!("mcpg_browser_redirects_total").increment(1);
+            return Response::builder()
+                .status(axum::http::StatusCode::SEE_OTHER)
+                .header(axum::http::header::LOCATION, url.clone())
+                .header(axum::http::header::VARY, "Accept")
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+    }
     let request_context = match build_full_request_context(
         &headers,
         &runtime,
@@ -1636,6 +1658,28 @@ async fn mcp_delete_handler(
 ) -> Response {
     let runtime = state.runtime.load();
     let config = state.config.load();
+    // Browser hand-off, BEFORE identity and every other gate: a plain
+    // navigation (GET/HEAD, Accept has text/html and not text/event-stream)
+    // 303s to the configured literal URL. Anonymous browsers are the point,
+    // the Location carries no request data, and the request class it claims
+    // is otherwise a guaranteed 405/406 — so the pre-auth surface gets
+    // simpler here, not wider. `Vary: Accept` keeps a shared cache from
+    // serving the redirect to an SSE client.
+    if let Some(ref url) = config.gateway.server.browser_redirect_url {
+        let accept = headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if accept.contains("text/html") && !accept.contains(SSE_ACCEPT) {
+            metrics::counter!("mcpg_browser_redirects_total").increment(1);
+            return Response::builder()
+                .status(axum::http::StatusCode::SEE_OTHER)
+                .header(axum::http::header::LOCATION, url.clone())
+                .header(axum::http::header::VARY, "Accept")
+                .body(axum::body::Body::empty())
+                .unwrap();
+        }
+    }
     let request_context = match build_full_request_context(
         &headers,
         &runtime,
