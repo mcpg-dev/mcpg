@@ -281,6 +281,11 @@ pub(crate) fn resolve_oci_source(
 /// first `/` is registry-shaped (has a `.`, has a `:` for port,
 /// or equals `localhost`).
 pub(crate) fn normalise_oci_reference(reference: &str, default_registry: &str) -> String {
+    // `oci://` is Helm's spelling and operators reach for it here too. The
+    // heuristic below would otherwise read `oci:` as a registry host — it
+    // contains a colon, so the reference looks "qualified" — and the pull
+    // would go to a registry by that name rather than failing on the scheme.
+    let reference = reference.strip_prefix("oci://").unwrap_or(reference);
     let looks_qualified = match reference.split_once('/') {
         Some((first, _rest)) => first.contains('.') || first.contains(':') || first == "localhost",
         None => false, // no `/` → nothing to treat as a registry
@@ -498,6 +503,7 @@ pub(crate) fn registry_host_from_reference(reference: &str) -> String {
     let stripped = reference
         .strip_prefix("https://")
         .or_else(|| reference.strip_prefix("http://"))
+        .or_else(|| reference.strip_prefix("oci://"))
         .unwrap_or(reference);
     stripped
         .split_once('/')

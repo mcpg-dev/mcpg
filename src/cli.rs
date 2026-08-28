@@ -434,6 +434,15 @@ pub fn print_top_help() {
          \n\
          Usage:\n\
          \n  mcpg                       Boot the gateway (config from MCPG_CONFIG)\n\
+         \n  mcpg --config <source>     Add a config layer, after MCPG_CONFIG and\n\
+         \n                             repeatable: a path, a file:// path, an\n\
+         \n                             https:// URL, inline base64:/data:, or\n\
+         \n                             mcpg+enc:<address> for a client-encrypted\n\
+         \n                             config. The encrypted form takes its\n\
+         \n                             secret from MCPG_CONFIG_SECRET_FILE (the\n\
+         \n                             preferred form — a Kubernetes Secret\n\
+         \n                             mounts as a file), MCPG_CONFIG_SECRET, or\n\
+         \n                             MCPG_CONFIG_SECRETS_FILE — never argv\n\
          \n  mcpg --stdio               Boot the gateway on the stdio transport\n\
          \n  mcpg --tunnel [wss-url]    Serve through a relay tunnel instead of a\n\
          \n                             public port (defaults to the MCPG Cloud\n\

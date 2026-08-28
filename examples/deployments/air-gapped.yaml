@@ -67,14 +67,22 @@ storage:
 # directly here with `source.path: "/opt/mcpg/plugins/<plugin>.zip"`.
 # An empty array is the smallest air-gapped wedge; populate as plugins
 # get pre-staged.
+#
 # `mock` is a plugin like any other — the gateway links no backend in, so the
-# binding below only resolves because this entry declares it. Air-gapped sites
-# mirror the artefact locally; see the OCI mirror notes in this file's README.
+# binding below only resolves because this entry declares it.
+#
+# It loads from the staged path the note above describes, because that is
+# what a site with no egress can actually obtain: the operator mirrors or
+# copies the artefact in, and the gateway reads it from disk without
+# reaching for a registry. Stage it before first boot — nothing here
+# fetches it for you. A site running its own registry can use that
+# mirror's coordinate under `oci:` instead; the one thing that does not
+# belong in this file is ours.
 plugins:
   - id: dev.mcpg.backend.mock
     class: backend
     source:
-      oci: "ghcr.io/mcpg-dev/source-code/plugins/backend-mock:0.0.1-alpha.10"
+      path: /opt/mcpg/plugins/backend-mock.zip
 
 mcp:
   capabilities:

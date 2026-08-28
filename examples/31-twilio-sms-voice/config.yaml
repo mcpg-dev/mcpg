@@ -34,6 +34,10 @@ plugins:
   - id: dev.mcpg.backend.twilio
     class: backend
     source: { oci: "oci://ghcr.io/mcpg-dev/plugins/backend-twilio:protocol-1" }
+    # The grant is fail-closed: every capability the descriptor requires must
+    # be listed here or the plugin is refused at load. `http_route_serve` is
+    # what the inbound-webhook entity below needs.
+    granted_capabilities: [network_outbound, http_route_serve]
     config:
       # The Account SID is ALWAYS required — it is both the REST path segment
       # and the identity Twilio signs webhooks with.

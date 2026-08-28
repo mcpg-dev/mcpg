@@ -27,6 +27,7 @@ pub mod control_plane;
 pub mod credentials;
 pub mod debug;
 pub mod diagnostics;
+pub mod encrypted;
 pub mod feature_flags;
 pub mod federation;
 pub mod gateway;

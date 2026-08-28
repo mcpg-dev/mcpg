@@ -33,12 +33,14 @@ cluster:
   kind: single_node
 
 # The `mock` backend behind every binding below is a plugin; the gateway links
-# none in, so this entry is what makes `kind: mock` resolve.
+# none in, so this entry is what makes `kind: mock` resolve. It pulls from the
+# public plugin channel at boot — keep the version in step with the gateway
+# you run.
 plugins:
   - id: dev.mcpg.backend.mock
     class: backend
     source:
-      oci: "ghcr.io/mcpg-dev/source-code/plugins/backend-mock:0.0.1-alpha.10"
+      oci: "ghcr.io/mcpg-dev/plugins/backend-mock:0.1.0-alpha.16"
 
 mcp:
   capabilities:

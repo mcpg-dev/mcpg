@@ -61,11 +61,20 @@ governance:
 # `default_limit` per your SLA tier. Layout D'' P4 flattened the plugin
 # list — entries live directly under `plugins:` (no `entries:` wrapper,
 # no `enabled:` toggle).
+#
+# This is the one example that pulls from a registry, deliberately: the
+# gateway images carry the backends and a handful of others, not this
+# one, and nothing else we ship exercises the `oci:` path. Per-tenant
+# limits need it — `server.anonymous_rate_limit_*` and
+# `server.completion_rate_limit_per_sec` are server-wide ceilings on
+# anonymous traffic and completions, not per-invocation gating. Pin the
+# version you run; a pinned example is the kind that goes stale, so
+# check it against the release you are on.
 plugins:
   - id: dev.mcpg.rate-limit
     class: tool_gate
     source:
-      oci: "ghcr.io/mcpg-dev/source-code/plugins/rate-limit:1.0.0"
+      oci: "ghcr.io/mcpg-dev/plugins/rate-limit:0.1.0-alpha.16"
     config:
       # per_principal scope (the default) keys the bucket on the
       # authenticated principal; unauthenticated requests fall back

@@ -880,6 +880,30 @@ fn normalise_oci_leaves_qualified_references_alone() {
     );
 }
 
+/// `oci://` is Helm's spelling, and every plugin example in the repo reaches
+/// for it. Without stripping, `oci:` reads as a registry host — it contains a
+/// colon, so the qualified-reference heuristic accepts it — and the pull goes
+/// to a registry by that name instead of failing on the scheme.
+#[test]
+fn normalise_oci_strips_the_helm_style_scheme() {
+    assert_eq!(
+        normalise_oci_reference(
+            "oci://ghcr.io/mcpg-dev/plugins/backend-duckdb:protocol-1",
+            "default.reg/scope"
+        ),
+        "ghcr.io/mcpg-dev/plugins/backend-duckdb:protocol-1"
+    );
+    // Still unqualified once the scheme is gone, so the default applies.
+    assert_eq!(
+        normalise_oci_reference("oci://audit:1.0.0", "ghcr.io/mcpg-dev/plugins"),
+        "ghcr.io/mcpg-dev/plugins/audit:1.0.0"
+    );
+    assert_eq!(
+        registry_host_from_reference("oci://ghcr.io/mcpg-dev/plugins/audit:1.0.0"),
+        "ghcr.io"
+    );
+}
+
 #[test]
 fn normalise_oci_prepends_default_for_unqualified() {
     assert_eq!(

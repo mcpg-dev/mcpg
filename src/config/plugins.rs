@@ -102,6 +102,27 @@ pub fn validate_plugins(entries: &[PluginEntryConfig]) -> Result<()> {
                 entry.source.oci,
             ));
         }
+        // A scheme the resolver does not strip is read as a registry HOST —
+        // the qualification heuristic treats a colon in the first segment as
+        // a port — so the pull silently goes to a registry named after the
+        // scheme, with no parse error anywhere. A real OCI reference never
+        // contains `://`, so anything else here is a mistake worth naming
+        // now rather than as a lookup failure at boot.
+        if let Some(oci) = entry.source.oci.as_deref() {
+            let rest = oci.split_once("://");
+            if let Some((scheme, _)) = rest
+                && !matches!(scheme, "oci" | "https" | "http")
+            {
+                return Err(anyhow::anyhow!(
+                    "{}.source.oci '{}' carries an unsupported scheme '{}://' — use a bare \
+                     OCI reference (`ghcr.io/org/name:tag`); only `oci://`, `https://` and \
+                     `http://` are accepted and stripped",
+                    path,
+                    oci,
+                    scheme
+                ));
+            }
+        }
     }
     Ok(())
 }

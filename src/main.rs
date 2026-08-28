@@ -127,11 +127,11 @@ async fn main() -> anyhow::Result<()> {
         })
         .unwrap_or_default();
     for spec in &comp.config {
-        config_sources.push(
-            mcpg::config::source::resolve(spec)
-                .await
-                .with_context(|| format!("--config {spec}"))?,
-        );
+        // The spec is echoed back on failure, and a pasted share link carries
+        // its key in the fragment — mask it before it reaches stderr.
+        config_sources.push(mcpg::config::source::resolve(spec).await.with_context(|| {
+            format!("--config {}", mcpg::config::encrypted::redacted_spec(spec))
+        })?);
     }
     // Load the config here (rather than via `app::build`) so the
     // composition flags can fold their control-plane attachment in before

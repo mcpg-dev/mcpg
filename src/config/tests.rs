@@ -3647,6 +3647,48 @@ fn plugin_entries_reject_invalid_kind() {
     assert!(err.to_string().contains("native"), "got: {err}");
 }
 
+/// An unstripped scheme is read as a registry HOST — a colon in the first
+/// segment looks like a port — so the pull goes to a registry named after
+/// the scheme with no parse error. Named at config-check time instead.
+#[test]
+fn plugin_entries_reject_an_unsupported_oci_scheme() {
+    let entry = |oci: &str| PluginEntryConfig {
+        id: "com.test.scheme".into(),
+        r#ref: None,
+        kind: "native".into(),
+        class: "tool_gate".into(),
+        source: PluginSourceConfig {
+            path: None,
+            oci: Some(oci.into()),
+        },
+        config: serde_json::json!({}),
+        signature: None,
+        granted_capabilities: Vec::new(),
+        limits: None,
+        enforce: true,
+        disabled: false,
+        inline_dispatch: false,
+        http_route: None,
+        observability: None,
+        ffi_limits: None,
+    };
+    let err =
+        crate::config::plugins::validate_plugins(&[entry("ftp://ghcr.io/org/p:1")]).unwrap_err();
+    assert!(err.to_string().contains("ftp://"), "got: {err}");
+
+    // The three the resolver strips must still pass, or the examples that
+    // legitimately use `oci://` would start failing their own check.
+    for ok in [
+        "oci://ghcr.io/org/p:1",
+        "https://ghcr.io/org/p:1",
+        "http://localhost:5000/p:1",
+        "ghcr.io/org/p:1",
+    ] {
+        crate::config::plugins::validate_plugins(&[entry(ok)])
+            .unwrap_or_else(|e| panic!("{ok} must validate, got: {e}"));
+    }
+}
+
 #[test]
 fn plugin_entries_reject_invalid_class() {
     let entries = vec![PluginEntryConfig {
