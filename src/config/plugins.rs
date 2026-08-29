@@ -618,7 +618,7 @@ pub struct PluginSourceConfig {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// OCI reference (e.g. `ghcr.io/mcpg-dev/source-code/plugins/audit:1.0.0`
+    /// OCI reference (e.g. `ghcr.io/mcpg-dev/source-code/plugins/audit:protocol-1`
     /// or `plugins/audit@sha256:…`). At boot the gateway pulls the
     /// artifact, verifies the manifest digest, caches it to
     /// `plugin_registry.cache_dir`, and loads it through the same

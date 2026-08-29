@@ -1550,7 +1550,7 @@ Exactly one of `path` / `oci` must be set. Both unset is invalid; both set is in
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `oci` | string (optional) |  | OCI reference (e.g. `ghcr.io/mcpg-dev/source-code/plugins/audit:1.0.0` or `plugins/audit@sha256:…`). At boot the gateway pulls the artifact, verifies the manifest digest, caches it to `plugin_registry.cache_dir`, and loads it through the same sidecar / packaged-zip path `path` would have taken. When the reference is missing a registry prefix, the `plugin_registry.default_registry` value is prepended — which is itself repointable per deployment via the `MCPG_DEFAULT_PLUGIN_REGISTRY` environment variable. |
+| `oci` | string (optional) |  | OCI reference (e.g. `ghcr.io/mcpg-dev/source-code/plugins/audit:protocol-1` or `plugins/audit@sha256:…`). At boot the gateway pulls the artifact, verifies the manifest digest, caches it to `plugin_registry.cache_dir`, and loads it through the same sidecar / packaged-zip path `path` would have taken. When the reference is missing a registry prefix, the `plugin_registry.default_registry` value is prepended — which is itself repointable per deployment via the `MCPG_DEFAULT_PLUGIN_REGISTRY` environment variable. |
 | `path` | string (optional) |  | Path to the plugin artifact on the local filesystem. Accepts a raw `.so` / `.wasm` (with a sidecar `plugin.yaml`) or a packaged `.zip`. |
 
 ### `PolicyCacheConfig`
