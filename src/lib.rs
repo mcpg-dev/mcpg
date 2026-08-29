@@ -18,6 +18,7 @@ pub mod admin;
 pub mod app;
 pub mod backends;
 pub mod builtins;
+pub mod capabilities;
 pub mod cli;
 pub mod compose;
 pub mod config;

@@ -82,6 +82,14 @@ async fn main() -> anyhow::Result<()> {
         return mcpg::compose::box_status().await;
     }
 
+    // `mcpg capabilities` — the capability manifest for THIS build, printed
+    // in-process for the same reason as `status`: there is no sibling binary,
+    // and a control plane invoking it inside the image must get the answer
+    // from the binary it is about to run.
+    if args.len() >= 2 && args[1] == "capabilities" {
+        return mcpg::capabilities::print();
+    }
+
     // Subcommand extension dispatch (kubectl-style): a bare-word first arg is a
     // toolchain subcommand delegated to a sibling `mcpg-*` binary, not a gateway
     // flag. `mcpg config <sub>` → `mcpg-config <sub>`; `mcpg cp …` → `mcpg-cp …`

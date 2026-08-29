@@ -448,6 +448,10 @@ pub fn print_top_help() {
          \n                             public port (defaults to the MCPG Cloud\n\
          \n                             relay; pass a URL for a self-hosted relay)\n\
          \n  mcpg <command> [args...]   Run a toolchain subcommand (below)\n\
+         \n  mcpg status                In-process box report (gateway, agent, CP)\n\
+         \n  mcpg capabilities          Print this build's capability manifest as\n\
+         \n                             JSON (config schema, ABI/protocol\n\
+         \n                             versions, baked plugins)\n\
          \n\
          Commands (delegate to sibling mcpg-* binaries):\n",
     );
