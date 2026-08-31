@@ -516,7 +516,7 @@ pub async fn boot_sidecar_cp(cp_args: &[String]) -> anyhow::Result<SidecarCp> {
             "`--control-plane` supervises the sibling `mcpg-control-plane` binary, \
              which is not installed (not on PATH, not next to this executable). It \
              ships in the mcpg toolchain suite — install it with:\n\n  \
-             curl -fsSL https://raw.githubusercontent.com/mcpg-dev/source-code/main/install.sh | sh\n\n\
+             curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh\n\n\
              or run a control plane yourself and attach with `--enroll <URL>`."
         );
     };
@@ -747,7 +747,7 @@ pub async fn boot_sidecar_inspector(
             "`--inspector` supervises the sibling `mcpg-inspector` binary, which is \
              not installed (not on PATH, not next to this executable). It ships in \
              the mcpg toolchain suite — install it with:\n\n  \
-             curl -fsSL https://raw.githubusercontent.com/mcpg-dev/source-code/main/install.sh | sh\n\n\
+             curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh\n\n\
              or run it yourself: `mcpg-inspector serve`."
         );
     };

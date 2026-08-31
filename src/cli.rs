@@ -390,7 +390,7 @@ fn exec_sibling(binary: &str, args: &[String], label: &str) -> anyhow::Result<()
                  `mcpg {label}` delegates to the sibling `{binary}` binary, which\n\
                  ships in the mcpg toolchain alongside `mcpg`. Install it with the\n\
                  installer (each binary is its own release artifact):\n\
-                 \n  curl -fsSL https://raw.githubusercontent.com/mcpg-dev/source-code/main/install.sh | sh -s -- --bin {binary}\n\
+                 \n  curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh -s -- --bin {binary}\n\
                  \nor build from the workspace source:\n\
                  \n  cargo build -p mcpg -p mcpg-config          # mcpg + mcpg-config\n\
                  \n  cargo build -p mcpg-control-plane-server    # mcpg-control-plane\n\
