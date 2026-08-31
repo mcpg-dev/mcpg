@@ -279,7 +279,8 @@ impl GatewayRuntime {
             before_count,
             after_count,
             hidden,
-        );
+        )
+        .with_upstream_request_id(request_context.upstream_request_id.clone());
         let _ = self.plugin_registry.emit_audit_event(&event).await;
 
         // Rebuild the response: for each surviving descriptor in

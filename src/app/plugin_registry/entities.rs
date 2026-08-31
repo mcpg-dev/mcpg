@@ -77,13 +77,15 @@ pub(crate) fn register_native_entities(
             format!("{}:{}", opts.alias, entity.inner_name())
         };
         match entity {
-            EntityRegistration::ToolGate { .. } => {
-                let mut adapter = mcpg_plugin_host::native_loader::NativeToolGateAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::ToolGate { vtable, .. } => {
+                let mut adapter =
+                    mcpg_plugin_host::native_loader::NativeToolGateAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 adapter.set_inline_fast(opts.inline_dispatch);
                 registry.register_tool_gate_with_alias(
                     Some(registry_alias.clone()),
@@ -93,13 +95,15 @@ pub(crate) fn register_native_entities(
                     opts.enforce,
                 )?;
             }
-            EntityRegistration::Transform { .. } => {
-                let mut adapter = mcpg_plugin_host::native_loader::NativeTransformAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::Transform { vtable, .. } => {
+                let mut adapter =
+                    mcpg_plugin_host::native_loader::NativeTransformAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 adapter.set_inline_fast(opts.inline_dispatch);
                 registry.register_transform_with_alias(
                     Some(registry_alias.clone()),
@@ -108,14 +112,15 @@ pub(crate) fn register_native_entities(
                     opts.config.clone(),
                 )?;
             }
-            EntityRegistration::IdentityProvider { .. } => {
+            EntityRegistration::IdentityProvider { vtable, .. } => {
                 // Identity `make` takes the host-filled cluster ref so
                 // cluster-aware providers (workload, …) can opt in; `None`
                 // when no coordinator is registered.
                 let cluster_ref = registry.cluster_backend_ffi_ref();
                 let mut adapter =
-                    mcpg_plugin_host::native_loader::NativeIdentityProviderAdapter::new(
+                    mcpg_plugin_host::native_loader::NativeIdentityProviderAdapter::new_for_entity(
                         loaded.clone(),
+                        vtable,
                         opts.config.clone(),
                         opts.alias.clone(),
                         svc.clone(),
@@ -129,44 +134,50 @@ pub(crate) fn register_native_entities(
                     opts.config.clone(),
                 )?;
             }
-            EntityRegistration::ApprovalNotifier { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeApprovalNotifierAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::ApprovalNotifier { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeApprovalNotifierAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_approval_notifier_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::PolicyEngine { .. } => {
+            EntityRegistration::PolicyEngine { vtable, .. } => {
                 // Policy engines take the cluster ref the same way identity
                 // providers do: Cedar / Casbin use it for entity-set sync,
                 // OPA to coordinate bundle reload across replicas.
                 let cluster_ref = registry.cluster_backend_ffi_ref();
-                let adapter = mcpg_plugin_host::native_loader::NativePolicyEngineAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                    cluster_ref,
-                )?;
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativePolicyEngineAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                        cluster_ref,
+                    )?;
                 registry.register_policy_engine_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::Backend { .. } => {
-                let mut adapter = mcpg_plugin_host::native_loader::NativeBackendAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::Backend { vtable, .. } => {
+                let mut adapter =
+                    mcpg_plugin_host::native_loader::NativeBackendAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 adapter.set_inline_fast(opts.inline_dispatch);
                 registry.register_backend_with_alias(
                     Some(registry_alias.clone()),
@@ -174,26 +185,30 @@ pub(crate) fn register_native_entities(
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::WatchStrategy { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeWatchStrategyAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::WatchStrategy { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeWatchStrategyAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_watch_strategy_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::HttpRoute { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeHttpRouteAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::HttpRoute { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeHttpRouteAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 // entity_name keys the (plugin_id, entity_name) mount and is
                 // embedded in the mount path: for a single-entity plugin it
                 // stays the operator alias, for a multi-entity cdylib it's
@@ -213,26 +228,30 @@ pub(crate) fn register_native_entities(
                     &loaded.required_capabilities,
                 )?;
             }
-            EntityRegistration::AuditSink { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeAuditSinkAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::AuditSink { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeAuditSinkAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_audit_sink_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::LogSink { .. } => {
-                let mut adapter = mcpg_plugin_host::native_loader::NativeLogSinkAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::LogSink { vtable, .. } => {
+                let mut adapter =
+                    mcpg_plugin_host::native_loader::NativeLogSinkAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 adapter.set_inline_fast(opts.inline_dispatch);
                 registry.register_log_sink_with_alias(
                     Some(registry_alias.clone()),
@@ -240,35 +259,40 @@ pub(crate) fn register_native_entities(
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::TelemetrySink { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeTelemetrySinkAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::TelemetrySink { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeTelemetrySinkAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_telemetry_sink_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::MetricsSink { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeMetricsSinkAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::MetricsSink { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeMetricsSinkAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_metrics_sink_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::Store { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeStoreAdapter::new(
+            EntityRegistration::Store { vtable, .. } => {
+                let adapter = mcpg_plugin_host::native_loader::NativeStoreAdapter::new_for_entity(
                     loaded.clone(),
+                    vtable,
                     opts.config.clone(),
                     opts.alias.clone(),
                     svc.clone(),
@@ -279,9 +303,10 @@ pub(crate) fn register_native_entities(
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::Cache { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeCacheAdapter::new(
+            EntityRegistration::Cache { vtable, .. } => {
+                let adapter = mcpg_plugin_host::native_loader::NativeCacheAdapter::new_for_entity(
                     loaded.clone(),
+                    vtable,
                     opts.config.clone(),
                     opts.alias.clone(),
                     svc.clone(),
@@ -292,65 +317,75 @@ pub(crate) fn register_native_entities(
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::SecretProvider { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeSecretProviderAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::SecretProvider { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeSecretProviderAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_secret_provider_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::ConfigProvider { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeConfigProviderAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::ConfigProvider { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeConfigProviderAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_config_provider_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::Transport { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeTransportAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::Transport { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeTransportAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_transport_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::Cluster { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeClusterAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::Cluster { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeClusterAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_cluster_backend_with_ffi(
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                     None,
                 )?;
             }
-            EntityRegistration::CatalogProvider { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeCatalogProviderAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::CatalogProvider { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeCatalogProviderAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_catalog_provider_with_alias(
                     Some(registry_alias.clone()),
                     Box::new(adapter),
@@ -358,26 +393,30 @@ pub(crate) fn register_native_entities(
                     opts.config.clone(),
                 )?;
             }
-            EntityRegistration::CredentialIssuer { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeCredentialIssuerAdapter::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::CredentialIssuer { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeCredentialIssuerAdapter::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_credential_issuer_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),
                     mcpg_plugin_protocol::PluginTier::Native,
                 )?;
             }
-            EntityRegistration::ContentStore { .. } => {
-                let adapter = mcpg_plugin_host::native_loader::NativeContentStorePlugin::new(
-                    loaded.clone(),
-                    opts.config.clone(),
-                    opts.alias.clone(),
-                    svc.clone(),
-                )?;
+            EntityRegistration::ContentStore { vtable, .. } => {
+                let adapter =
+                    mcpg_plugin_host::native_loader::NativeContentStorePlugin::new_for_entity(
+                        loaded.clone(),
+                        vtable,
+                        opts.config.clone(),
+                        opts.alias.clone(),
+                        svc.clone(),
+                    )?;
                 registry.register_content_store_with_alias(
                     Some(registry_alias.clone()),
                     Arc::new(adapter),

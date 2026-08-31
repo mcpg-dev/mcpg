@@ -418,7 +418,14 @@ impl GatewayBackendHost {
         // 3. Tool-gate plugin chain (payment / rate-limit / step-up / DLP).
         match self
             .plugin_registry
-            .evaluate_tool_gates_pre(&plugin_ctx, args, None)
+            .evaluate_tool_gates_pre(
+                &plugin_ctx,
+                args,
+                None,
+                // Host-initiated child call: the synthesized child
+                // request id has no caller-supplied correlation id.
+                None,
+            )
             .await
         {
             mcpg_plugin_protocol::GateDecision::Allow { .. } => None,

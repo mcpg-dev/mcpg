@@ -26,7 +26,10 @@ pub struct CredentialsConfig {
     /// Identity attribute (token-claim) names folded into the
     /// credential-cache key so callers differing only by these claims
     /// (commonly the tenant claim) get separate cached credentials.
-    /// Empty (default) excludes attributes from the key — set this to
+    /// The caller's `subject_token` (stamped by `oauth_impersonation`)
+    /// is ALWAYS folded when present — impersonated credentials never
+    /// share across bearers, with or without this setting.
+    /// Empty (default) excludes other attributes from the key — set this to
     /// your tenant claim name(s) when a `credential_issuer` derives its
     /// principal from an attribute claim, otherwise those callers share
     /// one credential. In a clustered cache every peer MUST set the same

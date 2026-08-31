@@ -171,7 +171,7 @@ not interpolated.
       param_exprs:
         # `now()` is an MCPG CEL builtin returning RFC3339.
         now: 'now()'
-        user: 'identity.subject'
+        user: 'identity.subject_id'
       # `ids` still comes from the caller via `arguments.ids`.
 ```
 
@@ -690,6 +690,13 @@ authenticated principal's tenant on every call.
       "app.current_tenant": "${identity.tenant}"
 ```
 
+> **Not yet enforced at runtime.** `session_vars` are validated,
+> stored, and reflected back, but the driver does not issue
+> `SET LOCAL` yet — so this RLS pattern does not fence anything
+> today. Until it does, fence with `param_exprs`
+> (`tenant: 'identity.attributes.tenant'`) in the query itself, as
+> §20 shows.
+
 DB-side RLS:
 
 ```sql
@@ -721,7 +728,7 @@ GUC), fall back to binding the tenant explicitly via CEL.
       row_mode: many
       max_rows: 100
       param_exprs:
-        tenant: 'identity.tenant'
+        tenant: 'identity.attributes.tenant'
 ```
 
 The principal's tenant comes from the auth chain; the caller
@@ -750,7 +757,7 @@ no `{count: 42}` envelope, just `42`.
       params: [tenant]
       row_mode: scalar
       param_exprs:
-        tenant: 'identity.tenant'
+        tenant: 'identity.attributes.tenant'
 ```
 
 ## 22. Top-N report
@@ -847,7 +854,7 @@ hit the DB.
       params: [key, tenant]
       row_mode: scalar
       param_exprs:
-        tenant: 'identity.tenant'
+        tenant: 'identity.attributes.tenant'
 ```
 
 The 30s cache absorbs the read storm; flag flips take up to

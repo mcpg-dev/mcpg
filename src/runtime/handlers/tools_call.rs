@@ -645,6 +645,9 @@ impl GatewayRuntime {
                                 mcpg_plugin_host::audit_events::tool_call_access_denied_event(
                                     &audit_ctx,
                                     &denial.audit_reason,
+                                )
+                                .with_upstream_request_id(
+                                    request_context.upstream_request_id.clone(),
                                 );
                             let _ = self.plugin_registry.emit_audit_event(&event).await;
                             // CP sample: pre-dispatch policy denial
@@ -738,7 +741,8 @@ impl GatewayRuntime {
                             "cp_license",
                             "rps_per_gateway",
                             &reason,
-                        );
+                        )
+                        .with_upstream_request_id(request_context.upstream_request_id.clone());
                         let _ = self.plugin_registry.emit_audit_event(&event).await;
                         self.tool_call_recorder.record(cp_metrics::ToolCallSample {
                             plugin_id: cp_metrics::plugin_id_from_kind(&binding_type_label(&route)),
@@ -800,7 +804,8 @@ impl GatewayRuntime {
                             "cp_license",
                             "tool_calls_per_month",
                             &reason,
-                        );
+                        )
+                        .with_upstream_request_id(request_context.upstream_request_id.clone());
                         let _ = self.plugin_registry.emit_audit_event(&event).await;
                         self.tool_call_recorder.record(cp_metrics::ToolCallSample {
                             plugin_id: cp_metrics::plugin_id_from_kind(&binding_type_label(&route)),
@@ -881,6 +886,9 @@ impl GatewayRuntime {
                                     &policy_id,
                                     kind.as_str(),
                                     &reason,
+                                )
+                                .with_upstream_request_id(
+                                    request_context.upstream_request_id.clone(),
                                 );
                                 let _ = self.plugin_registry.emit_audit_event(&event).await;
                                 return protocol_http_error(
@@ -934,6 +942,9 @@ impl GatewayRuntime {
                                             "none",
                                             "error",
                                             &e.to_string(),
+                                        )
+                                        .with_upstream_request_id(
+                                            request_context.upstream_request_id.clone(),
                                         );
                                     let _ = self.plugin_registry.emit_audit_event(&event).await;
                                     warn!(
@@ -976,7 +987,13 @@ impl GatewayRuntime {
                     // real backend result takes — the cached value is
                     // untrusted plugin output, not a finished response.
                     let mut cached_result_short_circuit: Option<serde_json::Value> = None;
-                    let plugin_gate_meta = if self.plugin_registry.has_tool_gate_plugins() {
+                    // Enter even with no tool_gate plugins loaded when the
+                    // operator wants tool-call audit records — the empty-chain
+                    // branch of `evaluate_tool_gates_pre` owns the
+                    // `mcpg.tool.call.allowed` emission.
+                    let plugin_gate_meta = if self.plugin_registry.has_tool_gate_plugins()
+                        || self.plugin_registry.emits_tool_call_allowed()
+                    {
                         let plugin_ctx = mcpg_plugin_protocol::PluginContext {
                             request_id: request_context.request_id.as_str().to_owned(),
                             session_id: request_context.session_id.clone(),
@@ -991,6 +1008,7 @@ impl GatewayRuntime {
                                 &plugin_ctx,
                                 params.arguments.as_ref().unwrap_or(&serde_json::json!({})),
                                 params.meta.as_ref(),
+                                request_context.upstream_request_id.as_deref(),
                             )
                             .await
                         {
@@ -2013,7 +2031,11 @@ impl GatewayRuntime {
                                 // Allow.modified_result. Captured here,
                                 // applied below before the result transform chain.
                                 let mut gate_modified_result: Option<serde_json::Value> = None;
-                                if self.plugin_registry.has_tool_gate_plugins() {
+                                // Enter even with no gates loaded when the operator
+                                // wants `mcpg.tool.call.completed` records — the
+                                // empty-chain branch owns that emission.
+                                let has_gates = self.plugin_registry.has_tool_gate_plugins();
+                                if has_gates || self.plugin_registry.emits_tool_call_completed() {
                                     let plugin_ctx = mcpg_plugin_protocol::PluginContext {
                                         request_id: request_context.request_id.as_str().to_owned(),
                                         session_id: request_context.session_id.clone(),
@@ -2023,8 +2045,14 @@ impl GatewayRuntime {
                                             .to_owned(),
                                         surface: "tool".to_owned(),
                                     };
-                                    let result_json = serde_json::to_value(&final_result)
-                                        .unwrap_or(serde_json::json!({}));
+                                    // With no gates the chain never reads the result;
+                                    // skip the serialization on the audit-only path.
+                                    let result_json = if has_gates {
+                                        serde_json::to_value(&final_result)
+                                            .unwrap_or(serde_json::json!({}))
+                                    } else {
+                                        serde_json::Value::Null
+                                    };
                                     match self
                                         .plugin_registry
                                         .evaluate_tool_gates_post(
@@ -2035,6 +2063,7 @@ impl GatewayRuntime {
                                                 .unwrap_or(&serde_json::json!({})),
                                             &result_json,
                                             execution_ms,
+                                            request_context.upstream_request_id.as_deref(),
                                         )
                                         .await
                                     {
@@ -2499,7 +2528,11 @@ impl GatewayRuntime {
                         // Allow.modified_result. Captured here,
                         // applied below before the result transform chain.
                         let mut gate_modified_result: Option<serde_json::Value> = None;
-                        if self.plugin_registry.has_tool_gate_plugins() {
+                        // Enter even with no gates loaded when the operator
+                        // wants `mcpg.tool.call.completed` records — the
+                        // empty-chain branch owns that emission.
+                        let has_gates = self.plugin_registry.has_tool_gate_plugins();
+                        if has_gates || self.plugin_registry.emits_tool_call_completed() {
                             let plugin_ctx = mcpg_plugin_protocol::PluginContext {
                                 request_id: request_context.request_id.as_str().to_owned(),
                                 session_id: request_context.session_id.clone(),
@@ -2508,8 +2541,13 @@ impl GatewayRuntime {
                                 transport: transport_label(&request_context.transport).to_owned(),
                                 surface: "tool".to_owned(),
                             };
-                            let result_json = serde_json::to_value(&final_result)
-                                .unwrap_or(serde_json::json!({}));
+                            // With no gates the chain never reads the result;
+                            // skip the serialization on the audit-only path.
+                            let result_json = if has_gates {
+                                serde_json::to_value(&final_result).unwrap_or(serde_json::json!({}))
+                            } else {
+                                serde_json::Value::Null
+                            };
                             match self
                                 .plugin_registry
                                 .evaluate_tool_gates_post(
@@ -2520,6 +2558,7 @@ impl GatewayRuntime {
                                         .unwrap_or(&serde_json::json!({})),
                                     &result_json,
                                     execution_ms,
+                                    request_context.upstream_request_id.as_deref(),
                                 )
                                 .await
                             {
@@ -2765,7 +2804,8 @@ impl GatewayRuntime {
                         transport: transport_label(&request_context.transport).to_owned(),
                         surface: "tool".to_owned(),
                     };
-                    let event = mcpg_plugin_host::audit_events::tool_call_unknown_event(&audit_ctx);
+                    let event = mcpg_plugin_host::audit_events::tool_call_unknown_event(&audit_ctx)
+                        .with_upstream_request_id(request_context.upstream_request_id.clone());
                     let _ = self.plugin_registry.emit_audit_event(&event).await;
                     protocol_http_error(
                         200,

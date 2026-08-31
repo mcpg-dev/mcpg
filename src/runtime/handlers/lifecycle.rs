@@ -98,7 +98,8 @@ impl GatewayRuntime {
                     &session.client_info.name,
                     &session.client_info.version,
                     transport_label(&request_context.transport),
-                );
+                )
+                .with_upstream_request_id(request_context.upstream_request_id.clone());
                 let _ = self.plugin_registry.emit_audit_event(&event).await;
                 // SEP-2133 extension advertisements. Each
                 // operator-enabled extension contributes one entry
@@ -191,11 +192,13 @@ impl GatewayRuntime {
                         }
                         // Audit: handshake ack on the audit
                         // lane. Bookends the `mcpg.session.opened` event.
-                        let event = mcpg_plugin_host::audit_events::session_initialized_acked_event(
-                            plugin_identity_from_request(request_context),
-                            request_context.session_id.as_deref(),
-                            transport_label(&request_context.transport),
-                        );
+                        let event =
+                            mcpg_plugin_host::audit_events::session_initialized_acked_event(
+                                plugin_identity_from_request(request_context),
+                                request_context.session_id.as_deref(),
+                                transport_label(&request_context.transport),
+                            )
+                            .with_upstream_request_id(request_context.upstream_request_id.clone());
                         let _ = self.plugin_registry.emit_audit_event(&event).await;
                         ProtocolHttpResponse {
                             http_status: 202,
@@ -216,7 +219,8 @@ impl GatewayRuntime {
                     request_context.request_id.as_str(),
                     request_context.session_id.as_deref(),
                     transport_label(&request_context.transport),
-                );
+                )
+                .with_upstream_request_id(request_context.upstream_request_id.clone());
                 let _ = self.plugin_registry.emit_audit_event(&event).await;
                 ProtocolHttpResponse {
                     http_status: 200,
@@ -296,7 +300,8 @@ impl GatewayRuntime {
                     &audit_ctx,
                     &elicitation_id_str,
                     user_action_label,
-                );
+                )
+                .with_upstream_request_id(request_context.upstream_request_id.clone());
                 let _ = self.plugin_registry.emit_audit_event(&event).await;
                 let mut payload = serde_json::json!({
                     "action": match params.action {

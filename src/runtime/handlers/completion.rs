@@ -126,7 +126,8 @@ impl GatewayRuntime {
                     &backend_name,
                     &params.argument.name,
                     result.values.len() as u64,
-                );
+                )
+                .with_upstream_request_id(request_context.upstream_request_id.clone());
                 let _ = self.plugin_registry.emit_audit_event(&event).await;
                 ProtocolHttpResponse {
                     http_status: 200,

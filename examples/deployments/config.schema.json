@@ -1892,7 +1892,7 @@
           "description": "Optional cluster pub/sub wrapper. When `enabled: true` AND a `cluster_backend` is bound, the gateway wraps the L1 cache with `ClusteredCredentialCache` so every peer instance sees Issued / Revoked events. Drops to local-only behaviour with a warning when `enabled: true` but no coordinator is bound."
         },
         "key_attributes": {
-          "description": "Identity attribute (token-claim) names folded into the credential-cache key so callers differing only by these claims (commonly the tenant claim) get separate cached credentials. Empty (default) excludes attributes from the key — set this to your tenant claim name(s) when a `credential_issuer` derives its principal from an attribute claim, otherwise those callers share one credential. In a clustered cache every peer MUST set the same `key_attributes` (the published event hash is computed with it) — divergence silently produces per-node cache misses, the same all-peers-agree constraint that already governs the hash algorithm.",
+          "description": "Identity attribute (token-claim) names folded into the credential-cache key so callers differing only by these claims (commonly the tenant claim) get separate cached credentials. The caller's `subject_token` (stamped by `oauth_impersonation`) is ALWAYS folded when present — impersonated credentials never share across bearers, with or without this setting. Empty (default) excludes other attributes from the key — set this to your tenant claim name(s) when a `credential_issuer` derives its principal from an attribute claim, otherwise those callers share one credential. In a clustered cache every peer MUST set the same `key_attributes` (the published event hash is computed with it) — divergence silently produces per-node cache misses, the same all-peers-agree constraint that already governs the hash algorithm.",
           "items": {
             "type": "string"
           },
@@ -4457,7 +4457,7 @@
         },
         "cache_dir": {
           "default": null,
-          "description": "Local cache directory for pulled OCI artefacts. Keyed by manifest digest so digest-pinned references skip the network on subsequent boots. When unset, defaults to `$XDG_CACHE_HOME/mcpg/plugins/oci` (or `/var/cache/mcpg/plugins/oci` for system deployments).",
+          "description": "Cache root for plugin artefacts: pulled OCI blobs land under `<dir>/oci` (keyed by manifest digest, so digest-pinned references skip the network on subsequent boots) and packaged zips unpack under `<dir>/unpack`. When unset, blobs default to `$XDG_CACHE_HOME/mcpg/plugins/oci` (or `/var/cache/mcpg/plugins/oci` for system deployments) and the unpack cache to the process temp dir. On a pod with a read-only root filesystem SET THIS to a writable mount — otherwise the first OCI pull fails creating the default under `$HOME`, which crash-loops a fresh pod while a hot-reload on a running one fails closed and keeps serving the prior config.",
           "type": [
             "string",
             "null"

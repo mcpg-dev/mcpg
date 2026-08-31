@@ -307,7 +307,8 @@ pub(crate) async fn register_modern_resource_subscriptions(
                 transport: crate::runtime::transport_label(&request_context.transport).to_owned(),
                 surface: "resource".to_owned(),
             };
-            let event = mcpg_plugin_host::audit_events::resource_subscribe_event(&audit_ctx, uri);
+            let event = mcpg_plugin_host::audit_events::resource_subscribe_event(&audit_ctx, uri)
+                .with_upstream_request_id(request_context.upstream_request_id.clone());
             let _ = runtime.plugin_registry().emit_audit_event(&event).await;
             leases.push(lease);
         }

@@ -1223,7 +1223,8 @@ impl GatewayRuntime {
                             request_context.request_id.as_str(),
                             request_context.session_id.as_deref(),
                             &level_label,
-                        );
+                        )
+                        .with_upstream_request_id(request_context.upstream_request_id.clone());
                         let _ = self.plugin_registry.emit_audit_event(&event).await;
                         ProtocolHttpResponse {
                             http_status: 200,

@@ -68,7 +68,8 @@ async fn enforce_aauth_resource_state(
             "credential revoked by its issuer",
             ctx.request_id.as_str(),
             "http",
-        );
+        )
+        .with_upstream_request_id(ctx.upstream_request_id.clone());
         let _ = runtime.plugin_registry().emit_audit_event(&event).await;
         return Err(invalid_token_response_with_headers(
             &ctx.request_id,
@@ -143,7 +144,8 @@ pub(crate) async fn build_request_context(
                         &reason,
                         request_id.as_str(),
                         "http",
-                    );
+                    )
+                    .with_upstream_request_id(upstream_request_id.clone());
                     let _ = reg.emit_audit_event(&event).await;
                 }
                 return Err(invalid_token_response(&request_id));
@@ -197,7 +199,8 @@ pub(crate) async fn build_request_context(
                         &reason,
                         request_id.as_str(),
                         "http",
-                    );
+                    )
+                    .with_upstream_request_id(upstream_request_id.clone());
                     let _ = reg.emit_audit_event(&event).await;
                 }
                 return Err(invalid_token_response(&request_id));
@@ -235,7 +238,8 @@ pub(crate) async fn build_request_context(
                         &reason,
                         request_id.as_str(),
                         "http",
-                    );
+                    )
+                    .with_upstream_request_id(upstream_request_id.clone());
                     let _ = reg.emit_audit_event(&event).await;
                 }
                 return Err(invalid_token_response(&request_id));
@@ -342,7 +346,8 @@ async fn enrich_identity_via_plugins(
                 &reason,
                 ctx.request_id.as_str(),
                 "http",
-            );
+            )
+            .with_upstream_request_id(ctx.upstream_request_id.clone());
             let _ = registry.emit_audit_event(&event).await;
             return Err(invalid_token_response_with_headers(
                 &ctx.request_id,

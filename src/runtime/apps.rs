@@ -177,7 +177,11 @@ impl GatewayRuntime {
 
         // Post-dispatch tool_gate chain (DLP / redaction / masking).
         let mut gate_modified_result: Option<Value> = None;
-        if self.plugin_registry.has_tool_gate_plugins() {
+        // Enter even with no gates loaded when the operator wants
+        // `mcpg.tool.call.completed` records — the empty-chain branch
+        // owns that emission.
+        let has_gates = self.plugin_registry.has_tool_gate_plugins();
+        if has_gates || self.plugin_registry.emits_tool_call_completed() {
             let plugin_ctx = mcpg_plugin_protocol::PluginContext {
                 request_id: request_context.request_id.as_str().to_owned(),
                 session_id: request_context.session_id.clone(),
@@ -186,10 +190,22 @@ impl GatewayRuntime {
                 transport: transport_label(&request_context.transport).to_owned(),
                 surface: "tool".to_owned(),
             };
-            let result_json = serde_json::to_value(&result).unwrap_or(serde_json::json!({}));
+            // With no gates the chain never reads the result; skip the
+            // serialization on the audit-only path.
+            let result_json = if has_gates {
+                serde_json::to_value(&result).unwrap_or(serde_json::json!({}))
+            } else {
+                serde_json::Value::Null
+            };
             match self
                 .plugin_registry
-                .evaluate_tool_gates_post(&plugin_ctx, arguments, &result_json, execution_ms)
+                .evaluate_tool_gates_post(
+                    &plugin_ctx,
+                    arguments,
+                    &result_json,
+                    execution_ms,
+                    request_context.upstream_request_id.as_deref(),
+                )
                 .await
             {
                 mcpg_plugin_protocol::GateDecision::Allow {

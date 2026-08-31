@@ -19,6 +19,7 @@ impl GatewayRuntime {
             resource: Some(format!("tool://{tool_name}")),
             outcome: mcpg_plugin_protocol::audit::AuditOutcome::Success,
             request_id: Some(request_context.request_id.as_str().to_owned()),
+            upstream_request_id: None,
             node_id: None,
             details,
             prev_event_hash: None,

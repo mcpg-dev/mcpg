@@ -3205,6 +3205,7 @@ fn extract_dynamic_list_bindings_picks_only_sql_resource_shapes() {
         driver: DriverKind::Sqlite,
         url: "sqlite::memory:".into(),
         pool: PoolConfig::default(),
+        allow_private_backends: false,
         query: QueryShape {
             body: QueryBody::Sql {
                 sql: "SELECT 1".into(),

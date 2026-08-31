@@ -75,7 +75,8 @@ impl GatewayRuntime {
             &audit_ctx,
             &cancelled_request_id.to_string(),
             reason,
-        );
+        )
+        .with_upstream_request_id(request_context.upstream_request_id.clone());
         let _ = self.plugin_registry.emit_audit_event(&event).await;
     }
 

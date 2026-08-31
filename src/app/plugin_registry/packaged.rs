@@ -71,8 +71,15 @@ pub(crate) fn load_packaged_plugin(
     // changes and a fresh directory is populated; old hash dirs
     // are left in place (a separate `mcpg-plugin cache gc` tool
     // could prune them in the future).
-    let base_cache_dir = std::env::temp_dir()
-        .join("mcpg-plugin-cache")
+    // The unpack cache follows the configured cache root like the OCI
+    // download cache does; only an UNCONFIGURED registry falls back to the
+    // temp dir. Split subtrees (unpack/ vs oci/) so the two caches never
+    // collide under one root.
+    let base_cache_dir = registry_cfg
+        .cache_dir
+        .as_ref()
+        .map(|d| std::path::PathBuf::from(d).join("unpack"))
+        .unwrap_or_else(|| std::env::temp_dir().join("mcpg-plugin-cache"))
         .join(sanitize_for_path(&entry.id));
 
     let unpacked = mcpg_plugin_host::Package::unpack_cached_to(zip_path, &base_cache_dir)?;

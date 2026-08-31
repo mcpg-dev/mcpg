@@ -685,11 +685,17 @@ pub struct PluginRegistryConfig {
     #[serde(default = "default_plugin_registry")]
     pub default_registry: String,
 
-    /// Local cache directory for pulled OCI artefacts. Keyed by
-    /// manifest digest so digest-pinned references skip the
-    /// network on subsequent boots. When unset, defaults to
+    /// Cache root for plugin artefacts: pulled OCI blobs land under
+    /// `<dir>/oci` (keyed by manifest digest, so digest-pinned
+    /// references skip the network on subsequent boots) and packaged
+    /// zips unpack under `<dir>/unpack`. When unset, blobs default to
     /// `$XDG_CACHE_HOME/mcpg/plugins/oci` (or
-    /// `/var/cache/mcpg/plugins/oci` for system deployments).
+    /// `/var/cache/mcpg/plugins/oci` for system deployments) and the
+    /// unpack cache to the process temp dir. On a pod with a read-only
+    /// root filesystem SET THIS to a writable mount — otherwise the
+    /// first OCI pull fails creating the default under `$HOME`, which
+    /// crash-loops a fresh pod while a hot-reload on a running one
+    /// fails closed and keeps serving the prior config.
     #[serde(default)]
     pub cache_dir: Option<String>,
 

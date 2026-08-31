@@ -186,7 +186,12 @@ impl GatewayRuntime {
         }
         match self
             .plugin_registry
-            .evaluate_tool_gates_pre(&plugin_ctx, arguments, None)
+            .evaluate_tool_gates_pre(
+                &plugin_ctx,
+                arguments,
+                None,
+                request_context.upstream_request_id.as_deref(),
+            )
             .await
         {
             mcpg_plugin_protocol::GateDecision::Allow { .. } => Ok(()),
