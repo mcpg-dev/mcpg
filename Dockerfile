@@ -42,7 +42,9 @@ RUN apt-get update \
 
 COPY --from=build /src/target/release/mcpg /usr/local/bin/mcpg
 
-USER mcpg
+# Numeric, not the name: kubelet's runAsNonRoot check refuses a
+# symbolic user because it cannot prove it is non-root.
+USER 10001:10001
 WORKDIR /home/mcpg
 
 ENV MCPG_CONFIG=/etc/mcpg/config.yaml \
