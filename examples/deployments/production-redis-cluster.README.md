@@ -23,6 +23,7 @@ Multi-replica production gateway behind a load balancer, every replica coordinat
 ## Required env vars
 
 - `MCPG_REDIS_URL` — Redis cluster connection.
+- `MCPG_CLUSTER_STATE_KEY` — URL-safe-base64 32-byte state-encryption key, identical on every replica (`openssl rand -base64 32 | tr '+/' '-_'`). Required whenever `cluster.kind` is not `single_node`.
 - `MCPG_OIDC_CLIENT_ID`, `MCPG_OIDC_CLIENT_SECRET` — IdP credentials.
 - `ACCOUNTS_API_TOKEN` — for the placeholder binding (drop with the binding).
 

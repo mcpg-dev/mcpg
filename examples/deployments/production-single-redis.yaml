@@ -11,6 +11,7 @@
 # Required env vars:
 #   MCPG_OIDC_CLIENT_SECRET   — OIDC client secret for token verification
 #   MCPG_REDIS_URL            — e.g. rediss://gateway-cache.internal:6380
+#   MCPG_CLUSTER_STATE_KEY    — URL-safe-base64 32-byte state key
 #
 # Boot:  MCPG_CONFIG=production-single-redis.yaml mcpg
 
@@ -43,6 +44,12 @@ cluster:
   url: "${env.MCPG_REDIS_URL}"
   password: "${env.MCPG_REDIS_PASSWORD}"
   key_prefix: "mcpg:prod"
+  # Required for any non-single_node cluster: seals all Redis-held capability
+  # state (sessions incl. SSE replay, pipelines, tasks, …) with
+  # XChaCha20-Poly1305. Names the env var (no `${env.…}` — the key itself
+  # never sits in the config); the var must hold a URL-safe-base64 32-byte
+  # key: openssl rand -base64 32 | tr '+/' '-_'
+  state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
   pool_size: 8
 
 # Governance umbrella (Layout D''): identity + authorization + audit

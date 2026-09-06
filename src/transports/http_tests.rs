@@ -2503,6 +2503,136 @@ async fn mcp_get_expired_last_event_id_returns_conflict() {
     assert_eq!(response.status(), StatusCode::CONFLICT);
 }
 
+/// Store three deliveries with distinct markers on the session's backlog and
+/// return their delivery ids.
+fn seed_backlog_deliveries(
+    runtime: &crate::runtime::GatewayRuntime,
+    session_id: &str,
+) -> Vec<String> {
+    ["alpha", "bravo", "charlie"]
+        .iter()
+        .enumerate()
+        .map(|(n, marker)| {
+            let msg = crate::runtime::pipeline_store::DeliveryMessage {
+                kind: crate::runtime::pipeline_store::DeliveryKind::DeferredToolResult,
+                jsonrpc_message: serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": n,
+                    "result": {"marker": marker}
+                }),
+                delivery_id: String::new(),
+            };
+            runtime
+                .pipeline_store()
+                .store_pending_delivery(session_id, &msg)
+                .expect("store delivery")
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_get_with_foreign_stream_delivery_cursor_replays_backlog_suffix() {
+    // The cursor's `{stream_id}:{ordinal}` core names a stream this replica
+    // cannot replay (another replica minted it), but its delivery tag orders
+    // the coordinator backlog — the resume must NOT dead-end in a 400: it
+    // opens a fresh stream, prunes the acked prefix, and replays exactly the
+    // missed suffix in order.
+    let state = build_test_state();
+    let runtime = state.runtime.load_full();
+    let (app, session_id) = initialize_session(router(state, "/health", "/mcp")).await;
+
+    let ids = seed_backlog_deliveries(&runtime, &session_id);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mcp")
+                .header(header::ACCEPT, "text/event-stream")
+                .header(SESSION_ID_HEADER, &session_id)
+                // Unknown stream id + the FIRST delivery's tag: the client
+                // received `alpha` live on the other replica's stream.
+                .header("last-event-id", format!("stream-77:9@{}", ids[0]))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = sse_response_text(response).await;
+    assert!(
+        !body.contains("alpha"),
+        "the acked delivery must not be replayed: {body}"
+    );
+    let bravo = body.find("bravo").expect("first missed delivery replayed");
+    let charlie = body
+        .find("charlie")
+        .expect("second missed delivery replayed");
+    assert!(bravo < charlie, "missed suffix must replay in order");
+    // Exactly once each — the ordered backlog replay, not a dedupe, is what
+    // prevents duplicates.
+    assert_eq!(body.matches("bravo").count(), 1);
+    assert_eq!(body.matches("charlie").count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_get_with_expired_delivery_cursor_falls_back_to_backlog_replay() {
+    // Same fallback for a cursor whose stream exists but whose event fell out
+    // of the replay window: a delivery-tagged cursor answers 200 with the
+    // backlog suffix, not the 409 an untagged expired cursor keeps.
+    let state = build_test_state();
+    let runtime = state.runtime.load_full();
+    let (app, session_id) = initialize_session(router(state, "/health", "/mcp")).await;
+
+    // Open a real stream so the session has a known stream id.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mcp")
+                .header(header::ACCEPT, "text/event-stream")
+                .header(SESSION_ID_HEADER, &session_id)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let body = sse_response_text(response).await;
+    let stream_id = body
+        .lines()
+        .find_map(|line| line.strip_prefix("id: "))
+        .and_then(|event_id| event_id.split(':').next().map(str::to_owned))
+        .expect("stream id");
+
+    let ids = seed_backlog_deliveries(&runtime, &session_id);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mcp")
+                .header(header::ACCEPT, "text/event-stream")
+                .header(SESSION_ID_HEADER, &session_id)
+                .header("last-event-id", format!("{}:999@{}", stream_id, ids[1]))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = sse_response_text(response).await;
+    assert!(!body.contains("alpha"), "below the ack — pruned: {body}");
+    assert!(!body.contains("bravo"), "the acked row itself — pruned");
+    assert_eq!(
+        body.matches("charlie").count(),
+        1,
+        "the missed suffix replays exactly once"
+    );
+}
+
 #[tokio::test]
 async fn metrics_endpoint_returns_404_when_disabled() {
     let mut config = AppConfig::default();

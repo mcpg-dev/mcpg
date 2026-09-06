@@ -150,8 +150,10 @@ pub(crate) async fn open_post_continuation_sse(
 
     // Drain any pending deliveries (the server-initiated request that caused
     // the suspension) and convert them into indexed SSE events on the freshly
-    // opened stream so they land in the replay window.
-    let pending = runtime.take_pending_deliveries(session_id);
+    // opened stream so they land in the replay window. The scan drain
+    // consults the coordinator KV even when this replica's pending index
+    // never saw the rows (a peer may have stored them).
+    let pending = runtime.drain_deliveries_for_reconnect(session_id);
     for msg in pending {
         if let Ok(records) = runtime.stream_delivery_message(
             session_id,

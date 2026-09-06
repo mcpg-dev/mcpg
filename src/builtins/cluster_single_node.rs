@@ -25,7 +25,7 @@
 //! Anything multi-node. The single-node coordinator is the safe
 //! default so a fresh gateway install works with zero
 //! configuration; any real deployment should replace it with
-//! NATS / Consul / etcd / Raft.
+//! NATS / redis / Raft.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -36,11 +36,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use mcpg_cluster_api::{
     ActiveLease, BoxActiveLease, BoxPeerEventStream, BoxPublishedMessageStream, ClusterBackend,
-    ClusterError, ClusterNodeInfo, ClusterPeer, KeyValueStore, PubSub, PublishedMessage, Watch,
+    ClusterError, ClusterNodeInfo, ClusterPeer, KeyValueStore, PubSub, PublishedMessage,
 };
 use mcpg_plugin_protocol::{PluginClass, PluginManifest};
 
-use crate::builtins::cluster_primitives::{MemoryBus, MemoryKv, MemoryWatch, WatchHub};
+use crate::builtins::cluster_primitives::{MemoryBus, MemoryKv};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -53,7 +53,7 @@ description: |
   Default coordinator for single-node deployments. Always leader,
   no peers, in-process broadcast pub/sub. Fencing tokens are
   strictly monotonic per key / role. Not suitable for multi-node
-  — replace with NATS / Consul / etcd / Raft for real HA.
+  — replace with NATS / redis / Raft for real HA.
 class: cluster
 runtime: static-firstparty-v1
 protocol_version: "1.0"
@@ -101,15 +101,10 @@ pub struct SingleNodeClusterBackend {
     state: Arc<Mutex<State>>,
     /// Shared in-memory `KeyValueStore` primitive — exposed via the
     /// `key_value_store()` accessor so capabilities can extract it.
-    /// Constructed with a [`WatchHub`] so put/delete events flow to
-    /// `MemoryWatch` subscribers.
     kv: Arc<MemoryKv>,
     /// Shared in-memory `PubSub` primitive — exposed via the
     /// `pub_sub()` accessor.
     bus: Arc<MemoryBus>,
-    /// Shared in-memory `Watch` primitive over the same hub `kv`
-    /// publishes into. Exposed via the `watch()` accessor.
-    watch: Arc<MemoryWatch>,
 }
 
 impl SingleNodeClusterBackend {
@@ -121,13 +116,7 @@ impl SingleNodeClusterBackend {
     /// deterministic assertions.
     pub fn with_node_id(node_id: impl Into<String>) -> Arc<Self> {
         let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        // Single shared hub: `MemoryKv` publishes onto it; the
-        // accompanying `MemoryWatch` subscribes from it. Operators
-        // who consume both `key_value_store()` and `watch()` see a
-        // consistent change stream.
-        let watch_hub = Arc::new(WatchHub::new());
-        let kv = Arc::new(MemoryKv::with_watch_hub(Arc::clone(&watch_hub)));
-        let watch = Arc::new(MemoryWatch::new(watch_hub));
+        let kv = Arc::new(MemoryKv::new());
         Arc::new(Self {
             manifest: PluginManifest {
                 id: "dev.mcpg.builtin.cluster.single-node".into(),
@@ -162,7 +151,6 @@ impl SingleNodeClusterBackend {
             })),
             kv,
             bus: Arc::new(MemoryBus::new()),
-            watch,
         })
     }
 
@@ -304,10 +292,6 @@ impl ClusterBackend for SingleNodeClusterBackend {
 
     fn pub_sub(&self) -> Option<Arc<dyn PubSub>> {
         Some(Arc::clone(&self.bus) as Arc<dyn PubSub>)
-    }
-
-    fn watch(&self) -> Option<Arc<dyn Watch>> {
-        Some(Arc::clone(&self.watch) as Arc<dyn Watch>)
     }
 
     async fn node_info(&self) -> ClusterNodeInfo {
@@ -522,8 +506,8 @@ impl ClusterBackend for SingleNodeClusterBackend {
             // surface the limitation loudly instead of pretending.
             return Err(ClusterError::InvalidReference {
                 message: "single-node coordinator does not implement queue \
-                     groups; use a multi-node backend (NATS / JetStream / \
-                     Consul) for load-balanced subscribers"
+                     groups; use a multi-node backend (NATS / JetStream) \
+                     for load-balanced subscribers"
                     .into(),
             });
         }

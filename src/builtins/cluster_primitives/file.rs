@@ -68,6 +68,11 @@ mod base64_bytes {
 #[derive(Debug)]
 pub struct FileKv {
     kv_dir: PathBuf,
+    /// Serializes `incr`'s read-add-rename cycle. FileKv is a
+    /// single-node, single-process backend, so one in-process lock is
+    /// what makes the counter genuinely atomic; the tmp+rename write
+    /// keeps it crash-consistent like every other write.
+    incr_lock: tokio::sync::Mutex<()>,
 }
 
 impl FileKv {
@@ -80,7 +85,10 @@ impl FileKv {
             .map_err(|e| ClusterError::BackendUnavailable {
                 reason: format!("create kv_dir {}: {}", kv_dir.display(), e),
             })?;
-        Ok(Arc::new(Self { kv_dir }))
+        Ok(Arc::new(Self {
+            kv_dir,
+            incr_lock: tokio::sync::Mutex::new(()),
+        }))
     }
 
     /// Spawn a background sweeper that drops expired entries every
@@ -333,6 +341,40 @@ impl KeyValueStore for FileKv {
         stored.expires_at_secs = ttl.map(|d| current_unix_secs() + d.as_secs().max(1));
         self.write_entry(&stored).await?;
         Ok(true)
+    }
+
+    async fn incr(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        let _guard = self.incr_lock.lock().await;
+        let now = current_unix_secs();
+        let stored = self.read_entry(key).await?;
+        let live = stored
+            .as_ref()
+            .is_some_and(|s| !s.expires_at_secs.is_some_and(|d| d <= now));
+        let current = match &stored {
+            Some(s) if live => mcpg_cluster_api::parse_counter(&s.payload)?,
+            _ => 0,
+        };
+        let next = current
+            .checked_add(delta)
+            .ok_or_else(mcpg_cluster_api::counter_overflow)?;
+        let expires_at_secs = match ttl {
+            Some(d) => Some(now + d.as_secs().max(1)),
+            // ttl=None leaves a live entry's expiry untouched.
+            None if live => stored.and_then(|s| s.expires_at_secs),
+            None => None,
+        };
+        self.write_entry(&StoredKv {
+            key: key.to_owned(),
+            payload: next.to_string().into_bytes(),
+            expires_at_secs,
+        })
+        .await?;
+        Ok(next)
     }
 }
 
@@ -672,6 +714,44 @@ mod tests {
             .unwrap();
         let entries = kv.list_prefix("a:", 100).await.unwrap();
         assert_eq!(entries.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_incr_atomic_across_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = FileKv::new(dir.path()).await.unwrap();
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let kv = Arc::clone(&kv);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..25 {
+                    kv.incr("c", 1, None).await.unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(kv.incr("c", 0, None).await.unwrap(), 100);
+        assert_eq!(&kv.get("c").await.unwrap().unwrap().bytes[..], b"100");
+    }
+
+    #[tokio::test]
+    async fn kv_contract_battery() {
+        // Keeps every minted tempdir alive until the battery finishes,
+        // then cleans them all up on drop.
+        let dirs = std::sync::Mutex::new(Vec::new());
+        // Whole-second timing: FileKv clamps every TTL to ≥ 1 s.
+        mcpg_cluster_api::test_suite::run_kv_contract_with(
+            mcpg_cluster_api::test_suite::KvContractTiming::seconds_granularity(),
+            || async {
+                let dir = tempfile::tempdir().unwrap();
+                let kv = FileKv::new(dir.path()).await.unwrap();
+                dirs.lock().unwrap().push(dir);
+                kv as Arc<dyn KeyValueStore>
+            },
+        )
+        .await;
     }
 
     #[tokio::test]

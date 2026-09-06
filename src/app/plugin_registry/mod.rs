@@ -297,7 +297,7 @@ pub(crate) async fn build_plugin_registry(
     }
 
     // The cluster coordinator is installed AFTER the `plugins[]` loop
-    // below — an external coordinator (`kind: redis/nats/consul/etcd`) is a
+    // below — an external coordinator (`kind: redis/nats`) is a
     // cdylib loaded by that loop, so its registration must precede the
     // single_node-vs-external selection + the vocabulary cross-check + the
     // boot reachability probe. See `install_cluster_coordinator` after the
@@ -553,34 +553,11 @@ pub(crate) async fn build_plugin_registry(
     // command / grpc / graphql / mock / soap dispatch via their cdylib
     // plugins through `execute_envelope_plugin` against the registered plugin.
 
-    // Register identity plugins (OIDC first, then JWKS as fallback).
-    // The plugin chain runs in-order; first `Resolved` wins.
-    // Same override rule as the observability pair: an explicit `plugins[]`
-    // artifact for this id is the signed copy and takes the slot. The
-    // gateway still links the crate — its config types and discovery-URL
-    // safety checks are part of the config schema — but the runtime plugin
-    // it registers steps aside.
-    // OIDC identity is NOT linked into this binary either: `dev.mcpg.identity
-    // .oidc` ships as a signed cdylib, so a config that asks for it declares
-    // the artifact in `plugins[]`. Unlike a telemetry sink, a missing identity
-    // provider is not a soft failure — requests would arrive unauthenticated —
-    // so this refuses the boot rather than warning.
-    if oidc_resolver.is_some()
-        && !registry
-            .identity_plugin_ids()
-            .iter()
-            .any(|id| id == crate::runtime::identity::oidc::PLUGIN_ID)
-    {
-        anyhow::bail!(
-            "`access.oauth` configures OIDC identity, but no identity plugin is \
-             registered under {id:?}. It ships as a cdylib: add a `plugins[]` \
-             entry with `source.path`/`source.oci` for it (the gateway images \
-             bake it at /usr/local/lib/mcpg/plugins/{id}/plugin.so). Refusing to \
-             boot rather than serve requests with the configured identity \
-             provider missing.",
-            id = crate::runtime::identity::oidc::PLUGIN_ID,
-        );
-    }
+    // Register the JWKS/JWT identity plugin when a verifier is configured.
+    // The identity chain runs in-order; first `Resolved` wins. When
+    // `access.oauth` also configures OIDC, that provider ships as a signed
+    // cdylib loaded by the `plugins[]` loop below; its presence is enforced
+    // once the loop has run.
     if let Some(verifier) = jwt_verifier {
         let jwt_plugin = crate::runtime::identity_plugin::JwtIdentityPlugin::new(verifier.clone());
         registry.register_identity(
@@ -1642,8 +1619,36 @@ pub(crate) async fn build_plugin_registry(
         }
     }
 
+    // OIDC identity is not linked into this binary: `dev.mcpg.identity.oidc`
+    // ships as a signed cdylib, so a config that asks for it declares the
+    // artifact in `plugins[]` and the loop above loads it into the identity
+    // chain. The gateway still links the crate — its config types and
+    // discovery-URL safety checks are part of the config schema — but the
+    // runtime plugin it registers steps aside for that signed copy. Unlike a
+    // telemetry sink, a missing identity provider is not a soft failure —
+    // requests would arrive unauthenticated — so a configured OIDC resolver
+    // with no registered provider refuses the boot. This runs after the
+    // `plugins[]` loop so the entry that supplies the provider has already
+    // had its chance to load and register.
+    if oidc_resolver.is_some()
+        && !registry
+            .identity_plugin_ids()
+            .iter()
+            .any(|id| id == crate::runtime::identity::oidc::PLUGIN_ID)
+    {
+        anyhow::bail!(
+            "`access.oauth` configures OIDC identity, but no identity plugin is \
+             registered under {id:?}. It ships as a cdylib: add a `plugins[]` \
+             entry with `source.path`/`source.oci` for it (the gateway images \
+             bake it at /usr/local/lib/mcpg/plugins/{id}/plugin.so). Refusing to \
+             boot rather than serve requests with the configured identity \
+             provider missing.",
+            id = crate::runtime::identity::oidc::PLUGIN_ID,
+        );
+    }
+
     // Install the cluster coordinator. Singleton. Runs AFTER the `plugins[]`
-    // loop so an external coordinator's cdylib (`kind: redis/nats/consul/etcd`)
+    // loop so an external coordinator's cdylib (`kind: redis/nats`)
     // is already registered by the loop above. `kind: single_node` (the
     // default) installs the in-process built-in here; other kinds map to
     // `dev.mcpg.cluster.<kind>` cdylibs that must be declared under `plugins[]`
@@ -1683,7 +1688,7 @@ pub(crate) async fn build_plugin_registry(
         } else {
             anyhow::bail!(
                 "cluster.kind='{kind}' is not recognized. \
-                 Valid kinds: single_node, etcd, consul, nats, redis.",
+                 Valid kinds: single_node, nats, redis.",
                 kind = config.cluster.kind,
             );
         }

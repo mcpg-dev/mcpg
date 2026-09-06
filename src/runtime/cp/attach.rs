@@ -240,6 +240,108 @@ mod attached {
         }
     }
 
+    /// Snapshot source for the agent's periodic `StatusReport` —
+    /// everything it ships is state the process already tracks: the
+    /// plugin registry's load table, the coordinator-health gauge cell
+    /// maintained by the periodic KV probe, and the coordinator's peer
+    /// cache. No new probing happens here.
+    struct GatewayStatusSource {
+        /// Same late-bound cell the config-apply hook shares; until
+        /// `AppState` is bound the snapshot falls back to boot config.
+        state: Arc<ArcSwapOption<crate::app::AppState>>,
+        boot_cluster_kind: String,
+        boot_single_node: bool,
+    }
+
+    /// The coordinator-health cell as a tri-state: `None` until the
+    /// periodic probe has run (single_node / KV-less coordinators never
+    /// probe), then whether the last KV ping was answered.
+    fn cluster_backend_up() -> Option<bool> {
+        use crate::runtime::{CLUSTER_BACKEND_UP, CLUSTER_UP_DOWN, CLUSTER_UP_HEALTHY};
+        match CLUSTER_BACKEND_UP.load(std::sync::atomic::Ordering::Relaxed) {
+            CLUSTER_UP_HEALTHY => Some(true),
+            CLUSTER_UP_DOWN => Some(false),
+            _ => None,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mcpg_control_plane_client::StatusSource for GatewayStatusSource {
+        async fn snapshot(&self) -> mcpg_control_plane_client::StatusSnapshot {
+            use mcpg_control_plane_client::{
+                ClusterStatusSample, PluginStatusSample, StatusSnapshot,
+            };
+
+            let state = self.state.load_full();
+            let (kind, single_node) = match state.as_ref() {
+                Some(s) => {
+                    let cfg = s.config.load();
+                    (cfg.cluster.kind.clone(), cfg.cluster.is_single_node())
+                }
+                None => (self.boot_cluster_kind.clone(), self.boot_single_node),
+            };
+
+            let cluster = if single_node {
+                ClusterStatusSample {
+                    kind,
+                    backend_up: None,
+                    peers: None,
+                }
+            } else {
+                // Peer count from the coordinator's own peer view (a
+                // heartbeat cache or registry scan — cheap, possibly a
+                // tick stale). Empty means the coordinator cannot
+                // enumerate peers (a live one always sees itself), so
+                // report unknown rather than a misleading zero. Bounded:
+                // a wedged coordinator FFI must not wedge the ticker.
+                let mut peers = None;
+                if let Some(s) = state.as_ref() {
+                    let rt = s.runtime.load_full();
+                    if let Some(backend) = rt.plugin_registry().cluster_backend() {
+                        peers = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            backend.list_peers(),
+                        )
+                        .await
+                        .ok()
+                        .map(|p| p.len() as u32)
+                        .filter(|n| *n > 0);
+                    }
+                }
+                ClusterStatusSample {
+                    kind,
+                    backend_up: cluster_backend_up(),
+                    peers,
+                }
+            };
+
+            let plugins = state
+                .as_ref()
+                .map(|s| {
+                    s.runtime
+                        .load()
+                        .plugin_registry()
+                        .loaded_plugins()
+                        .into_iter()
+                        .map(|p| PluginStatusSample {
+                            id: p.id,
+                            version: p.version,
+                            state: p.state,
+                            error: String::new(),
+                            invocations: 0,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            StatusSnapshot {
+                plugins,
+                warnings: Vec::new(),
+                cluster: Some(cluster),
+            }
+        }
+    }
+
     /// Provider that reads the cp-client's lock-free
     /// `ArcSwap<Option<QuotaStatus>>` and translates each load
     /// into the gateway-internal `QuotaStatusInfo`.
@@ -304,9 +406,14 @@ mod attached {
         let config_state: Arc<ArcSwapOption<crate::app::AppState>> =
             Arc::new(ArcSwapOption::empty());
 
-        let runner =
-            AgentRunner::new(agent_cfg).with_config_applier(Arc::new(GatewayConfigApplier {
+        let runner = AgentRunner::new(agent_cfg)
+            .with_config_applier(Arc::new(GatewayConfigApplier {
                 state: config_state.clone(),
+            }))
+            .with_status_source(Arc::new(GatewayStatusSource {
+                state: config_state.clone(),
+                boot_cluster_kind: config.cluster.kind.clone(),
+                boot_single_node: config.cluster.is_single_node(),
             }));
 
         // Wire the CP-pushed quota status provider before

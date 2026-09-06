@@ -197,12 +197,45 @@ pub trait PipelineStore: Send + Sync + std::fmt::Debug {
     /// key) so the caller can tag SSE events with it.
     fn take_pending_deliveries(&self, session_id: &str) -> anyhow::Result<Vec<DeliveryMessage>>;
 
+    /// Like [`Self::take_pending_deliveries`], but MUST consult the backing
+    /// store even when a process-local pending index believes the session has
+    /// nothing buffered. SSE open/reconnect paths use it: the rows a
+    /// reconnecting client is owed may have been stored by another replica,
+    /// which this process's index has never seen. Default: the plain drain
+    /// (an impl without a local index has nothing to bypass).
+    fn take_pending_deliveries_scan(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<DeliveryMessage>> {
+        self.take_pending_deliveries(session_id)
+    }
+
     /// Delete a single buffered delivery by its id WITHOUT draining the rest.
     /// Used by the reconnect ack-prune: when a client reconnects echoing a
     /// delivery-tagged `Last-Event-Id`, the row it already received is removed
     /// so the later drain does not replay it. Idempotent — a
     /// missing key is a no-op.
     fn delete_delivery(&self, session_id: &str, delivery_id: &str) -> anyhow::Result<()>;
+
+    /// Prune everything the client has proven it received by echoing a
+    /// delivery-tagged `Last-Event-Id`: the acknowledged row and every row
+    /// with a lower sequence. Deliveries stream to a session's SSE channel in
+    /// sequence order, so acknowledging one acknowledges its whole prefix.
+    ///
+    /// The prefix is pruned only while the acknowledged row itself is still
+    /// present: the per-session sequence counter outlives every row it
+    /// numbered, so a missing acked row means the ack predates the current
+    /// numbering epoch — a numerically-lower live row would then be a NEWER
+    /// delivery that must not be dropped. Idempotent and best-effort.
+    /// Default: exact-row delete only (an impl without ordered sequences has
+    /// no prefix to reason about).
+    fn ack_prune_deliveries(
+        &self,
+        session_id: &str,
+        acked_delivery_id: &str,
+    ) -> anyhow::Result<()> {
+        self.delete_delivery(session_id, acked_delivery_id)
+    }
 
     /// List pipeline IDs that have exceeded their timeout.
     fn list_expired_pipelines(&self) -> anyhow::Result<Vec<String>>;
@@ -229,7 +262,16 @@ pub trait PipelineStore: Send + Sync + std::fmt::Debug {
     ) -> anyhow::Result<Option<PipelineExecutionState>>;
 }
 
-// --- In-Memory Implementation ---
+/// Sequence component of a delivery id (`{seq:020}-{uuid}`): the zero-padded
+/// 20-digit prefix, parsed. `None` for any other shape, so callers fall back
+/// to exact-id handling rather than mis-ordering an unrecognized id.
+pub(crate) fn delivery_seq_of(delivery_id: &str) -> Option<i64> {
+    let (seq, _uuid) = delivery_id.split_once('-')?;
+    if seq.len() != 20 {
+        return None;
+    }
+    seq.parse().ok()
+}
 
 // ===========================================================================
 // KvBackedPipelineStore — single impl over the orthogonal KvState primitive
@@ -260,11 +302,6 @@ pub struct KvBackedPipelineStore {
     /// pipeline that is itself still alive.
     delivery_ttl: std::time::Duration,
     pending_request_ttl: std::time::Duration,
-    /// Monotonic counter for delivery-id ordering. Pre-pended to the
-    /// random UUID part so `list_prefix` returns deliveries in
-    /// insertion order even when bursts arrive within the same
-    /// millisecond.
-    delivery_seq: std::sync::atomic::AtomicU64,
     /// In-memory index of sessions that currently hold >=1 buffered delivery.
     /// Lets the response hot path skip the blocking `list_prefix` KV scan (a
     /// `block_in_place` that parks a tokio worker) for the overwhelmingly
@@ -311,7 +348,6 @@ impl KvBackedPipelineStore {
             // produced it.
             delivery_ttl: std::time::Duration::from_secs(300),
             pending_request_ttl: std::time::Duration::from_secs(300),
-            delivery_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -342,6 +378,13 @@ impl KvBackedPipelineStore {
     fn delivery_session_prefix(session_id: &str) -> String {
         format!("delivery:{session_id}:")
     }
+    /// Per-session atomic sequence counter behind every delivery id.
+    /// Deliberately OUTSIDE the `delivery:` namespace so backlog listings
+    /// (drains, the boot-time pending-index hydrate) never decode it as a
+    /// row.
+    fn delivery_seq_key(session_id: &str) -> String {
+        format!("delivery-seq:{session_id}")
+    }
 
     fn block<F, T>(fut: F) -> T
     where
@@ -354,6 +397,39 @@ impl KvBackedPipelineStore {
             }
             _ => futures::executor::block_on(fut),
         }
+    }
+
+    /// Shared drain body for the gated / scan `take_pending_deliveries`
+    /// variants: read, decode, delete and return the session's buffered
+    /// deliveries in sequence order.
+    fn drain_pending_deliveries(&self, session_id: &str) -> anyhow::Result<Vec<DeliveryMessage>> {
+        let prefix = Self::delivery_session_prefix(session_id);
+        Self::block(async {
+            // Sort by key — `store_pending_delivery` prefixes the
+            // delivery id with a monotonic sequence so lex sort
+            // recovers delivery order. `list_prefix` itself does
+            // not promise an order (e.g. DashMap-backed `MemoryKv`
+            // iterates by shard).
+            let mut entries = self.state.list_prefix(&prefix, 1024).await?;
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let mut messages = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                let mut msg: DeliveryMessage = match serde_json::from_slice(&value.bytes) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                // Re-stamp the delivery id from the KV key so the SSE event
+                // built from a drained backlog row carries the same id a live
+                // delivery would — a reconnect can then ack/prune it.
+                if let Some(delivery_id) = key.strip_prefix(&prefix) {
+                    msg.delivery_id = delivery_id.to_owned();
+                }
+                messages.push(msg);
+                let _ = self.state.delete(&key).await;
+            }
+            Ok::<Vec<DeliveryMessage>, mcpg_cluster_api::ClusterError>(messages)
+        })
+        .map_err(|e| anyhow::anyhow!("kv take_pending_deliveries: {e}"))
     }
 }
 
@@ -509,21 +585,32 @@ impl PipelineStore for KvBackedPipelineStore {
         session_id: &str,
         message: &DeliveryMessage,
     ) -> anyhow::Result<String> {
-        // Prefix the delivery id with a per-store monotonic 20-digit
-        // sequence so `list_prefix` returns deliveries in insertion
-        // order. UUIDs alone sort randomly; a wall-clock timestamp
-        // collides on same-millisecond bursts. The trailing UUID
-        // keeps ids globally unique across replicas.
-        let seq = self
-            .delivery_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let delivery_id = format!("{seq:020}-{}", uuid::Uuid::new_v4());
+        // Prefix the delivery id with a coordinator-monotonic 20-digit
+        // per-session sequence so `list_prefix` returns a session's
+        // deliveries in delivery order on EVERY replica — the atomic
+        // `incr` makes interleaved stores from different replicas
+        // globally ordered, which is what lets any replica serve a
+        // `Last-Event-Id` replay. UUIDs alone sort randomly; a
+        // wall-clock timestamp collides on same-millisecond bursts.
+        // The trailing UUID keeps ids globally unique.
+        //
+        // The counter shares the delivery TTL and slides on every store,
+        // so it outlives every row it numbered: a reborn (restarted)
+        // counter can only be observed once no rows from the previous
+        // numbering remain. `ack_prune_deliveries` leans on that.
         let bytes = serde_json::to_vec(message)?;
-        let key = Self::delivery_key(session_id, &delivery_id);
-        Self::block(async {
+        let seq_key = Self::delivery_seq_key(session_id);
+        let delivery_id = Self::block(async {
+            let seq = self
+                .state
+                .incr(&seq_key, 1, Some(self.delivery_ttl))
+                .await?;
+            let delivery_id = format!("{seq:020}-{}", uuid::Uuid::new_v4());
+            let key = Self::delivery_key(session_id, &delivery_id);
             self.state
                 .put(&key, bytes::Bytes::from(bytes), Some(self.delivery_ttl))
-                .await
+                .await?;
+            Ok::<String, mcpg_cluster_api::ClusterError>(delivery_id)
         })
         .map_err(|e| anyhow::anyhow!("kv store_pending_delivery: {e}"))?;
         // Mark AFTER the put is durable so the index never claims a delivery
@@ -537,37 +624,24 @@ impl PipelineStore for KvBackedPipelineStore {
         // `block_in_place`) when this session has no buffered deliveries — the
         // common case on the tools/call hot path. Removing before the scan
         // keeps a concurrent `store_pending_delivery` (which re-inserts) from
-        // being dropped.
+        // being dropped. The gate only sees rows THIS process stored (or
+        // hydrated at boot); SSE (re)connect paths use the `_scan` variant,
+        // which never trusts it.
         if self.sessions_with_pending.remove(session_id).is_none() {
             return Ok(Vec::new());
         }
-        let prefix = Self::delivery_session_prefix(session_id);
-        Self::block(async {
-            // Sort by key — `store_pending_delivery` prefixes the
-            // delivery id with a monotonic sequence so lex sort
-            // recovers insertion order. `list_prefix` itself does
-            // not promise an order (e.g. DashMap-backed `MemoryKv`
-            // iterates by shard).
-            let mut entries = self.state.list_prefix(&prefix, 1024).await?;
-            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-            let mut messages = Vec::with_capacity(entries.len());
-            for (key, value) in entries {
-                let mut msg: DeliveryMessage = match serde_json::from_slice(&value.bytes) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                // Re-stamp the delivery id from the KV key so the SSE event
-                // built from a drained backlog row carries the same id a live
-                // delivery would — a reconnect can then ack/prune it.
-                if let Some(delivery_id) = key.strip_prefix(&prefix) {
-                    msg.delivery_id = delivery_id.to_owned();
-                }
-                messages.push(msg);
-                let _ = self.state.delete(&key).await;
-            }
-            Ok::<Vec<DeliveryMessage>, mcpg_cluster_api::ClusterError>(messages)
-        })
-        .map_err(|e| anyhow::anyhow!("kv take_pending_deliveries: {e}"))
+        self.drain_pending_deliveries(session_id)
+    }
+
+    fn take_pending_deliveries_scan(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<DeliveryMessage>> {
+        // Remove-first like the gated path (a concurrent store re-inserts),
+        // but never let the index veto the scan: a reconnect may land on a
+        // replica whose index has never seen the rows another replica stored.
+        self.sessions_with_pending.remove(session_id);
+        self.drain_pending_deliveries(session_id)
     }
 
     fn delete_delivery(&self, session_id: &str, delivery_id: &str) -> anyhow::Result<()> {
@@ -578,6 +652,47 @@ impl PipelineStore for KvBackedPipelineStore {
         Self::block(async { self.state.delete(&key).await })
             .map_err(|e| anyhow::anyhow!("kv delete_delivery: {e}"))?;
         Ok(())
+    }
+
+    fn ack_prune_deliveries(
+        &self,
+        session_id: &str,
+        acked_delivery_id: &str,
+    ) -> anyhow::Result<()> {
+        if acked_delivery_id.is_empty() {
+            return Ok(());
+        }
+        // An id without the `{seq:020}-` shape carries no ordering to reason
+        // about — fall back to the exact-row delete.
+        let Some(acked_seq) = delivery_seq_of(acked_delivery_id) else {
+            return self.delete_delivery(session_id, acked_delivery_id);
+        };
+        let acked_key = Self::delivery_key(session_id, acked_delivery_id);
+        let prefix = Self::delivery_session_prefix(session_id);
+        Self::block(async {
+            // Epoch guard: prune the prefix only when the acked row itself
+            // was still present. The seq counter outlives every row it
+            // numbered, so an absent acked row means the ack predates the
+            // current numbering epoch — a numerically-lower live row is then
+            // NEWER than the ack and must survive. (Within one epoch an
+            // absent acked row also implies the rows below it are already
+            // gone: expiry, drains and this prune all remove seq-prefixes.)
+            if !self.state.delete(&acked_key).await? {
+                return Ok(());
+            }
+            let entries = self.state.list_prefix(&prefix, 1024).await?;
+            for (key, _) in entries {
+                let below_ack = key
+                    .strip_prefix(&prefix)
+                    .and_then(delivery_seq_of)
+                    .is_some_and(|seq| seq < acked_seq);
+                if below_ack {
+                    let _ = self.state.delete(&key).await;
+                }
+            }
+            Ok::<(), mcpg_cluster_api::ClusterError>(())
+        })
+        .map_err(|e| anyhow::anyhow!("kv ack_prune_deliveries: {e}"))
     }
 
     fn list_expired_pipelines(&self) -> anyhow::Result<Vec<String>> {
@@ -927,6 +1042,183 @@ mod tests {
         store
             .delete_delivery("sess-1", "00000000000000000000-deadbeef")
             .unwrap();
+    }
+
+    fn delivery(kind: DeliveryKind, marker: u64) -> DeliveryMessage {
+        DeliveryMessage {
+            kind,
+            jsonrpc_message: serde_json::json!({"jsonrpc":"2.0","id":marker,"result":{}}),
+            delivery_id: String::new(),
+        }
+    }
+
+    /// Two stores sharing one coordinator KV = two replicas.
+    fn replica_pair() -> (KvBackedPipelineStore, KvBackedPipelineStore) {
+        let shared: std::sync::Arc<dyn mcpg_cluster_api::KeyValueStore> =
+            std::sync::Arc::new(crate::builtins::cluster_primitives::MemoryKv::new());
+        (
+            KvBackedPipelineStore::new(std::sync::Arc::clone(&shared)),
+            KvBackedPipelineStore::new(shared),
+        )
+    }
+
+    #[test]
+    fn delivery_seq_of_parses_only_the_canonical_shape() {
+        assert_eq!(
+            delivery_seq_of("00000000000000000007-abc-def"),
+            Some(7),
+            "the seq is the 20-digit prefix; the uuid may itself contain dashes"
+        );
+        // Not 20 digits, no separator, or non-numeric: no ordering claim.
+        assert_eq!(delivery_seq_of("7-abc"), None);
+        assert_eq!(delivery_seq_of("no-seq-here"), None);
+        assert_eq!(delivery_seq_of("0000000000000000000x-abc"), None);
+        assert_eq!(delivery_seq_of("plainid"), None);
+    }
+
+    #[test]
+    fn delivery_seqs_are_coordinator_monotonic_across_replicas() {
+        // Interleaved stores from two replicas sharing one coordinator KV
+        // must mint globally increasing per-session sequences, so the
+        // key-sorted drain recovers true delivery order on ANY replica.
+        let (a, b) = replica_pair();
+        let mut ids = Vec::new();
+        for marker in 0..6u64 {
+            let store = if marker % 2 == 0 { &a } else { &b };
+            ids.push(
+                store
+                    .store_pending_delivery("sess-x", &delivery(DeliveryKind::Notification, marker))
+                    .unwrap(),
+            );
+        }
+        let seqs: Vec<i64> = ids.iter().map(|id| delivery_seq_of(id).unwrap()).collect();
+        assert!(
+            seqs.windows(2).all(|w| w[0] < w[1]),
+            "sequences must be strictly increasing in store order: {seqs:?}"
+        );
+        // Either replica's drain reads the shared KV and returns all six in
+        // store order.
+        let drained = b.take_pending_deliveries_scan("sess-x").unwrap();
+        let markers: Vec<u64> = drained
+            .iter()
+            .map(|m| m.jsonrpc_message["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(markers, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn scan_drain_finds_rows_stored_by_another_replica() {
+        let (a, b) = replica_pair();
+        a.store_pending_delivery("sess-x", &delivery(DeliveryKind::DeferredToolResult, 1))
+            .unwrap();
+        // The gated drain trusts the process-local pending index, which on B
+        // never saw the store — that is the hot-path optimization the scan
+        // variant exists to bypass.
+        assert!(b.take_pending_deliveries("sess-x").unwrap().is_empty());
+        let via_scan = b.take_pending_deliveries_scan("sess-x").unwrap();
+        assert_eq!(via_scan.len(), 1);
+        assert_eq!(via_scan[0].jsonrpc_message["id"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn ack_prune_drops_acked_prefix_and_drain_returns_exact_suffix() {
+        // Deliveries interleaved across replicas; the client acks the second
+        // one from a replica that minted neither. The acked row AND the row
+        // before it go; the drain then replays exactly the missed suffix, in
+        // order.
+        let (a, b) = replica_pair();
+        let _d1 = a
+            .store_pending_delivery("sess-x", &delivery(DeliveryKind::ServerRequest, 1))
+            .unwrap();
+        let d2 = b
+            .store_pending_delivery("sess-x", &delivery(DeliveryKind::DeferredToolResult, 2))
+            .unwrap();
+        let _d3 = a
+            .store_pending_delivery("sess-x", &delivery(DeliveryKind::Notification, 3))
+            .unwrap();
+        let _d4 = b
+            .store_pending_delivery("sess-x", &delivery(DeliveryKind::PipelineError, 4))
+            .unwrap();
+
+        b.ack_prune_deliveries("sess-x", &d2).unwrap();
+
+        let drained = b.take_pending_deliveries_scan("sess-x").unwrap();
+        let markers: Vec<u64> = drained
+            .iter()
+            .map(|m| m.jsonrpc_message["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(markers, vec![3, 4], "exactly the suffix after the ack");
+        // The pruned prefix is gone for good — a re-drain resurrects nothing.
+        assert!(b.take_pending_deliveries_scan("sess-x").unwrap().is_empty());
+    }
+
+    #[test]
+    fn ack_prune_without_the_acked_row_prunes_nothing() {
+        // Epoch guard: an ack whose row is gone may predate the current
+        // numbering epoch (the per-session counter expired and restarted), in
+        // which case numerically-lower rows are NEWER deliveries. The prune
+        // must refuse to touch them.
+        let store = KvBackedPipelineStore::new_in_memory();
+        store
+            .store_pending_delivery("sess-x", &delivery(DeliveryKind::ServerRequest, 1))
+            .unwrap();
+        store
+            .store_pending_delivery("sess-x", &delivery(DeliveryKind::Notification, 2))
+            .unwrap();
+        // A high-seq ack from a previous epoch; its row does not exist.
+        store
+            .ack_prune_deliveries("sess-x", "00000000000000009999-stale")
+            .unwrap();
+        assert_eq!(store.take_pending_deliveries("sess-x").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ack_prune_with_unrecognized_id_shape_deletes_only_that_row() {
+        // An id without the `{seq:020}-` shape carries no ordering claim —
+        // the prune degrades to the exact-row delete.
+        let store = KvBackedPipelineStore::new_in_memory();
+        let kept = store
+            .store_pending_delivery("sess-x", &delivery(DeliveryKind::ServerRequest, 1))
+            .unwrap();
+        let odd_id = "legacyshape";
+        let msg = delivery(DeliveryKind::Notification, 2);
+        futures::executor::block_on(store.state.put(
+            &KvBackedPipelineStore::delivery_key("sess-x", odd_id),
+            bytes::Bytes::from(serde_json::to_vec(&msg).unwrap()),
+            None,
+        ))
+        .unwrap();
+
+        store.ack_prune_deliveries("sess-x", odd_id).unwrap();
+
+        let drained = store.take_pending_deliveries("sess-x").unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].delivery_id, kept);
+    }
+
+    #[test]
+    fn single_store_delivery_ids_sort_in_insertion_order() {
+        // The default (single_node / in-memory) path keeps its ordering
+        // contract: ids sort lexicographically in insertion order, and the
+        // drain returns them that way.
+        let store = KvBackedPipelineStore::new_in_memory();
+        let mut ids = Vec::new();
+        for marker in 0..4u64 {
+            ids.push(
+                store
+                    .store_pending_delivery("sess-1", &delivery(DeliveryKind::Notification, marker))
+                    .unwrap(),
+            );
+        }
+        let mut sorted = ids.clone();
+        sorted.sort();
+        assert_eq!(ids, sorted);
+        let drained = store.take_pending_deliveries("sess-1").unwrap();
+        let markers: Vec<u64> = drained
+            .iter()
+            .map(|m| m.jsonrpc_message["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(markers, vec![0, 1, 2, 3]);
     }
 
     #[test]

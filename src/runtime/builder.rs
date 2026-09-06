@@ -1064,19 +1064,36 @@ impl GatewayRuntime {
             // `synthesize` config.
             let probe_registry = Arc::clone(&capability_registry);
             let probe_dispatcher = Arc::clone(&execution_dispatcher);
+            // Watch configs for `resource_templates[]` entries, keyed by
+            // binding name (the `profile` a Template route carries). The
+            // static `build_watch_configs` above maps only exact-URI
+            // `resources:`, so a template-matched subscribe resolves its
+            // config lazily here on first match.
+            let template_watch_configs =
+                crate::runtime::util::build_template_watch_configs(binding_configs);
             let watch_probe: watch_engine::WatchProbe = Arc::new(move |uri: &str| {
-                let route = probe_registry.resource_route(uri)?;
-                let crate::backends::ResourceRoute::Federated { source, .. } = route else {
-                    return None;
-                };
-                let engine = probe_dispatcher.federation_engine()?;
-                let interval_ms = engine.synthesized_poll_interval_ms(&source)?;
-                Some(watch_engine::WatchConfig {
-                    uri: uri.to_owned(),
-                    strategy: watch_engine::WatchStrategy::Poll { interval_ms },
-                    notification_filter: None,
-                    compiled_filter_program: None,
-                })
+                match probe_registry.resource_route(uri)? {
+                    // A federated resource whose upstream cannot push updates
+                    // gets a synthesized poll watcher per the federation config.
+                    crate::backends::ResourceRoute::Federated { source, .. } => {
+                        let engine = probe_dispatcher.federation_engine()?;
+                        let interval_ms = engine.synthesized_poll_interval_ms(&source)?;
+                        Some(watch_engine::WatchConfig {
+                            uri: uri.to_owned(),
+                            strategy: watch_engine::WatchStrategy::Poll { interval_ms },
+                            notification_filter: None,
+                            compiled_filter_program: None,
+                        })
+                    }
+                    // A subscribe on a URI matching a `resource_templates[]`
+                    // entry that declares `watch:` — synthesize the concrete-URI
+                    // config from the template binding's declared strategy.
+                    crate::backends::ResourceRoute::Template { profile, .. } => {
+                        let watch = template_watch_configs.get(&profile)?;
+                        Some(crate::runtime::util::watch_config_for(watch, uri))
+                    }
+                    _ => None,
+                }
             });
             watch_engine::WatchEngine::start_with_plugins(
                 watch_configs,

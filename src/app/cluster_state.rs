@@ -52,6 +52,23 @@ pub(crate) fn cross_check_cluster_provides(
             );
         }
     }
+    // Advisory, not fail-closed: a `bus` role backed by a payload-capped
+    // transport still serves small messages, but a delivery-bus terminal
+    // result routinely exceeds the cap and fails per-publish at runtime —
+    // say so once at boot instead.
+    if live.contains("bus") {
+        let profile = crate::config::wiring::cluster_bus_profile_for_kind(cluster_kind);
+        if let Some(cap) = profile.max_payload_bytes {
+            tracing::warn!(
+                cluster_kind,
+                max_payload_bytes = cap,
+                "cluster coordinator `bus` role has a declared per-message payload cap — \
+                 bus messages above it fail at publish time; delivery-bus terminal \
+                 results typically exceed it (prefer a capless bus backend for legacy \
+                 delivery/resume traffic)"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -362,8 +379,8 @@ pub(crate) fn default_capability_kv(
             return kv;
         }
         // Silent de-clustering guard: a coordinator IS installed
-        // but exposes no key_value_store (consul/etcd never do; redis/nats
-        // when unreachable at boot). With no per-capability `store:`
+        // but exposes no key_value_store (redis/nats when unreachable
+        // at boot). With no per-capability `store:`
         // override, this capability silently falls back to in-process
         // MemoryKv — per-replica state with green readiness. WARN loudly so
         // a multi-replica operator sees the de-clustering rather than
@@ -407,8 +424,8 @@ pub(crate) fn default_capability_bus(
             return bus;
         }
         // Silent de-clustering guard: a coordinator IS installed
-        // but exposes no pub_sub (consul/etcd never do; redis exposes one,
-        // nats when reachable). With no `<capability>.bus:` override the
+        // but exposes no pub_sub (redis exposes one, nats when
+        // reachable). With no `<capability>.bus:` override the
         // bus silently falls back to an in-process MemoryBus — so
         // server→client delivery / cancellation / approval fan-out stays
         // per-replica. WARN loudly.

@@ -183,6 +183,45 @@ impl KeyValueStore for StoreToKvAdapter {
             .map_err(map_store_error)?;
         Ok(true)
     }
+
+    async fn incr(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        // CAVEAT — NOT atomic, same gap as `put_if_absent` above: the
+        // plugin `Store` FFI trait has no conditional/arithmetic op, so
+        // this bridge emulates via get-then-put. Correct for callers that
+        // already serialize their own increments in-process (the quota
+        // gate holds a per-key mutex around this call); two replicas
+        // pointing a counter at a plugin-`Store` override CAN lose
+        // updates. For cross-replica-atomic counting, point the
+        // capability at the coordinator KV (`kind: cluster`).
+        let existing = self
+            .store
+            .get(self.role.clone(), key)
+            .await
+            .map_err(map_store_error)?;
+        let current = match &existing {
+            Some(v) => mcpg_cluster_api::parse_counter(&v.bytes)?,
+            None => 0,
+        };
+        let next = current
+            .checked_add(delta)
+            .ok_or_else(mcpg_cluster_api::counter_overflow)?;
+        let mut sv = StoreValue::new(Bytes::from(next.to_string()));
+        // ttl=None keeps the entry's remaining TTL (best-effort — the
+        // Store surface exposes only a remaining duration to re-arm).
+        if let Some(ttl) = ttl.or(existing.and_then(|v| v.ttl)) {
+            sv = sv.with_ttl(ttl);
+        }
+        self.store
+            .put(self.role.clone(), key, sv)
+            .await
+            .map_err(map_store_error)?;
+        Ok(next)
+    }
 }
 
 fn store_value_to_entry(value: StoreValue) -> Entry {

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// ```yaml
 /// cluster:
-///   kind: redis              # single_node | etcd | consul | nats | redis
+///   kind: redis              # single_node | nats | redis
 ///   url: ${env.REDIS_URL}   # rest of the fields are kind-specific
 ///   key_prefix: "mcpg:cluster:"
 /// ```
@@ -38,30 +38,37 @@ pub struct ClusterConfig {
     pub kind: String,
     /// Permit a plaintext (non-TLS) coordinator transport for a
     /// non-`single_node` coordinator. Defaults to `false`:
-    /// `validate()` refuses a plaintext redis/consul/etcd/nats
+    /// `validate()` refuses a plaintext redis/nats
     /// coordinator at boot, because the coordinator carries all shared
     /// state (sessions, credentials, delivery) in clear. Set `true`
     /// ONLY for local/dev/CI. Gateway-only — NOT forwarded to the
     /// plugin (it is a named field, so serde keeps it out of `config`).
     #[serde(default)]
     pub allow_insecure_transport: bool,
-    /// Whether coordinator health gates `/ready`. Defaults to
-    /// `off` (fail-open): a coordinator outage
-    /// is surfaced only via the `mcpg_cluster_backend_up` gauge + its
-    /// alert, never on readiness. `degrade` adds an informational
-    /// not-ready *check* to the readiness body but keeps `/ready` green
-    /// (no LB flapping). `fail` makes `/ready` return not-ready while the
-    /// coordinator is unreachable (fail-closed). Gateway-only named field
-    /// — kept out of the flattened plugin `config`.
-    #[serde(default)]
-    pub readiness_gate: ClusterReadinessGate,
-    /// Opt-in application-layer AEAD (XChaCha20-Poly1305) of ALL
+    /// Whether coordinator health gates `/ready`. Unset means a
+    /// kind-dependent default: `off` for `kind: single_node`, `degrade`
+    /// for every other kind; an explicitly configured value always wins.
+    /// `off` is fail-open: a coordinator outage is surfaced only via the
+    /// `mcpg_cluster_backend_up` gauge + its alert, never on readiness.
+    /// `degrade` adds an informational not-ready *check* to the readiness
+    /// body but keeps `/ready` green (no LB flapping). `fail` makes
+    /// `/ready` return not-ready while the coordinator is unreachable
+    /// (fail-closed). Gateway-only named field — kept out of the
+    /// flattened plugin `config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_gate: Option<ClusterReadinessGate>,
+    /// Application-layer AEAD (XChaCha20-Poly1305) of ALL
     /// coordinator-backed *capability* state — sessions (incl. SSE replay),
     /// delivery, cancellation, tasks, pipelines, idempotency, request-state,
-    /// subscriptions, quota, and the approvals backstop. Names the
+    /// subscriptions, quota, and the approvals backstop — and the derivation
+    /// source for the cross-replica modern-session resume key. Names the
     /// **env var** holding a URL-safe-base64 32-byte key (the key itself
-    /// never sits in the config artifact). Unset = plaintext serde on the
-    /// wire/at-rest; confidentiality then rests on the transport guard.
+    /// never sits in the config artifact); generate one with
+    /// `openssl rand -base64 32 | tr '+/' '-_'`. Required for every
+    /// non-`single_node` kind: `validate()` refuses a clustered coordinator
+    /// without it unless `allow_plaintext_state: true`. Unset (single_node,
+    /// or via the escape hatch) = plaintext serde on the wire/at-rest;
+    /// confidentiality then rests on the transport guard.
     /// Values are sealed per-key/per-topic
     /// (swap-resistant); keys/topics stay cleartext for routing. Does NOT
     /// cover the credential cache — it has its own
@@ -69,6 +76,18 @@ pub struct ClusterConfig {
     /// field — kept out of the flattened plugin `config`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_encryption_key_env: Option<String>,
+    /// Permit a clustered (non-`single_node`) coordinator WITHOUT
+    /// `state_encryption_key_env`. Defaults to `false`: `validate()`
+    /// refuses to boot clustered without a state key, because the
+    /// coordinator would hold session/pipeline/credential-adjacent
+    /// state in plaintext and cross-replica modern-session resume
+    /// (whose key derives from the same material) stays off. Set
+    /// `true` ONLY as a migration escape hatch — boot then logs a
+    /// loud warning naming the degraded surfaces. Inert for
+    /// `single_node`. Gateway-only named field — kept out of the
+    /// flattened plugin `config`.
+    #[serde(default)]
+    pub allow_plaintext_state: bool,
     /// Key id (kid) stamped on state envelopes for rotation visibility.
     /// Defaults to `mcpg-cluster-state` when a key is configured. Inert
     /// without `state_encryption_key_env`. Gateway-only named field.
@@ -101,7 +120,7 @@ pub struct ClusterConfig {
     /// `t.<segment>/` (keys) / `t.<segment>.` (topics) so a single
     /// coordinator namespace can be fenced per-tenant by broker-native
     /// ACLs — NATS subject perms `t.<segment>.>`, redis key-pattern ACLs
-    /// (`~…t.<segment>/*`), consul/etcd path ACLs. Unset = today's flat,
+    /// (`~…t.<segment>/*`). Unset = today's flat,
     /// un-prefixed keys/topics (one coordinator namespace == one trust
     /// domain). This is a **deployment-level** label, not a per-request
     /// tenant — the gateway process serves one tenant segment; the runtime
@@ -118,17 +137,22 @@ pub struct ClusterConfig {
     pub config: serde_json::Map<String, serde_json::Value>,
 }
 
-/// How coordinator health affects `/ready`.
+/// How coordinator health affects `/ready`. When `cluster.readiness_gate`
+/// is unset the effective value is kind-dependent — `off` for
+/// `single_node`, `degrade` for every other kind
+/// ([`ClusterConfig::effective_readiness_gate`]).
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ClusterReadinessGate {
-    /// Coordinator health never affects `/ready` (fail-open). Default.
+    /// Coordinator health never affects `/ready` (fail-open). The
+    /// default for `kind: single_node`.
     #[default]
     Off,
     /// Surface a not-ready *check* in the readiness body when the
     /// coordinator is down, but keep the overall `/ready` status green.
+    /// The default for every clustered (non-`single_node`) kind.
     Degrade,
     /// `/ready` returns not-ready while the coordinator is unreachable.
     Fail,
@@ -139,8 +163,9 @@ impl Default for ClusterConfig {
         Self {
             kind: default_cluster_kind(),
             allow_insecure_transport: false,
-            readiness_gate: ClusterReadinessGate::Off,
+            readiness_gate: None,
             allow_degraded_boot: false,
+            allow_plaintext_state: false,
             state_encryption_key_env: None,
             state_encryption_key_id: None,
             state_encryption_allow_plaintext_reads: false,
@@ -173,6 +198,78 @@ impl ClusterConfig {
         self.kind == "single_node"
     }
 
+    /// Effective `/ready` gate: the configured `readiness_gate` when set,
+    /// else the kind-dependent default — `off` for `single_node` (the
+    /// coordinator is in-process, there is nothing to probe), `degrade`
+    /// for every clustered kind (a coordinator outage surfaces as a
+    /// not-ready check in the readiness body while `/ready` stays green).
+    pub fn effective_readiness_gate(&self) -> ClusterReadinessGate {
+        self.readiness_gate.unwrap_or(if self.is_single_node() {
+            ClusterReadinessGate::Off
+        } else {
+            ClusterReadinessGate::Degrade
+        })
+    }
+
+    /// Refuse a clustered (non-`single_node`) coordinator without a
+    /// state-encryption key, unless the operator explicitly opted in via
+    /// `allow_plaintext_state: true` (which downgrades the hard failure
+    /// to a loud warning). Without the key the coordinator holds every
+    /// capability's state — sessions (incl. SSE replay), pipelines,
+    /// tasks, delivery, cancellation, idempotency, request-state,
+    /// subscriptions, quota, approvals — in plaintext, and cross-replica
+    /// modern-session resume stays off (its key derives from the same
+    /// material).
+    ///
+    /// Runs in `AppConfig::validate()` so the misconfiguration fails at
+    /// pre-flight (`mcpg config check`) and at boot, before any
+    /// coordinator connection. Only the config *field* is checked here;
+    /// the named env var is read at key-load time, where an unset/empty
+    /// or malformed value keeps its own hard error.
+    pub fn validate_state_encryption(&self) -> anyhow::Result<()> {
+        if self.is_single_node() || self.state_encryption_key_env.is_some() {
+            return Ok(());
+        }
+        if self.allow_plaintext_state {
+            self.warn_if_plaintext_state();
+            return Ok(());
+        }
+        anyhow::bail!(
+            "cluster.kind='{}' requires cluster.state_encryption_key_env — without it the \
+             coordinator holds session/pipeline/credential-adjacent state in plaintext and \
+             cross-replica modern-session resume stays off; set it to the name of an env var \
+             holding a URL-safe-base64 32-byte key (generate one: `openssl rand -base64 32 | \
+             tr '+/' '-_'`), or set `cluster.allow_plaintext_state: true` to accept the \
+             degraded posture (not recommended).",
+            self.kind,
+        );
+    }
+
+    /// Emit the loud plaintext-state warning for a clustered coordinator
+    /// running under the `allow_plaintext_state` escape hatch; no-op
+    /// otherwise. Called from `validate_state_encryption` (covers reload
+    /// and any validation with a live subscriber) and again from boot —
+    /// config validation runs before the tracing subscriber is
+    /// installed, so the validation-time copy is dropped at boot.
+    pub fn warn_if_plaintext_state(&self) {
+        if self.is_single_node()
+            || self.state_encryption_key_env.is_some()
+            || !self.allow_plaintext_state
+        {
+            return;
+        }
+        tracing::warn!(
+            cluster_kind = %self.kind,
+            "cluster.allow_plaintext_state=true — running clustered WITHOUT a \
+             state-encryption key: all coordinator-backed capability state (sessions \
+             incl. SSE replay, pipelines, tasks, delivery, cancellation, idempotency, \
+             request-state, subscriptions, quota, approvals) is stored and published \
+             in PLAINTEXT on the coordinator, and cross-replica modern-session resume \
+             stays OFF (its key derives from cluster.state_encryption_key_env). Set \
+             cluster.state_encryption_key_env and remove allow_plaintext_state."
+        );
+    }
+
     /// Refuse a plaintext coordinator transport for a non-`single_node`
     /// coordinator unless the operator explicitly opted in via
     /// `allow_insecure_transport: true`. The coordinator carries
@@ -181,8 +278,6 @@ impl ClusterConfig {
     /// Per-kind "plaintext" definition (scheme tests trim leading
     /// whitespace to match the plugins):
     /// - redis: `url` uses the `redis://` (not `rediss://`) scheme;
-    /// - consul: `address` uses `http://` (not `https://`);
-    /// - etcd: any `endpoint` is not an `https://` URL — a plaintext `http://` or a scheme-less `host:port` endpoint (which etcd-client connects in clear);
     /// - nats: `tls.require_tls` is explicitly `false` (the nats plugin otherwise requires TLS by default, and a `nats://` URL can still negotiate TLS on the port).
     ///
     /// Error messages never echo the URL (it may carry credentials).
@@ -200,8 +295,8 @@ impl ClusterConfig {
             return Ok(());
         }
         // Scheme tests trim leading whitespace so the gateway classifies a
-        // value identically to the coordinator plugins (etcd trims; a bare
-        // `" http://…"` must not slip past the guard while the plugin still
+        // value identically to the coordinator plugins (redis trims; a bare
+        // `" redis://…"` must not slip past the guard while the plugin still
         // connects plaintext).
         let plaintext: Option<&str> = match self.kind.as_str() {
             "redis" => self
@@ -210,32 +305,6 @@ impl ClusterConfig {
                 .and_then(|v| v.as_str())
                 .filter(|u| u.trim_start().starts_with("redis://"))
                 .map(|_| "the redis `url` uses the plaintext `redis://` scheme (use `rediss://`)"),
-            "consul" => self
-                .config
-                .get("address")
-                .and_then(|v| v.as_str())
-                .filter(|a| a.trim_start().starts_with("http://"))
-                .map(
-                    |_| "the consul `address` uses the plaintext `http://` scheme (use `https://`)",
-                ),
-            // etcd is fail-closed on scheme: anything that is not provably
-            // `https://` is treated as plaintext. A scheme-LESS endpoint
-            // (`etcd:2379`) is accepted by etcd-client and connects over
-            // plaintext HTTP, so "not https://" — not merely "starts with
-            // http://" — is the correct plaintext test here.
-            "etcd" => self
-                .config
-                .get("endpoints")
-                .and_then(|v| v.as_array())
-                .filter(|eps| {
-                    eps.iter()
-                        .filter_map(|e| e.as_str())
-                        .any(|e| !e.trim_start().starts_with("https://"))
-                })
-                .map(|_| {
-                    "an etcd `endpoint` is not an `https://` URL (a plaintext `http://` or \
-                     scheme-less `host:port` endpoint connects in clear; use `https://`)"
-                }),
             "nats" => self
                 .config
                 .get("tls")

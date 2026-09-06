@@ -1,4 +1,4 @@
-//! In-process `KeyValueStore` + `PubSub` + `Watch` primitive impls.
+//! In-process `KeyValueStore` + `PubSub` primitive impls.
 //!
 //! Used by the single-node cluster built-in when no `dir:` is configured.
 
@@ -9,10 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::stream::StreamExt;
-use mcpg_cluster_api::{
-    ClusterError, Entry, KeyValueStore, Message, PubSub, Subscription, Watch, WatchEvent,
-    WatchEventKind, WatchStream,
-};
+use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, Message, PubSub, Subscription};
 use tokio::sync::broadcast;
 
 // ---------------------------------------------------------------------------
@@ -27,22 +24,9 @@ use tokio::sync::broadcast;
 /// periodically scans and drops expired entries so the map size
 /// reflects live state — handy for `list_prefix` to avoid leaking
 /// dead keys to callers.
-///
-/// Watch events: when constructed via [`MemoryKv::with_watch_hub`],
-/// `put` / `delete` publish `WatchEvent::{Created,Updated,Deleted}`
-/// onto the shared [`WatchHub`]. TTL-driven sweep + lazy-on-touch
-/// cleanups DO NOT emit events (the contract is "events on
-/// explicit operations"). Subscribers attach via
-/// [`MemoryWatch::watch_prefix`].
 #[derive(Debug, Default)]
 pub struct MemoryKv {
     inner: Arc<DashMap<String, StoredEntry>>,
-    /// Optional watch publisher. `None` for capability-fallback
-    /// allocations (where the gateway constructs a fresh `MemoryKv`
-    /// without watch wiring); `Some` for the cluster_single_node
-    /// coordinator's primary KV (paired with a `MemoryWatch` over
-    /// the same hub).
-    watch_hub: Option<Arc<WatchHub>>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,16 +49,6 @@ impl MemoryKv {
         Self::default()
     }
 
-    /// Construct a KV that broadcasts every `put` / `delete` to
-    /// `hub`. Pair with a [`MemoryWatch`] holding the same hub so
-    /// `Watch::watch_prefix` subscribers see the events.
-    pub fn with_watch_hub(hub: Arc<WatchHub>) -> Self {
-        Self {
-            inner: Arc::default(),
-            watch_hub: Some(hub),
-        }
-    }
-
     /// Spawn a background sweeper that drops expired entries every
     /// `interval`. Returns the same instance for chaining; the task
     /// holds an `Arc` of the inner map and exits when the last
@@ -94,12 +68,6 @@ impl MemoryKv {
             }
         });
         self
-    }
-
-    fn publish_watch(&self, event: WatchEvent) {
-        if let Some(hub) = &self.watch_hub {
-            hub.publish(event);
-        }
     }
 }
 
@@ -131,24 +99,14 @@ impl KeyValueStore for MemoryKv {
         ttl: Option<Duration>,
     ) -> Result<(), ClusterError> {
         let (expires_system, expires_instant) = compute_deadline(ttl);
-        let prev = self.inner.insert(
+        self.inner.insert(
             key.to_owned(),
             StoredEntry {
-                bytes: value.clone(),
+                bytes: value,
                 expires_system,
                 expires_instant,
             },
         );
-        let kind = if prev.is_some() {
-            WatchEventKind::Updated
-        } else {
-            WatchEventKind::Created
-        };
-        self.publish_watch(WatchEvent {
-            key: key.to_owned(),
-            kind,
-            value: Some(value),
-        });
         Ok(())
     }
 
@@ -167,7 +125,7 @@ impl KeyValueStore for MemoryKv {
         let inserted = match self.inner.entry(key.to_owned()) {
             DmEntry::Occupied(mut occ) if occ.get().is_expired(now) => {
                 occ.insert(StoredEntry {
-                    bytes: value.clone(),
+                    bytes: value,
                     expires_system,
                     expires_instant,
                 });
@@ -176,33 +134,18 @@ impl KeyValueStore for MemoryKv {
             DmEntry::Occupied(_) => false,
             DmEntry::Vacant(vac) => {
                 vac.insert(StoredEntry {
-                    bytes: value.clone(),
+                    bytes: value,
                     expires_system,
                     expires_instant,
                 });
                 true
             }
         };
-        if inserted {
-            self.publish_watch(WatchEvent {
-                key: key.to_owned(),
-                kind: WatchEventKind::Created,
-                value: Some(value),
-            });
-        }
         Ok(inserted)
     }
 
     async fn delete(&self, key: &str) -> Result<bool, ClusterError> {
-        let removed = self.inner.remove(key);
-        if let Some((_, entry)) = &removed {
-            self.publish_watch(WatchEvent {
-                key: key.to_owned(),
-                kind: WatchEventKind::Deleted,
-                value: Some(entry.bytes.clone()),
-            });
-        }
-        Ok(removed.is_some())
+        Ok(self.inner.remove(key).is_some())
     }
 
     async fn list_prefix(
@@ -242,6 +185,55 @@ impl KeyValueStore for MemoryKv {
                 Ok(true)
             }
             None => Ok(false),
+        }
+    }
+
+    async fn incr(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        use dashmap::mapref::entry::Entry as DmEntry;
+        let now = Instant::now();
+        // Read-add-write under the shard lock the `entry` API holds —
+        // atomic against concurrent in-process callers. An expired
+        // incumbent restarts the counter at 0.
+        match self.inner.entry(key.to_owned()) {
+            DmEntry::Occupied(mut occ) => {
+                let live = !occ.get().is_expired(now);
+                let current = if live {
+                    mcpg_cluster_api::parse_counter(&occ.get().bytes)?
+                } else {
+                    0
+                };
+                let next = current
+                    .checked_add(delta)
+                    .ok_or_else(mcpg_cluster_api::counter_overflow)?;
+                let (expires_system, expires_instant) = if ttl.is_some() {
+                    compute_deadline(ttl)
+                } else if live {
+                    // ttl=None leaves an existing expiry untouched.
+                    (occ.get().expires_system, occ.get().expires_instant)
+                } else {
+                    (None, None)
+                };
+                occ.insert(StoredEntry {
+                    bytes: Bytes::from(next.to_string()),
+                    expires_system,
+                    expires_instant,
+                });
+                Ok(next)
+            }
+            DmEntry::Vacant(vac) => {
+                let (expires_system, expires_instant) = compute_deadline(ttl);
+                vac.insert(StoredEntry {
+                    bytes: Bytes::from(delta.to_string()),
+                    expires_system,
+                    expires_instant,
+                });
+                Ok(delta)
+            }
         }
     }
 }
@@ -347,99 +339,6 @@ impl PubSub for MemoryBus {
                             "subscriber lagged by {n} messages; resubscribe to recover"
                         ),
                     })
-                }
-            });
-        Ok(Box::pin(stream))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WatchHub + MemoryWatch
-// ---------------------------------------------------------------------------
-
-/// Shared broadcast channel for in-process `WatchEvent`s.
-///
-/// Constructed once by [`crate::builtins::cluster_single_node::SingleNodeClusterBackend`]
-/// and shared with both [`MemoryKv`] (publisher, via
-/// [`MemoryKv::with_watch_hub`]) and [`MemoryWatch`] (subscriber).
-/// Each subscriber receives every event the KV publishes, then
-/// filters by prefix in-stream.
-///
-/// Uses [`tokio::sync::broadcast`] under the hood. Slow subscribers
-/// that lag the channel buffer get a terminal
-/// `ClusterError::BackendUnavailable` so they can resubscribe.
-#[derive(Debug)]
-pub struct WatchHub {
-    sender: broadcast::Sender<WatchEvent>,
-}
-
-impl Default for WatchHub {
-    fn default() -> Self {
-        // 256 events of slack matches `MemoryBus`. Each event is a
-        // small struct (key + kind + Bytes), so memory cost is
-        // proportional to in-flight key/value sizes.
-        Self {
-            sender: broadcast::channel(256).0,
-        }
-    }
-}
-
-impl WatchHub {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            sender: broadcast::channel(cap).0,
-        }
-    }
-
-    /// Best-effort broadcast. Returns silently when no subscribers
-    /// are attached (matches PubSub fire-and-forget semantics).
-    pub fn publish(&self, event: WatchEvent) {
-        let _ = self.sender.send(event);
-    }
-}
-
-/// In-process [`Watch`] primitive. Delivers events for every key
-/// whose prefix matches the subscriber's request.
-///
-/// Pair with a [`MemoryKv`] constructed via [`MemoryKv::with_watch_hub`]
-/// holding the same [`WatchHub`]; events from that KV's `put` /
-/// `delete` flow through. Other KV instances (capability-fallback
-/// `MemoryKv::new()` allocations) are NOT visible to this watcher
-/// — by design, since cluster-backbone consumers should always
-/// share one primitive per cluster kind.
-#[derive(Debug)]
-pub struct MemoryWatch {
-    hub: Arc<WatchHub>,
-}
-
-impl MemoryWatch {
-    pub fn new(hub: Arc<WatchHub>) -> Self {
-        Self { hub }
-    }
-}
-
-#[async_trait]
-impl Watch for MemoryWatch {
-    async fn watch_prefix(&self, prefix: &str) -> Result<WatchStream, ClusterError> {
-        let receiver = self.hub.sender.subscribe();
-        let prefix_owned = prefix.to_owned();
-        let stream =
-            tokio_stream::wrappers::BroadcastStream::new(receiver).filter_map(move |item| {
-                let prefix = prefix_owned.clone();
-                async move {
-                    match item {
-                        Ok(event) if event.key.starts_with(&prefix) => Some(Ok(event)),
-                        Ok(_) => None,
-                        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(
-                            n,
-                        )) => Some(Err(ClusterError::BackendUnavailable {
-                            reason: format!("watch lagged by {n} events; resubscribe to recover"),
-                        })),
-                    }
                 }
             });
         Ok(Box::pin(stream))
@@ -601,92 +500,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_emits_created_then_updated_then_deleted() {
-        let hub = Arc::new(WatchHub::new());
-        let kv = MemoryKv::with_watch_hub(Arc::clone(&hub));
-        let watch = MemoryWatch::new(Arc::clone(&hub));
-        let mut stream = watch.watch_prefix("k:").await.unwrap();
-        // Allow the broadcast subscription to register.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        kv.put("k:1", Bytes::from_static(b"v1"), None)
+    async fn kv_incr_counts_and_respects_expiry() {
+        let kv = MemoryKv::new();
+        assert_eq!(kv.incr("c", 5, None).await.unwrap(), 5);
+        assert_eq!(kv.incr("c", -2, None).await.unwrap(), 3);
+        assert_eq!(&kv.get("c").await.unwrap().unwrap().bytes[..], b"3");
+
+        // A TTL'd counter left idle restarts at 0.
+        kv.incr("t", 9, Some(Duration::from_millis(20)))
             .await
             .unwrap();
-        kv.put("k:1", Bytes::from_static(b"v2"), None)
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(kv.incr("t", 1, None).await.unwrap(), 1);
+
+        // Non-integer values refuse the incr and stay intact.
+        kv.put("blob", Bytes::from_static(b"json{}"), None)
             .await
             .unwrap();
-        kv.delete("k:1").await.unwrap();
-        let e1 = tokio::time::timeout(Duration::from_millis(500), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(e1.kind, WatchEventKind::Created);
-        assert_eq!(e1.key, "k:1");
-        assert_eq!(e1.value.as_deref(), Some(b"v1".as_slice()));
-        let e2 = tokio::time::timeout(Duration::from_millis(500), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(e2.kind, WatchEventKind::Updated);
-        assert_eq!(e2.value.as_deref(), Some(b"v2".as_slice()));
-        let e3 = tokio::time::timeout(Duration::from_millis(500), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(e3.kind, WatchEventKind::Deleted);
-        assert_eq!(e3.value.as_deref(), Some(b"v2".as_slice()));
+        assert!(kv.incr("blob", 1, None).await.is_err());
+        assert_eq!(&kv.get("blob").await.unwrap().unwrap().bytes[..], b"json{}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kv_incr_atomic_across_threads() {
+        // Real OS-thread parallelism (the contract suite interleaves on
+        // one task): 8 tasks × 100 increments must never lose a count.
+        let kv = Arc::new(MemoryKv::new());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let kv = Arc::clone(&kv);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..100 {
+                    kv.incr("c", 1, None).await.unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(kv.incr("c", 0, None).await.unwrap(), 800);
     }
 
     #[tokio::test]
-    async fn watch_filters_by_prefix() {
-        let hub = Arc::new(WatchHub::new());
-        let kv = MemoryKv::with_watch_hub(Arc::clone(&hub));
-        let watch = MemoryWatch::new(Arc::clone(&hub));
-        let mut stream = watch.watch_prefix("a:").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        kv.put("b:1", Bytes::from_static(b"miss"), None)
-            .await
-            .unwrap();
-        kv.put("a:1", Bytes::from_static(b"hit"), None)
-            .await
-            .unwrap();
-        let e = tokio::time::timeout(Duration::from_millis(500), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(e.key, "a:1", "non-prefix-matching key MUST be filtered out");
-        assert_eq!(e.value.as_deref(), Some(b"hit".as_slice()));
-    }
-
-    #[tokio::test]
-    async fn watch_silent_for_kv_without_hub() {
-        // A capability-fallback MemoryKv (no hub) MUST NOT publish
-        // events even if there's a Watch listening to a separate hub.
-        let hub = Arc::new(WatchHub::new());
-        let kv_with_hub = MemoryKv::with_watch_hub(Arc::clone(&hub));
-        let kv_no_hub = MemoryKv::new();
-        let watch = MemoryWatch::new(Arc::clone(&hub));
-        let mut stream = watch.watch_prefix("k:").await.unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        // The no-hub KV's writes are invisible.
-        kv_no_hub
-            .put("k:silent", Bytes::from_static(b"x"), None)
-            .await
-            .unwrap();
-        // The with-hub KV's writes flow through.
-        kv_with_hub
-            .put("k:loud", Bytes::from_static(b"y"), None)
-            .await
-            .unwrap();
-        let e = tokio::time::timeout(Duration::from_millis(500), stream.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(e.key, "k:loud");
-        assert_eq!(e.value.as_deref(), Some(b"y".as_slice()));
+    async fn kv_contract_battery() {
+        mcpg_cluster_api::test_suite::run_kv_contract(|| async {
+            Arc::new(MemoryKv::new()) as Arc<dyn KeyValueStore>
+        })
+        .await;
     }
 }

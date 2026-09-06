@@ -1516,7 +1516,7 @@ mod resume_cancel_ownership_tests {
 
         // The client received it live; it reconnects echoing the tagged id.
         let cursor = format!("stream-0:5@{delivery_id}");
-        runtime.ack_delivery_from_cursor(session_id, &cursor);
+        runtime.ack_deliveries_from_cursor(session_id, &cursor);
 
         // The acked row is gone → the reconnect drain replays nothing.
         let drained = runtime.take_pending_deliveries(session_id);
@@ -1544,13 +1544,51 @@ mod resume_cancel_ownership_tests {
             .unwrap();
 
         // A plain (non-delivery) cursor acks nothing.
-        runtime.ack_delivery_from_cursor(session_id, "stream-0:5");
+        runtime.ack_deliveries_from_cursor(session_id, "stream-0:5");
 
         let drained = runtime.take_pending_deliveries(session_id);
         assert_eq!(
             drained.len(),
             1,
             "a never-delivered result must be drained on reconnect"
+        );
+    }
+
+    /// Prefix ack: one delivery-tagged Last-Event-Id acknowledges every
+    /// delivery up to and including it (deliveries stream in sequence order),
+    /// so the reconnect drain replays exactly the missed suffix, in order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_with_delivery_cursor_drains_only_the_missed_suffix() {
+        let runtime = test_runtime();
+        let session_id = "sess-suffix";
+        let mut ids = Vec::new();
+        for n in 1..=4u64 {
+            let msg = pipeline_store::DeliveryMessage {
+                kind: pipeline_store::DeliveryKind::DeferredToolResult,
+                jsonrpc_message: serde_json::json!({"jsonrpc":"2.0","id":n,"result":{}}),
+                delivery_id: String::new(),
+            };
+            ids.push(
+                runtime
+                    .pipeline_store
+                    .store_pending_delivery(session_id, &msg)
+                    .unwrap(),
+            );
+        }
+
+        // The client received the first two live; its last event id names the
+        // second delivery.
+        runtime.ack_deliveries_from_cursor(session_id, &format!("stream-0:7@{}", ids[1]));
+
+        let drained = runtime.drain_deliveries_for_reconnect(session_id);
+        let markers: Vec<u64> = drained
+            .iter()
+            .map(|m| m.jsonrpc_message["id"].as_u64().unwrap())
+            .collect();
+        assert_eq!(
+            markers,
+            vec![3, 4],
+            "the reconnect drain is exactly the missed suffix, in order"
         );
     }
 

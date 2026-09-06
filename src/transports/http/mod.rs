@@ -1515,7 +1515,31 @@ async fn mcp_get_handler(
         }
     }
 
-    match runtime.open_sse_stream(&request_context) {
+    let opened = match runtime.open_sse_stream(&request_context) {
+        Err(StreamAccessError::InvalidCursor | StreamAccessError::ExpiredCursor)
+            if request_context
+                .resume_cursor
+                .as_ref()
+                .is_some_and(|cursor| {
+                    crate::runtime::session_store::delivery_id_from_event_id(&cursor.last_event_id)
+                        .is_some()
+                }) =>
+        {
+            // Delivery-tagged cursor whose stream window is not replayable
+            // here — another replica minted the stream, or the event fell out
+            // of the window. The tag still orders the coordinator backlog, so
+            // any replica can serve the resume: open a fresh stream and let
+            // the ack-prune + ordered drain below deliver exactly the missed
+            // suffix from KV. Only an untagged cursor keeps the 400/409
+            // answer — with no delivery tag there is nothing to replay from.
+            metrics::counter!("mcpg_sse_resume_backlog_fallback_total").increment(1);
+            let mut fresh_context = request_context.clone();
+            fresh_context.resume_cursor = None;
+            runtime.open_sse_stream(&fresh_context)
+        }
+        other => other,
+    };
+    match opened {
         Ok(events) => {
             let session_id = request_context.session_id.clone();
 
@@ -1535,13 +1559,14 @@ async fn mcp_get_handler(
             if let Some(ref sid) = session_id {
                 // 0. Reconnect ack-prune: if the client reconnects
                 //    echoing a delivery-tagged Last-Event-Id, it has PROVEN it
-                //    received that backlog row (live or replayed). Delete it
-                //    from the coordinator-KV backlog BEFORE draining so an
-                //    already-delivered server-push is not replayed. Only the
-                //    exact acknowledged row is removed — never an unseen one —
-                //    so this cannot drop a result.
+                //    received that backlog row (live or replayed) and — since
+                //    deliveries stream in sequence order — every row before
+                //    it. Delete that whole prefix from the coordinator-KV
+                //    backlog BEFORE draining, so the drain replays exactly the
+                //    suffix the client missed. The prune is epoch-guarded in
+                //    the store, so it cannot drop an unseen result.
                 if let Some(ref cursor) = request_context.resume_cursor {
-                    runtime.ack_delivery_from_cursor(sid, &cursor.last_event_id);
+                    runtime.ack_deliveries_from_cursor(sid, &cursor.last_event_id);
                 }
 
                 // 1. Subscribe to the live delivery bus FIRST so nothing
@@ -1574,11 +1599,30 @@ async fn mcp_get_handler(
                 .await;
 
                 // 2. Drain the persisted backlog and assign replay event ids.
-                let pending = runtime.take_pending_deliveries(sid);
+                //    The scan drain consults the coordinator KV even when this
+                //    replica's pending index never saw the rows (they may have
+                //    been stored by a peer), and returns them in delivery
+                //    order — after the step-0 prefix prune that is exactly the
+                //    suffix the client missed.
+                //
+                //    A delivery can be both retained in the stream's replay
+                //    window (already in `events` above) and still in the
+                //    backlog; emit it once, from the window. Its row is
+                //    consumed by the drain either way.
+                let window_replayed: std::collections::HashSet<&str> = events
+                    .iter()
+                    .filter_map(|event| {
+                        crate::runtime::session_store::delivery_id_from_event_id(&event.event_id)
+                    })
+                    .collect();
+                let pending = runtime.drain_deliveries_for_reconnect(sid);
                 let mut sse_records = Vec::new();
                 {
                     let mut keys = drained_keys.lock().expect("drained-keys lock");
                     for msg in pending {
+                        if window_replayed.contains(msg.delivery_id.as_str()) {
+                            continue;
+                        }
                         keys.insert(delivery_dedupe_key(&msg));
                         if let Ok(records) = runtime.stream_delivery_message(
                             sid,

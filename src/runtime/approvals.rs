@@ -208,8 +208,9 @@ impl ApprovalRegistry {
         tenant_segment: Option<String>,
     ) -> Self {
         // Adopt the coordinator's KV (when it exposes one) as the
-        // durable resolution backstop. consul/etcd expose no KV → no
-        // backstop (the at-most-once topic is all they offer).
+        // durable resolution backstop. A coordinator that advertises no
+        // `kv` role has no KV → no backstop (the at-most-once topic is
+        // all it offers).
         self.backstop_kv = cluster.key_value_store().map(|kv| {
             // Cipher INNER, tenant prefix OUTER — mirrors the
             // capability-store wrap order so the cipher AAD binds the

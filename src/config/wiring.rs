@@ -303,13 +303,7 @@ fn resolve_full_plugin_id(
 pub fn is_builtin_cluster_kind(cluster_kind: &str) -> bool {
     matches!(
         cluster_kind,
-        "single-node-builtin"
-            | "single_node"
-            | "nats"
-            | "nats-jetstream"
-            | "redis"
-            | "consul"
-            | "etcd"
+        "single-node-builtin" | "single_node" | "nats" | "nats-jetstream" | "redis"
     )
 }
 
@@ -340,17 +334,13 @@ pub fn cluster_provides_for_kind(cluster_kind: &str) -> BTreeSet<&'static str> {
             set.insert("kv");
         }
         "redis" => {
+            // Redis backs all three: `cache` + `kv` over the same string
+            // primitive (TTL eviction for the cache slot) and `bus` via
+            // native PUBLISH/SUBSCRIBE (broadcast fan-out; subscribe
+            // queue groups are ignored — see cluster_bus_profile_for_kind).
             set.insert("cache");
             set.insert("kv");
-        }
-        "consul" | "etcd" => {
-            // consul (Event API) and etcd (Watch streams) back the `bus` role
-            // via coordinator-level publish/subscribe AND the `kv` role via a
-            // real `KeyValueStore` over the plugin FFI (etcd v3 KV + native
-            // lease TTL; consul KV HTTP API + a logical/emulated TTL). Neither
-            // exposes a native cache-eviction role.
             set.insert("bus");
-            set.insert("kv");
         }
         // Plugin-class cluster (any other id, typically reverse-domain) —
         // assume it provides every role; the runtime catches mismatches.
@@ -361,6 +351,54 @@ pub fn cluster_provides_for_kind(cluster_kind: &str) -> BTreeSet<&'static str> {
         }
     }
     set
+}
+
+/// DECLARED delivery properties of a built-in coordinator's `bus` role.
+/// A `bus` role string alone says nothing about *how* messages move, and
+/// the differences are operationally load-bearing, so they are declared
+/// data rather than tribal knowledge:
+///
+/// - `queue_groups` — whether `subscribe(topic, Some(group), ..)` balances
+///   each message to ONE member of the group. When `false` the group
+///   argument is accepted but ignored and every subscriber receives every
+///   message (broadcast).
+/// - `max_payload_bytes` — a hard per-message payload cap the backend
+///   enforces (publishing more yields a clean error). `None` = no cap
+///   small enough to matter for gateway bus traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterBusProfile {
+    pub queue_groups: bool,
+    pub max_payload_bytes: Option<usize>,
+}
+
+/// Return the declared bus profile for a built-in coordinator kind.
+///
+/// The suite-asserted twin of this table lives in
+/// `libs/plugins/cluster/equivalence-tests` (`declared_bus_profile`):
+/// the equivalence suite proves each live backend honours exactly these
+/// properties, so keep the two tables in lockstep. Kinds without an
+/// explicit arm (plugin-class clusters, and built-ins whose bus is plain
+/// fan-out) get the permissive broadcast/no-cap default; the profile is
+/// advisory — nothing here gates wiring, it feeds boot-time warnings and
+/// config-time diagnostics.
+pub fn cluster_bus_profile_for_kind(cluster_kind: &str) -> ClusterBusProfile {
+    match cluster_kind {
+        // Core NATS queue subscriptions balance a group for real. The
+        // server's default max payload (1 MiB) is far above gateway bus
+        // traffic, so no cap is declared.
+        "nats" | "nats-jetstream" => ClusterBusProfile {
+            queue_groups: true,
+            max_payload_bytes: None,
+        },
+        // redis PUBLISH fans out to every subscriber (no server-side
+        // consumer groups on channels); the single-node MemoryBus
+        // broadcasts in-process. None enforces a payload cap worth
+        // declaring.
+        _ => ClusterBusProfile {
+            queue_groups: false,
+            max_payload_bytes: None,
+        },
+    }
 }
 
 fn is_builtin_keyword(slot: SlotClass, value: &str) -> bool {
@@ -478,6 +516,15 @@ mod tests {
             err.to_string().contains("doesn't provide a `cache` role"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn bus_slot_accepts_cluster_keyword_on_redis() {
+        // redis advertises the `bus` role (native PUBLISH/SUBSCRIBE), so
+        // wiring the delivery/cancellation/approval buses to `cluster`
+        // resolves — they ride redis pub/sub, not a per-replica MemoryBus.
+        let r = resolve_kind(SlotClass::Bus, &kind("cluster"), &[], "redis").unwrap();
+        assert_eq!(r, ResolvedKind::Cluster);
     }
 
     #[test]
@@ -606,8 +653,6 @@ mod tests {
             "nats",
             "nats-jetstream",
             "redis",
-            "consul",
-            "etcd",
             "dev.mcpg.cluster.custom", // catch-all
         ] {
             for role in cluster_provides_for_kind(kind) {
@@ -620,6 +665,35 @@ mod tests {
     }
 
     #[test]
+    fn cluster_bus_profile_table_pins_declared_matrix() {
+        // The declared bus matrix: nats balances queue groups, everything
+        // else is broadcast with no cap worth declaring. The suite-asserted
+        // twin lives in mcpg-cluster-equivalence-tests
+        // (`declared_bus_profile`) — change both together.
+        for kind in ["nats", "nats-jetstream"] {
+            let p = cluster_bus_profile_for_kind(kind);
+            assert!(p.queue_groups, "{kind} balances queue groups");
+            assert_eq!(p.max_payload_bytes, None, "{kind} declares no cap");
+        }
+        for kind in ["redis", "single_node", "dev.mcpg.cluster.custom"] {
+            let p = cluster_bus_profile_for_kind(kind);
+            assert!(!p.queue_groups, "{kind} broadcasts (group ignored)");
+            assert_eq!(p.max_payload_bytes, None, "{kind} declares no cap");
+        }
+    }
+
+    #[test]
+    fn redis_provides_all_three_roles() {
+        // redis backs cache + kv (string primitive) AND bus (native
+        // PUBLISH/SUBSCRIBE) — the delivery/cancellation/approval buses
+        // ride redis pub/sub instead of a per-replica MemoryBus.
+        let roles = cluster_provides_for_kind("redis");
+        for role in ["cache", "kv", "bus"] {
+            assert!(roles.contains(role), "redis must provide `{role}`");
+        }
+    }
+
+    #[test]
     fn is_builtin_cluster_kind_matches_explicit_arms_only() {
         for kind in [
             "single_node",
@@ -627,8 +701,6 @@ mod tests {
             "nats",
             "nats-jetstream",
             "redis",
-            "consul",
-            "etcd",
         ] {
             assert!(is_builtin_cluster_kind(kind), "{kind} should be built-in");
         }

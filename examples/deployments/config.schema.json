@@ -1605,7 +1605,7 @@
     },
     "ClusterConfig": {
       "additionalProperties": true,
-      "description": "Top-level cluster config. The cluster plugin is the unified backbone for MCPG multi-instance state + coordination — it internally instantiates the four primitive impls (`KeyValueStore`, `PubSub`, `Lease`, `Watch`) and exposes them via accessor methods. `kind` is the discriminator; everything else is kind-specific config that flows straight to the plugin's factory as JSON.\n\n```yaml cluster: kind: redis              # single_node | etcd | consul | nats | redis url: ${env.REDIS_URL}   # rest of the fields are kind-specific key_prefix: \"mcpg:cluster:\" ```\n\n`kind: single_node` (the default when `cluster:` is omitted) installs the in-process built-in coordinator and ignores the rest of the block. Other kinds map to `mcpg-plugin-cluster-<kind>`; the cdylib must still be declared under `plugins[]` (the inline `cluster.*` fields override any `config:` block on the matching entry).",
+      "description": "Top-level cluster config. The cluster plugin is the unified backbone for MCPG multi-instance state + coordination — it internally instantiates the four primitive impls (`KeyValueStore`, `PubSub`, `Lease`, `Watch`) and exposes them via accessor methods. `kind` is the discriminator; everything else is kind-specific config that flows straight to the plugin's factory as JSON.\n\n```yaml cluster: kind: redis              # single_node | nats | redis url: ${env.REDIS_URL}   # rest of the fields are kind-specific key_prefix: \"mcpg:cluster:\" ```\n\n`kind: single_node` (the default when `cluster:` is omitted) installs the in-process built-in coordinator and ignores the rest of the block. Other kinds map to `mcpg-plugin-cluster-<kind>`; the cdylib must still be declared under `plugins[]` (the inline `cluster.*` fields override any `config:` block on the matching entry).",
       "properties": {
         "allow_degraded_boot": {
           "default": false,
@@ -1614,7 +1614,12 @@
         },
         "allow_insecure_transport": {
           "default": false,
-          "description": "Permit a plaintext (non-TLS) coordinator transport for a non-`single_node` coordinator. Defaults to `false`: `validate()` refuses a plaintext redis/consul/etcd/nats coordinator at boot, because the coordinator carries all shared state (sessions, credentials, delivery) in clear. Set `true` ONLY for local/dev/CI. Gateway-only — NOT forwarded to the plugin (it is a named field, so serde keeps it out of `config`).",
+          "description": "Permit a plaintext (non-TLS) coordinator transport for a non-`single_node` coordinator. Defaults to `false`: `validate()` refuses a plaintext redis/nats coordinator at boot, because the coordinator carries all shared state (sessions, credentials, delivery) in clear. Set `true` ONLY for local/dev/CI. Gateway-only — NOT forwarded to the plugin (it is a named field, so serde keeps it out of `config`).",
+          "type": "boolean"
+        },
+        "allow_plaintext_state": {
+          "default": false,
+          "description": "Permit a clustered (non-`single_node`) coordinator WITHOUT `state_encryption_key_env`. Defaults to `false`: `validate()` refuses to boot clustered without a state key, because the coordinator would hold session/pipeline/credential-adjacent state in plaintext and cross-replica modern-session resume (whose key derives from the same material) stays off. Set `true` ONLY as a migration escape hatch — boot then logs a loud warning naming the degraded surfaces. Inert for `single_node`. Gateway-only named field — kept out of the flattened plugin `config`.",
           "type": "boolean"
         },
         "kind": {
@@ -1622,13 +1627,15 @@
           "type": "string"
         },
         "readiness_gate": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/ClusterReadinessGate"
+            },
+            {
+              "type": "null"
             }
           ],
-          "default": "off",
-          "description": "Whether coordinator health gates `/ready`. Defaults to `off` (fail-open): a coordinator outage is surfaced only via the `mcpg_cluster_backend_up` gauge + its alert, never on readiness. `degrade` adds an informational not-ready *check* to the readiness body but keeps `/ready` green (no LB flapping). `fail` makes `/ready` return not-ready while the coordinator is unreachable (fail-closed). Gateway-only named field — kept out of the flattened plugin `config`."
+          "description": "Whether coordinator health gates `/ready`. Unset means a kind-dependent default: `off` for `kind: single_node`, `degrade` for every other kind; an explicitly configured value always wins. `off` is fail-open: a coordinator outage is surfaced only via the `mcpg_cluster_backend_up` gauge + its alert, never on readiness. `degrade` adds an informational not-ready *check* to the readiness body but keeps `/ready` green (no LB flapping). `fail` makes `/ready` return not-ready while the coordinator is unreachable (fail-closed). Gateway-only named field — kept out of the flattened plugin `config`."
         },
         "state_encryption_allow_plaintext_reads": {
           "default": false,
@@ -1636,7 +1643,7 @@
           "type": "boolean"
         },
         "state_encryption_key_env": {
-          "description": "Opt-in application-layer AEAD (XChaCha20-Poly1305) of ALL coordinator-backed *capability* state — sessions (incl. SSE replay), delivery, cancellation, tasks, pipelines, idempotency, request-state, subscriptions, quota, and the approvals backstop. Names the **env var** holding a URL-safe-base64 32-byte key (the key itself never sits in the config artifact). Unset = plaintext serde on the wire/at-rest; confidentiality then rests on the transport guard. Values are sealed per-key/per-topic (swap-resistant); keys/topics stay cleartext for routing. Does NOT cover the credential cache — it has its own `encryption_key` under the credentials config. Gateway-only named field — kept out of the flattened plugin `config`.",
+          "description": "Application-layer AEAD (XChaCha20-Poly1305) of ALL coordinator-backed *capability* state — sessions (incl. SSE replay), delivery, cancellation, tasks, pipelines, idempotency, request-state, subscriptions, quota, and the approvals backstop — and the derivation source for the cross-replica modern-session resume key. Names the **env var** holding a URL-safe-base64 32-byte key (the key itself never sits in the config artifact); generate one with `openssl rand -base64 32 | tr '+/' '-_'`. Required for every non-`single_node` kind: `validate()` refuses a clustered coordinator without it unless `allow_plaintext_state: true`. Unset (single_node, or via the escape hatch) = plaintext serde on the wire/at-rest; confidentiality then rests on the transport guard. Values are sealed per-key/per-topic (swap-resistant); keys/topics stay cleartext for routing. Does NOT cover the credential cache — it has its own `encryption_key` under the credentials config. Gateway-only named field — kept out of the flattened plugin `config`.",
           "type": [
             "string",
             "null"
@@ -1650,7 +1657,7 @@
           ]
         },
         "tenant_segment": {
-          "description": "Optional per-deployment tenant segment. When set, EVERY coordinator-backed capability KV key and bus topic is prefixed with `t.<segment>/` (keys) / `t.<segment>.` (topics) so a single coordinator namespace can be fenced per-tenant by broker-native ACLs — NATS subject perms `t.<segment>.>`, redis key-pattern ACLs (`~…t.<segment>/*`), consul/etcd path ACLs. Unset = today's flat, un-prefixed keys/topics (one coordinator namespace == one trust domain). This is a **deployment-level** label, not a per-request tenant — the gateway process serves one tenant segment; the runtime carries no per-request tenant at key/topic-formation time, so per-request multi-tenancy remains future work. Turning it on is a key-namespace cutover (existing flat-keyed state goes invisible). Must be a single token (no `. * > / : ` or whitespace). Gateway-only named field — kept out of the flattened plugin `config`.",
+          "description": "Optional per-deployment tenant segment. When set, EVERY coordinator-backed capability KV key and bus topic is prefixed with `t.<segment>/` (keys) / `t.<segment>.` (topics) so a single coordinator namespace can be fenced per-tenant by broker-native ACLs — NATS subject perms `t.<segment>.>`, redis key-pattern ACLs (`~…t.<segment>/*`). Unset = today's flat, un-prefixed keys/topics (one coordinator namespace == one trust domain). This is a **deployment-level** label, not a per-request tenant — the gateway process serves one tenant segment; the runtime carries no per-request tenant at key/topic-formation time, so per-request multi-tenancy remains future work. Turning it on is a key-namespace cutover (existing flat-keyed state goes invisible). Must be a single token (no `. * > / : ` or whitespace). Gateway-only named field — kept out of the flattened plugin `config`.",
           "type": [
             "string",
             "null"
@@ -1660,17 +1667,17 @@
       "type": "object"
     },
     "ClusterReadinessGate": {
-      "description": "How coordinator health affects `/ready`.",
+      "description": "How coordinator health affects `/ready`. When `cluster.readiness_gate` is unset the effective value is kind-dependent — `off` for `single_node`, `degrade` for every other kind ([`ClusterConfig::effective_readiness_gate`]).",
       "oneOf": [
         {
-          "description": "Coordinator health never affects `/ready` (fail-open). Default.",
+          "description": "Coordinator health never affects `/ready` (fail-open). The default for `kind: single_node`.",
           "enum": [
             "off"
           ],
           "type": "string"
         },
         {
-          "description": "Surface a not-ready *check* in the readiness body when the coordinator is down, but keep the overall `/ready` status green.",
+          "description": "Surface a not-ready *check* in the readiness body when the coordinator is down, but keep the overall `/ready` status green. The default for every clustered (non-`single_node`) kind.",
           "enum": [
             "degrade"
           ],
@@ -6968,8 +6975,8 @@
       "default": {
         "allow_degraded_boot": false,
         "allow_insecure_transport": false,
+        "allow_plaintext_state": false,
         "kind": "single_node",
-        "readiness_gate": "off",
         "state_encryption_allow_plaintext_reads": false
       },
       "description": "Cluster coordinator. Singleton: the operator picks one coordinator and configures it inline. Default is the built-in single-node coordinator — safe for single-instance deployments. Other kinds map to `mcpg-plugin-cluster-*` cdylib plugins; the cdylib must still be declared under `plugins[]` for the gateway to load it. The inline `cluster` block is the single source of truth for the coordinator's runtime config — it overrides any `config:` block on the matching `plugins[]` row."

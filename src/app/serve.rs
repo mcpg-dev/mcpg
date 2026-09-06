@@ -153,9 +153,9 @@ pub async fn run(state: AppState) -> Result<()> {
 
     // Periodic coordinator-health probe → `mcpg_cluster_backend_up`
     // gauge + the readiness gate. Only for a clustered coordinator that
-    // exposes a KV accessor (single_node is in-process; consul/etcd are
-    // coordination-only with no KV to ping — the gate stays a no-op there,
-    // with a WARN if the operator nonetheless set a gate).
+    // exposes a KV accessor (single_node is in-process; a coordinator
+    // advertising no `kv` role has no KV to ping — the gate stays a no-op
+    // there, with a WARN if the operator nonetheless set a gate).
     let cluster_health_handle = if config.cluster.is_single_node() {
         None
     } else {
@@ -166,10 +166,15 @@ pub async fn run(state: AppState) -> Result<()> {
                 std::time::Duration::from_secs(10),
             )),
             None => {
-                if !matches!(
-                    config.cluster.readiness_gate,
-                    crate::config::ClusterReadinessGate::Off
-                ) {
+                // Warn only on an explicitly configured non-off gate: the
+                // kind-dependent `degrade` default on a KV-less coordinator
+                // is not an operator mistake (the gate simply never probes,
+                // so the readiness body stays silent).
+                if config
+                    .cluster
+                    .readiness_gate
+                    .is_some_and(|g| !matches!(g, crate::config::ClusterReadinessGate::Off))
+                {
                     tracing::warn!(
                         "cluster.readiness_gate is set but the '{}' coordinator exposes no KV \
                          accessor — coordinator health cannot be probed, so the readiness gate \

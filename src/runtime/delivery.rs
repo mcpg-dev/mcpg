@@ -174,6 +174,22 @@ impl GatewayRuntime {
             .unwrap_or_default()
     }
 
+    /// Drain the session's buffered deliveries for an SSE (re)connect.
+    /// Unlike [`Self::take_pending_deliveries`] this always consults the
+    /// coordinator KV: the rows a reconnecting client is owed may have been
+    /// stored by another replica, which this process's pending index has
+    /// never seen. Returned in delivery order (coordinator-monotonic
+    /// per-session sequence), so after an ack-prune the drain is exactly the
+    /// missed suffix.
+    pub fn drain_deliveries_for_reconnect(
+        &self,
+        session_id: &str,
+    ) -> Vec<pipeline_store::DeliveryMessage> {
+        self.pipeline_store
+            .take_pending_deliveries_scan(session_id)
+            .unwrap_or_default()
+    }
+
     /// Subscribe to delivery messages for a session.
     pub async fn subscribe_session_delivery(
         &self,

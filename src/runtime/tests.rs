@@ -3261,6 +3261,62 @@ fn extract_dynamic_list_bindings_picks_only_sql_resource_shapes() {
 }
 
 #[test]
+fn template_watch_configs_capture_template_bindings_for_lazy_synthesis() {
+    use crate::config::{ResourceWatchConfig, WatchStrategyConfig};
+
+    // A resource_templates[] binding: uri_template (no exact uri) + watch.
+    let mut tmpl = sample_binding_mock("instruction_read");
+    tmpl.uri = None;
+    tmpl.uri_template = Some("instruction://{id}".into());
+    tmpl.watch = Some(ResourceWatchConfig {
+        strategy: WatchStrategyConfig::Plugin {
+            kind: "instruction_events".into(),
+            spec: serde_json::Map::new(),
+        },
+        notification_filter: None,
+    });
+
+    // An exact-URI binding with watch — belongs to build_watch_configs.
+    let mut exact = sample_binding_mock("static_res");
+    exact.uri = Some("r://static".into());
+    exact.watch = Some(ResourceWatchConfig {
+        strategy: WatchStrategyConfig::Poll { interval_ms: 10 },
+        notification_filter: None,
+    });
+
+    // A template binding without watch — excluded from both maps.
+    let mut no_watch = sample_binding_mock("plain_tmpl");
+    no_watch.uri = None;
+    no_watch.uri_template = Some("plain://{x}".into());
+
+    let bindings = [tmpl, exact, no_watch];
+
+    // build_watch_configs maps only the exact-URI binding; templates are skipped.
+    let exact_map = super::build_watch_configs(&bindings);
+    assert_eq!(exact_map.len(), 1);
+    assert!(exact_map.contains_key("r://static"));
+
+    // build_template_watch_configs captures only the watch-carrying template,
+    // keyed by binding name (the `profile` a Template route carries).
+    let tmpl_map = super::build_template_watch_configs(&bindings);
+    assert_eq!(tmpl_map.len(), 1);
+    let watch = tmpl_map
+        .get("instruction_read")
+        .expect("template watch keyed by binding name");
+
+    // watch_config_for synthesizes the concrete-URI config with the template's
+    // strategy — exactly what the subscribe-time probe does on a matched URI.
+    let cfg = super::watch_config_for(watch, "instruction://ins_x");
+    assert_eq!(cfg.uri, "instruction://ins_x");
+    match &cfg.strategy {
+        watch_engine::WatchStrategy::Plugin { kind, .. } => {
+            assert_eq!(kind, "instruction_events");
+        }
+        other => panic!("expected the template's Plugin strategy, got {other:?}"),
+    }
+}
+
+#[test]
 fn build_watch_configs_compiles_expression_filter() {
     use crate::config::{NotificationFilterConfig, ResourceWatchConfig, WatchStrategyConfig};
 

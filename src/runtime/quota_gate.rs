@@ -20,20 +20,26 @@
 //! dispatch proceeds normally and the gate's bookkeeping (counter
 //! decrement, concurrency permit acquisition) is committed.
 //!
-//! # Atomicity caveat
+//! # Atomicity
 //!
-//! The [`mcpg_cluster_api::KeyValueStore`] trait does not expose
-//! atomic increment or compare-and-swap. Token-bucket and budget
-//! state therefore use a local read-modify-write loop serialized
-//! by an in-process `Mutex` keyed by the bucket's KV-key. For a
-//! single-instance gateway this is correct; for a multi-instance
-//! deployment that shares a KV (cluster mode), two replicas can
-//! race the same bucket and either over-grant or over-deny by a
-//! small constant. Pre-1.0 we accept that — operators who need
-//! cluster-correct quota enforcement should pin the
-//! `governance.quotas.store:` to a backend that grows native CAS
-//! support (a future cluster-api evolution) or accept the bounded
-//! drift.
+//! Rate-limit state rides [`mcpg_cluster_api::KeyValueStore::incr`],
+//! the coordinator's atomic add-and-get, so replicas sharing a KV
+//! cannot double-spend the same bucket: every consume is one atomic
+//! counter advance (see [`consume_token_bucket`] for the encoding).
+//! An in-process per-key `Mutex` still serializes local callers —
+//! that keeps single-instance allow/deny decisions exactly
+//! sequential; across replicas the only contention artifact is a
+//! bounded, self-healing over-deny at the limit boundary (a denied
+//! call's refund racing another replica's consume), never an
+//! over-grant.
+//!
+//! Budget state is different: its window accumulator is a multi-field
+//! JSON record that a single counter cannot carry, so it keeps the
+//! local read-modify-write under the per-key `Mutex`. Correct on a
+//! single instance; two replicas sharing a budget can still race the
+//! same window and drift by a small constant. Operators who need
+//! hard cross-replica budget enforcement should keep replicas at 1
+//! for now.
 //!
 //! Concurrency caps don't suffer from this: in-flight permits are
 //! tracked entirely in-process via a [`tokio::sync::Semaphore`]
@@ -123,9 +129,11 @@ impl std::fmt::Debug for ConcurrencyPermit {
 
 /// Wrapper around the operator-resolved
 /// [`mcpg_cluster_api::KeyValueStore`] that adds in-process
-/// per-key serialization. Token-bucket and budget read-modify-
-/// write must be atomic w.r.t. concurrent requests touching the
-/// same bucket key; the underlying KV trait has no incr/CAS today.
+/// per-key serialization on top of the KV's own atomicity.
+/// Rate-limit accounting drives the KV's atomic `incr` under the
+/// per-key lock (locally sequential decisions, cross-replica-atomic
+/// spend); the budget accumulator is a read-modify-write that the
+/// lock alone serializes (in-process only — see the module doc).
 #[derive(Debug)]
 pub struct QuotaStore {
     kv: Arc<dyn KeyValueStore>,
@@ -177,19 +185,6 @@ impl QuotaStore {
 // Token bucket primitive.
 // ---------------------------------------------------------------------------
 
-/// Persisted token-bucket state. Stored as JSON in the quota KV
-/// under `quotas.rate_limit.<policy_id>.<scope_key>`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct TokenBucketState {
-    /// Tokens currently in the bucket. Float so refill granularity
-    /// finer than 1/min works (e.g. 100 calls / min refills 1 token
-    /// every 600 ms — partial tokens accumulate).
-    tokens: f64,
-    /// Last refill instant, UTC epoch milliseconds. Used to compute
-    /// elapsed time for refill on each consume.
-    last_refill_unix_ms: i64,
-}
-
 /// Maximum bucket capacity for a policy. Defaults to one second's
 /// worth of refill (matches the doc on [`RateLimitPolicy::burst`]).
 fn capacity_for(rate_per_min: u32, burst: Option<u32>) -> f64 {
@@ -202,15 +197,38 @@ fn capacity_for(rate_per_min: u32, burst: Option<u32>) -> f64 {
     (f64::from(rate_per_min) / 60.0).max(1.0)
 }
 
-/// Tokens-per-millisecond refill rate.
-fn refill_rate_per_ms(rate_per_min: u32) -> f64 {
-    f64::from(rate_per_min) / 60_000.0
+/// Microseconds one token takes to refill (the GCRA emission
+/// interval). Rounded division; config validation guarantees
+/// `rate_per_min > 0`, the two `.max(1)`s are belts against a zero
+/// sneaking past it and against a >60M/min rate rounding the
+/// interval down to nothing.
+fn emission_interval_us(rate_per_min: u32) -> i64 {
+    let rate = i64::from(rate_per_min.max(1));
+    ((60_000_000 + rate / 2) / rate).max(1)
 }
 
-/// Try to consume one token from the named bucket. Refills based
-/// on elapsed wall-clock since the last consume; if the bucket
-/// has < 1 token after refill, the call is denied and no token
-/// is consumed.
+/// Try to consume one token from the named bucket. Denied calls
+/// consume nothing.
+///
+/// The bucket is GCRA — the continuous-refill token bucket expressed
+/// as a single **theoretical-arrival-time (TAT) counter**, in µs since
+/// the Unix epoch, that only ever moves through the KV's atomic
+/// `incr`:
+///
+/// 1. consume: `TAT += interval` (one atomic add = one token spent);
+/// 2. clamp: if the pre-add TAT was behind `now` (fresh or idle
+///    bucket), add the gap so the bucket refills to exactly full —
+///    the `min(capacity, …)` clamp of the classic formulation;
+/// 3. decide: allow iff the post-add TAT ≤ `now + capacity·interval`;
+/// 4. deny: refund the step-1 add, so the denied call spent nothing.
+///
+/// Because the spend itself is a single cross-replica-atomic add, two
+/// replicas can never grant the same token. The store's per-key mutex
+/// serializes local callers, making single-instance decisions exactly
+/// those of the mutex-held bucket this encodes; concurrent replicas
+/// contending at the boundary can transiently over-deny (a refund
+/// racing a consume), never over-grant, and the clamp self-heals it
+/// within one refill interval.
 ///
 /// `key` is the operator-stable bucket key (typically
 /// `quotas.rate_limit.<policy_id>.<scope_key>`).
@@ -222,42 +240,43 @@ async fn consume_token_bucket(
     policy: &RateLimitPolicy,
     now_ms: i64,
 ) -> Result<bool> {
-    let capacity = capacity_for(policy.rate.calls_per_minute, policy.burst);
-    let refill_per_ms = refill_rate_per_ms(policy.rate.calls_per_minute);
-    // Keep state alive for at least 2x the time it would take a
-    // full bucket to drain at min refill — long-idle entries roll
-    // back to "full" via the absent-key fast path below.
+    let interval_us = emission_interval_us(policy.rate.calls_per_minute);
+    let capacity_us =
+        (capacity_for(policy.rate.calls_per_minute, policy.burst) * interval_us as f64) as i64;
+    let now_us = now_ms.saturating_mul(1000);
+    // Storage hygiene: an hour idle and the counter is gone; the next
+    // consume then starts from a full bucket via the clamp. Sliding —
+    // every touch re-arms it.
     let ttl = Some(Duration::from_secs(3600));
 
-    store
-        .read_modify_write(key, move |prev| {
-            let mut state = match prev {
-                Some(b) => {
-                    serde_json::from_slice::<TokenBucketState>(&b).unwrap_or(TokenBucketState {
-                        tokens: capacity,
-                        last_refill_unix_ms: now_ms,
-                    })
-                }
-                None => TokenBucketState {
-                    tokens: capacity,
-                    last_refill_unix_ms: now_ms,
-                },
-            };
-            // Refill since last consume.
-            let elapsed_ms = (now_ms - state.last_refill_unix_ms).max(0);
-            let refill = (elapsed_ms as f64) * refill_per_ms;
-            state.tokens = (state.tokens + refill).min(capacity);
-            state.last_refill_unix_ms = now_ms;
-
-            // Consume if at least one token is available.
-            let allowed = state.tokens >= 1.0;
-            if allowed {
-                state.tokens -= 1.0;
-            }
-            let bytes = Bytes::from(serde_json::to_vec(&state)?);
-            Ok((bytes, ttl, allowed))
-        })
+    let lock = store.lock_for(key);
+    let _guard = lock.lock().await;
+    let mut tat = store
+        .kv
+        .incr(key, interval_us, ttl)
         .await
+        .with_context(|| format!("quota_store: incr failed for `{key}`"))?;
+    let behind = now_us - (tat - interval_us);
+    if behind > 0 {
+        // Fresh or idle bucket: burn the banked idle credit so refill
+        // caps at capacity (TAT lands on now + one consume).
+        tat = store
+            .kv
+            .incr(key, behind, ttl)
+            .await
+            .with_context(|| format!("quota_store: incr clamp failed for `{key}`"))?;
+    }
+    let allowed = tat <= now_us.saturating_add(capacity_us);
+    if !allowed {
+        // Refund the consume. Best-effort: if the refund itself fails,
+        // the deny stands (one token stays burned until refill) rather
+        // than flipping an already-made decision onto the gate's
+        // fail-open/fail-closed error path.
+        if let Err(e) = store.kv.incr(key, -interval_us, ttl).await {
+            tracing::warn!(key, error = %e, "quota rate-limit refund failed; token stays burned");
+        }
+    }
+    Ok(allowed)
 }
 
 // ---------------------------------------------------------------------------
@@ -739,6 +758,22 @@ mod tests {
             _ttl: Option<Duration>,
         ) -> std::result::Result<bool, mcpg_cluster_api::error::ClusterError> {
             Ok(true)
+        }
+
+        async fn incr(
+            &self,
+            key: &str,
+            delta: i64,
+            _ttl: Option<Duration>,
+        ) -> std::result::Result<i64, mcpg_cluster_api::error::ClusterError> {
+            let mut m = self.inner.lock().await;
+            let current = match m.get(key) {
+                Some(b) => mcpg_cluster_api::parse_counter(b)?,
+                None => 0,
+            };
+            let next = current + delta;
+            m.insert(key.to_owned(), Bytes::from(next.to_string()));
+            Ok(next)
         }
     }
 

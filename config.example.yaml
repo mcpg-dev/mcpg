@@ -1078,11 +1078,9 @@ governance:
 #   # human-approval prompts; pair it with the gateway's approval state machine.
 #
 # ── Plugins selected via DEDICATED top-level blocks (not plugins[]) ──
-#   cluster (class: cluster)        — chosen by `cluster: { kind: redis|nats|consul|etcd, ... }`:
+#   cluster (class: cluster)        — chosen by `cluster: { kind: redis|nats, ... }`:
 #       dev.mcpg.cluster.redis   | url, key_prefix="mcpg:cluster:", lease_ttl_ms=30000, peer_ttl_ms=60000
 #       dev.mcpg.cluster.nats    | servers[], jetstream{…}, node{id}, lease{default_ttl_sec=30}
-#       dev.mcpg.cluster.consul  | address, service_name, token?, kv_prefix="mcpg/"
-#       dev.mcpg.cluster.etcd    | endpoints[], key_prefix="/mcpg/", event_ttl_secs=60, auth?
 #   content_store (class: content_store) — chosen by `storage.providers[].kind`:
 #       dev.mcpg.storage.builtin | in_process{max_bytes=256MiB} | file_system{root, max_bytes=8GiB}
 #       dev.mcpg.storage.s3      | bucket, region, prefix, endpoint_url?, force_path_style?, max_bytes=256MiB

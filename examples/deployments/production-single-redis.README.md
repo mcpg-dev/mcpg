@@ -26,6 +26,7 @@ Single-instance production gateway with Redis-backed cluster primitives. The "Re
 ## Required env vars
 
 - `MCPG_REDIS_URL` — Redis connection (`rediss://` recommended outside localhost).
+- `MCPG_CLUSTER_STATE_KEY` — URL-safe-base64 32-byte state-encryption key (`openssl rand -base64 32 | tr '+/' '-_'`). Required whenever `cluster.kind` is not `single_node`; seals the Redis-held session/pipeline state.
 - `MCPG_OIDC_CLIENT_ID`, `MCPG_OIDC_CLIENT_SECRET` — IdP credentials referenced by `${env.…}` in the YAML.
 - `ACCOUNTS_API_TOKEN` — bearer token the example HTTP binding sends to its upstream. Drop with the binding if you don't keep it.
 

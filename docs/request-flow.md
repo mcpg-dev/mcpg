@@ -996,7 +996,7 @@ The sections below describe what hops where.
 ```
 
 The shared KV + bus come from the **single top-level `cluster.kind`**
-coordinator (`single_node | redis | nats | consul | etcd`) — there is no
+coordinator (`single_node | redis | nats`) — there is no
 `plugins.backend.provider` knob. Every capability (sessions / tasks /
 pipelines / delivery / cancellation) inherits the coordinator's
 `key_value_store()` / `pub_sub()` primitives; a per-capability `store:` /

@@ -30,6 +30,7 @@ This is *application-layer* multi-tenancy. Subdomain-based routing (different ho
 ## Required env vars
 
 - `MCPG_REDIS_URL` — Redis cluster.
+- `MCPG_CLUSTER_STATE_KEY` — URL-safe-base64 32-byte state-encryption key, identical on every replica (`openssl rand -base64 32 | tr '+/' '-_'`). Required whenever `cluster.kind` is not `single_node`.
 - IdP credentials (issuer / audience are inline in the YAML; verification keys come from the IdP's JWKS).
 
 ## CEL primer for tenant-aware bindings

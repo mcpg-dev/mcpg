@@ -28,6 +28,12 @@ pub async fn build_from_sources(
     config_sources: Vec<crate::config::ConfigSource>,
 ) -> Result<AppState> {
     let mut observability = observability::init(&config.observability)?;
+    // The `allow_plaintext_state` warning fires here rather than only in
+    // validation: config validation runs before the tracing subscriber is
+    // installed, so its copy of the warning never reaches the boot log.
+    // Emitted before plugin loading so it lands even when a later boot
+    // step (e.g. a missing coordinator cdylib) aborts the start.
+    config.cluster.warn_if_plaintext_state();
     // Config loads before this point, so the report waits for a subscriber.
     let ignored_env = crate::config::AppConfig::ignored_env_overrides();
     if !ignored_env.is_empty() {
@@ -59,7 +65,7 @@ pub async fn build_from_sources(
     // Build the plugin registry FIRST, before any capability touches
     // its KV / PubSub primitives. This guarantees the cluster
     // coordinator is fully registered (single-node built-in OR
-    // cdylib-loaded redis / nats / consul / etcd) by the time
+    // cdylib-loaded redis / nats) by the time
     // capability boot extracts its primitives via
     // `registry.cluster_backend().key_value_store()` etc. — so every
     // capability inherits them universally with no kind-specific
@@ -91,8 +97,8 @@ pub async fn build_from_sources(
 
     // Capability boot draws KV / PubSub primitives from the cluster
     // coordinator. `Some` for any cluster kind that exposes the
-    // primitive (single-node always does; redis / nats both do; consul
-    // / etcd partially do — see `provides:` on each plugin manifest).
+    // primitive (single-node always does; redis / nats both do — see
+    // `provides:` on each plugin manifest).
     // `None` falls back to a fresh in-process `MemoryKv` / `MemoryBus`
     // per capability — the unconditional default before any kind of
     // cluster plugin is loaded.

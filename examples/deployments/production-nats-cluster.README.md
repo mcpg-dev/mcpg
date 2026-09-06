@@ -20,6 +20,7 @@ Same as `production-redis-cluster` for the server / auth / audit / bindings / ob
 ## Required env vars
 
 - `MCPG_NATS_URL` — NATS connection.
+- `MCPG_CLUSTER_STATE_KEY` — URL-safe-base64 32-byte state-encryption key, identical on every replica (`openssl rand -base64 32 | tr '+/' '-_'`). Required whenever `cluster.kind` is not `single_node`.
 - `MCPG_OIDC_CLIENT_ID`, `MCPG_OIDC_CLIENT_SECRET` — IdP credentials.
 
 ## Audit

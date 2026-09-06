@@ -10,6 +10,9 @@
 # Required env vars:
 #   MCPG_OIDC_CLIENT_ID, MCPG_OIDC_CLIENT_SECRET   — IdP credentials
 #   MCPG_NATS_URL                                   — nats://… or tls://…
+#   MCPG_CLUSTER_STATE_KEY                          — URL-safe-base64 32-byte
+#                                                     state key, same on every
+#                                                     replica
 
 gateway:
   server:
@@ -38,6 +41,14 @@ cluster:
     replicas: 3
     storage: file
     state_bucket: "mcpg-prod"
+  # Required for any non-single_node cluster: seals all coordinator-backed
+  # capability state (sessions incl. SSE replay, pipelines, tasks, delivery,
+  # cancellation, …) with XChaCha20-Poly1305 and derives the key that makes
+  # modern-session resume work across replicas. Names the env var (no
+  # `${env.…}` — the key itself never sits in the config); the var must hold
+  # a URL-safe-base64 32-byte key, IDENTICAL on every replica:
+  #   openssl rand -base64 32 | tr '+/' '-_'
+  state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
 
 # `delivery` and `cancellation` inherit the cluster's pub/sub by default
 # (NATS subject-based fan-out here) — no override needed.

@@ -37,6 +37,13 @@ cluster:
   password: "${env.MCPG_REDIS_PASSWORD}"
   key_prefix: "mcpg:multi-tenant"
   pool_size: 16
+  # Required for any non-single_node cluster: seals all Redis-held tenant
+  # state (sessions incl. SSE replay, pipelines, tasks, delivery, …) with
+  # XChaCha20-Poly1305 and derives the cross-replica modern-session resume
+  # key. Names the env var (no `${env.…}`); the var must hold a
+  # URL-safe-base64 32-byte key, IDENTICAL on every replica:
+  #   openssl rand -base64 32 | tr '+/' '-_'
+  state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
 
 governance:
   access:

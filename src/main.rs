@@ -42,6 +42,14 @@ async fn main() -> anyhow::Result<()> {
         return mcpg::cli::dispatch_plugin_command(&args[2..]);
     }
 
+    // `mcpg dev cluster <up|down|status>` — the local multi-node cluster
+    // harness (NATS container + N gateway child processes). Handled before
+    // the plugin-loader dev mode below, which owns every other `mcpg dev`
+    // spelling.
+    if args.len() >= 3 && args[1] == "dev" && args[2] == "cluster" {
+        return mcpg::dev_cluster::run(&args[3..]).await;
+    }
+
     // `mcpg dev [--plugin <path> ...]` — local dev
     // mode. Synthesises a minimal config layered on top of the
     // operator's existing `MCPG_CONFIG` (if any) so a plugin author

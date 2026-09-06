@@ -121,20 +121,21 @@ impl GatewayRuntime {
             ReadinessStatus::NotReady
         };
 
-        // Coordinator health gate. Read the operator's
-        // `cluster.readiness_gate` from the live config snapshot; the
-        // periodic probe maintains `CLUSTER_BACKEND_UP`.
+        // Coordinator health gate. Read the effective
+        // `cluster.readiness_gate` (kind-dependent default: `off` for
+        // single_node, `degrade` for clustered kinds) from the live config
+        // snapshot; the periodic probe maintains `CLUSTER_BACKEND_UP`.
         if let Some(gate) = self
             .shared_services
             .load()
             .as_ref()
-            .map(|s| s.config_snapshot.cluster.readiness_gate)
+            .map(|s| s.config_snapshot.cluster.effective_readiness_gate())
             && !matches!(gate, crate::config::ClusterReadinessGate::Off)
         {
             let up = CLUSTER_BACKEND_UP.load(std::sync::atomic::Ordering::Relaxed);
             // Only surface a check once the backend has actually been
-            // probed (`up != NOT_PROBED`) — a KV-less coordinator
-            // (consul/etcd) or pre-first-probe window stays silent.
+            // probed (`up != NOT_PROBED`) — a KV-less coordinator or the
+            // pre-first-probe window stays silent.
             if up != CLUSTER_UP_NOT_PROBED {
                 let healthy = up == CLUSTER_UP_HEALTHY;
                 let fail_gate = matches!(gate, crate::config::ClusterReadinessGate::Fail);
@@ -174,7 +175,7 @@ impl GatewayRuntime {
     /// [`Self::readiness_snapshot`]'s gate reads — independent of whether
     /// any lease consumer (cedar / workload) is active. The caller only
     /// spawns this for a clustered coordinator that exposes a KV accessor
-    /// (single_node / consul / etcd are skipped — see `run`).
+    /// (single_node is skipped — see `run`).
     pub(crate) fn spawn_cluster_health_probe(
         kv: Arc<dyn mcpg_cluster_api::KeyValueStore>,
         interval: std::time::Duration,

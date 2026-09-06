@@ -1811,13 +1811,13 @@ fn cross_check_cluster_provides_accepts_matching_single_node() {
 
 #[test]
 fn cross_check_cluster_provides_fails_on_table_drift() {
-    // single_node provides cache/kv/bus, but the `redis` table arm is
-    // cache/kv (no bus). Cross-checking the single-node coordinator AS IF
-    // it were kind `redis` must fail-closed — this is exactly the drift
+    // single_node provides cache/kv/bus, but the `nats` table arm is
+    // bus/kv (no cache). Cross-checking the single-node coordinator AS IF
+    // it were kind `nats` must fail-closed — this is exactly the drift
     // (static fallback table vs running coordinator) the check exists to
     // catch on a built-in kind.
     let coordinator = crate::builtins::cluster_single_node::SingleNodeClusterBackend::new();
-    let err = cross_check_cluster_provides(coordinator.as_ref(), "redis")
+    let err = cross_check_cluster_provides(coordinator.as_ref(), "nats")
         .expect_err("table/coordinator role drift must fail-closed");
     let msg = err.to_string();
     assert!(msg.contains("role drift"), "unexpected error: {msg}");
@@ -1977,7 +1977,7 @@ async fn probe_cluster_reachability_degrades_when_allowed() {
 
 #[tokio::test]
 async fn probe_cluster_reachability_ok_for_bus_only_coordinator() {
-    // A consul/etcd-style coordinator advertises only `bus`; the probe must
+    // A bus-only coordinator advertises only `bus`; the probe must
     // round-trip the pub_sub primitive and NOT require kv.
     let mock = ProbeMockBackend::new(&["bus"], false);
     probe_cluster_reachability(&mock, false)
@@ -2033,6 +2033,30 @@ fn cluster_state_key_bytes_none_when_unset() {
     );
 }
 
+#[test]
+fn cluster_state_key_load_rejects_set_but_empty_env_var() {
+    // Config-time validation only checks the *field*; a named env var
+    // that resolves to an empty string still fails hard at key-load
+    // time, in both the cipher and the raw-bytes paths.
+    let var = "MCPG_TEST_EMPTY_CLUSTER_STATE_KEY";
+    unsafe { std::env::set_var(var, "") };
+    let cluster = crate::config::ClusterConfig {
+        kind: "redis".to_owned(),
+        state_encryption_key_env: Some(var.to_owned()),
+        ..crate::config::ClusterConfig::default()
+    };
+    let cipher_err = match build_state_cipher(&cluster) {
+        Ok(_) => panic!("empty key value must fail cipher construction"),
+        Err(e) => e.to_string(),
+    };
+    assert!(cipher_err.contains(var), "{cipher_err}");
+    let bytes_err = cluster_state_key_bytes(&cluster)
+        .expect_err("empty key value must fail raw-key load")
+        .to_string();
+    assert!(bytes_err.contains("expected 32"), "{bytes_err}");
+    unsafe { std::env::remove_var(var) };
+}
+
 /// `mock` is a plugin like every other backend: the gateway links none of them
 /// in, so a `kind: mock` binding resolves ONLY when `plugins[]` declares the
 /// artefact. A config that binds it without declaring it must leave boot with
@@ -2068,6 +2092,105 @@ mcp:
         bundle.registry.backend("mock").is_none(),
         "an undeclared `kind: mock` binding must not resolve — the mock is a \
          dev-dependency fixture and must never be linked into a shipped binary"
+    );
+}
+
+/// Minimal OIDC OAuth resolver for the boot-ordering tests below. Its mere
+/// presence (the `oidc_resolver: Some(_)` argument) is what arms the
+/// "an OIDC identity provider must be registered" boot check; the provider
+/// details never matter to that check.
+fn test_oidc_resolver() -> std::sync::Arc<crate::runtime::oidc::OidcOAuthResolver> {
+    let cfg = crate::config::OidcOAuthConfig {
+        token_source: crate::config::TokenSourceConfig::default(),
+        providers: vec![crate::config::OidcProviderConfig {
+            issuer: "https://login.example.com/".into(),
+            discovery_uri: None,
+            audiences: vec![],
+            verification: crate::config::VerificationConfig::OidcJwks {
+                allowed_algs: vec!["RS256".into()],
+                refresh_interval_secs: 300,
+                timeout_ms: 2000,
+                max_staleness_secs: 3600,
+                allow_hmac: false,
+            },
+            claim_mappings: crate::config::ClaimMappingConfig::default(),
+            clock_skew_secs: 60,
+            allowed_issuer_hosts: Vec::new(),
+            allow_private_issuer: true,
+            allow_any_audience: false,
+        }],
+    };
+    std::sync::Arc::new(
+        crate::runtime::oidc::from_gateway_config(&cfg).expect("oidc resolver builds"),
+    )
+}
+
+/// `access.oauth` configures OIDC but no identity plugin is registered
+/// anywhere — no `plugins[]` entries, no JWKS verifier — so boot must refuse.
+/// The check lives after the `plugins[]` load loop AND outside the
+/// `if !config.plugins.is_empty()` guard, so it still fires when the operator
+/// declared no plugin entries at all.
+#[tokio::test]
+async fn oidc_configured_without_any_provider_refuses_boot() {
+    let mut config = crate::config::AppConfig::default();
+    let err =
+        match super::build_plugin_registry(&mut config, None, Some(test_oidc_resolver())).await {
+            Ok(_) => panic!("a configured OIDC resolver with no provider must refuse boot"),
+            Err(e) => e,
+        };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("no identity plugin is registered under"),
+        "expected the OIDC-missing boot refusal, got: {msg}"
+    );
+    assert!(
+        msg.contains(crate::runtime::identity::oidc::PLUGIN_ID),
+        "the refusal names the OIDC plugin id, got: {msg}"
+    );
+}
+
+/// Regression for the boot-ordering defect: a config that follows the
+/// refusal's own advice — an OIDC `plugins[]` entry — must reach the loader
+/// instead of being pre-empted by the missing-provider check. When that check
+/// ran before the `plugins[]` load loop, this exact config bailed with
+/// "no identity plugin is registered … add a `plugins[]` entry" even though
+/// the entry is present. With the check moved after the loop, the loop runs
+/// first: the artifact is absent from disk, so the load error surfaces rather
+/// than the premature refusal — proving the ordering.
+///
+/// The positive half — the entry actually loads and boot succeeds — needs a
+/// real signed cdylib on disk and lives in the e2e/conformance harnesses: the
+/// OIDC provider is a cdylib that is never linked into the gateway, so a unit
+/// test cannot make `identity_plugin_ids()` contain it. This asserts the
+/// reorder through the load error instead.
+#[tokio::test]
+async fn oidc_plugins_entry_is_loaded_before_the_missing_provider_check() {
+    let mut config: crate::config::AppConfig = serde_yaml::from_str(
+        r#"
+plugins:
+  - id: dev.mcpg.identity.oidc
+    kind: native
+    class: identity
+    source:
+      path: /nonexistent/mcpg-test-oidc-provider.so
+"#,
+    )
+    .expect("config parses");
+
+    let err =
+        match super::build_plugin_registry(&mut config, None, Some(test_oidc_resolver())).await {
+            Ok(_) => panic!("an absent cdylib artifact must fail the load"),
+            Err(e) => e,
+        };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("artifact not found") && msg.contains("dev.mcpg.identity.oidc"),
+        "the plugins[] loader must run and report the missing artifact, got: {msg}"
+    );
+    assert!(
+        !msg.contains("no identity plugin is registered"),
+        "the missing-provider check must not pre-empt the loader for a declared \
+         OIDC entry, got: {msg}"
     );
 }
 

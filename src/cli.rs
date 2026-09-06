@@ -204,11 +204,15 @@ fn find_sibling_descriptor(artifact: &Path) -> anyhow::Result<PathBuf> {
 fn print_dev_help() {
     eprintln!(
         "Usage: mcpg dev --plugin <artifact-path> [--plugin <path>] [--stdio]\n\
+         \n       mcpg dev cluster <up|down|status>\n\
          \n\
          Run the gateway in local-dev mode with one or more path-loaded\n\
          plugins. Each --plugin entry is added to\n\
          the in-memory `plugins[]` config; the gateway's normal\n\
          MCPG_CONFIG continues to apply for transports, server, etc.\n\
+         \n\
+         `mcpg dev cluster` instead runs a local multi-node cluster (a NATS\n\
+         container + N gateway nodes) — see `mcpg dev cluster --help`.\n\
          \n\
          The plugin descriptor (`plugin.yaml`) is read from:\n\
          \n  1. <artifact-parent>/plugin.yaml         (scaffolder convention)\n\
@@ -488,7 +492,11 @@ pub fn print_top_help() {
         );
     }
     out.push_str("\n  status         This box: gateway, agent pairing, local control plane");
-    out.push_str("\n  dev            Run the gateway with path-loaded plugins (local dev)\n");
+    out.push_str("\n  dev            Run the gateway with path-loaded plugins (local dev)");
+    out.push_str(
+        "\n  dev cluster    Local multi-node cluster: NATS container + N nodes\
+         \n                   up [-n N] / down [--purge] / status\n",
+    );
     if !config || !cp || !cloud || !admin || !plugins || !inspector {
         out.push_str(
             "\nSome toolchain commands are not shown because their mcpg-* binary is\n\

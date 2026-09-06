@@ -3232,12 +3232,29 @@ cluster:
 }
 
 #[test]
-fn cluster_readiness_gate_parses_and_defaults_off() {
+fn cluster_readiness_gate_parses_and_defaults_by_kind() {
     use crate::config::ClusterReadinessGate;
-    // Default (unset) → Off (fail-open, the historical behaviour).
-    let default: AppConfig = serde_yaml::from_str("cluster:\n  kind: redis\n").expect("parse");
-    assert_eq!(default.cluster.readiness_gate, ClusterReadinessGate::Off);
-    // Explicit values parse (snake_case).
+    // Unset → kind-dependent effective default: `off` for single_node
+    // (in-process coordinator, nothing to probe), `degrade` for every
+    // clustered kind.
+    let single: AppConfig = serde_yaml::from_str("{}").expect("parse");
+    assert_eq!(single.cluster.readiness_gate, None);
+    assert_eq!(
+        single.cluster.effective_readiness_gate(),
+        ClusterReadinessGate::Off
+    );
+    for kind in ["redis", "nats"] {
+        let cfg: AppConfig =
+            serde_yaml::from_str(&format!("cluster:\n  kind: {kind}\n")).expect("parse");
+        assert_eq!(cfg.cluster.readiness_gate, None, "for {kind}");
+        assert_eq!(
+            cfg.cluster.effective_readiness_gate(),
+            ClusterReadinessGate::Degrade,
+            "for {kind}"
+        );
+    }
+    // Explicit values parse (snake_case) and always win over the
+    // kind-dependent default — `off` on a clustered kind stays `off`.
     for (yaml_val, want) in [
         ("off", ClusterReadinessGate::Off),
         ("degrade", ClusterReadinessGate::Degrade),
@@ -3247,10 +3264,23 @@ fn cluster_readiness_gate_parses_and_defaults_off() {
             "cluster:\n  kind: redis\n  readiness_gate: {yaml_val}\n  url: rediss://r:6379\n"
         ))
         .expect("parse");
-        assert_eq!(cfg.cluster.readiness_gate, want, "for {yaml_val}");
+        assert_eq!(cfg.cluster.readiness_gate, Some(want), "for {yaml_val}");
+        assert_eq!(
+            cfg.cluster.effective_readiness_gate(),
+            want,
+            "for {yaml_val}"
+        );
         // The named field stays OUT of the flattened plugin config map.
         assert!(!cfg.cluster.config.contains_key("readiness_gate"));
     }
+    // An explicit `off` on single_node is also a no-op change.
+    let cfg: AppConfig =
+        serde_yaml::from_str("cluster:\n  kind: single_node\n  readiness_gate: fail\n")
+            .expect("parse");
+    assert_eq!(
+        cfg.cluster.effective_readiness_gate(),
+        ClusterReadinessGate::Fail
+    );
 }
 
 #[test]
@@ -3266,8 +3296,6 @@ fn cluster_config_defaults_to_single_node() {
 #[test]
 fn cluster_backend_plugin_id_maps_known_kinds() {
     for (kind, expected) in [
-        ("etcd", "dev.mcpg.cluster.etcd"),
-        ("consul", "dev.mcpg.cluster.consul"),
         ("nats", "dev.mcpg.cluster.nats"),
         ("redis", "dev.mcpg.cluster.redis"),
     ] {
@@ -3275,6 +3303,7 @@ fn cluster_backend_plugin_id_maps_known_kinds() {
             kind: kind.to_owned(),
             allow_insecure_transport: false,
             allow_degraded_boot: false,
+            allow_plaintext_state: false,
             readiness_gate: Default::default(),
             state_encryption_key_env: None,
             state_encryption_key_id: None,
@@ -3295,6 +3324,7 @@ fn cluster_plugin_id_follows_kind_convention() {
         kind: "no-such-coordinator".to_owned(),
         allow_insecure_transport: false,
         allow_degraded_boot: false,
+        allow_plaintext_state: false,
         readiness_gate: Default::default(),
         state_encryption_key_env: None,
         state_encryption_key_id: None,
@@ -3347,6 +3377,97 @@ fn tenant_segment_not_leaked_into_flatten_config() {
     assert!(!cfg.config.contains_key("tenant_segment"));
 }
 
+// Clustered-requires-a-state-key guard. A non-`single_node` coordinator
+// without `state_encryption_key_env` refuses to validate unless the
+// operator opts into plaintext via `allow_plaintext_state: true`.
+
+#[test]
+fn state_encryption_required_when_clustered() {
+    let cfg = ClusterConfig {
+        kind: "redis".to_owned(),
+        ..ClusterConfig::default()
+    };
+    let msg = cfg
+        .validate_state_encryption()
+        .expect_err("clustered without a key must be refused")
+        .to_string();
+    assert!(msg.contains("cluster.state_encryption_key_env"), "{msg}");
+    assert!(msg.contains("32-byte key"), "{msg}");
+    assert!(msg.contains("openssl rand -base64 32"), "{msg}");
+    assert!(msg.contains("cluster.allow_plaintext_state"), "{msg}");
+}
+
+#[test]
+fn state_encryption_escape_hatch_allows_clustered_plaintext() {
+    let cfg = ClusterConfig {
+        kind: "nats".to_owned(),
+        allow_plaintext_state: true,
+        ..ClusterConfig::default()
+    };
+    assert!(cfg.validate_state_encryption().is_ok());
+}
+
+#[test]
+fn state_encryption_key_satisfies_clustered_requirement() {
+    let cfg = ClusterConfig {
+        kind: "nats".to_owned(),
+        state_encryption_key_env: Some("MCPG_CLUSTER_STATE_KEY".to_owned()),
+        ..ClusterConfig::default()
+    };
+    assert!(cfg.validate_state_encryption().is_ok());
+}
+
+#[test]
+fn state_encryption_not_required_for_single_node() {
+    assert!(ClusterConfig::default().validate_state_encryption().is_ok());
+}
+
+#[test]
+fn app_config_validate_enforces_clustered_state_key() {
+    // The guard is wired into `AppConfig::validate()` (the same
+    // pre-flight `mcpg config check` runs), not buried in boot.
+    let clustered: AppConfig =
+        serde_yaml::from_str("cluster:\n  kind: redis\n  url: rediss://r:6379\n").expect("parse");
+    let msg = clustered
+        .validate()
+        .expect_err("clustered without a key must fail validate()")
+        .to_string();
+    assert!(msg.contains("cluster.state_encryption_key_env"), "{msg}");
+
+    let keyed: AppConfig = serde_yaml::from_str(
+        "cluster:\n  kind: redis\n  url: rediss://r:6379\n  \
+         state_encryption_key_env: MCPG_CLUSTER_STATE_KEY\n",
+    )
+    .expect("parse");
+    keyed.validate().expect("clustered with a key validates");
+
+    let hatch: AppConfig = serde_yaml::from_str(
+        "cluster:\n  kind: redis\n  url: rediss://r:6379\n  allow_plaintext_state: true\n",
+    )
+    .expect("parse");
+    hatch
+        .validate()
+        .expect("allow_plaintext_state boots without a key");
+
+    let single: AppConfig = serde_yaml::from_str("{}").expect("parse");
+    single.validate().expect("single_node needs no state key");
+}
+
+// `allow_plaintext_state` is a NAMED field: it must route to the struct,
+// not be absorbed into the flattened plugin `config` map.
+#[test]
+fn allow_plaintext_state_not_leaked_into_flatten_config() {
+    let cfg: ClusterConfig = serde_json::from_value(serde_json::json!({
+        "kind": "redis",
+        "url": "rediss://r:6379",
+        "allow_plaintext_state": true,
+    }))
+    .unwrap();
+    assert!(cfg.allow_plaintext_state);
+    assert!(cfg.config.contains_key("url"));
+    assert!(!cfg.config.contains_key("allow_plaintext_state"));
+}
+
 #[test]
 fn validate_tenant_segment_accepts_token_rejects_reserved_chars() {
     let ok = |seg: &str| {
@@ -3381,6 +3502,7 @@ fn cluster_cfg(kind: &str, allow_insecure: bool, config: serde_json::Value) -> C
         kind: kind.to_owned(),
         allow_insecure_transport: allow_insecure,
         allow_degraded_boot: false,
+        allow_plaintext_state: false,
         readiness_gate: Default::default(),
         state_encryption_key_env: None,
         state_encryption_key_id: None,
@@ -3438,70 +3560,9 @@ fn transport_security_opt_out_permits_plaintext_redis() {
 }
 
 #[test]
-fn transport_security_refuses_plaintext_consul() {
-    let cfg = cluster_cfg(
-        "consul",
-        false,
-        serde_json::json!({ "address": "http://consul:8500" }),
-    );
-    let err = cfg
-        .validate_transport_security()
-        .expect_err("plaintext http:// consul must be refused");
-    assert!(err.to_string().contains("https://"));
-}
-
-#[test]
-fn transport_security_accepts_https_consul() {
-    let cfg = cluster_cfg(
-        "consul",
-        false,
-        serde_json::json!({ "address": "https://consul:8500" }),
-    );
-    assert!(cfg.validate_transport_security().is_ok());
-}
-
-#[test]
-fn transport_security_refuses_any_plaintext_etcd_endpoint() {
-    // A single plaintext endpoint in the list is enough to refuse.
-    let cfg = cluster_cfg(
-        "etcd",
-        false,
-        serde_json::json!({ "endpoints": ["https://e1:2379", "http://e2:2379"] }),
-    );
-    let err = cfg
-        .validate_transport_security()
-        .expect_err("any plaintext http:// etcd endpoint must be refused");
-    assert!(err.to_string().contains("https://"));
-}
-
-#[test]
-fn transport_security_refuses_scheme_less_etcd_endpoint() {
-    // A scheme-less `host:port` endpoint connects plaintext in etcd-client
-    // — it must be treated as plaintext, not silently allowed.
-    let cfg = cluster_cfg(
-        "etcd",
-        false,
-        serde_json::json!({ "endpoints": ["etcd-0:2379", "etcd-1:2379"] }),
-    );
-    let err = cfg
-        .validate_transport_security()
-        .expect_err("scheme-less etcd endpoints must be refused as plaintext");
-    assert!(err.to_string().contains("https://"));
-}
-
-#[test]
 fn transport_security_refuses_whitespace_prefixed_plaintext() {
     // The guard trims leading whitespace so it classifies identically to the
-    // plugins — a `" http://…"` endpoint must not slip past.
-    let cfg = cluster_cfg(
-        "etcd",
-        false,
-        serde_json::json!({ "endpoints": [" http://e1:2379"] }),
-    );
-    assert!(
-        cfg.validate_transport_security().is_err(),
-        "leading-whitespace plaintext etcd endpoint must be refused"
-    );
+    // plugins — a `"  redis://…"` url must not slip past.
     let redis = cluster_cfg(
         "redis",
         false,
@@ -3511,16 +3572,6 @@ fn transport_security_refuses_whitespace_prefixed_plaintext() {
         redis.validate_transport_security().is_err(),
         "leading-whitespace plaintext redis url must be refused"
     );
-}
-
-#[test]
-fn transport_security_accepts_all_https_etcd_endpoints() {
-    let cfg = cluster_cfg(
-        "etcd",
-        false,
-        serde_json::json!({ "endpoints": ["https://e1:2379", "https://e2:2379"] }),
-    );
-    assert!(cfg.validate_transport_security().is_ok());
 }
 
 #[test]

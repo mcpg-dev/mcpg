@@ -71,7 +71,7 @@ libs/plugins/          — one flat directory per plugin class (all cdylibs)
 ├── backend/{http,command,nats,grpc,graphql,kafka,sql,mock,llms}/
 │                        — backend bindings + their watch strategies
 │                          (nats_topic, kafka_topic, sql_polling/pg_listen, …)
-├── cluster/{redis,nats,consul,etcd}/ — cluster cdylibs. Each implements
+├── cluster/{redis,nats}/ — cluster cdylibs. Each implements
 │                          ClusterBackend + advertises its primitive accessors
 │                          via `provides:` on the manifest. The single-node
 │                          primitive impls live in apps/gateway/src/builtins/.
@@ -269,8 +269,6 @@ pool. Recognised override kinds: `memory`, `redis`, `nats`.
 | `single_node` (default) | `MemoryKv` (or `FileKv` when `dir:` set) | `MemoryBus` (or `FileBus`) | always-acquire | `MemoryWatch` |
 | `redis` | `RedisKv` | `RedisTopicBus` | `RedisLock` | `RedisWatch` (Streams) |
 | `nats` | `NatsKv` (JetStream KV) | `NatsTopicBus` (core) | `NatsLock` (JS KV CAS) | `NatsWatch` (JS KV `watch_all`) |
-| `consul` | — | — | consul session | — |
-| `etcd` | — | — | etcd lease | — |
 
 `—` means the cluster plugin doesn't expose that primitive; capabilities
 needing it MUST set per-capability overrides.
@@ -345,4 +343,4 @@ Policy outcomes:
 4. **Fail closed** — Identity verification failures, policy denials, and provider errors fail closed
 5. **CEL for policy** — CEL expressions power the authorization layer (not Rego, not custom DSL)
 6. **Backend + step taxonomy is explicit** — 27 `BackendImpl` kinds (10 general-purpose + 17 LLM) and 18 pipeline step kinds; adding a kind requires clear business justification
-7. **Cluster-backbone state model** — `cluster.kind` selects ONE backend (single_node / redis / nats / consul / etcd); every capability inherits its `KeyValueStore` / `PubSub` primitive from the cluster plugin's accessors by default. Per-capability `store:` / `bus:` overrides open their own pool when an operator wants finer control.
+7. **Cluster-backbone state model** — `cluster.kind` selects ONE backend (single_node / redis / nats); every capability inherits its `KeyValueStore` / `PubSub` primitive from the cluster plugin's accessors by default. Per-capability `store:` / `bus:` overrides open their own pool when an operator wants finer control.

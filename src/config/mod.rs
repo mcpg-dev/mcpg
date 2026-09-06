@@ -385,6 +385,11 @@ impl AppConfig {
             // but it DOES take effect, and reporting it as ignored would be a
             // lie an operator acts on.
             "DEFAULT_PLUGIN_REGISTRY",
+            // The conventional value of `cluster.state_encryption_key_env`
+            // (the chart, templates and examples all point it here): read by
+            // name at key load, never merged as an overlay — same
+            // would-be-a-lie hazard as DEFAULT_PLUGIN_REGISTRY.
+            "CLUSTER_STATE_KEY",
             "STATE_DIR",
             "PLUGIN_DIR",
             "JSON_LOGS",
@@ -784,6 +789,7 @@ impl AppConfig {
         self.validate_wiring_resolution()?;
         self.warn_cluster_connection_overlap();
         self.cluster.validate_transport_security()?;
+        self.cluster.validate_state_encryption()?;
         self.cluster.validate_tenant_segment()?;
         self.validate_cancellation_partitioning()?;
         self.validate_schemas()?;

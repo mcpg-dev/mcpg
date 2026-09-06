@@ -57,14 +57,19 @@ impl GatewayRuntime {
             .stream_message(session_id, message_json, delivery_id)
     }
 
-    /// Prune the backlog row a reconnecting client has acknowledged by
-    /// echoing a delivery-tagged `Last-Event-Id`. Only the exact row the
-    /// client proved it received is deleted, so this can never drop an
-    /// unseen result; once pruned, the row cannot be replayed on this or a
-    /// later reconnect. Idempotent and best-effort.
-    pub fn ack_delivery_from_cursor(&self, session_id: &str, last_event_id: &str) {
+    /// Prune the backlog rows a reconnecting client has acknowledged by
+    /// echoing a delivery-tagged `Last-Event-Id`: the exact acked row plus
+    /// every row with a lower sequence (deliveries stream in sequence order,
+    /// so acknowledging one acknowledges its prefix). The rows left after
+    /// this are exactly the suffix the client missed, which the reconnect
+    /// drain then replays in order. The prefix prune is epoch-guarded in the
+    /// store, so a stale ack can never drop an unseen result. Idempotent and
+    /// best-effort.
+    pub fn ack_deliveries_from_cursor(&self, session_id: &str, last_event_id: &str) {
         if let Some(delivery_id) = session_store::delivery_id_from_event_id(last_event_id) {
-            let _ = self.pipeline_store.delete_delivery(session_id, delivery_id);
+            let _ = self
+                .pipeline_store
+                .ack_prune_deliveries(session_id, delivery_id);
         }
     }
 }

@@ -98,29 +98,41 @@ const LEADER_ROLE: &str = "gateway.registry_sync";
 const OVERLAY_KV_KEY: &str = "registry_sync/overlay";
 
 /// The KV-published overlay envelope. `v` guards against a peer on an
-/// incompatible snapshot layout applying garbage.
+/// incompatible snapshot layout applying garbage. `fence` is the
+/// publishing leader's `ActiveLease` fencing token: the high-water
+/// mark travels inside the envelope itself, and every adopter (and
+/// the next leader, before overwriting) rejects an envelope whose
+/// token is below the highest it has seen — a deposed leader that
+/// still thinks it leads cannot publish stale state over a successor's.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct OverlaySnapshot {
     v: u32,
+    /// Publishing leader's fencing token. Defaulted so an envelope
+    /// written before tokens were stamped decodes as 0 (never
+    /// preferred over a stamped one).
+    #[serde(default)]
+    fence: u64,
     federations: Vec<FederationConfig>,
 }
 
 const OVERLAY_SNAPSHOT_V: u32 = 1;
 
-fn encode_overlay_snapshot(overlay: &RegistryOverlay) -> Option<Vec<u8>> {
+fn encode_overlay_snapshot(overlay: &RegistryOverlay, fence: u64) -> Option<Vec<u8>> {
     serde_json::to_vec(&OverlaySnapshot {
         v: OVERLAY_SNAPSHOT_V,
+        fence,
         federations: overlay.federations.clone(),
     })
     .ok()
 }
 
-fn decode_overlay_snapshot(bytes: &[u8]) -> Option<RegistryOverlay> {
+/// Decode → `(overlay, publisher's fencing token)`.
+fn decode_overlay_snapshot(bytes: &[u8]) -> Option<(RegistryOverlay, u64)> {
     let snap: OverlaySnapshot = serde_json::from_slice(bytes).ok()?;
     if snap.v != OVERLAY_SNAPSHOT_V {
         return None;
     }
-    Some(RegistryOverlay {
+    let overlay = RegistryOverlay {
         federations: snap
             .federations
             .into_iter()
@@ -129,7 +141,8 @@ fn decode_overlay_snapshot(bytes: &[u8]) -> Option<RegistryOverlay> {
             .filter(|f| !f.upstream.url.starts_with("tunnel://"))
             .map(clamp_adopted)
             .collect(),
-    })
+    };
+    Some((overlay, snap.fence))
 }
 
 /// Re-assert the synthesis rails on a federation adopted from the
@@ -160,6 +173,10 @@ fn clamp_adopted(mut fed: FederationConfig) -> FederationConfig {
 /// snapshot per registry across transient failures.
 pub(crate) struct RegistrySyncer {
     state: AppState,
+    /// Highest overlay fencing token this replica has seen (adopted or
+    /// published). Adoption ignores envelopes below it, so a zombie
+    /// ex-leader's stale publish cannot roll a follower back.
+    overlay_fence_seen: std::sync::atomic::AtomicU64,
 }
 
 struct RegistryRun {
@@ -181,7 +198,12 @@ struct RegistryRun {
 impl RegistrySyncer {
     pub(crate) fn spawn(state: AppState) {
         tokio::spawn(async move {
-            Self { state }.run().await;
+            Self {
+                state,
+                overlay_fence_seen: std::sync::atomic::AtomicU64::new(0),
+            }
+            .run()
+            .await;
         });
     }
 
@@ -244,10 +266,26 @@ impl RegistrySyncer {
         };
         match kv.get(OVERLAY_KV_KEY).await {
             Ok(Some(entry)) => {
-                let Some(overlay) = decode_overlay_snapshot(&entry.bytes) else {
+                let Some((overlay, fence)) = decode_overlay_snapshot(&entry.bytes) else {
                     tracing::warn!("registry overlay KV snapshot is undecodable; keeping current");
                     return;
                 };
+                // Fencing: never adopt an envelope published under a
+                // lower token than the highest already seen — it is a
+                // deposed leader's stale state.
+                let seen = self
+                    .overlay_fence_seen
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if fence < seen {
+                    tracing::warn!(
+                        fence,
+                        highest_seen = seen,
+                        "registry overlay snapshot carries a stale fencing token; ignoring"
+                    );
+                    return;
+                }
+                self.overlay_fence_seen
+                    .fetch_max(fence, std::sync::atomic::Ordering::AcqRel);
                 let current = self.state.registry_overlay.load_full();
                 if *current == overlay {
                     return;
@@ -272,20 +310,50 @@ impl RegistrySyncer {
     }
 
     /// Leader path: publish the overlay so followers (and the next
-    /// leader, warm-starting) can adopt it without crawling.
+    /// leader, warm-starting) can adopt it without crawling. `fence`
+    /// is this leader's `ActiveLease` fencing token; it rides inside
+    /// the envelope and is the mark adopters compare against.
     async fn publish_kv_overlay(
         &self,
         backend: &Arc<dyn mcpg_cluster_api::ClusterBackend>,
         overlay: &RegistryOverlay,
+        fence: u64,
     ) {
         let Some(kv) = self.overlay_kv(backend) else {
             return;
         };
-        let Some(bytes) = encode_overlay_snapshot(overlay) else {
+        // A deposed leader still draining a crawl must not overwrite its
+        // successor's snapshot: read the stored envelope first and stand
+        // down when it carries a higher token. (Read-then-put, so a
+        // racing successor can still be overwritten in a narrow window —
+        // adopters' own compare-on-adopt is what makes that overwrite
+        // inert.)
+        match kv.get(OVERLAY_KV_KEY).await {
+            Ok(Some(entry)) => {
+                if let Some((_, stored_fence)) = decode_overlay_snapshot(&entry.bytes)
+                    && stored_fence > fence
+                {
+                    tracing::warn!(
+                        fence,
+                        stored_fence,
+                        "registry overlay already published under a newer leadership; not overwriting"
+                    );
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "registry overlay KV pre-publish read failed");
+            }
+        }
+        let Some(bytes) = encode_overlay_snapshot(overlay, fence) else {
             return;
         };
         if let Err(e) = kv.put(OVERLAY_KV_KEY, bytes.into(), None).await {
             tracing::warn!(error = %e, "registry overlay KV publish failed");
+        } else {
+            self.overlay_fence_seen
+                .fetch_max(fence, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
@@ -456,7 +524,8 @@ impl RegistrySyncer {
                     ),
                 }
                 if let Some(backend) = &leadership {
-                    self.publish_kv_overlay(backend, &overlay).await;
+                    let fence = lease.as_ref().map_or(0, |l| l.fencing_token());
+                    self.publish_kv_overlay(backend, &overlay, fence).await;
                 }
             }
         }
@@ -982,9 +1051,13 @@ mod tests {
         let overlay = RegistryOverlay {
             federations: vec![overlay_fed("acme--com.acme--crm", "com.acme.crm.")],
         };
-        let bytes = encode_overlay_snapshot(&overlay).expect("encode");
-        let decoded = decode_overlay_snapshot(&bytes).expect("decode");
+        let bytes = encode_overlay_snapshot(&overlay, 42).expect("encode");
+        let (decoded, fence) = decode_overlay_snapshot(&bytes).expect("decode");
         assert_eq!(decoded, overlay);
+        assert_eq!(
+            fence, 42,
+            "the publisher's fencing token rides the envelope"
+        );
 
         // A different snapshot version is refused, not misapplied.
         let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1017,7 +1090,7 @@ mod tests {
                 }
             }]
         });
-        let decoded = decode_overlay_snapshot(&serde_json::to_vec(&hostile).unwrap())
+        let (decoded, _) = decode_overlay_snapshot(&serde_json::to_vec(&hostile).unwrap())
             .expect("snapshot still decodes");
         let fed = &decoded.federations[0];
         assert_eq!(
@@ -1153,5 +1226,21 @@ mod tests {
         let overlay = assemble_overlay(&registries, &runs);
         assert_eq!(overlay.federations.len(), 1);
         assert_eq!(overlay.federations[0].name, "first--com.acme--crm");
+    }
+
+    #[test]
+    fn overlay_snapshot_without_fence_decodes_as_zero() {
+        // An envelope written before tokens were stamped carries no
+        // `fence` field; it must decode (as 0) rather than be dropped,
+        // and 0 never outranks any stamped snapshot.
+        let overlay = RegistryOverlay {
+            federations: vec![overlay_fed("reg--com.acme--crm", "com.acme.crm.")],
+        };
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&encode_overlay_snapshot(&overlay, 7).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("fence");
+        let bytes = serde_json::to_vec(&v).unwrap();
+        let (_, fence) = decode_overlay_snapshot(&bytes).expect("legacy envelope decodes");
+        assert_eq!(fence, 0);
     }
 }

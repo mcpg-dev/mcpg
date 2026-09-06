@@ -37,92 +37,118 @@ pub(crate) fn extract_dynamic_list_bindings(
         .collect()
 }
 
-/// Translate per-binding `watch:` YAML into the engine's
-/// `WatchConfig` map at bootstrap. Bindings without `uri`
-/// are skipped — watch is meaningful on `kind: resource` and
-/// `kind: resource_template`, and only concrete URIs show up in
-/// subscribe state. Template URIs don't yet support watch
-/// (the runtime doesn't synthesize concrete instances).
+/// Translate one binding's `watch:` config into the engine's
+/// `WatchConfig` for a concrete `uri`, compiling the CEL notification
+/// filter eagerly. Shared by the exact-URI bootstrap map
+/// ([`build_watch_configs`]) and the subscribe-time template probe,
+/// which supplies the concrete URI a `resource_templates[]` entry
+/// matched.
+pub(crate) fn watch_config_for(
+    watch: &crate::config::ResourceWatchConfig,
+    uri: &str,
+) -> watch_engine::WatchConfig {
+    use crate::config::WatchStrategyConfig;
+    let strategy = match &watch.strategy {
+        WatchStrategyConfig::Poll { interval_ms } => watch_engine::WatchStrategy::Poll {
+            interval_ms: *interval_ms,
+        },
+        WatchStrategyConfig::Webhook {
+            token,
+            previous_tokens,
+        } => watch_engine::WatchStrategy::Webhook {
+            token: token.clone(),
+            previous_tokens: previous_tokens.clone(),
+        },
+        WatchStrategyConfig::NatsTopic { subject } => watch_engine::WatchStrategy::Plugin {
+            kind: "nats_topic".into(),
+            spec: serde_json::json!({ "subject": subject }),
+        },
+        WatchStrategyConfig::KafkaTopic { topic, group_id } => {
+            watch_engine::WatchStrategy::Plugin {
+                kind: "kafka_topic".into(),
+                spec: serde_json::json!({
+                    "topic": topic,
+                    "group_id": group_id,
+                }),
+            }
+        }
+        WatchStrategyConfig::SqlPolling { spec } => {
+            // Pass the operator-supplied spec through unchanged —
+            // the SQL polling plugin owns the schema and validates
+            // at register time. Every replica runs its own watcher
+            // (DB load × N) and emits to the cluster delivery bus,
+            // which routes per-session to whichever replica holds
+            // the SSE stream.
+            watch_engine::WatchStrategy::Plugin {
+                kind: "sql_polling".into(),
+                spec: serde_json::Value::Object(spec.clone()),
+            }
+        }
+        WatchStrategyConfig::PostgresListenNotify { url, channel } => {
+            watch_engine::WatchStrategy::Plugin {
+                kind: "postgres_listen_notify".into(),
+                spec: serde_json::json!({
+                    "url": url,
+                    "channel": channel,
+                }),
+            }
+        }
+        WatchStrategyConfig::Plugin { kind, spec } => watch_engine::WatchStrategy::Plugin {
+            kind: kind.clone(),
+            spec: serde_json::Value::Object(spec.clone()),
+        },
+    };
+    // Compile the CEL filter eagerly so the engine's per-event
+    // fast-path skips re-parse. `Expression` is the only mode
+    // that needs a program; the others use scope-based logic.
+    let compiled_filter_program = match &watch.notification_filter {
+        Some(crate::config::NotificationFilterConfig::Expression { expression }) => {
+            watch_engine::compile_notification_filter(expression)
+        }
+        _ => None,
+    };
+    watch_engine::WatchConfig {
+        uri: uri.to_owned(),
+        strategy,
+        notification_filter: watch.notification_filter.clone(),
+        compiled_filter_program,
+    }
+}
+
+/// The bootstrap `WatchConfig` map for exact-URI `resources:` bindings,
+/// keyed by `uri`. Template bindings carry `uri_template`, not `uri`, so
+/// they are skipped here and resolved lazily by the subscribe-time probe
+/// via [`build_template_watch_configs`].
 pub(crate) fn build_watch_configs(
     binding_configs: &[BackendConfig],
 ) -> HashMap<String, watch_engine::WatchConfig> {
-    use crate::config::WatchStrategyConfig;
+    let mut out = HashMap::new();
+    for binding in binding_configs {
+        let (Some(watch), Some(uri)) = (&binding.watch, binding.uri.as_deref()) else {
+            continue;
+        };
+        out.insert(uri.to_owned(), watch_config_for(watch, uri));
+    }
+    out
+}
+
+/// Watch configs for `resource_templates[]` bindings — they carry
+/// `uri_template`, not an exact `uri`, so [`build_watch_configs`] skips them.
+/// Keyed by binding name, which is the `profile` a
+/// [`crate::backends::ResourceRoute::Template`] carries; the subscribe-time
+/// probe synthesizes a concrete-URI `WatchConfig` from these on first match.
+pub(crate) fn build_template_watch_configs(
+    binding_configs: &[BackendConfig],
+) -> HashMap<String, crate::config::ResourceWatchConfig> {
     let mut out = HashMap::new();
     for binding in binding_configs {
         let Some(watch) = &binding.watch else {
             continue;
         };
-        let Some(uri) = binding.uri.as_deref() else {
+        if binding.uri_template.is_none() {
             continue;
-        };
-        let strategy = match &watch.strategy {
-            WatchStrategyConfig::Poll { interval_ms } => watch_engine::WatchStrategy::Poll {
-                interval_ms: *interval_ms,
-            },
-            WatchStrategyConfig::Webhook {
-                token,
-                previous_tokens,
-            } => watch_engine::WatchStrategy::Webhook {
-                token: token.clone(),
-                previous_tokens: previous_tokens.clone(),
-            },
-            WatchStrategyConfig::NatsTopic { subject } => watch_engine::WatchStrategy::Plugin {
-                kind: "nats_topic".into(),
-                spec: serde_json::json!({ "subject": subject }),
-            },
-            WatchStrategyConfig::KafkaTopic { topic, group_id } => {
-                watch_engine::WatchStrategy::Plugin {
-                    kind: "kafka_topic".into(),
-                    spec: serde_json::json!({
-                        "topic": topic,
-                        "group_id": group_id,
-                    }),
-                }
-            }
-            WatchStrategyConfig::SqlPolling { spec } => {
-                // Pass the operator-supplied spec through unchanged —
-                // the SQL polling plugin owns the schema and validates
-                // at register time. Every replica runs its own watcher
-                // (DB load × N) and emits to the cluster delivery bus,
-                // which routes per-session to whichever replica holds
-                // the SSE stream.
-                watch_engine::WatchStrategy::Plugin {
-                    kind: "sql_polling".into(),
-                    spec: serde_json::Value::Object(spec.clone()),
-                }
-            }
-            WatchStrategyConfig::PostgresListenNotify { url, channel } => {
-                watch_engine::WatchStrategy::Plugin {
-                    kind: "postgres_listen_notify".into(),
-                    spec: serde_json::json!({
-                        "url": url,
-                        "channel": channel,
-                    }),
-                }
-            }
-            WatchStrategyConfig::Plugin { kind, spec } => watch_engine::WatchStrategy::Plugin {
-                kind: kind.clone(),
-                spec: serde_json::Value::Object(spec.clone()),
-            },
-        };
-        // Compile the CEL filter eagerly so the engine's per-event
-        // fast-path skips re-parse. `Expression` is the only mode
-        // that needs a program; the others use scope-based logic.
-        let compiled_filter_program = match &watch.notification_filter {
-            Some(crate::config::NotificationFilterConfig::Expression { expression }) => {
-                watch_engine::compile_notification_filter(expression)
-            }
-            _ => None,
-        };
-        out.insert(
-            uri.to_owned(),
-            watch_engine::WatchConfig {
-                uri: uri.to_owned(),
-                strategy,
-                notification_filter: watch.notification_filter.clone(),
-                compiled_filter_program,
-            },
-        );
+        }
+        out.insert(binding.name.clone(), watch.clone());
     }
     out
 }
