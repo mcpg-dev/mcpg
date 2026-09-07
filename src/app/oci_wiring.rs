@@ -280,12 +280,50 @@ pub(crate) fn resolve_oci_source(
 /// registry) iff it contains a `/` AND the segment before the
 /// first `/` is registry-shaped (has a `.`, has a `:` for port,
 /// or equals `localhost`).
+/// Rewrite a first-party plugin ID used as the repository segment into the
+/// name the registry actually publishes under: `dev.mcpg.identity.oidc`
+/// becomes `identity-oidc`.
+///
+/// Config authors reach for the dotted id because it is what `plugins[].id`
+/// carries, and the reference reads as obviously correct. It 404s, OCI
+/// resolution is fail-closed, and the pod fails boot pointing at a registry
+/// path rather than at the config line. Only the `dev.mcpg.` prefix is
+/// rewritten — a third-party repository whose name happens to contain dots
+/// is left exactly as written.
+fn canonicalise_first_party_repo(reference: &str) -> std::borrow::Cow<'_, str> {
+    // Split the digest and tag off first so neither is mistaken for part of
+    // the repository path (a registry port lives before the first `/`, so
+    // only a `:` after the last `/` is a tag).
+    let (path, suffix) = match reference.split_once('@') {
+        Some((p, d)) => (p, format!("@{d}")),
+        None => {
+            let tag_at = reference.rfind('/').map_or_else(
+                || reference.find(':'),
+                |slash| reference[slash..].find(':').map(|i| slash + i),
+            );
+            match tag_at {
+                Some(i) => (&reference[..i], reference[i..].to_owned()),
+                None => (reference, String::new()),
+            }
+        }
+    };
+    let Some((prefix, last)) = path.rsplit_once('/') else {
+        return std::borrow::Cow::Borrowed(reference);
+    };
+    let Some(short) = last.strip_prefix("dev.mcpg.") else {
+        return std::borrow::Cow::Borrowed(reference);
+    };
+    std::borrow::Cow::Owned(format!("{prefix}/{}{suffix}", short.replace('.', "-")))
+}
+
 pub(crate) fn normalise_oci_reference(reference: &str, default_registry: &str) -> String {
     // `oci://` is Helm's spelling and operators reach for it here too. The
     // heuristic below would otherwise read `oci:` as a registry host — it
     // contains a colon, so the reference looks "qualified" — and the pull
     // would go to a registry by that name rather than failing on the scheme.
     let reference = reference.strip_prefix("oci://").unwrap_or(reference);
+    let canonical = canonicalise_first_party_repo(reference);
+    let reference: &str = &canonical;
     let looks_qualified = match reference.split_once('/') {
         Some((first, _rest)) => first.contains('.') || first.contains(':') || first == "localhost",
         None => false, // no `/` → nothing to treat as a registry

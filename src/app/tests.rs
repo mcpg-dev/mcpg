@@ -865,6 +865,53 @@ fn build_policy_chain_refuses_yaml_rules_when_not_registered() {
 
 // -- OCI reference normalisation + auth interpolation --------------
 
+/// The registry publishes first-party plugins under their hyphenated SHORT
+/// name, but `plugins[].id` carries the dotted id — so an author writes the id
+/// into the reference and gets a 404 that fails boot pointing at the registry
+/// rather than at the config line. Accept both spellings.
+#[test]
+fn normalise_oci_accepts_the_dotted_plugin_id_as_the_repo_segment() {
+    for (written, want) in [
+        (
+            "ghcr.io/mcpg-dev/plugins/dev.mcpg.identity.oidc",
+            "ghcr.io/mcpg-dev/plugins/identity-oidc",
+        ),
+        // Tags and digests must survive the rewrite untouched.
+        (
+            "ghcr.io/mcpg-dev/plugins/dev.mcpg.backend.http:protocol-1",
+            "ghcr.io/mcpg-dev/plugins/backend-http:protocol-1",
+        ),
+        (
+            "ghcr.io/mcpg-dev/plugins/dev.mcpg.backend.http@sha256:abc",
+            "ghcr.io/mcpg-dev/plugins/backend-http@sha256:abc",
+        ),
+        // A registry port is not a tag.
+        (
+            "registry.internal:5000/p/dev.mcpg.backend.http",
+            "registry.internal:5000/p/backend-http",
+        ),
+    ] {
+        assert_eq!(
+            normalise_oci_reference(written, "default.reg/scope"),
+            want,
+            "rewriting {written}"
+        );
+    }
+}
+
+/// The rewrite is scoped to the first-party prefix: a third-party repository
+/// whose name contains dots is somebody else's namespace, not a mis-spelling.
+#[test]
+fn normalise_oci_leaves_third_party_dotted_names_alone() {
+    for r in [
+        "ghcr.io/acme/com.acme.backend.s3:1.0",
+        "ghcr.io/mcpg-dev/plugins/backend-http:protocol-1",
+        "registry.internal:5000/mcpg.plugins/thing",
+    ] {
+        assert_eq!(normalise_oci_reference(r, "default.reg/scope"), r);
+    }
+}
+
 #[test]
 fn normalise_oci_leaves_qualified_references_alone() {
     assert_eq!(
