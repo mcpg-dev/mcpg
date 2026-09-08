@@ -621,7 +621,7 @@ pub struct PluginSourceConfig {
     /// OCI reference (e.g. `ghcr.io/mcpg-dev/source-code/plugins/audit:protocol-1`
     /// or `plugins/audit@sha256:…`). At boot the gateway pulls the
     /// artifact, verifies the manifest digest, caches it to
-    /// `plugin_registry.cache_dir`, and loads it through the same
+    /// `gateway.plugin_registry.cache_dir`, and loads it through the same
     /// sidecar / packaged-zip path `path` would have taken. When
     /// the reference is missing a registry prefix, the
     /// `plugin_registry.default_registry` value is prepended — which is

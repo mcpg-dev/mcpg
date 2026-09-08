@@ -5,7 +5,7 @@ use super::*;
 /// local cache doesn't already have a matching manifest digest.
 ///
 /// The returned path points inside the gateway's OCI pull cache
-/// (`plugin_registry.cache_dir` or `$XDG_CACHE_HOME/mcpg/plugins/oci`
+/// (`gateway.plugin_registry.cache_dir` or `$XDG_CACHE_HOME/mcpg/plugins/oci`
 /// by default) and is safe to hand to [`load_packaged_plugin`].
 ///
 /// Authentication follows `plugin_registry.auth`:
