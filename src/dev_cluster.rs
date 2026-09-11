@@ -41,7 +41,9 @@ const CLUSTER_PLUGIN_ID: &str = "dev.mcpg.cluster.nats";
 /// resolver appends `:protocol-<major>-<os>-<arch>` for the plugin
 /// protocol this binary speaks, so the reference never goes stale.
 const CLUSTER_PLUGIN_OCI: &str = "ghcr.io/mcpg-dev/plugins/cluster-nats";
-/// Where the official container images bake first-party plugins.
+/// Baked-plugin layout, kept as a middle resolution step for an image that
+/// carries one. Official images do not, so this normally misses and the OCI
+/// reference above is what resolves.
 const BAKED_PLUGIN_PATH: &str = "/usr/local/lib/mcpg/plugins/dev.mcpg.cluster.nats/plugin.so";
 
 const DEFAULT_NODES: usize = 3;

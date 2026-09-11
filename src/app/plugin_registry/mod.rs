@@ -1638,9 +1638,9 @@ pub(crate) async fn build_plugin_registry(
     {
         anyhow::bail!(
             "`access.oauth` configures OIDC identity, but no identity plugin is \
-             registered under {id:?}. It ships as a cdylib: add a `plugins[]` \
-             entry with `source.path`/`source.oci` for it (the gateway images \
-             bake it at /usr/local/lib/mcpg/plugins/{id}/plugin.so). Refusing to \
+             registered under {id:?}. It ships as a cdylib the image does not \
+             carry: add a `plugins[]` entry naming it, `source.oci` for the \
+             published artifact or `source.path` for a local build. Refusing to \
              boot rather than serve requests with the configured identity \
              provider missing.",
             id = crate::runtime::identity::oidc::PLUGIN_ID,
@@ -1944,10 +1944,10 @@ fn warn_unregistered_observability_sinks(
                 plugin_id = %kind,
                 signal = %signal,
                 "{signal} sink {kind:?} is configured but no plugin is registered \
-                 under that id — it ships as a cdylib, so add a `plugins[]` entry \
-                 with `source.path`/`source.oci` for it (the gateway images bake \
-                 it at /usr/local/lib/mcpg/plugins/<id>/plugin.so). Until then \
-                 this signal is not exported."
+                 under that id — it ships as a cdylib the image does not carry, \
+                 so add a `plugins[]` entry naming it, `source.oci` for the \
+                 published artifact or `source.path` for a local build. Until \
+                 then this signal is not exported."
             );
         }
     };

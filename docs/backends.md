@@ -152,7 +152,7 @@ bindings (single source of truth), so the entry needs no `config:` block:
 plugins:
   - id: dev.mcpg.backend.nats
     source:
-      oci: ghcr.io/mcpg-dev/source-code/plugins/backend-nats:<version>-linux-amd64
+      oci: ghcr.io/mcpg-dev/plugins/backend-nats
       # or: path: /opt/mcpg/plugins/libmcpg_plugin_backend_nats.so
 ```
 
@@ -255,7 +255,7 @@ linux-gnu, musl, macOS, and Windows — via rdkafka's `cmake-build` + vendored d
 plugins:
   - id: dev.mcpg.backend.kafka
     source:
-      oci: ghcr.io/mcpg-dev/source-code/plugins/backend-kafka:<version>-linux-amd64
+      oci: ghcr.io/mcpg-dev/plugins/backend-kafka
       # or, for a locally-staged build:
       # path: /opt/mcpg/plugins/libmcpg_plugin_backend_kafka.so
 ```
@@ -703,7 +703,7 @@ per-scheme auth, and safety limits live:
 plugins:
   - id: dev.mcpg.backend.openapi
     source:
-      oci: ghcr.io/mcpg-dev/source-code/plugins/backend-openapi:<version>-linux-amd64
+      oci: ghcr.io/mcpg-dev/plugins/backend-openapi
       # or: path: /opt/mcpg/plugins/libmcpg_plugin_backend_openapi.so
     config:
       sources:

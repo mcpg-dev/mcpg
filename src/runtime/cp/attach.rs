@@ -102,10 +102,18 @@ pub async fn wire_if_configured(
 ) -> anyhow::Result<Option<CpAttachHandle>> {
     #[cfg(not(feature = "cp-attached"))]
     {
-        let _ = (runtime, config, observability);
-        // Feature off — nothing to do. The config block, if
-        // present, is silently ignored (operators get a clear
-        // error from `cargo build` if they forget the feature).
+        let _ = (runtime, observability);
+        // Feature off — nothing to do. A configured block is still worth one
+        // line: on a managed platform the control plane renders it, and a
+        // gateway that ignores it in silence looks enrolled from every side
+        // but the platform's.
+        if config.gateway.control_plane.is_some() {
+            tracing::warn!(
+                "control_plane: `gateway.control_plane` is configured but this binary was built \
+                 without the `cp-attached` feature — the block is ignored and the gateway will \
+                 not enrol; rebuild with `--features cp-attached`"
+            );
+        }
         Ok(None)
     }
     #[cfg(feature = "cp-attached")]
@@ -119,6 +127,7 @@ mod attached {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use anyhow::Context as _;
     use arc_swap::{ArcSwap, ArcSwapOption};
     use mcpg_control_plane_client::{
         AgentRunner, AgentRunnerConfig, DekHandle, MetricsBuffer, QuotaStatus,
@@ -375,13 +384,30 @@ mod attached {
             return Ok(None);
         };
 
+        // The block is not a plugin spec, so the config-load resolver never
+        // walks it; its two URLs get the same `${env.X}` pass here. That is
+        // how a managed platform keeps the enrollment token out of the
+        // rendered config: the block names an environment variable and a
+        // Secret projected into the pod carries the value.
+        let cp_url =
+            crate::runtime::expr::resolve_env_in_string(&cp.url).context("control_plane.url")?;
+        let enrollment_url = cp
+            .enrollment_url
+            .as_deref()
+            .map(|u| {
+                crate::runtime::expr::resolve_env_in_string(u)
+                    .context("control_plane.enrollment_url")
+            })
+            .transpose()?
+            .filter(|u| !u.trim().is_empty());
+
         // Sanity-check the config — Register requires either an
         // enrollment URL on first boot or cached creds in the
         // state dir. Bail with a clear message if neither.
         let creds_existed = std::path::Path::new(&cp.state_dir)
             .join("agent-creds.json")
             .exists();
-        if cp.enrollment_url.is_none() && !creds_existed {
+        if enrollment_url.is_none() && !creds_existed {
             anyhow::bail!(
                 "control_plane: no cached creds at {} — set enrollment_url on first boot",
                 cp.state_dir
@@ -390,8 +416,8 @@ mod attached {
 
         std::fs::create_dir_all(&cp.state_dir)?;
         let agent_cfg = AgentRunnerConfig {
-            cp_endpoint: cp.url.clone(),
-            enrollment_url: cp.enrollment_url.clone().unwrap_or_default(),
+            cp_endpoint: cp_url.clone(),
+            enrollment_url: enrollment_url.unwrap_or_default(),
             instance_uid: cp.instance_uid.clone().unwrap_or_else(default_instance_uid),
             version: env!("CARGO_PKG_VERSION").to_owned(),
             state_dir: cp.state_dir.clone().into(),
@@ -449,7 +475,7 @@ mod attached {
         observability.set_log_sink(Arc::new(CpClientLogSink { buf: runner.logs() }));
 
         info!(
-            cp_endpoint = %cp.url,
+            cp_endpoint = %cp_url,
             state_dir = %cp.state_dir,
             capture_payloads,
             "control_plane: wired tool-call recorder; spawning agent"

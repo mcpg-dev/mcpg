@@ -20,7 +20,9 @@ use sha2::Digest;
 /// do not bump it — consumers must ignore what they do not know.
 const MANIFEST_VERSION: u32 = 1;
 
-/// Where gateway images bake their plugins (`<dir>/<plugin id>/plugin.so`).
+/// The layout a baked plugin would occupy (`<dir>/<plugin id>/plugin.so`).
+/// Published images ship none, so this scan reports an empty list for them —
+/// an image that carries plugins is the exception the field exists to report.
 const BAKED_PLUGINS_DIR: &str = "/usr/local/lib/mcpg/plugins";
 
 #[derive(Debug, Serialize)]
@@ -41,6 +43,11 @@ pub struct CapabilityManifest {
     pub config_schema: serde_json::Value,
     /// Plugins shipped inside the image, discovered from the baked dir.
     pub baked_plugins: Vec<BakedPlugin>,
+    /// Cargo features this binary was built with, of the ones that change
+    /// what it can do for a platform. A control plane blessing a release
+    /// reads this: a gateway without `cp-attached` ignores the
+    /// `gateway.control_plane` block it renders and never enrols.
+    pub features: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,11 +59,52 @@ pub struct BakedPlugin {
     pub class: Option<String>,
 }
 
+/// Drop `description` keywords so the schema hash answers "did the config
+/// CONTRACT change", not "did a doc comment change". `schemars` renders every
+/// doc comment into the schema, so hashing it whole makes an edited sentence
+/// indistinguishable from a renamed field — a consumer comparing the hash
+/// across releases reads a docstring as a breaking change.
+///
+/// The keys of `properties` and friends are FIELD NAMES, not keywords, and the
+/// config really does have fields called `description`. Those maps are
+/// recursed through by value so such a field keeps its place in the hash;
+/// removing the key there would silently drop a real part of the contract,
+/// which is the failure this function exists to avoid.
+fn strip_doc_text(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("description");
+            for (key, child) in map.iter_mut() {
+                if matches!(
+                    key.as_str(),
+                    "properties" | "patternProperties" | "$defs" | "definitions"
+                ) {
+                    if let serde_json::Value::Object(named) = child {
+                        for (_, sub) in named.iter_mut() {
+                            strip_doc_text(sub);
+                        }
+                    }
+                } else {
+                    strip_doc_text(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_doc_text(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Build the manifest for this binary, scanning `dir` for baked plugins.
 pub fn manifest(baked_dir: &Path) -> CapabilityManifest {
     let schema = serde_json::to_value(schemars::schema_for!(crate::config::AppConfig))
         .expect("AppConfig schema serializes");
-    let canonical = serde_json::to_vec(&schema).expect("schema value re-serializes compactly");
+    let mut structural = schema.clone();
+    strip_doc_text(&mut structural);
+    let canonical = serde_json::to_vec(&structural).expect("schema value re-serializes compactly");
     let config_schema_sha256 = hex(&sha2::Sha256::digest(&canonical));
 
     CapabilityManifest {
@@ -68,7 +116,21 @@ pub fn manifest(baked_dir: &Path) -> CapabilityManifest {
         config_schema_sha256,
         config_schema: schema,
         baked_plugins: scan_baked(baked_dir),
+        features: built_features(),
     }
+}
+
+/// The product-relevant features compiled in. Listed by hand: a feature is
+/// only worth reporting when a platform decides something on it.
+fn built_features() -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if cfg!(feature = "cp-attached") {
+        out.push("cp-attached");
+    }
+    if cfg!(feature = "governance-quotas") {
+        out.push("governance-quotas");
+    }
+    out
 }
 
 /// Entry point behind `mcpg capabilities`. `MCPG_BAKED_PLUGINS_DIR`
@@ -144,12 +206,31 @@ mod tests {
         );
         assert!(m.mcp_protocol_versions.contains(&"2025-11-25"));
         assert!(m.mcp_protocol_versions.contains(&"2026-07-28"));
-        let canonical = serde_json::to_vec(&m.config_schema).unwrap();
+        // The published schema keeps its prose; the hash is taken over the
+        // structure alone, so reproducing it means stripping the doc text the
+        // same way.
+        let mut structural = m.config_schema.clone();
+        strip_doc_text(&mut structural);
+        let canonical = serde_json::to_vec(&structural).unwrap();
         assert_eq!(
             m.config_schema_sha256,
             hex(&sha2::Sha256::digest(&canonical))
         );
+        assert!(
+            serde_json::to_string(&m.config_schema)
+                .unwrap()
+                .contains("\"description\""),
+            "the published schema should still carry its documentation"
+        );
         assert!(m.baked_plugins.is_empty());
+        // The manifest reports what this build carries — a control plane
+        // reads it before blessing — and it must agree with the compiler.
+        assert_eq!(
+            m.features.contains(&"cp-attached"),
+            cfg!(feature = "cp-attached"),
+            "features: {:?}",
+            m.features
+        );
         // The schema is the real one, not a stub.
         assert!(
             m.config_schema.get("definitions").is_some() || m.config_schema.get("$defs").is_some()
@@ -179,5 +260,75 @@ mod tests {
         assert_eq!(got[0].class.as_deref(), Some("backend"));
         assert_eq!(got[1].id, "dev.mcpg.transform.masking");
         assert_eq!(got[1].class, None);
+    }
+
+    /// A doc-comment edit must not move the hash: the signal answers "did the
+    /// config contract change", and a consumer that sees it move reads a
+    /// breaking change. Structural edits must still move it, or it says nothing.
+    #[test]
+    fn schema_hash_covers_structure_not_prose() {
+        use serde_json::json;
+        let hash = |v: &serde_json::Value| {
+            let mut c = v.clone();
+            super::strip_doc_text(&mut c);
+            super::hex(&sha2::Sha256::digest(
+                serde_json::to_vec(&c).expect("re-serializes"),
+            ))
+        };
+        let base = json!({
+            "type": "object",
+            "description": "the gateway config",
+            "properties": {
+                "port": { "type": "integer", "description": "listening port" }
+            }
+        });
+        let mut reworded = base.clone();
+        reworded["description"] = json!("THE GATEWAY CONFIGURATION");
+        reworded["properties"]["port"]["description"] = json!("the port it listens on");
+        assert_eq!(hash(&base), hash(&reworded), "a docstring moved the hash");
+
+        let mut retyped = base.clone();
+        retyped["properties"]["port"]["type"] = json!("string");
+        assert_ne!(
+            hash(&base),
+            hash(&retyped),
+            "a type change did not move the hash"
+        );
+
+        let mut added = base.clone();
+        added["properties"]["host"] = json!({ "type": "string" });
+        assert_ne!(
+            hash(&base),
+            hash(&added),
+            "a new field did not move the hash"
+        );
+    }
+
+    /// The config really has fields NAMED `description`, and the keys of a
+    /// `properties` map are field names rather than keywords. Dropping them
+    /// would remove part of the contract from the very signal that reports it.
+    #[test]
+    fn a_field_named_description_survives_stripping() {
+        use serde_json::json;
+        let mut schema = json!({
+            "type": "object",
+            "description": "prose that must go",
+            "properties": {
+                "description": { "type": "string", "description": "prose that must go" }
+            }
+        });
+        super::strip_doc_text(&mut schema);
+        assert!(
+            schema["properties"]["description"].is_object(),
+            "the field named `description` was dropped from the hashed structure"
+        );
+        assert_eq!(schema["properties"]["description"]["type"], json!("string"));
+        assert!(schema.get("description").is_none(), "the keyword survived");
+        assert!(
+            schema["properties"]["description"]
+                .get("description")
+                .is_none(),
+            "the field's own doc text survived"
+        );
     }
 }

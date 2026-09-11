@@ -13,8 +13,8 @@
 //! secret opens it.
 //!
 //! Layers merge in the order given, later winning, exactly like a
-//! path-separator-joined `MCPG_CONFIG` list; `--config` layers apply after the
-//! `MCPG_CONFIG` files.
+//! path-separator-joined `MCPG_CONFIG` list. The flag outranks the
+//! environment: when `--config` is given, `MCPG_CONFIG` is not read.
 
 use std::path::PathBuf;
 use std::time::Duration;

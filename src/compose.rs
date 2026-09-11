@@ -54,10 +54,11 @@ pub struct CompositionArgs {
     pub tunnel_mode: Option<String>,
     /// Relay endpoint, from `--tunnel <wss-url>` or `--tunnel-relay <wss-url>`.
     pub tunnel_relay: Option<String>,
-    /// `--config <source>` (repeatable) — explicit config layers, applied
-    /// after any `MCPG_CONFIG` files (later wins). Each source is a local path,
-    /// a `file://` path, an `https://` URL (fetched at boot), or inline
-    /// `base64:`/`data:` YAML. Resolved in `main` (the fetch is async).
+    /// `--config <source>` (repeatable) — the config layers (later wins),
+    /// outranking `MCPG_CONFIG`, which is not read when this is given. Each
+    /// source is a local path, a `file://` path, an `https://` URL (fetched
+    /// at boot), or inline `base64:`/`data:` YAML. Resolved in `main` (the
+    /// fetch is async).
     pub config: Vec<String>,
     /// `--inspector` — supervise an `mcpg-inspector` sidecar pre-wired
     /// against this gateway.

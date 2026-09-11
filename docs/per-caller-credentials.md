@@ -1,7 +1,8 @@
 # Per-caller credentials with `cred://`
 
-> **Status.** Available from PROTOCOL_VERSION 1.8 / ABI v25 onward.
-> HTTP added at 1.10. Supported backends: **SQL** (Postgres, MySQL,
+> **Status.** Shipped; part of the frozen v1 plugin contract
+> (`MCPG_PLUGIN_ABI_VERSION = 1`, `PROTOCOL_VERSION = "1.0"`).
+> Supported backends: **SQL** (Postgres, MySQL,
 > MariaDB, SQLite), **NATS**, **Kafka**, **HTTP**. Pipeline steps
 > that delegate to these backends inherit per-caller credentials
 > automatically.
@@ -317,17 +318,20 @@ credential bytes ever land in audit fields).
 ### Backwards compatibility
 
 A binding spec with no `cred://` references is **bit-for-bit
-identical** to the pre-1.8 path. The static-cred fast path
-short-circuits resolution + identity-keyed caching entirely —
-your existing fleet does not silently start opening
+identical** to the static-credential path. The static-cred
+fast path short-circuits resolution + identity-keyed caching
+entirely — your existing fleet does not silently start opening
 per-credential pools just because you upgraded the gateway.
 
-PROTOCOL_VERSION bumped 1.7 → 1.8 to reflect the new
-`BackendRequest.identity` field. The field is optional, so
-plugins built against 1.7 continue to deserialize 1.8 requests
-(the field is `None` for those plugins). Operator-side: nothing
-to migrate — the new spec fields on NATS/Kafka are all `Option<_>`
-with sensible defaults.
+`BackendRequest.identity` is part of the frozen v1 contract. The
+field is optional and additive — `BackendRequest` does not deny
+unknown fields, so a plugin whose struct omits `identity`
+deserializes requests unchanged. `identity` is `None` on
+system-initiated calls (await runtime, watch-engine fetch), which
+adapters MUST treat as "no caller, static-cred only" and refuse
+`cred://` resolution rather than fall back to an arbitrary
+identity. Operator-side: nothing to migrate — the new spec fields
+on NATS/Kafka are all `Option<_>` with sensible defaults.
 
 ---
 

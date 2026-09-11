@@ -800,7 +800,7 @@ governance:
 #     kind: native                 # native (default) | wasm
 #     class: tool_gate             # snake_case PluginClass (see list below)
 #     source: { path: ./plugins/libX.so }        # exactly one of path | oci
-#     # source: { oci: ghcr.io/mcpg-dev/plugins/cedar:1.0.0 }   # OCI artifact (pulled at boot)
+#     # source: { oci: ghcr.io/mcpg-dev/plugins/policy-cedar }   # OCI artifact (pulled at boot)
 #     config: { ... }              # plugin-specific (the per-plugin blocks below)
 #     enforce: true                # false ⇒ shadow mode: evaluate + log but override deny/challenge → allow
 #     disabled: false              # true ⇒ parsed + validated but NOT loaded (keep config, toggle off)

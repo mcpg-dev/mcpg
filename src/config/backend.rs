@@ -1441,6 +1441,7 @@ mod pipeline_step_tests {
         let kinds = [
             "dynamodb",
             "elasticsearch",
+            "oci_registry",
             "oracle",
             "snowflake",
             "duckdb",

@@ -1149,6 +1149,7 @@ mod tests {
                 "elasticsearch",
                 serde_json::json!({}),
             ),
+            ("oci", "oci_registry", "oci_registry", serde_json::json!({})),
             (
                 "ora",
                 "oracle",

@@ -98,13 +98,13 @@ pub(crate) fn resolve_oci_source(
         )
     })?;
 
-    // Cache filename is the sanitised reference. Two references
-    // with different digests get different files; digest-pinned
-    // refs are stable forever; tag-based refs are re-pulled on
-    // every boot (registry may have updated the tag — we rely on
-    // the registry's content-addressable guarantee to avoid
-    // re-downloading blobs that the local pulled file already
-    // matches).
+    // Cache filename is the sanitised reference, so a MOVING TAG maps to one
+    // file across every republish. Nothing below re-reads the registry on a
+    // cache hit: the sidecar anchors the bytes a previous pull persisted, which
+    // answers "is this file intact", not "is this file current". A gateway that
+    // has cached `:protocol-1` therefore keeps that build until the cache is
+    // evicted or the reference itself changes — rolling a plugin forward needs
+    // a new tag, not a new build under the same one.
     let cache_name = sanitize_for_path(&normalised).replace('/', "_") + ".zip";
     let cache_path = cache_base.join(&cache_name);
 

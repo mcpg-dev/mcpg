@@ -126,28 +126,60 @@ async fn main() -> anyhow::Result<()> {
         _cp_sidecar = Some(sidecar);
     }
 
-    // Config comes from two ordered inputs, both later-wins overlays:
-    //   1. `MCPG_CONFIG` — a single path or a path-separator-joined list of
-    //      FILES (`base.yaml:prod.yaml` on Unix, `;`-joined on Windows).
-    //   2. `--config <source>` flags (repeatable), applied AFTER the env
-    //      files. Each source is a local path, a `file://` path, an
-    //      `https://` URL fetched now, or inline `base64:`/`data:` YAML — so
-    //      URLs and inline blobs (which can't survive the `:`-split in
-    //      `MCPG_CONFIG`) get a clean home here.
-    // `MCPG_*` env vars are applied last, over everything.
-    let mut config_sources: Vec<mcpg::config::ConfigSource> = std::env::var_os("MCPG_CONFIG")
-        .map(|v| {
-            std::env::split_paths(&v)
-                .map(mcpg::config::ConfigSource::File)
-                .collect()
-        })
-        .unwrap_or_default();
+    // Where the config comes from follows the precedence every CLI its
+    // operators already use (kubectl, docker, terraform, cargo): the flag
+    // the person typed outranks the environment, which outranks the file's
+    // own defaults. So `--config <source>` (repeatable; a local path, a
+    // `file://` path, an `https://` URL fetched now, or inline
+    // `base64:`/`data:` YAML) is THE source list when given, and
+    // `MCPG_CONFIG` — a single path or a path-separator-joined list of
+    // files — is read only without it. An image bakes `MCPG_CONFIG` as its
+    // default; a flag on the command line is never beaten by that default.
+    // Layers within one list merge later-wins. `MCPG_*` setting overrides
+    // apply over the loaded layers.
+    let env_config = std::env::var_os("MCPG_CONFIG").filter(|v| !v.is_empty());
+    let (mut config_sources, config_origin): (Vec<mcpg::config::ConfigSource>, &str) = if comp
+        .config
+        .is_empty()
+    {
+        (
+            env_config
+                .as_ref()
+                .map(|v| {
+                    std::env::split_paths(v)
+                        .map(mcpg::config::ConfigSource::File)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            "MCPG_CONFIG",
+        )
+    } else {
+        if let Some(v) = &env_config {
+            eprintln!(
+                "mcpg: --config given; MCPG_CONFIG={} is not loaded (a flag outranks the environment)",
+                v.to_string_lossy()
+            );
+        }
+        (Vec::new(), "--config")
+    };
     for spec in &comp.config {
         // The spec is echoed back on failure, and a pasted share link carries
         // its key in the fragment — mask it before it reaches stderr.
         config_sources.push(mcpg::config::source::resolve(spec).await.with_context(|| {
             format!("--config {}", mcpg::config::encrypted::redacted_spec(spec))
         })?);
+    }
+    // A missing file is reported with the thing that named it: the error
+    // otherwise says where the gateway noticed, not what was wrong.
+    for source in &config_sources {
+        if let mcpg::config::ConfigSource::File(path) = source
+            && !path.is_file()
+        {
+            anyhow::bail!(
+                "config file not found: {} (named by {config_origin})",
+                path.display()
+            );
+        }
     }
     // Load the config here (rather than via `app::build`) so the
     // composition flags can fold their control-plane attachment in before
