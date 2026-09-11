@@ -23,7 +23,12 @@ WORKDIR /src
 COPY . .
 # An existing Cargo.lock (the release pipeline stages the resolved one into
 # the build context) pins the graph; without one the build resolves fresh.
-RUN cargo build --release --bin mcpg
+# `cp-attached` is the image's shipped feature set: a managed gateway
+# enrols with its control plane from the `gateway.control_plane` block the
+# platform renders, and a binary built without the feature ignores that
+# block. The list is asserted against the release manifest by the
+# monorepo's CI, so it cannot drift from what the tarballs are built with.
+RUN cargo build --release --features cp-attached --bin mcpg
 
 # ----------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
