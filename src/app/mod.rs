@@ -2,6 +2,7 @@ pub mod config_overlay;
 pub mod config_watch;
 pub mod host_services_impl;
 pub mod plugin_kv_adapter;
+pub mod secrets_watch;
 
 mod auth_wiring;
 mod boot;

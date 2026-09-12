@@ -2,11 +2,11 @@
 
 What SIGHUP picks up vs what requires a restart. Keep this honest — operators rely on it to plan rolling upgrades vs in-place config rolls.
 
-> Source of truth: `apps/gateway/src/app/mod.rs` — the `reload_config` function. Anything it rebuilds is reload-safe; anything it reads-but-discards or doesn't read at all needs a restart.
+> Source of truth: `apps/gateway/src/app/reload.rs` — the `reload_config` function. Anything it rebuilds is reload-safe; anything it reads-but-discards or doesn't read at all needs a restart. The triggers live in `app/serve.rs` (SIGHUP), `admin/` (HTTP), `app/config_watch.rs`, and `app/secrets_watch.rs`.
 
 ## How reload works
 
-Three triggers, identical semantics:
+Four triggers, identical semantics:
 
 ```
 # Operator shell:
@@ -22,17 +22,27 @@ $ curl -X POST http://gw:9090/admin/v1/config:reload
 #       poll_interval_ms: 5000
 # Save the YAML on disk; the next poll tick picks it up.
 $ vim /etc/mcpg/mcpg.yaml
+
+# Background secrets-watcher (on whenever gateway.secrets.dir is set):
+#   gateway:
+#     secrets:
+#       dir: /var/run/mcpg/secrets
+#       watch: true              # default true
+#       poll_interval_ms: 5000   # default 5000; floor 1000
+# Rotate a file in the directory; the next poll tick re-resolves ${secret.*}.
+$ printf 'new-value' > /var/run/mcpg/secrets/API_TOKEN
 ```
 
-The admin endpoint and the file-watcher both run the same `reload_config` function as the SIGHUP handler — full `GatewayRuntime` rebuild, ArcSwap atomic swap, session store preserved, credential cache rebuilt fresh. Each replica reloads independently; there is no cluster broadcast (Kustomize / CI loops over pods explicitly when they want fleet-wide propagation; the file-watcher reacts on each replica because every pod sees its own ConfigMap mount).
+The admin endpoint and both watchers run the same `reload_config` function as the SIGHUP handler — full `GatewayRuntime` rebuild, ArcSwap atomic swap, session store preserved, credential cache rebuilt fresh. Each replica reloads independently; there is no cluster broadcast (Kustomize / CI loops over pods explicitly when they want fleet-wide propagation; the watchers react on each replica because every pod sees its own ConfigMap / Secret mount).
 
-The admin endpoint is auth-gated by the existing `admin.auth` block (`disabled` / `static_bearer` / `trusted_header`). It returns `200 OK` on success, `500` on failure (the response body's `error` carries the cause + the previous config remains live). The audit event is tagged `source: "admin_api"` for HTTP triggers, `source: "sighup"` for signal triggers, and `source: "file_watch"` for file-watcher triggers — auditors can distinguish the three. Every trigger increments `mcpg_admin_reload_triggers_total{trigger="<source>"}` AND the pre-existing `mcpg_config_reloads_total` so dashboards tracking aggregate reloads (across all triggers) keep working.
+The admin endpoint is auth-gated by the existing `admin.auth` block (`disabled` / `static_bearer` / `trusted_header`). It returns `200 OK` on success, `500` on failure (the response body's `error` carries the cause + the previous config remains live). The audit event is tagged `source: "admin_api"` for HTTP triggers, `source: "sighup"` for signal triggers, `source: "file_watch"` for config file-watcher triggers, and `source: "secrets_watch"` for secrets-directory triggers — auditors can distinguish the four. Every trigger increments `mcpg_admin_reload_triggers_total{trigger="<source>"}` AND the pre-existing `mcpg_config_reloads_total` so dashboards tracking aggregate reloads (across all triggers) keep working.
 
 1. Re-loads the same `MCPG_CONFIG` source set (single file or layered via `:` / `;` separator).
 2. Re-applies the same `MCPG_*` env-var overlay.
-3. Builds a fresh `GatewayRuntime` with the new config.
-4. Atomically swaps the runtime via `ArcSwap`. In-flight requests on the old runtime complete safely — they hold an `Arc` to the previous runtime until they finish.
-5. Emits an audit event tagged `source: "sighup"` / `source: "admin_api"` / `source: "file_watch"` (one of three) so the rotation is on record.
+3. Re-resolves every config-load reference: `${env.X}`, secret-provider URIs, and `${secret.NAME}` from `gateway.secrets.dir`.
+4. Builds a fresh `GatewayRuntime` with the new config.
+5. Atomically swaps the runtime via `ArcSwap`. In-flight requests on the old runtime complete safely — they hold an `Arc` to the previous runtime until they finish.
+6. Emits an audit event tagged `source: "sighup"` / `source: "admin_api"` / `source: "file_watch"` / `source: "secrets_watch"` (one of four) so the rotation is on record.
 
 The session store is held outside the runtime in `AppState` and is **not rebuilt**. Active sessions, their replay buffers, and their session-keyed quotas survive the reload.
 
@@ -59,6 +69,7 @@ The session store is held outside the runtime in `AppState` and is **not rebuilt
 | `storage.response_cache` | Gateway-managed LLM response cache. | |
 | `observability.plugin_health_probe` | Plugin liveness prober tuning. | |
 | `gateway.config_overlay[]` | `config_provider` URI list snapshotted at boot + deep-merged into the overlay. | |
+| `${secret.NAME}` values under `gateway.secrets.dir` | Every reference is re-read from `<dir>/<NAME>` on reload; the runtime's `secrets_digest` (reported to the control plane) is recomputed. | The secrets-watcher triggers this reload automatically; SIGHUP / admin / file-watch pick up rotated values too. |
 | `cluster` (kind unchanged) | Coordinator config (URL, key prefix, pool size). | The cluster plugin re-initialises with new params. |
 | `mcp.capabilities.tasks.store`, `mcp.configurations.{sessions,pipelines,subscriptions}.store`, `mcp.configurations.{delivery,cancellation}.bus` | Capability-state overrides. Default `kind: cluster` (inherits from the backend); override to `kind: memory` / `file` to pin in-process. | Switching from in-process to a clustered backend mid-flight loses local-only state — see "Caveats" below. |
 | `mcp.capabilities.tasks.{default_ttl_ms, max_tasks_per_session, result_wait_ms, reaper_interval_ms}` | Task retention policy. | Applied to existing + new task entries. |
@@ -129,11 +140,41 @@ Not a SIGHUP replacement. Operators still want SIGHUP for "reload right now" —
 
 ---
 
+## Trigger: secrets-watch
+
+Background polling task over `gateway.secrets.dir`, the directory behind `${secret.NAME}`. On by default whenever `dir` is set; independent of `config_watch.enabled`:
+
+```yaml
+gateway:
+  secrets:
+    dir: /var/run/mcpg/secrets   # one file per key: ${secret.API_TOKEN} reads <dir>/API_TOKEN
+    watch: true                  # default true; false = rotate values by SIGHUP / admin reload instead
+    poll_interval_ms: 5000       # default 5000; floor 1000 (clamped at spawn time)
+```
+
+What it is for:
+
+- **Managed (mcpg.cloud) gateways.** The platform mounts the tenant's Secret at `/var/run/mcpg/secrets` and sets this block. `mcpg cloud secret set KEY` updates the Secret; the kubelet projects the new value into the volume; the watcher re-resolves every `${secret.*}` reference on the next tick. No restart, no config publish.
+- **Self-hosted gateways.** Point `dir` at any directory — a Kubernetes Secret volume, a Vault Agent sink, a directory your rotation job writes into. Same behaviour.
+
+How it picks up changes:
+
+- SHA-256 fingerprints every regular file in `dir` (symlinks followed — a Kubernetes Secret volume is `NAME -> ..data/NAME`, and the kubelet rotates by swapping the `..data` link) every `poll_interval_ms`. Any added, removed, or rewritten file triggers `reload_config`, the same path every other trigger takes; `${secret.*}` references are re-read from the directory during that reload.
+- Reload errors keep the *old* fingerprint set as the baseline, so the next tick retries the same delta until the reload succeeds — the same back-pressure the config file-watcher gives.
+- The audit event carries `keys_changed: [<names>]` + `duration_ms`. Names only, never values; the values never appear in logs, audit events, or error messages either (an unresolvable reference is reported as `${secret.NAME}`).
+- A change to a file the config does not reference still triggers a reload (the watcher does not know the reference set); the reload is a no-op for the served surface, and the `secrets_digest` — which covers every key in the directory, referenced or not, so the control plane can compare it with the set it registered — moves to the new value.
+
+Cost is one `read()` per file in the directory per interval — the same profile as the config file-watcher.
+
+---
+
 ## Caveats
 
 **Capability storage backend swaps.** Changing `mcp.capabilities.tasks.store` (or `mcp.configurations.{pipelines,subscriptions,sessions}.store` / etc.) from `kind: memory` to `kind: cluster` on a running gateway means in-flight tasks held in the in-process map are lost — they never make it to the cluster-backed primitive. For lossless backend swaps, drain the gateway, switch the YAML, then restart.
 
 **MCPG_* env vars.** Env vars are resolved at config-load time and applied last in the merge order (after every YAML file). SIGHUP re-reads the env block, so a `kill -HUP` after `export MCPG_REDIS_URL=...` picks up the new value. But CEL `${env.X}` expressions inside YAML resolve once at load — they're then cached on the config struct. The next reload re-resolves them, so an env-var rotation reaches the gateway on SIGHUP.
+
+**`${secret.NAME}` values.** Resolved at config load like `${env.X}`, from the file `<gateway.secrets.dir>/<NAME>`. Every reload re-reads them; with `watch: true` (the default) the secrets-watcher triggers that reload itself within one poll interval of the file changing. A `${secret.*}` reference in a config with no `gateway.secrets.dir` fails validation (so `mcpg config check` catches it); a missing file, a non-UTF-8 file, or a NAME outside `^[A-Za-z_][A-Za-z0-9_]{0,63}$` fails the boot or reload with the key named. The substituted value is final: it is never re-read as an `env://` / `file://` provider URI or an `${env.X}` reference.
 
 **OIDC discovery cache.** The OIDC plugin runs its own JWKS refresh + introspection cache. SIGHUP rebuilds the resolver, which clears those caches. Operators rotating an IdP signing key can SIGHUP to force the next request to fetch the new JWKS instead of waiting for the per-provider `refresh_interval_secs`.
 
@@ -143,9 +184,9 @@ Not a SIGHUP replacement. Operators still want SIGHUP for "reload right now" —
 
 ## Verifying a reload landed
 
-After any of the three triggers, watch for:
+After any of the four triggers, watch for:
 
-- An audit event with `source: "sighup"` / `"admin_api"` / `"file_watch"` (the audit channel emits a config-rotated event automatically). The `file_watch` variant additionally carries `paths_changed: [...]` so auditors see which file in a layered set actually changed.
+- An audit event with `source: "sighup"` / `"admin_api"` / `"file_watch"` / `"secrets_watch"` (the audit channel emits a config-rotated event automatically). The `file_watch` variant additionally carries `paths_changed: [...]` so auditors see which file in a layered set actually changed; the `secrets_watch` variant carries `keys_changed: [...]` — key names only.
 - A `tools/list_changed` notification on every active session if `mcp.capabilities.*[]` shape changed.
 - Health endpoint stays at 200 throughout — no listener bounce.
 - `mcpg config check` against the new file set should already have been green before the trigger.
@@ -163,4 +204,8 @@ $ mcpg config check config.yaml override.yaml \
 $ mcpg config check config.yaml override.yaml \
     && cp -f config.yaml /etc/mcpg/config.yaml
 # wait one poll_interval_ms; watch the audit log for source: "file_watch"
+
+# Secrets-watch path (gateway.secrets.dir set; managed gateways: `mcpg cloud secret set`):
+$ printf '%s' "$NEW_TOKEN" > /var/run/mcpg/secrets/API_TOKEN
+# wait one poll_interval_ms; watch the audit log for source: "secrets_watch", keys_changed: ["API_TOKEN"]
 ```

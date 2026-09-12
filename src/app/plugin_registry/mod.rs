@@ -1,10 +1,10 @@
 use super::*;
 
-// `expand_env_refs_in_spec` was retired in the STATE-1 unification.
-// Binding-spec resolution now goes through
+// Binding-spec resolution goes through
 // `crate::config::resolver::resolve_config_value`, which runs CEL
-// `${env.X}` first and then walks bound `scheme://` providers
-// (env, file, vault, …) in one async pass.
+// `${env.X}` first, then walks bound `scheme://` providers
+// (env, file, vault, …), then substitutes mounted `${secret.X}` values,
+// in one async pass.
 
 mod entities;
 mod native;
@@ -99,6 +99,11 @@ pub(crate) struct PluginBundle {
     /// task per unique URI after registry assembly so backend pools
     /// can evict + rebuild on Vault rotations.
     pub resolved_secret_refs: std::collections::BTreeSet<String>,
+    /// Digest of the `${secret.NAME}` values this build resolved with
+    /// (see [`crate::config::SecretsSource::digest`]); empty when the
+    /// config referenced none. Published on the runtime so the
+    /// control-plane status report can say which secret set is live.
+    pub secrets_digest: String,
 }
 
 pub(crate) async fn build_plugin_registry(
@@ -117,6 +122,10 @@ pub(crate) async fn build_plugin_registry(
     // pools (HTTP, SQL, NATS, Kafka) evict + rebuild on rotation.
     let mut resolved_secret_refs: std::collections::BTreeSet<String> =
         std::collections::BTreeSet::new();
+
+    // One reader for every `${secret.NAME}` this build resolves, so the
+    // keys it serves are exactly the keys the digest covers.
+    let secrets = crate::config::SecretsSource::from_config(&config.gateway.secrets);
 
     // Late-bound `BackendHost` shared by HTTP / SQL /
     // NATS / Kafka backend plugins. The
@@ -782,15 +791,19 @@ pub(crate) async fn build_plugin_registry(
             );
         }
 
-        // CEL pass first, secret-URI pass second — applied uniformly
-        // to every string leaf via `config::resolver::resolve_config_value`.
+        // CEL pass first, secret-URI pass second, mounted `${secret.*}`
+        // last — applied uniformly to every string leaf via
+        // `config::resolver::resolve_config_value`.
         let mut secret_refs_expanded: usize = 0;
         let mut secret_skipped_schemes = std::collections::BTreeSet::<String>::new();
         for entry in resolved_entries.iter_mut() {
-            let report =
-                crate::config::resolver::resolve_config_value(&mut entry.config, &registry)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("plugin '{}' config: {e}", entry.id))?;
+            let report = crate::config::resolver::resolve_config_value(
+                &mut entry.config,
+                &registry,
+                &secrets,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("plugin '{}' config: {e:#}", entry.id))?;
             secret_refs_expanded += report.expanded;
             secret_skipped_schemes.extend(report.skipped_schemes);
             resolved_secret_refs.extend(report.resolved_refs);
@@ -1426,17 +1439,19 @@ pub(crate) async fn build_plugin_registry(
                 ));
             };
             // Resolve config-time secret refs in the spec (CEL `${env.X}`
-            // + bound `scheme://…` URIs), then thread the resolved-ref
-            // hint so the plugin's rotation subscription scopes eviction
-            // to those URIs — identical to the SQL/HTTP static paths.
-            let report = crate::config::resolver::resolve_config_value(&mut spec, &registry)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "resolve config refs in dynamic backend binding '{}': {e}",
-                        binding.name
-                    )
-                })?;
+            // + bound `scheme://…` URIs + mounted `${secret.X}`), then
+            // thread the resolved-ref hint so the plugin's rotation
+            // subscription scopes eviction to those URIs — identical to
+            // the SQL/HTTP static paths.
+            let report =
+                crate::config::resolver::resolve_config_value(&mut spec, &registry, &secrets)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "resolve config refs in dynamic backend binding '{}': {e:#}",
+                            binding.name
+                        )
+                    })?;
             inject_secret_refs_hint(&mut spec, &report.resolved_refs);
             resolved_secret_refs.extend(report.resolved_refs);
             let name = binding.name.clone();
@@ -1555,15 +1570,16 @@ pub(crate) async fn build_plugin_registry(
                     kind,
                 ));
             }
-            let report = crate::config::resolver::resolve_config_value(&mut spec, &registry)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "resolve config refs in pipeline step '{}' of binding '{}': {e}",
-                        step.id(),
-                        binding_name
-                    )
-                })?;
+            let report =
+                crate::config::resolver::resolve_config_value(&mut spec, &registry, &secrets)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "resolve config refs in pipeline step '{}' of binding '{}': {e:#}",
+                            step.id(),
+                            binding_name
+                        )
+                    })?;
             inject_secret_refs_hint(&mut spec, &report.resolved_refs);
             resolved_secret_refs.extend(report.resolved_refs);
             // A pipeline step's config-origin cred/resource refs are as
@@ -1917,6 +1933,7 @@ pub(crate) async fn build_plugin_registry(
         #[cfg(feature = "governance-quotas")]
         quota_gate,
         resolved_secret_refs,
+        secrets_digest: secrets.digest(),
     })
 }
 

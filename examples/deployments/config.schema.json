@@ -2731,6 +2731,18 @@
           },
           "description": "OCI plugin-registry configuration. Lives here (rather than per-plugin) because it's gateway-process tuning — where to fetch plugin artifacts from — not per-plugin config. Per-plugin source auth/tls live inline in each plugin entry's `source.{auth,tls}:`. Only consulted when at least one plugin entry uses `source: { oci: ... }`."
         },
+        "secrets": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecretsConfig"
+            }
+          ],
+          "default": {
+            "poll_interval_ms": 5000,
+            "watch": true
+          },
+          "description": "Directory-backed `${secret.NAME}` values, hot-reloaded on change. `${secret.NAME}` resolves to the bytes of `<dir>/<NAME>` in the same config-load pass as `${env.X}`; a background poller reloads the gateway when any file in `dir` changes. See [`SecretsConfig`]. Managed gateways get this block from the platform (a mounted Secret volume); self-hosted gateways point it at any directory."
+        },
         "server": {
           "allOf": [
             {
@@ -5321,6 +5333,32 @@
       },
       "type": "object"
     },
+    "SecretsConfig": {
+      "additionalProperties": false,
+      "description": "`gateway.secrets:` — directory-backed `${secret.NAME}` values, hot-reloaded on change. Every `${secret.NAME}` in the config resolves to the exact bytes of `<dir>/<NAME>` at config load. With `dir` unset, any `${secret.*}` reference is a config error.",
+      "properties": {
+        "dir": {
+          "description": "Directory holding one file per secret; `${secret.NAME}` reads `<dir>/<NAME>` (symlinks followed, so a mounted Kubernetes Secret volume works as-is). NAME must match `^[A-Za-z_][A-Za-z0-9_]{0,63}$`. Unset: the config may not reference any `${secret.*}`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "poll_interval_ms": {
+          "default": 5000,
+          "description": "Poll interval in milliseconds for `watch`. Values below 1000 are clamped to 1000 at spawn time (a warning is logged at validate time) — sub-second polling burns I/O for no operator-visible benefit.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "watch": {
+          "default": true,
+          "description": "Poll `dir` and hot-reload the gateway when any file in it changes (added, removed, or rewritten). The reload re-resolves every `${secret.*}` reference, so a rotated value is live within one poll interval — no restart, no config publish. Only meaningful when `dir` is set.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "ServedRegistryConfig": {
       "additionalProperties": false,
       "description": "`mcp.registry:` — serve a v0.1 MCP-Registry view of this gateway. The catalog exposed is exactly one server entry: the gateway itself (its whole governed surface hangs off one MCP endpoint), so pointing a registry-driven client policy here yields \"the approved server is MCPG\".",
@@ -7097,6 +7135,10 @@
             "ca_cert": null,
             "insecure": false
           }
+        },
+        "secrets": {
+          "poll_interval_ms": 5000,
+          "watch": true
         },
         "server": {
           "access_log": true,

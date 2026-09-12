@@ -3,8 +3,9 @@
 //! Holds the gateway's own network face: listener (`server`),
 //! admin surface (`admin`), Control Plane attachment
 //! (`control_plane`), the OCI plugin-registry defaults
-//! (`gateway.plugin_registry:`), and the config-overlay URI list
-//! (`gateway.config_overlay:`).
+//! (`gateway.plugin_registry:`), the config-overlay URI list
+//! (`gateway.config_overlay:`), and the mounted-secret directory
+//! (`gateway.secrets:`).
 //!
 //! These fields are grouped under one umbrella so the "binary's
 //! network face" mental model has a single home (they previously
@@ -14,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::plugins::PluginRegistryConfig;
+use super::secrets::SecretsConfig;
 use super::{AdminConfig, ControlPlaneAttachConfig, ServerConfig};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
@@ -80,6 +82,15 @@ pub struct GatewayConfig {
     /// rolling restart).
     #[serde(default)]
     pub config_watch: ConfigWatchConfig,
+
+    /// Directory-backed `${secret.NAME}` values, hot-reloaded on change.
+    /// `${secret.NAME}` resolves to the bytes of `<dir>/<NAME>` in the
+    /// same config-load pass as `${env.X}`; a background poller reloads
+    /// the gateway when any file in `dir` changes. See [`SecretsConfig`].
+    /// Managed gateways get this block from the platform (a mounted
+    /// Secret volume); self-hosted gateways point it at any directory.
+    #[serde(default)]
+    pub secrets: SecretsConfig,
 }
 
 /// `gateway.config_watch:` — operator-tunable file-watch reload

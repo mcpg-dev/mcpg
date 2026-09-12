@@ -343,10 +343,19 @@ mod attached {
                 })
                 .unwrap_or_default();
 
+            // The digest the serving runtime resolved its `${secret.*}`
+            // references with — a reload swaps the runtime, so a rotation
+            // that landed shows up in the next report.
+            let secrets_digest = state
+                .as_ref()
+                .map(|s| s.runtime.load().secrets_digest().to_owned())
+                .unwrap_or_default();
+
             StatusSnapshot {
                 plugins,
                 warnings: Vec::new(),
                 cluster: Some(cluster),
+                secrets_digest,
             }
         }
     }

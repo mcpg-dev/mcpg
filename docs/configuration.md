@@ -243,6 +243,7 @@ plugins:
 | Root | Resolved at | Notes |
 |---|---|---|
 | `env.<NAME>` | Config-load (once) | Process environment. Errors if unset. |
+| `secret.<NAME>` | Config-load, re-read on every reload | File `<gateway.secrets.dir>/<NAME>`, the secrets directory mounted into the gateway. Errors if the directory is unset or the file is unreadable. The secrets watcher reloads the gateway when a file changes. |
 | `arguments.<key>` | Per request | Tool-call arguments. |
 | `identity.<field>` | Per request | `subject_id`, `attributes.<key>`, `roles[N]`, `groups[N]`, … |
 | `cred://<plugin_id>/<target>[#part]` | Per request | Credential plugin lookup. Covers outbound OAuth tokens (`cred://dev.mcpg.credential.oauth-client-credentials/<provider>`), Vault dynamic DB creds (`cred://vault-dynamic-db/orders#username`), and any other registered `credential_issuer` plugin. |
@@ -250,7 +251,7 @@ plugins:
 | `tool_name` | Per request | Current tool's MCP name. |
 | `steps.<id>.output` | Pipeline only | Previous step's result. |
 
-`env.X` is resolved once at config-load — restarts pick up new values. Everything else is per-request, so a token rotation reaches in-flight calls on the next dispatch without a reload.
+`env.X` is resolved once at config-load — restarts pick up new values. `secret.X` is resolved at config-load too, but the gateway watches the directory and reloads itself when a file changes, so a rotated file reaches new calls within one poll interval. Everything else is per-request, so a token rotation reaches in-flight calls on the next dispatch without a reload.
 
 ---
 
@@ -1081,6 +1082,7 @@ The shipped shells a templated app can select.
 | `control_plane` | [`ControlPlaneAttachConfig`](#controlplaneattachconfig) (optional) |  | Optional Control Plane attachment. When set AND the `cp-attached` Cargo feature is built in, the gateway registers with the CP at boot, opens an agent Channel, and ships per-tool-call samples for centralized observability. When the feature isn't built in, this block is silently ignored. |
 | `inspector` | [`InspectorSidecarConfig`](#inspectorsidecarconfig) | (see type) | Supervised inspector sidecar (`mcpg --inspector`, or `enabled: true` here): the gateway spawns a sibling `mcpg-inspector serve` pre-wired against this gateway with a per-boot loopback credential. |
 | `plugin_registry` | [`PluginRegistryConfig`](#pluginregistryconfig) | (see type) | OCI plugin-registry configuration. Lives here (rather than per-plugin) because it's gateway-process tuning — where to fetch plugin artifacts from — not per-plugin config. Per-plugin source auth/tls live inline in each plugin entry's `source.{auth,tls}:`. Only consulted when at least one plugin entry uses `source: { oci: ... }`. |
+| `secrets` | [`SecretsConfig`](#secretsconfig) | (see type) | Directory-backed `${secret.NAME}` values, hot-reloaded on change. `${secret.NAME}` resolves to the bytes of `<dir>/<NAME>` in the same config-load pass as `${env.X}`; a background poller reloads the gateway when any file in `dir` changes. See [`SecretsConfig`]. Managed gateways get this block from the platform (a mounted Secret volume); self-hosted gateways point it at any directory. |
 | `server` | [`ServerConfig`](#serverconfig) | (see type) | Listener configuration — bind address, transport mode (HTTP / stdio / SSE), TLS, allowed origins, and per-request timeouts. The block is mandatory in practice (the listener won't bind without `bind_address`) but defaults to a localhost dev-mode shape so out-of-the-box `mcpg` boots without any config. |
 
 ### `GovernanceConfig`
@@ -1776,6 +1778,16 @@ A named schema entry in the registry. Exactly one source must be provided.
 | `file` | string (optional) |  | Path to a local JSON Schema file (relative to the config file). |
 | `inline` | any |  | Inline JSON Schema definition. |
 | `url` | string (optional) |  | URL to fetch the JSON Schema from at startup. |
+
+### `SecretsConfig`
+
+`gateway.secrets:` — directory-backed `${secret.NAME}` values, hot-reloaded on change. Every `${secret.NAME}` in the config resolves to the exact bytes of `<dir>/<NAME>` at config load. With `dir` unset, any `${secret.*}` reference is a config error.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `dir` | string (optional) |  | Directory holding one file per secret; `${secret.NAME}` reads `<dir>/<NAME>` (symlinks followed, so a mounted Kubernetes Secret volume works as-is). NAME must match `^[A-Za-z_][A-Za-z0-9_]{0,63}$`. Unset: the config may not reference any `${secret.*}`. |
+| `poll_interval_ms` | integer | `5000` | Poll interval in milliseconds for `watch`. Values below 1000 are clamped to 1000 at spawn time (a warning is logged at validate time) — sub-second polling burns I/O for no operator-visible benefit. |
+| `watch` | boolean | `true` | Poll `dir` and hot-reload the gateway when any file in it changes (added, removed, or rewritten). The reload re-resolves every `${secret.*}` reference, so a rotated value is live within one poll interval — no restart, no config publish. Only meaningful when `dir` is set. |
 
 ### `ServedRegistryConfig`
 

@@ -46,6 +46,7 @@ pub mod resolver;
 pub mod schema;
 pub mod schema_safety;
 pub mod secret_scan;
+pub mod secrets;
 pub mod server;
 pub mod source;
 pub mod storage;
@@ -118,6 +119,7 @@ pub use quotas::{
     BackendQuotasRef, BudgetPolicy, ConcurrencyPolicy, QuotasConfig, RateLimitPolicy, RateLimitRate,
 };
 pub use schema::SchemaEntry;
+pub use secrets::{SecretsConfig, SecretsSource};
 pub use server::{
     AauthResourceMetadataConfig, AauthSigningKeyConfig, ClientCertMode, ServerConfig, TlsConfig,
     TransportMode, TunnelConfig, TunnelExposure, TunnelFederationConfig, TunnelTrustMode,
@@ -775,6 +777,7 @@ impl AppConfig {
                 "gateway.config_watch.poll_interval_ms is below the 1000ms floor; clamping to 1000ms at spawn time"
             );
         }
+        self.validate_secret_refs()?;
         self.debug
             .tools
             .validate(self.feature_flags.debug_tools_enabled)?;
@@ -1152,6 +1155,32 @@ impl AppConfig {
                  bus is '{effective}', which is exact-match only and would silently \
                  drop every cancellation under the `mcpg.cancel.*` wildcard subscribe. \
                  Either set cluster.kind to redis/nats or disable partition_by_principal."
+            ));
+        }
+        Ok(())
+    }
+
+    /// `${secret.NAME}` resolves against `gateway.secrets.dir`; without
+    /// the block, a reference can only ever fail at boot, so refuse it at
+    /// validate time and name the token. With the block, mirror the
+    /// config-watch floor warning for the poller.
+    fn validate_secret_refs(&self) -> Result<()> {
+        let secrets = &self.gateway.secrets;
+        if secrets.dir.is_some() {
+            if secrets.watch && secrets.poll_interval_ms < 1000 {
+                tracing::warn!(
+                    value = secrets.poll_interval_ms,
+                    "gateway.secrets.poll_interval_ms is below the 1000ms floor; clamping to 1000ms at spawn time"
+                );
+            }
+            return Ok(());
+        }
+        let as_json = serde_json::to_value(self).context("serialise config for validation")?;
+        if let Some(token) = secrets::first_secret_ref(&as_json) {
+            return Err(anyhow::anyhow!(
+                "config references `{token}` but gateway.secrets.dir is not set; \
+                 secrets resolve from files under that directory, so mount it and set \
+                 gateway.secrets.dir (managed gateways receive the block from the platform)"
             ));
         }
         Ok(())

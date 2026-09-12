@@ -88,6 +88,7 @@ pub async fn build_from_sources(
         #[cfg(feature = "governance-quotas")]
         quota_gate,
         resolved_secret_refs,
+        secrets_digest,
     } = build_plugin_registry(&mut config, jwt_verifier.as_ref(), oidc_resolver.clone()).await?;
 
     // Runs here rather than at validation time so it sees the final binding
@@ -389,6 +390,7 @@ pub async fn build_from_sources(
     // directly. `None` keeps the runtime returning generic
     // "unknown resource" for those URIs.
     runtime.set_content_stores(content_stores.clone());
+    runtime.set_secrets_digest(secrets_digest);
 
     // Embedded EMA authorization server (governance.access.authorization_server).
     runtime.set_ema_authorization_server(build_ema_authorization_server(&config)?);

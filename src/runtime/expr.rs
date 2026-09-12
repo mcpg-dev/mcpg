@@ -8,7 +8,8 @@
 //! sites need no churn.
 
 pub(crate) use mcpg_expr::{
-    DynamicValue, ExprContext, ExprRequestContext, resolve_env_in_string, validate_header_value,
+    DynamicValue, ExprContext, ExprRequestContext, resolve_env_in_string, resolve_secret_in_string,
+    validate_header_value,
 };
 
 #[allow(unused_imports)]

@@ -2285,3 +2285,53 @@ fn built_in_official_key_bundle_decodes_and_flows_into_inherit_path() {
         "official key bundle produced no anchors"
     );
 }
+
+/// A config that references no `${secret.*}` publishes an empty digest —
+/// the control plane reads "empty" as "no secrets in use", never as a
+/// value to compare.
+#[tokio::test]
+async fn plugin_registry_publishes_an_empty_secrets_digest_without_references() {
+    let mut config = AppConfig::default();
+    let bundle = super::build_plugin_registry(&mut config, None, None)
+        .await
+        .expect("plugin registry builds");
+    assert_eq!(bundle.secrets_digest, "");
+}
+
+/// `${secret.NAME}` inside a plugin entry's config resolves before the
+/// artefact loads, so a missing key fails the registry build with the key
+/// named — and the artefact path never gets a chance to be the error.
+#[tokio::test]
+async fn plugin_registry_build_names_the_missing_secret_key() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("PRESENT"), "s3cret-value").unwrap();
+    let mut config: AppConfig = serde_yaml::from_str(&format!(
+        r#"
+gateway:
+  secrets:
+    dir: {}
+plugins:
+  - id: dev.example.consumer
+    kind: native
+    source:
+      path: /nonexistent/libconsumer.so
+    config:
+      present: "${{secret.PRESENT}}"
+      token: "Bearer ${{secret.MISSING}}"
+"#,
+        dir.path().display()
+    ))
+    .expect("config parses");
+
+    let err = match super::build_plugin_registry(&mut config, None, None).await {
+        Ok(_) => panic!("a missing secret must refuse the build"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("plugin 'dev.example.consumer' config"),
+        "{err}"
+    );
+    assert!(err.contains("${secret.MISSING}"), "{err}");
+    assert!(!err.contains("s3cret-value"), "{err}");
+    assert!(!err.contains("libconsumer.so"), "{err}");
+}

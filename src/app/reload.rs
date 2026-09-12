@@ -91,6 +91,7 @@ pub(crate) async fn reload_with_config(
         #[cfg(feature = "governance-quotas")]
         quota_gate,
         resolved_secret_refs,
+        secrets_digest,
     } = build_plugin_registry(
         &mut new_config,
         jwt_verifier.as_ref(),
@@ -335,6 +336,7 @@ pub(crate) async fn reload_with_config(
     )?;
 
     new_runtime.set_content_stores(content_stores.clone());
+    new_runtime.set_secrets_digest(secrets_digest);
     new_runtime.set_ema_authorization_server(build_ema_authorization_server(&new_config)?);
     new_runtime.set_aauth_resource(crate::app::auth_wiring::build_aauth_resource(&new_config)?);
     #[cfg(feature = "governance-quotas")]

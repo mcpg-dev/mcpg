@@ -328,6 +328,11 @@ pub async fn run(state: AppState) -> Result<()> {
     // the gateway booted without on-disk config files.
     let config_watch_handle = config_watch::spawn(state.clone());
 
+    // Spawn the secrets-directory reload trigger. No-op when
+    // `gateway.secrets.dir` is unset or `gateway.secrets.watch = false`;
+    // independent of the config file-watch above.
+    let secrets_watch_handle = secrets_watch::spawn(state.clone());
+
     // Anonymous adoption ping. Fully gated and fail-open: it logs
     // its on/off decision, and only when enabled spawns a detached task that
     // never blocks boot or reacts to the endpoint. Snapshots the config and
@@ -550,6 +555,14 @@ pub async fn run(state: AppState) -> Result<()> {
     if let Some(handle) = config_watch_handle {
         handle.abort();
         info!("config-watch task stopped");
+    }
+
+    // Same contract as the config watcher: abort is safe because the
+    // task holds no runtime state across await points beyond the reload
+    // itself, and the listeners are already torn down.
+    if let Some(handle) = secrets_watch_handle {
+        handle.abort();
+        info!("secrets-watch task stopped");
     }
 
     // Flush metrics — `shutdown_all` above drains every plugin

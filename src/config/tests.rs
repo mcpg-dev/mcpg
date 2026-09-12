@@ -4883,3 +4883,53 @@ fn cloud_tier_speaks_the_licensing_vocabulary_and_still_accepts_free() {
     // rather than silently defaulting to unspecified.
     assert!(AppConfig::load_from_yaml_str("cloud:\n  tier: plus\n").is_err());
 }
+
+/// `${secret.NAME}` needs `gateway.secrets.dir` to resolve from. A config
+/// that references one without the block is refused at validate time
+/// (so `mcpg config check` catches it), naming the token and the fix.
+#[test]
+fn secret_reference_without_a_secrets_dir_is_refused_at_validate_time() {
+    let yaml = r#"
+mcp:
+  capabilities:
+    tools:
+      - name: dev.example.call
+        description: call
+        backend:
+          kind: http
+          url: https://api.example.com/v1
+          headers:
+            Authorization: "Bearer ${secret.API_TOKEN}"
+"#;
+    let err = AppConfig::load_from_yaml_str(yaml)
+        .expect_err("a secret reference without a dir must not validate")
+        .to_string();
+    assert!(err.contains("${secret.API_TOKEN}"), "{err}");
+    assert!(err.contains("gateway.secrets.dir"), "{err}");
+
+    let with_dir = format!("{yaml}\ngateway:\n  secrets:\n    dir: /var/run/mcpg/secrets\n");
+    let cfg = AppConfig::load_from_yaml_str(&with_dir).expect("the block admits the reference");
+    assert_eq!(
+        cfg.gateway.secrets.dir.as_deref(),
+        Some(std::path::Path::new("/var/run/mcpg/secrets"))
+    );
+    assert!(
+        cfg.gateway.secrets.watch,
+        "watch defaults on when dir is set"
+    );
+    assert_eq!(cfg.gateway.secrets.poll_interval_ms, 5000);
+}
+
+/// The block itself is strict: an unknown key is a config error, and the
+/// defaults leave `${secret.*}` unavailable.
+#[test]
+fn secrets_block_defaults_and_rejects_unknown_keys() {
+    let cfg = AppConfig::load_from_yaml_str("gateway: {}\n").expect("defaults");
+    assert!(cfg.gateway.secrets.dir.is_none());
+    assert!(cfg.gateway.secrets.watch);
+    assert_eq!(cfg.gateway.secrets.poll_interval_ms, 5000);
+    assert!(
+        AppConfig::load_from_yaml_str("gateway:\n  secrets:\n    directory: /x\n").is_err(),
+        "unknown keys under gateway.secrets are refused"
+    );
+}

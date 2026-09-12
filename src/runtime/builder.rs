@@ -1149,6 +1149,7 @@ impl GatewayRuntime {
             credential_cache,
             execution_dispatcher: Arc::clone(&execution_dispatcher),
             content_stores: None,
+            secrets_digest: String::new(),
             session_store,
             jwt_verifier,
             oidc_resolver,
@@ -1260,6 +1261,19 @@ impl GatewayRuntime {
     /// `ContentStore` profile instances.
     pub fn content_stores(&self) -> Option<&Arc<content_store_registry::ContentStoreRegistry>> {
         self.content_stores.as_ref()
+    }
+
+    /// Install the digest of the mounted `${secret.*}` values the config
+    /// resolved with. Called from the boot path and from every reload,
+    /// so the value always describes the config currently serving.
+    pub fn set_secrets_digest(&mut self, digest: String) {
+        self.secrets_digest = digest;
+    }
+
+    /// Digest of the `${secret.*}` values in effect (hex SHA-256 over
+    /// sorted `NAME=VALUE\n`); empty when the config references none.
+    pub fn secrets_digest(&self) -> &str {
+        &self.secrets_digest
     }
 
     /// Install the runtime quota gate.

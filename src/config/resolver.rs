@@ -1,4 +1,4 @@
-//! Two-phase config-time string resolution.
+//! Config-time string resolution.
 //!
 //! Every operator-supplied string field that may carry a credential
 //! or env-var interpolation is resolved through the helpers in this
@@ -14,17 +14,24 @@
 //!    is bound to a `SecretProvider` plugin (`env`, `file`, `vault`,
 //!    `aws-sm`, …), the provider fetches the secret and the field's
 //!    value is replaced.
+//! 3. **`${secret.NAME}` interpolation** — sync, from the mounted
+//!    directory behind `gateway.secrets.dir`. Runs last, so a
+//!    substituted value is final: a tenant-authored secret can never
+//!    be re-read as an `env://` / `file://` provider URI or an
+//!    `${env.X}` reference, which would turn the secret store into a
+//!    channel for reading the process environment or the filesystem.
 //!
-//! The two passes are complementary. CEL can interpolate inside a
-//! larger string (`"Bearer ${env.TOKEN}"`); secret URIs must occupy
-//! the entire string (the field's value *is* the URI). Both spelled
-//! correctly are valid; an operator can use either or both:
+//! The passes are complementary. CEL can interpolate inside a
+//! larger string (`"Bearer ${env.TOKEN}"`, `"Bearer ${secret.TOKEN}"`);
+//! secret URIs must occupy the entire string (the field's value *is*
+//! the URI). An operator can use any of them:
 //!
 //! ```yaml
 //! state:
 //!   url: ${env.REDIS_URL}                 # CEL only
 //!   password: vault://secret/redis#pw      # URI only
 //!   key_prefix: "mcpg:${env.MCPG_ENV}"    # CEL inline (no URI)
+//!   token: "Bearer ${secret.API_TOKEN}"   # mounted secret inline
 //! ```
 
 use anyhow::{Context, Result};
@@ -32,35 +39,44 @@ use mcpg_plugin_host::PluginRegistry;
 use mcpg_plugin_host::secret_resolver::{ResolveReport, resolve_single_secret_ref};
 use serde_json::Value;
 
-/// Resolve a single config-time string field through both phases.
+use super::secrets::SecretsSource;
+
+/// Resolve a single config-time string field through every phase.
 ///
 /// Returns the post-resolution value. Pass-through for plain
-/// literals, errors on missing `${env.X}` env vars or failed
-/// secret-provider lookups.
-pub async fn resolve_config_string(input: &str, registry: &PluginRegistry) -> Result<String> {
+/// literals, errors on missing `${env.X}` env vars, failed
+/// secret-provider lookups, or unresolvable `${secret.NAME}` refs.
+pub async fn resolve_config_string(
+    input: &str,
+    registry: &PluginRegistry,
+    secrets: &SecretsSource,
+) -> Result<String> {
     let after_cel = crate::runtime::expr::resolve_env_in_string(input)
         .with_context(|| format!("CEL env-var resolution failed for `{input}`"))?;
-    if let Some(resolved) = resolve_single_secret_ref(&after_cel, registry)
+    let after_uri = match resolve_single_secret_ref(&after_cel, registry)
         .await
         .with_context(|| format!("secret-provider resolution failed for `{after_cel}`"))?
     {
-        Ok(resolved)
-    } else {
-        Ok(after_cel)
-    }
+        Some(resolved) => resolved,
+        None => after_cel,
+    };
+    apply_secrets_to_string(&after_uri, secrets)
 }
 
-/// Resolve every string leaf inside `value` through both phases,
-/// mutating in place. CEL pass first (env-only at config load),
-/// then secret-URI pass via the bound `SecretProvider` plugins.
+/// Resolve every string leaf inside `value` through every phase,
+/// mutating in place: env CEL pass, then the secret-URI pass via the
+/// bound `SecretProvider` plugins, then `${secret.NAME}` from the
+/// mounted directory.
 ///
 /// Returns the [`ResolveReport`] from the secret-URI pass so callers
 /// can surface per-scheme audit detail (counts of expansions,
 /// schemes skipped because no provider was bound). Errors on CEL
-/// failure or any secret-provider failure.
+/// failure, any secret-provider failure, or a `${secret.NAME}` that
+/// cannot be read.
 pub async fn resolve_config_value(
     value: &mut Value,
     registry: &PluginRegistry,
+    secrets: &SecretsSource,
 ) -> Result<ResolveReport> {
     apply_cel_to_value(value)?;
     let report = mcpg_plugin_host::secret_resolver::resolve_secret_refs(value, registry).await;
@@ -73,6 +89,7 @@ pub async fn resolve_config_value(
             .join("; ");
         anyhow::bail!("secret-provider resolution failed: {failures}");
     }
+    apply_secrets_to_value(value, secrets)?;
     Ok(report)
 }
 
@@ -127,21 +144,46 @@ fn scan_env_names(s: &str, out: &mut std::collections::BTreeSet<String>) {
 /// [`mcpg_plugin_host::secret_resolver::resolve_secret_refs`] walker
 /// but for the CEL pass (which is sync and env-only at this phase).
 fn apply_cel_to_value(value: &mut Value) -> Result<()> {
+    for_each_string_leaf(value, &mut |s| {
+        crate::runtime::expr::resolve_env_in_string(s)
+            .with_context(|| format!("CEL env-var resolution failed for `{s}`"))
+    })
+}
+
+/// Walk a JSON value and replace every `${secret.NAME}` in its string
+/// leaves with the mounted value. Errors name the reference, never a
+/// value.
+fn apply_secrets_to_value(value: &mut Value, secrets: &SecretsSource) -> Result<()> {
+    for_each_string_leaf(value, &mut |s| apply_secrets_to_string(s, secrets))
+}
+
+/// `${secret.NAME}` substitution for one string. The error context
+/// carries the reference (`${secret.NAME}` is safe to log); the
+/// surrounding string is omitted because after the earlier passes it
+/// may already hold resolved values.
+fn apply_secrets_to_string(s: &str, secrets: &SecretsSource) -> Result<String> {
+    crate::runtime::expr::resolve_secret_in_string(s, &|name| secrets.lookup(name))
+        .context("mounted-secret resolution failed")
+}
+
+fn for_each_string_leaf(
+    value: &mut Value,
+    f: &mut dyn FnMut(&str) -> Result<String>,
+) -> Result<()> {
     match value {
         Value::String(s) => {
-            *s = crate::runtime::expr::resolve_env_in_string(s)
-                .with_context(|| format!("CEL env-var resolution failed for `{s}`"))?;
+            *s = f(s)?;
             Ok(())
         }
         Value::Array(items) => {
             for v in items.iter_mut() {
-                apply_cel_to_value(v)?;
+                for_each_string_leaf(v, f)?;
             }
             Ok(())
         }
         Value::Object(map) => {
             for (_k, v) in map.iter_mut() {
-                apply_cel_to_value(v)?;
+                for_each_string_leaf(v, f)?;
             }
             Ok(())
         }
@@ -213,5 +255,109 @@ mod tests {
         apply_cel_to_value(&mut v).unwrap();
         assert_eq!(v["url"], "/${arguments.path}");
         assert_eq!(v["header"], "${context.principal_id}");
+    }
+
+    fn secrets_in(dir: &std::path::Path) -> SecretsSource {
+        SecretsSource::from_config(&crate::config::SecretsConfig {
+            dir: Some(dir.to_path_buf()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn secrets_walker_replaces_refs_in_nested_strings_and_records_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("API_TOKEN"), "tok-123").unwrap();
+        std::fs::write(dir.path().join("HOST"), "db.internal").unwrap();
+        let secrets = secrets_in(dir.path());
+        let mut v = serde_json::json!({
+            "auth": "Bearer ${secret.API_TOKEN}",
+            "nested": { "urls": ["https://${secret.HOST}/a", "https://${secret.HOST}/b"] },
+            "literal": "no-secrets-here",
+            "request_time": "${arguments.x}",
+        });
+        apply_secrets_to_value(&mut v, &secrets).unwrap();
+        assert_eq!(v["auth"], "Bearer tok-123");
+        assert_eq!(v["nested"]["urls"][0], "https://db.internal/a");
+        assert_eq!(v["nested"]["urls"][1], "https://db.internal/b");
+        assert_eq!(v["literal"], "no-secrets-here");
+        assert_eq!(v["request_time"], "${arguments.x}");
+        assert_eq!(secrets.referenced_keys(), ["API_TOKEN", "HOST"]);
+        assert_eq!(secrets.digest().len(), 64);
+    }
+
+    #[test]
+    fn secrets_walker_error_names_the_key_and_no_value() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("PRESENT"), "s3cret-value").unwrap();
+        let secrets = secrets_in(dir.path());
+        let mut v = serde_json::json!({
+            "a": "${secret.PRESENT}",
+            "b": "${secret.MISSING}",
+        });
+        let err = format!(
+            "{:#}",
+            apply_secrets_to_value(&mut v, &secrets).unwrap_err()
+        );
+        assert!(err.contains("${secret.MISSING}"), "{err}");
+        assert!(!err.contains("s3cret-value"), "{err}");
+    }
+
+    #[test]
+    fn secrets_walker_without_dir_says_so() {
+        let mut v = serde_json::json!({ "a": "${secret.API_TOKEN}" });
+        let err = format!(
+            "{:#}",
+            apply_secrets_to_value(&mut v, &SecretsSource::unconfigured()).unwrap_err()
+        );
+        assert!(err.contains("gateway.secrets.dir"), "{err}");
+        assert!(err.contains("${secret.API_TOKEN}"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn secret_values_are_never_reinterpreted_by_the_earlier_passes() {
+        // SAFETY: test-only, single-threaded env manipulation
+        unsafe {
+            std::env::set_var("MCPGTEST_PLATFORM_TOKEN", "platform-only");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AS_URI"), "env://MCPGTEST_PLATFORM_TOKEN").unwrap();
+        std::fs::write(dir.path().join("AS_CEL"), "${env.MCPGTEST_PLATFORM_TOKEN}").unwrap();
+        let secrets = secrets_in(dir.path());
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_secret_provider(
+                crate::builtins::secret_env::EnvSecretProvider::new(),
+                mcpg_plugin_protocol::PluginTier::Native,
+            )
+            .unwrap();
+        registry
+            .bind_secret_scheme("env", "dev.mcpg.builtin.secret.env")
+            .unwrap();
+
+        let mut v = serde_json::json!({
+            "uri": "${secret.AS_URI}",
+            "cel": "${secret.AS_CEL}",
+            "direct": "env://MCPGTEST_PLATFORM_TOKEN",
+        });
+        resolve_config_value(&mut v, &registry, &secrets)
+            .await
+            .unwrap();
+        assert_eq!(
+            v["direct"], "platform-only",
+            "operator-written URI resolves"
+        );
+        assert_eq!(v["uri"], "env://MCPGTEST_PLATFORM_TOKEN");
+        assert_eq!(v["cel"], "${env.MCPGTEST_PLATFORM_TOKEN}");
+        assert_eq!(
+            resolve_config_string("${secret.AS_URI}", &registry, &secrets)
+                .await
+                .unwrap(),
+            "env://MCPGTEST_PLATFORM_TOKEN"
+        );
+        unsafe {
+            std::env::remove_var("MCPGTEST_PLATFORM_TOKEN");
+        }
     }
 }

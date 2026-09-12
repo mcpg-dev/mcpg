@@ -804,6 +804,11 @@ pub struct GatewayRuntime {
     /// content surface. Bootstrap installs the registry via
     /// [`Self::set_content_stores`] after the runtime is constructed.
     content_stores: Option<Arc<content_store_registry::ContentStoreRegistry>>,
+    /// Digest of the `${secret.NAME}` values the config this runtime was
+    /// built from resolved with; empty when it referenced none. Installed
+    /// via [`Self::set_secrets_digest`] by the boot and reload paths and
+    /// reported to the control plane in every status report.
+    secrets_digest: String,
     pub(crate) execution_dispatcher: Arc<ExecutionDispatcher>,
     session_store: Arc<dyn SessionStore>,
     jwt_verifier: Option<identity::JwtVerifier>,
