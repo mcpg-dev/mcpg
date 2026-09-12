@@ -558,9 +558,67 @@ mod attached {
                 // push (or the agent's reconnect pull) reapplies.
                 return Err("gateway AppState not yet bound".to_owned());
             };
+            // The CP pushes the rendered file on every first connect; when that
+            // is the file this gateway booted from, a reload would rebuild the
+            // runtime to reach the config it already runs.
+            if pushed_matches_mounted_file(&state.config_sources, &bundle.config_toml) {
+                info!("control_plane: CP config matches the mounted file; no reload");
+                return Ok(());
+            }
+            // A provisioned gateway runs the config its operator mounted: the
+            // provisioner's render plus the operator's own overlay (default
+            // backend plugins, registry cache, resource metadata, trace sink),
+            // rolled into the pod on every publish. A control-plane push can
+            // never carry that overlay, so applying one would strip it; the
+            // mounted file stays authoritative and the push is acknowledged as
+            // the state this pod already reached through its roll.
+            if is_operator_delivered(
+                &state.base_config.load().cloud.provenance,
+                &state.config_sources,
+            ) {
+                info!(
+                    "control_plane: provisioned gateway; the mounted config is authoritative, \
+                     CP push acknowledged without reload"
+                );
+                return Ok(());
+            }
             crate::app::reload_config_from_yaml(&state, yaml)
                 .await
                 .map_err(|e| format!("hot-reload failed: {e}"))
+        }
+    }
+
+    /// Whether this gateway's config was rendered by the platform and mounted
+    /// by its operator: a file-backed layer whose loaded form carries the
+    /// provisioner's placement provenance, which a hand-written config never
+    /// legitimately has (the operator overwrites it at render).
+    pub(super) fn is_operator_delivered(
+        provenance: &crate::config::CloudProvenance,
+        sources: &[crate::config::ConfigSource],
+    ) -> bool {
+        let has_file = sources
+            .iter()
+            .any(|s| matches!(s, crate::config::ConfigSource::File(_)));
+        has_file && provenance.cluster_id.is_some() && provenance.namespace.is_some()
+    }
+
+    /// Whether `pushed` is, byte for byte (trailing whitespace aside), the last
+    /// file-backed config layer as it is on disk right now. Inline layers and an
+    /// unreadable file never match: a push is only skipped for a config the
+    /// gateway can be shown to already have.
+    pub(super) fn pushed_matches_mounted_file(
+        sources: &[crate::config::ConfigSource],
+        pushed: &[u8],
+    ) -> bool {
+        let Some(path) = sources.iter().rev().find_map(|s| match s {
+            crate::config::ConfigSource::File(p) => Some(p),
+            crate::config::ConfigSource::Inline { .. } => None,
+        }) else {
+            return false;
+        };
+        match std::fs::read(path) {
+            Ok(on_disk) => on_disk.trim_ascii_end() == pushed.trim_ascii_end(),
+            Err(_) => false,
         }
     }
 
@@ -570,5 +628,98 @@ mod attached {
             .or_else(|| std::env::var("COMPUTERNAME").ok())
             .unwrap_or_else(|| "localhost".to_owned());
         format!("{hn}-{}", &uuid::Uuid::now_v7().to_string()[..8])
+    }
+}
+
+#[cfg(all(test, feature = "cp-attached"))]
+mod tests {
+    use super::attached::{is_operator_delivered, pushed_matches_mounted_file};
+    use crate::config::ConfigSource;
+
+    const MOUNTED: &[u8] = b"gateway:\n  server:\n    port: 8080\n";
+
+    fn mounted_file(dir: &std::path::Path, bytes: &[u8]) -> ConfigSource {
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, bytes).unwrap();
+        ConfigSource::File(path)
+    }
+
+    #[test]
+    fn identical_bytes_match_the_last_file_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = vec![
+            ConfigSource::Inline {
+                origin: "base64:".into(),
+                yaml: "gateway: {}".into(),
+            },
+            mounted_file(dir.path(), MOUNTED),
+        ];
+        assert!(pushed_matches_mounted_file(&sources, MOUNTED));
+        // A trailing newline is not a different config.
+        assert!(pushed_matches_mounted_file(
+            &sources,
+            MOUNTED.strip_suffix(b"\n").unwrap()
+        ));
+    }
+
+    /// Provenance alone does not make a gateway operator-delivered — it
+    /// has to run from a mounted file — and a file alone does not either,
+    /// since a self-hosted gateway attached to a CP also boots from a file.
+    #[test]
+    fn operator_delivery_needs_a_file_and_the_platforms_provenance() {
+        use crate::config::CloudProvenance;
+        let dir = tempfile::tempdir().unwrap();
+        let file = vec![mounted_file(dir.path(), MOUNTED)];
+        let inline = vec![ConfigSource::Inline {
+            origin: "base64:".into(),
+            yaml: "gateway: {}".into(),
+        }];
+        let stamped = CloudProvenance {
+            cluster_id: Some("cell-1".into()),
+            namespace: Some("tenant-acme".into()),
+            ..CloudProvenance::default()
+        };
+        assert!(is_operator_delivered(&stamped, &file));
+        assert!(!is_operator_delivered(&CloudProvenance::default(), &file));
+        assert!(!is_operator_delivered(&stamped, &inline));
+        let half = CloudProvenance {
+            cluster_id: Some("cell-1".into()),
+            ..CloudProvenance::default()
+        };
+        assert!(!is_operator_delivered(&half, &file));
+    }
+
+    #[test]
+    fn different_bytes_do_not_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = vec![mounted_file(dir.path(), MOUNTED)];
+        assert!(!pushed_matches_mounted_file(
+            &sources,
+            b"gateway:\n  server:\n    port: 9090\n"
+        ));
+    }
+
+    /// The comparison is against the file as it is now, not as it was at boot.
+    #[test]
+    fn the_file_is_re_read_on_every_push() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = vec![mounted_file(dir.path(), b"gateway: {}\n")];
+        assert!(!pushed_matches_mounted_file(&sources, MOUNTED));
+        std::fs::write(dir.path().join("config.yaml"), MOUNTED).unwrap();
+        assert!(pushed_matches_mounted_file(&sources, MOUNTED));
+    }
+
+    #[test]
+    fn no_file_layer_or_unreadable_file_never_matches() {
+        let inline_only = vec![ConfigSource::Inline {
+            origin: "base64:".into(),
+            yaml: String::from_utf8(MOUNTED.to_vec()).unwrap(),
+        }];
+        assert!(!pushed_matches_mounted_file(&inline_only, MOUNTED));
+        assert!(!pushed_matches_mounted_file(&[], MOUNTED));
+
+        let dir = tempfile::tempdir().unwrap();
+        let missing = vec![ConfigSource::File(dir.path().join("gone.yaml"))];
+        assert!(!pushed_matches_mounted_file(&missing, MOUNTED));
     }
 }
