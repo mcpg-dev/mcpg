@@ -474,10 +474,12 @@ outcome. The table below pins the cases where both are relevant.
 | 400  | `-32600`   | Missing `Accept` or non-SSE-compatible Accept | T12-08. |
 | 400  | `-32602`   | `_meta.progressToken` not string or non-empty number | T15-04. |
 | 400  | `-32600`   | `_meta` key uses MCP-reserved prefix | T15-05. |
-| 401  | `-32041`   | Identity gate: missing / invalid credential | `WWW-Authenticate` header carries `resource_metadata`. |
-| 401  | `-32044`   | Identity gate: insufficient scope | Carries `error="insufficient_scope"` and required `scope=`. |
+| 401  | `-32000`   | Identity gate: a presented credential is invalid, expired, or bound to another audience | `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…"`. |
+| 401  | `-32003` / `-32022` | Policy refused a caller that presented **no** credential (trust floor, CEL `allow_if`) while a bearer verifier (`jwks` / `oidc_oauth`) is configured | `WWW-Authenticate: Bearer resource_metadata="…"`. The URL names the metadata of the hostname the request arrived on (`Host`, or `X-Forwarded-Host` behind a trusted proxy), so an OAuth host starts its flow against the URL it connected to. Without a verifier the refusal stays a 403. |
 | 402  | `-33042`   | Payment required (MPP, UCP, ACP) | Plugin-specific `-33050`..`-33061` when the plugin surfaces its own variant. |
-| 403  | `-32041`   | Policy denial / CORS rejection | Origin not on `server.allowed_origins`. |
+| 403  | `-32003`   | An authenticated caller is below a tool's trust floor, or lacks a required scope | A scope denial carries `error="insufficient_scope"` and the required `scope=` (SEP-2350); a bare 403 carries no challenge — re-authenticating cannot help. |
+| 403  | `-32022`   | CEL `allow_if` denial for an authenticated caller | |
+| 403  | n/a        | CORS rejection | Empty body. Origin not on `server.allowed_origins`. |
 | 404  | `-32600`   | Unknown session id on header | Operator-termed session never reuses an id. |
 | 409  | `-32600`   | Expired `Last-Event-Id` SSE cursor | Client must reinitialise the session. |
 | 429  | `-32099`   | Completion rate limit exceeded | T13-07. |

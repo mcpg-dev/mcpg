@@ -58,7 +58,9 @@ pub enum JwtVerificationResult {
 pub struct JwtVerifier {
     keys: Vec<KeyEntry>,
     issuer: Option<String>,
-    audience: Option<String>,
+    /// Every accepted audience (`audience` + `audiences`); a token passes
+    /// when its `aud` names any of them. Empty = no audience check.
+    audiences: Vec<String>,
     /// Dev escape-hatch: when true, a token may omit the `aud` claim even
     /// though an audience is configured. Production keeps this false so a
     /// missing `aud` is rejected (audience-binding / confused-deputy).
@@ -72,7 +74,7 @@ impl std::fmt::Debug for JwtVerifier {
         f.debug_struct("JwtVerifier")
             .field("key_count", &self.keys.len())
             .field("issuer", &self.issuer)
-            .field("audience", &self.audience)
+            .field("audiences", &self.audiences)
             .field("header_name", &self.header_name)
             .finish()
     }
@@ -109,7 +111,12 @@ impl JwtVerifier {
         Ok(Self {
             keys,
             issuer: config.issuer.clone(),
-            audience: config.audience.clone(),
+            audiences: config
+                .audience
+                .iter()
+                .chain(config.audiences.iter())
+                .cloned()
+                .collect(),
             allow_missing_audience: config.allow_missing_audience,
             header_name: config.header_name.clone(),
             header_prefix: config.header_prefix.clone(),
@@ -205,8 +212,8 @@ impl JwtVerifier {
                 required.push("iss");
             }
 
-            if let Some(ref audience) = self.audience {
-                validation.set_audience(&[audience]);
+            if !self.audiences.is_empty() {
+                validation.set_audience(&self.audiences);
                 if !self.allow_missing_audience {
                     required.push("aud");
                 }
@@ -307,6 +314,7 @@ mod tests {
             keys_json: None,
             issuer: Some("test-issuer".to_owned()),
             audience: Some("test-audience".to_owned()),
+            audiences: vec![],
             header_name: "authorization".to_owned(),
             header_prefix: "Bearer ".to_owned(),
             allow_missing_audience: true,
@@ -572,6 +580,37 @@ mod tests {
         match verifier.verify_from_headers(&headers_with(&token)) {
             JwtVerificationResult::Verified { .. } => {}
             other => panic!("escape-hatch should accept missing aud, got {other:?}"),
+        }
+    }
+
+    /// A token bound to any entry of `audiences` verifies; one bound to
+    /// an audience outside the accepted set is still refused.
+    #[test]
+    fn audiences_list_accepts_any_listed_audience() {
+        let secret = "super-secret-key-for-testing-only";
+        let config = JwksConfig {
+            audiences: vec!["https://mcp.acme.example/mcp".to_owned()],
+            ..prod_config()
+        };
+        let verifier = JwtVerifier::from_jwks_json(&test_hmac_jwks(secret), &config).unwrap();
+
+        let mut claims = valid_claims();
+        claims.aud = Some(Audience::Single("https://mcp.acme.example/mcp".to_owned()));
+        match verifier.verify_from_headers(&headers_with(&make_test_token(secret, &claims))) {
+            JwtVerificationResult::Verified { .. } => {}
+            other => panic!("token bound to a listed audience must verify, got {other:?}"),
+        }
+
+        let canonical = make_test_token(secret, &valid_claims());
+        match verifier.verify_from_headers(&headers_with(&canonical)) {
+            JwtVerificationResult::Verified { .. } => {}
+            other => panic!("token bound to `audience` must still verify, got {other:?}"),
+        }
+
+        claims.aud = Some(Audience::Single("https://other.example/mcp".to_owned()));
+        match verifier.verify_from_headers(&headers_with(&make_test_token(secret, &claims))) {
+            JwtVerificationResult::Invalid(_) => {}
+            other => panic!("token bound to an unlisted audience must be refused, got {other:?}"),
         }
     }
 }

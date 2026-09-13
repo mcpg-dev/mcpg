@@ -75,8 +75,8 @@ pub(crate) use probes::{health_handler, metrics_handler, readiness_handler, runt
 pub(crate) use response::{
     INSUFFICIENT_SCOPE_DATA_KEY, map_gateway_response, map_protocol_error_response,
     map_protocol_error_with_status, map_sse_events, map_transport_rejection,
-    reject_method_on_modern_wire, resource_metadata_url, with_request_id_header,
-    with_session_id_header, with_www_authenticate_challenge,
+    reject_method_on_modern_wire, request_host, resource_metadata_url, with_request_id_header,
+    with_resource_metadata_pointer, with_session_id_header, with_www_authenticate_challenge,
 };
 pub(crate) use sse::{
     ResourceSubscriptionGuard, SlottedEventStream, SseStreamSlot, acquire_sse_slot,
@@ -520,7 +520,7 @@ async fn mcp_handler(
     .await
     {
         Ok(ctx) => ctx,
-        Err(resp) => return resp,
+        Err(resp) => return refused_credential_response(resp, &config, &headers),
     };
 
     let client_accepts_sse = match mcp_post_preflight(&headers, &config, peer, &request_context) {
@@ -648,12 +648,24 @@ async fn mcp_handler(
         &state,
         &runtime,
         &config,
+        &headers,
         &request_context,
         wire,
         client_accepts_sse,
         dispatch,
     )
     .await
+}
+
+/// The identity gate refused the credential: point the challenge at the
+/// resource metadata bound to the hostname the request came in on.
+fn refused_credential_response(
+    response: Response,
+    config: &crate::config::AppConfig,
+    headers: &HeaderMap,
+) -> Response {
+    let host = request_host(headers, config.gateway.server.trust_proxy_ip);
+    with_resource_metadata_pointer(response, &resource_metadata_url(config, host.as_deref()))
 }
 
 /// A request's dispatch either produced a runtime result the response tail has
@@ -936,10 +948,12 @@ async fn dispatch_legacy(
 /// SSE stream, the ephemeral/unary inline-JSON fast paths, the legacy session
 /// SSE channel, or the POST-continuation upgrade — in that order, which is the
 /// order they were written in and the order their conditions assume.
+#[allow(clippy::too_many_arguments)]
 async fn finish_response(
     state: &AppState,
     runtime: &crate::runtime::GatewayRuntime,
     config: &crate::config::AppConfig,
+    headers: &HeaderMap,
     request_context: &RequestContext,
     wire: WireVersion,
     client_accepts_sse: bool,
@@ -951,13 +965,19 @@ async fn finish_response(
         modern_tools_call_session,
     } = dispatch;
     let auth_enabled = config.governance.access.is_enabled();
+    // The challenge names the resource metadata bound to the hostname the
+    // request arrived on, so a host reaching a custom domain discovers a
+    // `resource` equal to the URL it used.
+    let host = request_host(headers, config.gateway.server.trust_proxy_ip);
+    let prm_url = resource_metadata_url(config, host.as_deref());
+    let caller = Some(&request_context.identity);
     // The AAuth challenge context: the resource role plus the caller — an
     // AAuth caller short on scope is stepped up with a resource token.
     let aauth_challenge = runtime
         .aauth_resource()
         .map(|resource| response::AauthChallenge {
             resource,
-            identity: Some(&request_context.identity),
+            identity: caller,
         });
     // SEP-2567/2575: a 2026-07-28 server MUST NOT surface `Mcp-Session-Id`
     // on the wire. The synthetic operational session still exists
@@ -1033,8 +1053,9 @@ async fn finish_response(
                     let resp = with_www_authenticate_challenge(
                         map_gateway_response(response),
                         auth_enabled,
-                        &resource_metadata_url(config),
+                        &prm_url,
                         aauth_challenge,
+                        caller,
                     );
                     return resp;
                 }
@@ -1074,8 +1095,9 @@ async fn finish_response(
                     let resp = with_www_authenticate_challenge(
                         map_gateway_response(response),
                         auth_enabled,
-                        &resource_metadata_url(config),
+                        &prm_url,
                         aauth_challenge,
+                        caller,
                     );
                     return with_session_id_header(resp, session_id_for_header.as_deref());
                 }
@@ -1100,8 +1122,9 @@ async fn finish_response(
                     None => with_www_authenticate_challenge(
                         map_gateway_response(response),
                         auth_enabled,
-                        &resource_metadata_url(config),
+                        &prm_url,
                         aauth_challenge,
+                        caller,
                     ),
                 };
                 return with_session_id_header(resp, session_id_for_header.as_deref());
@@ -1184,8 +1207,9 @@ async fn finish_response(
             let resp = with_www_authenticate_challenge(
                 map_gateway_response(response),
                 auth_enabled,
-                &resource_metadata_url(config),
+                &prm_url,
                 aauth_challenge,
+                caller,
             );
             let resp = with_session_id_header(resp, session_id_for_header.as_deref());
             wire.apply_protocol_version_header(resp)
@@ -1489,7 +1513,7 @@ async fn mcp_get_handler(
     .await
     {
         Ok(ctx) => ctx,
-        Err(resp) => return resp,
+        Err(resp) => return refused_credential_response(resp, &config, &headers),
     };
     if let Some(response) = validate_origin(
         &headers,
@@ -1770,7 +1794,7 @@ async fn mcp_delete_handler(
     .await
     {
         Ok(ctx) => ctx,
-        Err(resp) => return resp,
+        Err(resp) => return refused_credential_response(resp, &config, &headers),
     };
     if let Some(response) = validate_origin(
         &headers,

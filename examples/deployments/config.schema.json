@@ -3109,6 +3109,14 @@
             "null"
           ]
         },
+        "audiences": {
+          "default": [],
+          "description": "Further accepted audiences, alongside `audience` — one per extra resource identifier the gateway is reached at, so a token bound to any bound hostname verifies. A token passes when its `aud` names at least one accepted audience.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "header_name": {
           "default": "authorization",
           "type": "string"
@@ -3925,6 +3933,14 @@
       "additionalProperties": false,
       "description": "Configuration for the OAuth Protected Resource Metadata endpoint (RFC 9728).",
       "properties": {
+        "additional_resources": {
+          "default": [],
+          "description": "Further resource identifiers this gateway is reached at — one per extra hostname (a custom domain in front of the same instance). A client compares the published `resource` with the URL it connected to (RFC 9728 §3.3), so the metadata document and the `WWW-Authenticate` challenge name whichever of `resource` and these matches the request's `Host`; a request for an unlisted host gets the canonical `resource`. Each entry is validated like `resource`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "allow_loopback_resource": {
           "default": false,
           "description": "Local-development escape hatch: permit a loopback `resource` (`localhost` / `127.0.0.1` / `[::1]`). A wildcard host (`0.0.0.0` / `[::]`) is NEVER a valid resource identifier and is refused even with this set. Production deployments leave this `false` and configure the canonical public URL.",

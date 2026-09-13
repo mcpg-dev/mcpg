@@ -483,6 +483,7 @@ async fn invalid_bearer_token_rejected_with_401() {
         keys_json: None,
         issuer: Some("test-issuer".to_owned()),
         audience: Some("test-audience".to_owned()),
+        audiences: vec![],
         header_name: "authorization".to_owned(),
         header_prefix: "Bearer ".to_owned(),
         allow_missing_audience: true,
@@ -527,6 +528,7 @@ async fn missing_bearer_token_falls_back_not_401() {
         keys_json: None,
         issuer: Some("test-issuer".to_owned()),
         audience: Some("test-audience".to_owned()),
+        audiences: vec![],
         header_name: "authorization".to_owned(),
         header_prefix: "Bearer ".to_owned(),
         allow_missing_audience: true,
@@ -1604,6 +1606,108 @@ async fn promoted_command_json_call_can_require_stricter_trust_than_global_defau
     let trusted_body = response_text(trusted_response).await;
     assert!(trusted_body.contains("mcpg.command.json_call"));
     assert!(trusted_body.contains("\"json\":{\"message\":\"hello\"}"));
+}
+
+/// With a bearer verifier configured, an anonymous call below a tool's
+/// trust floor is answered with 401 and the `resource_metadata` challenge
+/// for the hostname the request arrived on — the status an OAuth host
+/// starts its flow from — while anonymous `initialize` keeps working. The
+/// JSON-RPC envelope still names the trust-floor refusal.
+#[tokio::test]
+async fn anonymous_trust_floor_refusal_is_a_401_challenge_when_auth_is_configured() {
+    let state = build_test_state_with_all_runtime_controls(
+        false,
+        RuntimeDebugConfig {
+            enabled: false,
+            command_profiles: std::collections::BTreeMap::from([(
+                DEFAULT_COMMAND_PROFILE.to_owned(),
+                CommandToolRuntimeConfig {
+                    command: "cat".to_owned(),
+                    args: vec![],
+                    timeout_ms: 2_000,
+                    max_output_bytes: 4_096,
+                },
+            )]),
+            network_profiles: std::collections::BTreeMap::from([(
+                DEFAULT_NETWORK_PROFILE.to_owned(),
+                NetworkToolRuntimeConfig::default(),
+            )]),
+            bindings: DebugToolBackends::default(),
+            exposure: DebugToolExposure::default(),
+            default_allow_private_backends: true,
+        },
+        vec![test_command_binding("mcpg.command.json_call")],
+        ToolAccessPolicyConfig {
+            default_minimum_trust: RequestTrustLevel::Unauthenticated,
+            cel_allow_if: None,
+            rules: vec![ToolTrustRule {
+                tool_name: "mcpg.command.json_call".to_owned(),
+                minimum_trust: RequestTrustLevel::Verified,
+                cel_allow_if: None,
+                required_scopes: Vec::new(),
+            }],
+        },
+    );
+    let mut config = (**state.config.load()).clone();
+    config.governance.access.jwks = Some(crate::config::access::JwksConfig {
+        url: "https://idp.example.com/.well-known/jwks.json".to_owned(),
+        keys_json: None,
+        issuer: Some("https://idp.example.com".to_owned()),
+        audience: Some("https://gateway.example.com/mcp".to_owned()),
+        audiences: vec!["https://mcp.acme.example/mcp".to_owned()],
+        header_name: crate::config::access::default_jwks_header_name(),
+        header_prefix: crate::config::access::default_jwks_header_prefix(),
+        allow_missing_audience: false,
+    });
+    config.governance.access.resource_metadata = Some(crate::config::OAuthResourceMetadataConfig {
+        resource: "https://gateway.example.com/mcp".to_owned(),
+        additional_resources: vec!["https://mcp.acme.example/mcp".to_owned()],
+        authorization_servers: vec!["https://idp.example.com".to_owned()],
+        scopes_supported: vec![],
+        bearer_methods_supported: vec!["header".to_owned()],
+        allow_loopback_resource: false,
+    });
+    state.config.store(Arc::new(config));
+    let app = router(state, "/health", "/mcp");
+    let (app, session_id) = initialize_session(app).await;
+
+    let refused = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "mcp.acme.example")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+                .header(
+                    PROTOCOL_VERSION_HEADER,
+                    crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                )
+                .header(SESSION_ID_HEADER, &session_id)
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 200,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "mcpg.command.json_call",
+                            "arguments": {"message": "hello"}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        refused.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+        "Bearer resource_metadata=\"https://mcp.acme.example/.well-known/oauth-protected-resource/mcp\""
+    );
+    let body = response_json(refused).await;
+    assert_eq!(body["error"]["code"], -32003);
 }
 
 #[tokio::test]
@@ -5654,6 +5758,7 @@ async fn t6_01_oauth_metadata_with_explicit_config() {
                 oidc_oauth: None,
                 resource_metadata: Some(crate::config::OAuthResourceMetadataConfig {
                     resource: "https://gateway.example.com/mcp".to_owned(),
+                    additional_resources: vec![],
                     authorization_servers: vec!["https://auth.example.com/".to_owned()],
                     scopes_supported: vec!["openid".to_owned(), "tools".to_owned()],
                     bearer_methods_supported: vec!["header".to_owned()],
@@ -5702,6 +5807,7 @@ async fn auth02_path_aware_prm_well_known_served() {
                 oidc_oauth: None,
                 resource_metadata: Some(crate::config::OAuthResourceMetadataConfig {
                     resource: "https://gateway.example.com/mcp".to_owned(),
+                    additional_resources: vec![],
                     authorization_servers: vec!["https://auth.example.com/".to_owned()],
                     scopes_supported: vec!["tools".to_owned()],
                     bearer_methods_supported: vec!["header".to_owned()],
@@ -5730,12 +5836,262 @@ async fn auth02_path_aware_prm_well_known_served() {
     assert_eq!(json["resource"], "https://gateway.example.com/mcp");
 }
 
+/// A gateway bound to several hostnames publishes, for each request, the
+/// resource identifier of the hostname it arrived on (RFC 9728 §3.3: the
+/// client compares `resource` with the URL it used); an unlisted host and a
+/// missing `Host` get the canonical identifier. `X-Forwarded-Host` counts
+/// only behind a trusted proxy.
+#[tokio::test]
+async fn prm_resource_follows_the_request_host() {
+    let prm = |trust_proxy: bool| {
+        let mut config = AppConfig::default();
+        config.governance.access.resource_metadata =
+            Some(crate::config::OAuthResourceMetadataConfig {
+                resource: "https://gateway.example.com/mcp".to_owned(),
+                additional_resources: vec!["https://mcp.acme.example/mcp".to_owned()],
+                authorization_servers: vec!["https://auth.example.com/".to_owned()],
+                scopes_supported: vec![],
+                bearer_methods_supported: vec!["header".to_owned()],
+                allow_loopback_resource: false,
+            });
+        config.gateway.server.trust_proxy_ip = trust_proxy;
+        config
+    };
+    let served = |config: AppConfig, host: Option<&str>, forwarded: Option<&str>| {
+        let app = router(
+            finish_app_state(config, default_test_runtime()),
+            "/health",
+            "/mcp",
+        );
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/.well-known/oauth-protected-resource/mcp");
+        if let Some(host) = host {
+            req = req.header("host", host);
+        }
+        if let Some(forwarded) = forwarded {
+            req = req.header("x-forwarded-host", forwarded);
+        }
+        async move {
+            let response = app
+                .oneshot(req.body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            json["resource"].as_str().unwrap_or_default().to_owned()
+        }
+    };
+
+    assert_eq!(
+        served(prm(false), Some("MCP.acme.example:443"), None).await,
+        "https://mcp.acme.example/mcp"
+    );
+    assert_eq!(
+        served(prm(false), Some("gateway.example.com"), None).await,
+        "https://gateway.example.com/mcp"
+    );
+    assert_eq!(
+        served(prm(false), Some("unlisted.example"), None).await,
+        "https://gateway.example.com/mcp"
+    );
+    assert_eq!(
+        served(prm(false), None, None).await,
+        "https://gateway.example.com/mcp"
+    );
+    // A forwarded host is only believed behind a trusted proxy.
+    assert_eq!(
+        served(
+            prm(false),
+            Some("gateway.example.com"),
+            Some("mcp.acme.example")
+        )
+        .await,
+        "https://gateway.example.com/mcp"
+    );
+    assert_eq!(
+        served(
+            prm(true),
+            Some("gateway.example.com"),
+            Some("mcp.acme.example, edge.internal")
+        )
+        .await,
+        "https://mcp.acme.example/mcp"
+    );
+}
+
 const TEST_PRM_URL: &str = "https://gateway.example.com/.well-known/oauth-protected-resource/mcp";
+
+/// An unauthenticated caller refused by policy (a bare 403 — the trust
+/// floor, a CEL rule) is told to authenticate: 401 with the
+/// `resource_metadata` challenge, so an OAuth host starts its flow. A
+/// verified caller keeps its 403, an unknown caller is never lifted, a
+/// scope-shaped 403 keeps its step-up form, and nothing is lifted when no
+/// verifier is configured.
+#[test]
+fn unauthenticated_policy_403_becomes_401_challenge() {
+    let anon = crate::runtime::RequestIdentity::Anonymous {
+        source: "test".into(),
+    };
+    let lifted = with_www_authenticate_challenge(
+        axum::http::StatusCode::FORBIDDEN.into_response(),
+        true,
+        TEST_PRM_URL,
+        None,
+        Some(&anon),
+    );
+    assert_eq!(lifted.status(), StatusCode::UNAUTHORIZED);
+    let value = lifted
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .expect("challenge")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        value,
+        format!("Bearer resource_metadata=\"{TEST_PRM_URL}\"")
+    );
+
+    let verified = crate::runtime::RequestIdentity::Verified {
+        subject_id: "user-1".into(),
+        issuer: "https://idp.example".into(),
+        auth_provider: "oidc".into(),
+        source: "test".into(),
+        roles: vec![],
+        groups: vec![],
+        scopes: vec![],
+        attributes: Default::default(),
+    };
+    let kept = with_www_authenticate_challenge(
+        axum::http::StatusCode::FORBIDDEN.into_response(),
+        true,
+        TEST_PRM_URL,
+        None,
+        Some(&verified),
+    );
+    assert_eq!(kept.status(), StatusCode::FORBIDDEN);
+    assert!(kept.headers().get(header::WWW_AUTHENTICATE).is_none());
+
+    let unknown = with_www_authenticate_challenge(
+        axum::http::StatusCode::FORBIDDEN.into_response(),
+        true,
+        TEST_PRM_URL,
+        None,
+        None,
+    );
+    assert_eq!(unknown.status(), StatusCode::FORBIDDEN);
+
+    let mut scoped = axum::http::StatusCode::FORBIDDEN.into_response();
+    scoped.headers_mut().insert(
+        HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
+        HeaderValue::from_static("tools:write"),
+    );
+    let scoped = with_www_authenticate_challenge(scoped, true, TEST_PRM_URL, None, Some(&anon));
+    assert_eq!(scoped.status(), StatusCode::FORBIDDEN);
+    assert!(
+        scoped
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("insufficient_scope")
+    );
+
+    let no_verifier = with_www_authenticate_challenge(
+        axum::http::StatusCode::FORBIDDEN.into_response(),
+        false,
+        TEST_PRM_URL,
+        None,
+        Some(&anon),
+    );
+    assert_eq!(no_verifier.status(), StatusCode::FORBIDDEN);
+}
+
+/// The identity gate's `invalid_token` challenge gains the
+/// `resource_metadata` pointer; a challenge that already names one, a
+/// non-Bearer challenge, and a non-401 are left alone.
+#[test]
+fn invalid_token_challenge_gains_resource_metadata_pointer() {
+    let refused = (
+        axum::http::StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer error=\"invalid_token\"")],
+    )
+        .into_response();
+    let completed = with_resource_metadata_pointer(refused, TEST_PRM_URL);
+    assert_eq!(
+        completed.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+        &format!("Bearer error=\"invalid_token\", resource_metadata=\"{TEST_PRM_URL}\"")
+    );
+
+    let already = (
+        axum::http::StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            "Bearer resource_metadata=\"https://other.example/.well-known/oauth-protected-resource\"",
+        )],
+    )
+        .into_response();
+    let untouched = with_resource_metadata_pointer(already, TEST_PRM_URL);
+    assert!(
+        !untouched
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(TEST_PRM_URL)
+    );
+
+    let forbidden = axum::http::StatusCode::FORBIDDEN.into_response();
+    let forbidden = with_resource_metadata_pointer(forbidden, TEST_PRM_URL);
+    assert!(forbidden.headers().get(header::WWW_AUTHENTICATE).is_none());
+}
+
+/// The challenge URL follows the request host the same way the metadata
+/// document does.
+#[test]
+fn resource_metadata_url_follows_the_request_host() {
+    let config = AppConfig {
+        governance: crate::config::GovernanceConfig {
+            access: crate::config::AccessConfig {
+                authorization_server: None,
+                jwks: None,
+                oidc_oauth: None,
+                resource_metadata: Some(crate::config::OAuthResourceMetadataConfig {
+                    resource: "https://gateway.example.com/mcp".to_owned(),
+                    additional_resources: vec!["https://mcp.acme.example/mcp".to_owned()],
+                    authorization_servers: vec![],
+                    scopes_supported: vec![],
+                    bearer_methods_supported: vec!["header".to_owned()],
+                    allow_loopback_resource: false,
+                }),
+            },
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    assert_eq!(
+        resource_metadata_url(&config, Some("mcp.acme.example")),
+        "https://mcp.acme.example/.well-known/oauth-protected-resource/mcp"
+    );
+    assert_eq!(resource_metadata_url(&config, None), TEST_PRM_URL);
+    assert_eq!(
+        resource_metadata_url(&config, Some("unlisted.example")),
+        TEST_PRM_URL
+    );
+    assert_eq!(
+        resource_metadata_url(&AppConfig::default(), Some("mcp.acme.example")),
+        response::RELATIVE_PRM_PATH
+    );
+}
 
 #[test]
 fn t6_02_www_authenticate_header_added_on_401() {
     let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
     let www_auth = response.headers().get(header::WWW_AUTHENTICATE);
     assert!(www_auth.is_some());
     let value = www_auth.unwrap().to_str().unwrap();
@@ -5747,7 +6103,7 @@ fn t6_02_www_authenticate_header_added_on_401() {
 #[test]
 fn t6_02_www_authenticate_header_not_added_when_auth_disabled() {
     let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let response = with_www_authenticate_challenge(response, false, TEST_PRM_URL, None);
+    let response = with_www_authenticate_challenge(response, false, TEST_PRM_URL, None, None);
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 }
 
@@ -5772,7 +6128,8 @@ fn aauth_challenge_rides_401_when_configured() {
         identity,
     };
     let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, Some(ch(None)));
+    let response =
+        with_www_authenticate_challenge(response, true, TEST_PRM_URL, Some(ch(None)), None);
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_some());
     assert_eq!(
         response.headers().get("aauth-requirement").unwrap(),
@@ -5788,7 +6145,7 @@ fn aauth_challenge_rides_401_when_configured() {
     );
 
     let ok = axum::http::StatusCode::OK.into_response();
-    let ok = with_www_authenticate_challenge(ok, true, TEST_PRM_URL, Some(ch(None)));
+    let ok = with_www_authenticate_challenge(ok, true, TEST_PRM_URL, Some(ch(None)), None);
     assert!(ok.headers().get("aauth-requirement").is_none());
 
     // A bare authorization 403 for an AUTHENTICATED caller is not a
@@ -5805,8 +6162,13 @@ fn aauth_challenge_rides_401_when_configured() {
         attributes: Default::default(),
     };
     let forbidden = axum::http::StatusCode::FORBIDDEN.into_response();
-    let forbidden =
-        with_www_authenticate_challenge(forbidden, true, TEST_PRM_URL, Some(ch(Some(&verified))));
+    let forbidden = with_www_authenticate_challenge(
+        forbidden,
+        true,
+        TEST_PRM_URL,
+        Some(ch(Some(&verified))),
+        None,
+    );
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
     assert!(forbidden.headers().get("aauth-requirement").is_none());
 
@@ -5817,7 +6179,8 @@ fn aauth_challenge_rides_401_when_configured() {
         source: "test".into(),
     };
     let floor = axum::http::StatusCode::FORBIDDEN.into_response();
-    let floor = with_www_authenticate_challenge(floor, true, TEST_PRM_URL, Some(ch(Some(&anon))));
+    let floor =
+        with_www_authenticate_challenge(floor, true, TEST_PRM_URL, Some(ch(Some(&anon))), None);
     assert_eq!(floor.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         floor.headers().get("aauth-requirement").unwrap(),
@@ -5842,6 +6205,7 @@ fn aauth_challenge_rides_401_when_configured() {
             resource: &person_mode,
             identity: None,
         }),
+        None,
     );
     assert_eq!(
         response.headers().get("aauth-requirement").unwrap(),
@@ -5909,6 +6273,7 @@ fn aauth_step_up_mints_resource_token_on_scope_denial() {
             resource: &resource,
             identity: Some(&person),
         }),
+        None,
     );
     assert_eq!(stepped.status(), StatusCode::UNAUTHORIZED);
     let req = stepped
@@ -5949,6 +6314,7 @@ fn aauth_step_up_mints_resource_token_on_scope_denial() {
             resource: &resource,
             identity: Some(&anon),
         }),
+        None,
     );
     assert_eq!(plain.status(), StatusCode::FORBIDDEN);
     assert!(plain.headers().get("aauth-requirement").is_none());
@@ -5966,7 +6332,7 @@ fn aauth_step_up_mints_resource_token_on_scope_denial() {
 #[test]
 fn t6_02_www_authenticate_not_added_on_200() {
     let response = axum::http::StatusCode::OK.into_response();
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 }
 
@@ -5980,7 +6346,7 @@ fn t4_07_www_authenticate_includes_insufficient_scope_hint() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("tools.call sampling.read"),
     );
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
     let value = response
         .headers()
         .get(header::WWW_AUTHENTICATE)
@@ -6009,7 +6375,7 @@ fn auth09_insufficient_scope_403_carries_step_up_challenge() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("payments.write"),
     );
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let value = response
         .headers()
@@ -6036,7 +6402,7 @@ fn auth09_insufficient_scope_403_carries_step_up_challenge() {
 #[test]
 fn auth09_bare_403_gets_no_challenge() {
     let response = axum::http::StatusCode::FORBIDDEN.into_response();
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 }
@@ -6051,11 +6417,11 @@ fn auth04_403_not_conflated_into_401() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("admin.read"),
     );
-    let forbidden = with_www_authenticate_challenge(forbidden, true, TEST_PRM_URL, None);
+    let forbidden = with_www_authenticate_challenge(forbidden, true, TEST_PRM_URL, None, None);
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
 
     let unauth = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let unauth = with_www_authenticate_challenge(unauth, true, TEST_PRM_URL, None);
+    let unauth = with_www_authenticate_challenge(unauth, true, TEST_PRM_URL, None, None);
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
     // The unauthenticated challenge does not name a specific scope.
     let unauth_value = unauth
@@ -6075,7 +6441,7 @@ fn t4_07_insufficient_scope_header_stripped_even_on_non_401() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("tools.call"),
     );
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None);
+    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
     assert!(
         response
             .headers()
@@ -9324,6 +9690,7 @@ async fn mcp_registry_serves_v01_catalog_view() {
                 oidc_oauth: None,
                 resource_metadata: Some(crate::config::OAuthResourceMetadataConfig {
                     resource: "https://gateway.example.com/mcp".to_owned(),
+                    additional_resources: vec![],
                     authorization_servers: vec![],
                     scopes_supported: vec![],
                     bearer_methods_supported: vec![],

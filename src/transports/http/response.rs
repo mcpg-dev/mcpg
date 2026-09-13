@@ -191,18 +191,76 @@ pub(crate) const RELATIVE_PRM_PATH: &str = "/.well-known/oauth-protected-resourc
 
 /// Resolve the absolute `resource_metadata` URL advertised in
 /// `WWW-Authenticate` challenges. RFC 9728 wants the absolute well-known
-/// URL; we derive it from the canonical configured `resource`. When no
+/// URL; we derive it from the configured resource identifier bound to the
+/// hostname the request arrived on (`request_host`, see [`request_host`]),
+/// falling back to the canonical `resource`. When no
 /// `resource_metadata.resource` is configured we fall back to the relative
 /// root path (back-compat with deployments that haven't set a canonical
 /// resource yet).
-pub(crate) fn resource_metadata_url(config: &crate::config::AppConfig) -> String {
+pub(crate) fn resource_metadata_url(
+    config: &crate::config::AppConfig,
+    request_host: Option<&str>,
+) -> String {
     config
         .governance
         .access
         .resource_metadata
         .as_ref()
-        .map(crate::config::OAuthResourceMetadataConfig::well_known_url)
+        .map(|rm| rm.well_known_url_for_host(request_host))
         .unwrap_or_else(|| RELATIVE_PRM_PATH.to_owned())
+}
+
+/// The hostname a request arrived for, as `host[:port]`: the first
+/// `X-Forwarded-Host` value when the operator trusts the fronting proxy
+/// (`server.trust_proxy_ip`, the same switch as for `X-Forwarded-For`),
+/// else the `Host` header. Only ever matched against configured resource
+/// identifiers, so a spoofed value selects among operator-set URLs at most.
+pub(crate) fn request_host(headers: &HeaderMap, trust_proxy: bool) -> Option<String> {
+    let forwarded = trust_proxy
+        .then(|| headers.get("x-forwarded-host"))
+        .flatten()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    forwarded
+        .or_else(|| {
+            headers
+                .get(axum::http::header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        })
+        .map(str::to_owned)
+}
+
+/// Complete the identity gate's `Bearer error="invalid_token"` challenge
+/// with the `resource_metadata` pointer (RFC 9728 §5.1) so a client whose
+/// credential was refused can re-discover the authorization server. Only
+/// a 401 carrying a `WWW-Authenticate` value without the pointer is
+/// touched.
+pub(crate) fn with_resource_metadata_pointer(mut response: Response, url: &str) -> Response {
+    if response.status() != axum::http::StatusCode::UNAUTHORIZED {
+        return response;
+    }
+    let Some(existing) = response
+        .headers()
+        .get(axum::http::header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned)
+    else {
+        return response;
+    };
+    if existing.contains("resource_metadata=") || !existing.starts_with("Bearer") {
+        return response;
+    }
+    let url = sanitize_header_quotes(url);
+    if let Ok(value) = HeaderValue::from_str(&format!("{existing}, resource_metadata=\"{url}\"")) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::WWW_AUTHENTICATE, value);
+    }
+    response
 }
 
 /// Attach the RFC 6750 / RFC 9728 `WWW-Authenticate` challenge to 401
@@ -216,6 +274,15 @@ pub(crate) fn resource_metadata_url(config: &crate::config::AppConfig) -> String
 ///   per RFC 6750 §3.1 / SEP-2350. A bare 403 (ordinary authorization
 ///   denial, no missing-scope hint) is left untouched — it is not a
 ///   re-authentication signal.
+///
+/// - **bare 403 to an unauthenticated caller**: lifted to a **401** with
+///   the `Bearer resource_metadata="…"` challenge. A caller that presented
+///   no verifiable credential and was refused by policy (a trust floor, a
+///   CEL rule) lacks valid credentials in the RFC 9110 §15.5.2 sense, and
+///   an OAuth-capable host starts its flow from exactly that status. An
+///   authenticated caller that is still refused keeps its 403 —
+///   re-authenticating cannot help it. `caller` is the resolved identity;
+///   `None` (unknown) never lifts.
 ///
 /// `resource_metadata` is the absolute well-known URL (see
 /// [`resource_metadata_url`]). The internal scope header is always
@@ -234,6 +301,7 @@ pub(crate) fn with_www_authenticate_challenge(
     auth_enabled: bool,
     resource_metadata: &str,
     aauth: Option<AauthChallenge<'_>>,
+    caller: Option<&crate::runtime::RequestIdentity>,
 ) -> Response {
     // The scope hint is read here (before it is stripped below) so the AAuth
     // step-up can name the scopes the caller lacks.
@@ -252,6 +320,15 @@ pub(crate) fn with_www_authenticate_challenge(
 
     if !auth_enabled {
         return response;
+    }
+
+    if response.status() == axum::http::StatusCode::FORBIDDEN
+        && insufficient_scope.is_none()
+        && caller.is_some_and(|identity| {
+            identity.trust_level() < crate::runtime::RequestTrustLevel::Verified
+        })
+    {
+        *response.status_mut() = axum::http::StatusCode::UNAUTHORIZED;
     }
 
     let status = response.status();

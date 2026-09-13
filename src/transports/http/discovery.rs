@@ -301,8 +301,12 @@ fn aauth_problem(
 ///
 /// Returns JSON document at `GET /.well-known/oauth-protected-resource` that lets
 /// MCP clients discover which authorization server(s) protect this gateway.
+/// The published `resource` is the configured identifier bound to the
+/// hostname the request arrived on (a client compares it with the URL it
+/// connected to, RFC 9728 §3.3), falling back to the canonical one.
 pub(crate) async fn oauth_protected_resource_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let config = state.config.load();
 
@@ -328,8 +332,9 @@ pub(crate) async fn oauth_protected_resource_handler(
     if auth_servers.is_empty() {
         auth_servers = derive_authorization_servers(&config.governance.access);
     }
+    let host = super::request_host(&headers, config.gateway.server.trust_proxy_ip);
     Json(serde_json::json!({
-        "resource": rm.resource,
+        "resource": rm.resource_for_host(host.as_deref()),
         "authorization_servers": auth_servers,
         "scopes_supported": rm.scopes_supported,
         "bearer_methods_supported": rm.bearer_methods_supported,

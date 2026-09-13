@@ -283,6 +283,15 @@ pub struct OAuthResourceMetadataConfig {
     /// public URL explicitly, or opt into the loopback form for local
     /// development with `allow_loopback_resource: true`.
     pub resource: String,
+    /// Further resource identifiers this gateway is reached at — one per
+    /// extra hostname (a custom domain in front of the same instance). A
+    /// client compares the published `resource` with the URL it connected
+    /// to (RFC 9728 §3.3), so the metadata document and the
+    /// `WWW-Authenticate` challenge name whichever of `resource` and these
+    /// matches the request's `Host`; a request for an unlisted host gets
+    /// the canonical `resource`. Each entry is validated like `resource`.
+    #[serde(default)]
+    pub additional_resources: Vec<String>,
     /// Authorization server URLs. If empty, derived from OIDC provider issuers.
     #[serde(default)]
     pub authorization_servers: Vec<String>,
@@ -327,54 +336,63 @@ fn resource_host(resource: &str) -> Option<String> {
         .split(['/', '?', '#'])
         .next()
         .unwrap_or(after_scheme);
-    // IPv6 literal: `[::1]:8080` — keep the bracketed host, drop the port.
+    Some(host_of_authority(authority))
+}
+
+/// The host of a `host[:port]` authority (a URL authority or a request
+/// `Host` value), lowercased and without the port. An IPv6 literal keeps
+/// its address, without the brackets.
+fn host_of_authority(authority: &str) -> String {
+    let authority = authority.trim();
     if let Some(rest) = authority.strip_prefix('[') {
         let host = rest.split(']').next().unwrap_or(rest);
-        return Some(host.to_owned());
+        return host.to_ascii_lowercase();
     }
-    Some(authority.split(':').next().unwrap_or(authority).to_owned())
+    authority
+        .split(':')
+        .next()
+        .unwrap_or(authority)
+        .to_ascii_lowercase()
 }
 
 impl OAuthResourceMetadataConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.resource.trim().is_empty() {
-            return Err(anyhow::anyhow!(
-                "governance.access.resource_metadata.resource must not be empty"
-            ));
-        }
-        if !self.resource.starts_with("https://") && !self.resource.starts_with("http://") {
-            return Err(anyhow::anyhow!(
-                "governance.access.resource_metadata.resource must be a valid absolute URL (http:// or https://)"
-            ));
-        }
-        // RFC 8707 §2: the resource identifier MUST NOT carry a fragment.
-        if self.resource.contains('#') {
-            return Err(anyhow::anyhow!(
-                "governance.access.resource_metadata.resource must not contain a fragment (RFC 8707 §2)"
-            ));
-        }
-        let Some(host) = resource_host(&self.resource) else {
-            return Err(anyhow::anyhow!(
-                "governance.access.resource_metadata.resource is not a parseable URL: {}",
-                self.resource
-            ));
-        };
-        if is_wildcard_host(&host) {
-            return Err(anyhow::anyhow!(
-                "governance.access.resource_metadata.resource host `{host}` is a wildcard/unspecified \
-                 address — it can never be a token audience. Set the canonical external URL \
-                 the gateway is reached at."
-            ));
-        }
-        if is_loopback_host(&host) && !self.allow_loopback_resource {
-            return Err(anyhow::anyhow!(
-                "governance.access.resource_metadata.resource host `{host}` is loopback; a published \
-                 PRM resource must be the canonical external URL clients reach. Set the public URL, \
-                 or for local development opt in with \
-                 governance.access.resource_metadata.allow_loopback_resource: true"
-            ));
+        validate_resource_identifier(
+            "governance.access.resource_metadata.resource",
+            &self.resource,
+            self.allow_loopback_resource,
+        )?;
+        for extra in &self.additional_resources {
+            validate_resource_identifier(
+                "governance.access.resource_metadata.additional_resources[]",
+                extra,
+                self.allow_loopback_resource,
+            )?;
         }
         Ok(())
+    }
+
+    /// Every resource identifier this gateway answers to: the canonical
+    /// `resource` first, then `additional_resources`.
+    pub fn resources(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.resource.as_str())
+            .chain(self.additional_resources.iter().map(String::as_str))
+    }
+
+    /// The resource identifier to publish for a request that arrived with
+    /// `request_host` (`host[:port]`, as in a `Host` header): the configured
+    /// identifier whose host equals it, else the canonical `resource`. Hosts
+    /// compare case-insensitively and without ports.
+    pub fn resource_for_host(&self, request_host: Option<&str>) -> &str {
+        let Some(wanted) = request_host
+            .map(host_of_authority)
+            .filter(|host| !host.is_empty())
+        else {
+            return &self.resource;
+        };
+        self.resources()
+            .find(|candidate| resource_host(candidate).as_deref() == Some(wanted.as_str()))
+            .unwrap_or(&self.resource)
     }
 
     /// Build the absolute RFC 9728 well-known metadata URL for this
@@ -385,6 +403,50 @@ impl OAuthResourceMetadataConfig {
     pub fn well_known_url(&self) -> String {
         well_known_resource_metadata_url(&self.resource)
     }
+
+    /// [`Self::well_known_url`] for the identifier
+    /// [`Self::resource_for_host`] selects.
+    pub fn well_known_url_for_host(&self, request_host: Option<&str>) -> String {
+        well_known_resource_metadata_url(self.resource_for_host(request_host))
+    }
+}
+
+/// What every published resource identifier must satisfy: an absolute
+/// `http(s)` URL without a fragment (RFC 8707 §2) whose host can be a
+/// token audience — never a wildcard, and loopback only by opt-in.
+fn validate_resource_identifier(field: &str, resource: &str, allow_loopback: bool) -> Result<()> {
+    if resource.trim().is_empty() {
+        return Err(anyhow::anyhow!("{field} must not be empty"));
+    }
+    if !resource.starts_with("https://") && !resource.starts_with("http://") {
+        return Err(anyhow::anyhow!(
+            "{field} must be a valid absolute URL (http:// or https://)"
+        ));
+    }
+    if resource.contains('#') {
+        return Err(anyhow::anyhow!(
+            "{field} must not contain a fragment (RFC 8707 §2)"
+        ));
+    }
+    let Some(host) = resource_host(resource) else {
+        return Err(anyhow::anyhow!(
+            "{field} is not a parseable URL: {resource}"
+        ));
+    };
+    if is_wildcard_host(&host) {
+        return Err(anyhow::anyhow!(
+            "{field} host `{host}` is a wildcard/unspecified address — it can never be a token \
+             audience. Set the canonical external URL the gateway is reached at."
+        ));
+    }
+    if is_loopback_host(&host) && !allow_loopback {
+        return Err(anyhow::anyhow!(
+            "{field} host `{host}` is loopback; a published PRM resource must be the canonical \
+             external URL clients reach. Set the public URL, or for local development opt in \
+             with governance.access.resource_metadata.allow_loopback_resource: true"
+        ));
+    }
+    Ok(())
 }
 
 /// RFC 9728 §3.1 path-aware well-known construction. Splits an
@@ -458,6 +520,12 @@ pub struct JwksConfig {
     pub issuer: Option<String>,
     #[serde(default)]
     pub audience: Option<String>,
+    /// Further accepted audiences, alongside `audience` — one per extra
+    /// resource identifier the gateway is reached at, so a token bound to
+    /// any bound hostname verifies. A token passes when its `aud` names at
+    /// least one accepted audience.
+    #[serde(default)]
+    pub audiences: Vec<String>,
     #[serde(default = "default_jwks_header_name")]
     pub header_name: String,
     #[serde(default = "default_jwks_header_prefix")]
@@ -501,12 +569,17 @@ impl JwksConfig {
                     "governance.access.jwks.audience must not be empty when provided"
                 ));
             }
-            (None, false) => {
+            (None, false) if self.audiences.is_empty() => {
                 return Err(anyhow::anyhow!(
                     "governance.access.jwks.audience is required (set governance.access.jwks.allow_missing_audience=true only for local development)"
                 ));
             }
             _ => {}
+        }
+        if self.audiences.iter().any(|aud| aud.trim().is_empty()) {
+            return Err(anyhow::anyhow!(
+                "governance.access.jwks.audiences must not contain an empty entry"
+            ));
         }
         if self.header_name.trim().is_empty() {
             return Err(anyhow::anyhow!(

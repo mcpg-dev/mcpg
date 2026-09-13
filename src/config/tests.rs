@@ -2207,6 +2207,7 @@ fn validate_accepts_valid_jwks_auth_config() {
                     keys_json: None,
                     issuer: Some("https://auth.example.com/".to_owned()),
                     audience: Some("mcpg".to_owned()),
+                    audiences: vec![],
                     header_name: "authorization".to_owned(),
                     header_prefix: "Bearer ".to_owned(),
                     allow_missing_audience: true,
@@ -2232,6 +2233,7 @@ fn validate_accepts_minimal_jwks_auth_config() {
                     keys_json: None,
                     issuer: None,
                     audience: None,
+                    audiences: vec![],
                     header_name: "authorization".to_owned(),
                     header_prefix: "Bearer ".to_owned(),
                     allow_missing_audience: true,
@@ -2257,6 +2259,7 @@ fn validate_rejects_jwks_without_url_or_keys() {
                     keys_json: None,
                     issuer: None,
                     audience: None,
+                    audiences: vec![],
                     header_name: "authorization".to_owned(),
                     header_prefix: "Bearer ".to_owned(),
                     allow_missing_audience: true,
@@ -2283,6 +2286,7 @@ fn validate_rejects_non_http_jwks_url() {
                     keys_json: None,
                     issuer: None,
                     audience: None,
+                    audiences: vec![],
                     header_name: "authorization".to_owned(),
                     header_prefix: "Bearer ".to_owned(),
                     allow_missing_audience: true,
@@ -2309,6 +2313,7 @@ fn validate_rejects_whitespace_only_jwks_issuer() {
                     keys_json: None,
                     issuer: Some("   ".to_owned()),
                     audience: None,
+                    audiences: vec![],
                     header_name: "authorization".to_owned(),
                     header_prefix: "Bearer ".to_owned(),
                     allow_missing_audience: true,
@@ -2335,6 +2340,7 @@ fn validate_rejects_empty_jwks_header_name() {
                     keys_json: None,
                     issuer: None,
                     audience: None,
+                    audiences: vec![],
                     header_name: "  ".to_owned(),
                     header_prefix: "Bearer ".to_owned(),
                     allow_missing_audience: true,
@@ -2361,6 +2367,7 @@ fn validate_accepts_jwks_with_inline_keys_json() {
                     keys_json: Some(r#"{"keys":[]}"#.to_owned()),
                     issuer: None,
                     audience: None,
+                    audiences: vec![],
                     header_name: "authorization".to_owned(),
                     header_prefix: "Bearer ".to_owned(),
                     allow_missing_audience: true,
@@ -2386,6 +2393,7 @@ fn trust_level_config_verified_orders_above_header_asserted() {
 fn validate_accepts_valid_resource_metadata() {
     let rm = OAuthResourceMetadataConfig {
         resource: "https://gateway.example.com/mcp".to_owned(),
+        additional_resources: vec![],
         authorization_servers: vec!["https://auth.example.com/".to_owned()],
         scopes_supported: vec![],
         bearer_methods_supported: vec!["header".to_owned()],
@@ -2398,6 +2406,7 @@ fn validate_accepts_valid_resource_metadata() {
 fn validate_rejects_empty_resource_metadata_resource() {
     let rm = OAuthResourceMetadataConfig {
         resource: "".to_owned(),
+        additional_resources: vec![],
         authorization_servers: vec![],
         scopes_supported: vec![],
         bearer_methods_supported: vec!["header".to_owned()],
@@ -2411,6 +2420,7 @@ fn validate_rejects_empty_resource_metadata_resource() {
 fn validate_rejects_non_url_resource_metadata_resource() {
     let rm = OAuthResourceMetadataConfig {
         resource: "not-a-url".to_owned(),
+        additional_resources: vec![],
         authorization_servers: vec![],
         scopes_supported: vec![],
         bearer_methods_supported: vec!["header".to_owned()],
@@ -2430,11 +2440,81 @@ fn resource_metadata_default_bearer_methods() {
 fn prm_with_resource(resource: &str, allow_loopback: bool) -> OAuthResourceMetadataConfig {
     OAuthResourceMetadataConfig {
         resource: resource.to_owned(),
+        additional_resources: vec![],
         authorization_servers: vec![],
         scopes_supported: vec![],
         bearer_methods_supported: vec!["header".to_owned()],
         allow_loopback_resource: allow_loopback,
     }
+}
+
+/// Every additional resource identifier is held to the same rules as the
+/// canonical one.
+#[test]
+fn validate_holds_additional_resources_to_the_resource_rules() {
+    let mut rm = prm_with_resource("https://gateway.example.com/mcp", false);
+    rm.additional_resources = vec!["https://mcp.acme.example/mcp".to_owned()];
+    assert!(rm.validate().is_ok());
+
+    for (bad, expected) in [
+        ("", "must not be empty"),
+        ("mcp.acme.example/mcp", "valid absolute URL"),
+        ("https://mcp.acme.example/mcp#frag", "fragment"),
+        ("http://0.0.0.0/mcp", "wildcard"),
+        ("http://localhost/mcp", "loopback"),
+    ] {
+        rm.additional_resources = vec![bad.to_owned()];
+        let err = rm.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("additional_resources") && err.contains(expected),
+            "{bad:?} got: {err}"
+        );
+    }
+}
+
+/// The identifier published for a request is the one bound to the host
+/// the request arrived on; hosts compare case-insensitively and without
+/// ports; anything else falls back to the canonical `resource`.
+#[test]
+fn resource_for_host_selects_the_bound_identifier() {
+    let mut rm = prm_with_resource("https://gateway.example.com/mcp", false);
+    rm.additional_resources = vec![
+        "https://mcp.acme.example/mcp".to_owned(),
+        "https://gw.other.example:8443/mcp".to_owned(),
+    ];
+    assert_eq!(
+        rm.resource_for_host(Some("mcp.acme.example")),
+        "https://mcp.acme.example/mcp"
+    );
+    assert_eq!(
+        rm.resource_for_host(Some("MCP.Acme.Example:443")),
+        "https://mcp.acme.example/mcp"
+    );
+    assert_eq!(
+        rm.resource_for_host(Some("gw.other.example")),
+        "https://gw.other.example:8443/mcp"
+    );
+    assert_eq!(
+        rm.resource_for_host(Some("gateway.example.com")),
+        "https://gateway.example.com/mcp"
+    );
+    assert_eq!(
+        rm.resource_for_host(Some("unlisted.example")),
+        "https://gateway.example.com/mcp"
+    );
+    assert_eq!(
+        rm.resource_for_host(Some("")),
+        "https://gateway.example.com/mcp"
+    );
+    assert_eq!(
+        rm.resource_for_host(None),
+        "https://gateway.example.com/mcp"
+    );
+    assert_eq!(
+        rm.well_known_url_for_host(Some("mcp.acme.example")),
+        "https://mcp.acme.example/.well-known/oauth-protected-resource/mcp"
+    );
+    assert_eq!(rm.well_known_url_for_host(None), rm.well_known_url());
 }
 
 /// TAN-05 (RFC 8707/9728): a wildcard/unspecified bind host is never a
@@ -4286,6 +4366,7 @@ fn jwks_rejects_missing_audience_by_default() {
         keys_json: None,
         issuer: Some("https://idp.example.com".to_owned()),
         audience: None,
+        audiences: vec![],
         header_name: super::access::default_jwks_header_name(),
         header_prefix: super::access::default_jwks_header_prefix(),
         allow_missing_audience: false,
@@ -4301,11 +4382,35 @@ fn jwks_accepts_missing_audience_when_escape_hatch_set() {
         keys_json: None,
         issuer: Some("https://idp.example.com".to_owned()),
         audience: None,
+        audiences: vec![],
         header_name: super::access::default_jwks_header_name(),
         header_prefix: super::access::default_jwks_header_prefix(),
         allow_missing_audience: true,
     };
     cfg.validate().unwrap();
+}
+
+/// `audiences` alone satisfies the audience-binding requirement, and an
+/// empty entry is refused.
+#[test]
+fn jwks_audiences_list_stands_in_for_audience() {
+    let mut cfg = JwksConfig {
+        url: "https://idp.example.com/.well-known/jwks.json".to_owned(),
+        keys_json: None,
+        issuer: Some("https://idp.example.com".to_owned()),
+        audience: None,
+        audiences: vec!["https://mcp.acme.example/mcp".to_owned()],
+        header_name: super::access::default_jwks_header_name(),
+        header_prefix: super::access::default_jwks_header_prefix(),
+        allow_missing_audience: false,
+    };
+    cfg.validate().unwrap();
+    cfg.audiences.push(" ".to_owned());
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("audiences must not contain an empty entry"),
+        "got: {err}"
+    );
 }
 
 // -- SignalToggle::validate ------------------------------------

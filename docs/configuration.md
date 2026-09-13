@@ -1174,6 +1174,7 @@ Which capability surfaces to import.
 | --- | --- | --- | --- |
 | `allow_missing_audience` | boolean | `false` | Dev escape-hatch: allow tokens without audience binding. Production MUST set an audience. |
 | `audience` | string (optional) |  |  |
+| `audiences` | array&lt;string&gt; | `[]` | Further accepted audiences, alongside `audience` — one per extra resource identifier the gateway is reached at, so a token bound to any bound hostname verifies. A token passes when its `aud` names at least one accepted audience. |
 | `header_name` | string | `"authorization"` |  |
 | `header_prefix` | string | `"Bearer "` |  |
 | `issuer` | string (optional) |  |  |
@@ -1366,6 +1367,7 @@ Configuration for the OAuth Protected Resource Metadata endpoint (RFC 9728).
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
+| `additional_resources` | array&lt;string&gt; | `[]` | Further resource identifiers this gateway is reached at — one per extra hostname (a custom domain in front of the same instance). A client compares the published `resource` with the URL it connected to (RFC 9728 §3.3), so the metadata document and the `WWW-Authenticate` challenge name whichever of `resource` and these matches the request's `Host`; a request for an unlisted host gets the canonical `resource`. Each entry is validated like `resource`. |
 | `allow_loopback_resource` | boolean | `false` | Local-development escape hatch: permit a loopback `resource` (`localhost` / `127.0.0.1` / `[::1]`). A wildcard host (`0.0.0.0` / `[::]`) is NEVER a valid resource identifier and is refused even with this set. Production deployments leave this `false` and configure the canonical public URL. |
 | `authorization_servers` | array&lt;string&gt; | `[]` | Authorization server URLs. If empty, derived from OIDC provider issuers. |
 | `bearer_methods_supported` | array&lt;string&gt; | (see type) | Bearer token presentation methods. Defaults to `["header"]`. |
