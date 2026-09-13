@@ -2087,6 +2087,92 @@ async fn delete_mcp_session_terminates_it() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// Every event stream — the legacy GET stream, the modern
+/// `subscriptions/listen` POST — carries `X-Accel-Buffering: no`, so an
+/// nginx-family proxy in front of the gateway does not hold the body until
+/// the upstream closes. A JSON response carries nothing of the kind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_event_stream_disables_proxy_buffering() {
+    let state = build_test_state();
+    install_protocol_registry_for_tests(&state);
+    let app = router(state, "/health", "/mcp");
+    let (app, session_id) = initialize_session(app).await;
+
+    let stream = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mcp")
+                .header(header::ACCEPT, "text/event-stream")
+                .header(SESSION_ID_HEADER, &session_id)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert_eq!(stream.headers()["x-accel-buffering"], "no");
+
+    let listen = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "subscriptions/listen")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 11,
+                        "method": "subscriptions/listen",
+                        "params": { "subscriptions": [{ "type": "tools/listChanged" }] }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listen.status(), StatusCode::OK);
+    assert!(
+        listen.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    assert_eq!(listen.headers()["x-accel-buffering"], "no");
+
+    let json = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json")
+                .header(SESSION_ID_HEADER, &session_id)
+                .header("mcp-protocol-version", "2025-11-25")
+                .body(Body::from(
+                    serde_json::json!({"jsonrpc": "2.0", "id": 12, "method": "tools/list"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json.status(), StatusCode::OK);
+    assert!(
+        json.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    assert!(!json.headers().contains_key("x-accel-buffering"));
+}
+
 #[tokio::test]
 async fn mcp_get_returns_method_not_allowed_until_sse_is_implemented() {
     let app = router(build_test_state(), "/health", "/mcp");

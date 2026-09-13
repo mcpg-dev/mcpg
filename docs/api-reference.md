@@ -53,6 +53,7 @@ Transport rules:
 
 **Response headers**:
 - `X-Mcpg-Request-Id: {uuid}` — Gateway request ID (all responses)
+- `X-Accel-Buffering: no` — On every `text/event-stream` response (the GET stream, an SSE-framed POST result, `subscriptions/listen`). An nginx-family proxy in front of the gateway (nginx, APISIX, OpenResty) honours it per response and streams the body instead of holding it until the upstream closes — which an event stream never does on its own, so a buffering proxy shows the client no status line at all. A proxy that does not honour it needs its response buffering turned off for the MCP route.
 - `Mcp-Session-Id: {session_id}` — Set on initialize response
 - `Mcp-Protocol-Version: 2025-11-25` — Negotiated version
 

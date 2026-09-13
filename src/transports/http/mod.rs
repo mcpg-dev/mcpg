@@ -341,6 +341,15 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         config.gateway.server.max_request_body_mb
     };
     router
+        // Every event stream tells an nginx-family proxy in front of the
+        // gateway not to buffer it: such a proxy holds a response without a
+        // Content-Length until the upstream closes, and an SSE body never
+        // closes on its own — the client sees no status line at all. One
+        // layer covers the GET stream, the SSE-framed POST results and the
+        // long-lived `subscriptions/listen` response alike.
+        .layer(axum::middleware::map_response(
+            no_proxy_buffering_for_event_streams,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(
             body_cap_mb * 1024 * 1024,
         ))
@@ -357,6 +366,26 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Response header that nginx-family proxies (nginx, APISIX, OpenResty) honour
+/// per response to disable their upstream response buffering.
+const NO_PROXY_BUFFERING_HEADER: &str = "x-accel-buffering";
+
+/// Stamp `X-Accel-Buffering: no` on every `text/event-stream` response.
+async fn no_proxy_buffering_for_event_streams(mut response: Response) -> Response {
+    let is_event_stream = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.trim_start().starts_with("text/event-stream"));
+    if is_event_stream {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static(NO_PROXY_BUFFERING_HEADER),
+            axum::http::HeaderValue::from_static("no"),
+        );
+    }
+    response
 }
 
 /// Panic responder for [`tower_http::catch_panic::CatchPanicLayer`]. Converts a
