@@ -317,8 +317,8 @@ impl CapabilityRegistry {
                             output_schema: composed_output_schema.clone(),
                             annotations: build_tool_annotations(binding),
                             execution: build_tool_execution(binding),
-                            icons: None,
-                            meta: None,
+                            icons: crate::config::binding_icons(binding.icons.as_ref()),
+                            meta: binding.descriptor_meta.clone(),
                         },
                         route,
                     });
@@ -405,8 +405,8 @@ impl CapabilityRegistry {
                             title: binding.title.clone(),
                             description: Some(binding.description.clone()),
                             arguments,
-                            icons: None,
-                            meta: None,
+                            icons: crate::config::binding_icons(binding.icons.as_ref()),
+                            meta: binding.descriptor_meta.clone(),
                         },
                         route: PromptRoute::Binding {
                             profile: binding.name.clone(),

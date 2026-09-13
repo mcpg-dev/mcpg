@@ -360,6 +360,48 @@ fn registry_exposes_http_post_binding_as_network_json_call() {
     }
 }
 
+/// A binding's `descriptor_meta` and `icons` land on the tool and prompt
+/// descriptors verbatim, as they do on resources — SEP-1865 hosts learn
+/// which `ui://` resource renders a tool from `_meta.ui.resourceUri` in
+/// `tools/list`.
+#[test]
+fn tool_and_prompt_bindings_carry_descriptor_meta_and_icons() {
+    let meta = serde_json::json!({ "ui": { "resourceUri": "ui://acme/review" } });
+    let icon = crate::config::BackendIconConfig {
+        src: "https://acme.example/icon.png".to_owned(),
+        mime_type: Some("image/png".to_owned()),
+        sizes: Some(vec!["48x48".to_owned()]),
+        theme: None,
+    };
+    let mut tool = http_post_binding("proposals.get");
+    tool.descriptor_meta = Some(meta.clone());
+    tool.icons = Some(vec![icon.clone()]);
+    let mut prompt = http_post_binding("review.prompt");
+    prompt.descriptor_meta = Some(meta.clone());
+    prompt.icons = Some(vec![icon]);
+
+    let registry = CapabilityRegistry::new(
+        false,
+        DebugToolBackends::default(),
+        DebugToolExposure::default(),
+        std::slice::from_ref(&tool),
+        std::slice::from_ref(&prompt),
+        &[],
+        &[],
+        None,
+    );
+
+    let listed = &registry.tools()[0];
+    assert_eq!(listed.meta.as_ref(), Some(&meta));
+    assert_eq!(
+        listed.icons.as_ref().map(|i| i[0].src.as_str()),
+        Some("https://acme.example/icon.png")
+    );
+    let listed = &registry.prompts()[0];
+    assert_eq!(listed.meta.as_ref(), Some(&meta));
+    assert_eq!(listed.icons.as_ref().map(|i| i.len()), Some(1));
+}
+
 #[test]
 fn registry_exposes_http_get_binding_as_network_query_call() {
     let bindings = vec![http_get_binding("analytics.query")];
