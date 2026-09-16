@@ -5,6 +5,19 @@
 
 use super::*;
 
+/// Whether the rebinding guard would admit `origin` under `allowed_origins` —
+/// the same rule [`validate_origin`] applies, exposed so config validation can
+/// ask the guard instead of reimplementing it.
+pub fn origin_admitted(allowed_origins: &[String], origin: &str) -> bool {
+    let origin_lower = origin.trim().trim_end_matches('.').to_ascii_lowercase();
+    if allowed_origins.is_empty() {
+        return is_loopback_origin(&origin_lower);
+    }
+    allowed_origins
+        .iter()
+        .any(|candidate| candidate.trim_end_matches('.').to_ascii_lowercase() == origin_lower)
+}
+
 pub(crate) fn validate_origin(
     headers: &HeaderMap,
     allowed_origins: &[String],

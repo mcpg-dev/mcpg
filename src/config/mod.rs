@@ -21,6 +21,7 @@ pub mod apps;
 pub mod audit;
 pub mod backend;
 pub mod capability_state;
+pub mod check;
 pub mod cloud;
 pub mod cluster;
 pub mod control_plane;
@@ -121,8 +122,9 @@ pub use quotas::{
 pub use schema::SchemaEntry;
 pub use secrets::{SecretsConfig, SecretsSource};
 pub use server::{
-    AauthResourceMetadataConfig, AauthSigningKeyConfig, ClientCertMode, ServerConfig, TlsConfig,
-    TransportMode, TunnelConfig, TunnelExposure, TunnelFederationConfig, TunnelTrustMode,
+    AauthResourceMetadataConfig, AauthSigningKeyConfig, ClientCertMode, CorsConfig, ServerConfig,
+    TlsConfig, TransportMode, TunnelConfig, TunnelExposure, TunnelFederationConfig,
+    TunnelTrustMode,
 };
 pub use source::ConfigSource;
 pub use storage::{
@@ -737,6 +739,37 @@ impl AppConfig {
                 anyhow::bail!(
                     "server.browser_redirect_url must be http or https (got scheme {:?})",
                     parsed.scheme()
+                );
+            }
+        }
+        if let Some(ref cors) = server.cors {
+            cors.validate()?;
+            // The rebinding guard runs first and knows nothing about CORS, so a
+            // grant it would refuse is a permission the browser is given and the
+            // gateway then denies — a 403 that looks like a CORS bug and is not.
+            for origin in &cors.allowed_origins {
+                if !crate::transports::http_origin_admitted(&server.allowed_origins, origin) {
+                    anyhow::bail!(
+                        "server.cors.allowed_origins names `{origin}`, which \
+                         server.allowed_origins does not admit — the DNS-rebinding guard would \
+                         refuse the request the CORS grant invited. Add it to \
+                         server.allowed_origins, or drop it from server.cors.allowed_origins."
+                    );
+                }
+            }
+        }
+        if let Some(ref raw) = server.canonical_url {
+            let parsed = url::Url::parse(raw)
+                .map_err(|e| anyhow::anyhow!("server.canonical_url is not a URL: {e}"))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                anyhow::bail!(
+                    "server.canonical_url must be http or https (got scheme {:?})",
+                    parsed.scheme()
+                );
+            }
+            if parsed.host_str().is_none_or(str::is_empty) {
+                anyhow::bail!(
+                    "server.canonical_url must name a host — every other host redirects to it"
                 );
             }
         }

@@ -87,6 +87,42 @@ pub struct ServerConfig {
     /// authenticates the caller and injects this header.
     #[serde(default)]
     pub trust_subject_header: bool,
+    /// Cross-origin access for browser clients. Unset (the default) means the
+    /// gateway answers no preflight, so a browser cannot call it directly at
+    /// all — `allowed_origins` alone is the DNS-rebinding guard, which checks
+    /// the `Origin` of requests that arrive rather than granting a browser
+    /// permission to send them. A page must then reach the gateway through a
+    /// same-origin proxy.
+    ///
+    /// Set this to let listed origins call the gateway from a page. Every
+    /// origin here must also be admitted by `allowed_origins`: the guard runs
+    /// first, and a CORS grant for an origin the guard refuses would be a
+    /// permission the browser is given and the gateway then denies. Config
+    /// validation refuses that combination rather than serving it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
+
+    /// The one URL this gateway is addressed by. When set, a request arriving
+    /// on any OTHER host is answered `308 Permanent Redirect` to the same path
+    /// and query under this URL's origin — the MCP endpoint and the OAuth
+    /// metadata alike — so the deployment advertises exactly one resource
+    /// identity no matter how many names resolve to it.
+    ///
+    /// The point is OAuth, not tidiness: a client derives its token audience
+    /// from the protected-resource document of the host it connected to, so a
+    /// gateway reachable under two names either accepts two audiences or
+    /// refuses tokens minted for the wrong one. Redirecting every other name
+    /// to the canonical one leaves a single answer.
+    ///
+    /// Operational paths are exempt and keep serving on every host: the health
+    /// path, `/ready`, `/runtime` and the metrics path — a kubelet probe
+    /// carries the pod IP as its `Host` and must not be redirected.
+    ///
+    /// Must be an absolute `http(s)` URL. Typically the same value as
+    /// `governance.access.resource_metadata.resource`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_url: Option<String>,
+
     /// Browser hand-off for the MCP endpoint. When set, a plain browser
     /// NAVIGATION to the MCP path — method GET or HEAD, `Accept` includes
     /// `text/html` and does not include `text/event-stream` — is answered
@@ -255,6 +291,8 @@ impl Default for ServerConfig {
             anonymous_rate_limit_burst: default_anonymous_rate_limit_burst(),
             trust_proxy_ip: false,
             trust_subject_header: false,
+            cors: None,
+            canonical_url: None,
             browser_redirect_url: None,
             aauth_resource_metadata: None,
             revalidate_mutated_tool_arguments: false,
@@ -695,6 +733,106 @@ impl TlsConfig {
                          `mandatory`"
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `gateway.server.cors` — who may call this gateway from a browser page.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CorsConfig {
+    /// Exact origins (`scheme://host[:port]`) a page may call from. No
+    /// wildcard: `*` with credentials is refused by every browser, and
+    /// without credentials it would publish a gateway to every page on the
+    /// web. Compared case-insensitively, like the rebinding guard.
+    pub allowed_origins: Vec<String>,
+    /// Request headers a page may send. Defaults to the set MCP needs —
+    /// content negotiation, the session and protocol headers, the SSE resume
+    /// cursor, bearer auth, idempotency and trace context. Add to it for a
+    /// header a plugin reads.
+    #[serde(default = "default_cors_allowed_headers")]
+    pub allowed_headers: Vec<String>,
+    /// Response headers a page may READ. A browser hides every other header
+    /// from script, so the session id, the request id and the auth challenge
+    /// have to be named here to be usable.
+    #[serde(default = "default_cors_expose_headers")]
+    pub expose_headers: Vec<String>,
+    /// How long a browser may cache the preflight answer, in seconds.
+    #[serde(default = "default_cors_max_age_secs")]
+    pub max_age_secs: u32,
+    /// Allow cookies and TLS client certificates on cross-origin calls. MCP
+    /// authenticates with a bearer token, which needs no credential mode, so
+    /// this stays false unless a deployment front-ends the gateway with a
+    /// cookie session.
+    #[serde(default)]
+    pub allow_credentials: bool,
+}
+
+fn default_cors_allowed_headers() -> Vec<String> {
+    [
+        "content-type",
+        "accept",
+        "authorization",
+        "mcp-session-id",
+        "mcp-protocol-version",
+        "last-event-id",
+        "idempotency-key",
+        "traceparent",
+        "tracestate",
+    ]
+    .iter()
+    .map(|h| (*h).to_owned())
+    .collect()
+}
+
+fn default_cors_expose_headers() -> Vec<String> {
+    [
+        "mcp-session-id",
+        "mcp-protocol-version",
+        "x-mcpg-request-id",
+        "www-authenticate",
+        "retry-after",
+        "idempotent-replayed",
+        "idempotent-replayed-at",
+    ]
+    .iter()
+    .map(|h| (*h).to_owned())
+    .collect()
+}
+
+fn default_cors_max_age_secs() -> u32 {
+    600
+}
+
+impl CorsConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.allowed_origins.is_empty() {
+            anyhow::bail!(
+                "server.cors.allowed_origins must not be empty — omit the `cors` block entirely \
+                 to serve no browser client"
+            );
+        }
+        for origin in &self.allowed_origins {
+            if origin == "*" {
+                anyhow::bail!(
+                    "server.cors.allowed_origins must name exact origins; `*` would publish this \
+                     gateway to every page on the web (and browsers refuse it outright when \
+                     credentials are allowed)"
+                );
+            }
+            let parsed = url::Url::parse(origin).map_err(|e| {
+                anyhow::anyhow!("server.cors.allowed_origins entry `{origin}` is not a URL: {e}")
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                anyhow::bail!("server.cors.allowed_origins entry `{origin}` must be http or https");
+            }
+            if parsed.path() != "/" && !parsed.path().is_empty() {
+                anyhow::bail!(
+                    "server.cors.allowed_origins entry `{origin}` must be an ORIGIN \
+                     (scheme://host[:port]) with no path — a browser sends no path in `Origin`"
+                );
             }
         }
         Ok(())

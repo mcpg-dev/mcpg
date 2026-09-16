@@ -177,6 +177,13 @@ impl TraceContext {
     }
 }
 
+/// The HTTP transport's origin-admission rule, for config validation: a CORS
+/// grant for an origin the DNS-rebinding guard refuses is a contradiction, and
+/// the two must answer from one implementation.
+pub fn http_origin_admitted(allowed_origins: &[String], origin: &str) -> bool {
+    http::origin_admitted(allowed_origins, origin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

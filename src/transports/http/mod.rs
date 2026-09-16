@@ -56,6 +56,7 @@ impl TlsInfoExtUnwrap for TlsInfoExt {
     }
 }
 
+mod cors;
 mod discovery;
 mod identity;
 mod probes;
@@ -83,6 +84,7 @@ pub(crate) use sse::{
     delivery_bus_sse, delivery_dedupe_key, delivery_to_sse_event, open_post_continuation_sse,
     register_modern_resource_subscriptions, sse_event_from_record,
 };
+pub use validate::origin_admitted;
 pub(crate) use validate::{
     enforce_http_protocol_version_header, post_accepts_sse, validate_get_accept, validate_origin,
     validate_post_accept, validate_post_content_type,
@@ -192,13 +194,16 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
                 .delete(mcp_delete_handler),
         );
 
+    // Kept for the canonical-host exemption list below: the metrics endpoint is
+    // scraped by address, not by the gateway's public name.
+    let mut metrics_path: Option<String> = None;
     if config.observability.is_metrics_on() {
         // The route delegates rendering to the canonical Prometheus
         // plugin via `MetricsSink::render_text_exposition`. Path comes
         // from the first sink whose kind is the Prometheus plugin id
         // (the gateway-side built-ins are stderr/stdout/file only).
         // Defaults to `/metrics` when the operator didn't override it.
-        let metrics_path = config
+        let path = config
             .observability
             .metrics
             .sinks
@@ -207,7 +212,8 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
             .and_then(|s| s.config.get("path").and_then(|v| v.as_str()))
             .unwrap_or("/metrics")
             .to_owned();
-        router = router.route(&metrics_path, get(metrics_handler));
+        router = router.route(&path, get(metrics_handler));
+        metrics_path = Some(path);
     }
 
     // Webhook receiver for external resource change notifications.
@@ -340,6 +346,43 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
     } else {
         config.gateway.server.max_request_body_mb
     };
+    // Browser clients: answer the preflight and expose the headers script has
+    // to read. A deployment with no `cors` block adds no layer at all, so a
+    // non-browser gateway pays nothing.
+    if let Some(cors_cfg) = config.gateway.server.cors.clone() {
+        let cors_cfg = std::sync::Arc::new(cors_cfg);
+        router = router.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let cors_cfg = cors_cfg.clone();
+                async move { cors::cors_layer(cors_cfg, req, next).await }
+            },
+        ));
+    }
+
+    // One identity: when `server.canonical_url` is set, a request on any other
+    // host is redirected rather than served, so the deployment advertises a
+    // single OAuth resource however many names resolve to it. Operational
+    // paths keep answering on every host (a kubelet probe's `Host` is the pod
+    // IP). Applied outermost so a redirected request touches nothing else.
+    let canonical = config.gateway.server.canonical_url.clone();
+    if let Some(canonical) = canonical {
+        let exempt: Vec<String> = std::iter::once(health_path.to_owned())
+            .chain(["/ready".to_owned(), "/runtime".to_owned()])
+            .chain(metrics_path.clone())
+            .collect();
+        let trust_proxy = config.gateway.server.trust_proxy_ip;
+        router =
+            router.layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let canonical = canonical.clone();
+                    let exempt = exempt.clone();
+                    async move {
+                        redirect_to_canonical(req, next, &canonical, &exempt, trust_proxy).await
+                    }
+                },
+            ));
+    }
+
     router
         // Every event stream tells an nginx-family proxy in front of the
         // gateway not to buffer it: such a proxy holds a response without a
@@ -366,6 +409,81 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Answer `308` to the canonical origin when a request arrives on another host.
+///
+/// The redirect preserves method, path and query — 308 forbids a client from
+/// rewriting the method, so a POSTed JSON-RPC call replays as a POST. Anything
+/// on `exempt` (health, readiness, runtime, metrics) is served on every host:
+/// a kubelet probe reaches the pod by IP and would follow a redirect to a name
+/// it cannot resolve.
+///
+/// A request with no `Host` at all is served rather than redirected — there is
+/// nothing to compare, and HTTP/1.0 clients and some probes omit it.
+async fn redirect_to_canonical(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+    canonical: &str,
+    exempt: &[String],
+    trust_proxy: bool,
+) -> Response {
+    let path = req.uri().path();
+    if exempt.iter().any(|p| p == path) {
+        return next.run(req).await;
+    }
+    let Some(canonical_host) = url::Url::parse(canonical)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+    else {
+        return next.run(req).await;
+    };
+    let Some(arrived_on) = request_host(req.headers(), trust_proxy) else {
+        return next.run(req).await;
+    };
+    if canonical_host_matches(&arrived_on, &canonical_host) {
+        return next.run(req).await;
+    }
+    let origin = canonical.trim_end_matches('/');
+    let origin = match url::Url::parse(origin) {
+        Ok(u) => format!(
+            "{}://{}",
+            u.scheme(),
+            u.host_str().unwrap_or_default().to_owned()
+                + &u.port().map(|p| format!(":{p}")).unwrap_or_default()
+        ),
+        Err(_) => return next.run(req).await,
+    };
+    let target = format!(
+        "{origin}{}",
+        req.uri()
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or("/")
+    );
+    metrics::counter!("mcpg_canonical_host_redirects_total").increment(1);
+    match axum::http::HeaderValue::from_str(&target) {
+        Ok(location) => (
+            axum::http::StatusCode::PERMANENT_REDIRECT,
+            [(axum::http::header::LOCATION, location)],
+        )
+            .into_response(),
+        Err(_) => next.run(req).await,
+    }
+}
+
+/// Host comparison for the canonical check: case-insensitive, port-insensitive
+/// (the canonical URL carries the scheme's port, a `Host` header usually does
+/// not).
+fn canonical_host_matches(arrived_on: &str, canonical_host: &str) -> bool {
+    let bare = |h: &str| -> String {
+        let h = h.trim();
+        if let Some(rest) = h.strip_prefix('[') {
+            return rest.split(']').next().unwrap_or(rest).to_ascii_lowercase();
+        }
+        h.split(':').next().unwrap_or(h).to_ascii_lowercase()
+    };
+    bare(arrived_on) == bare(canonical_host)
 }
 
 /// Response header that nginx-family proxies (nginx, APISIX, OpenResty) honour

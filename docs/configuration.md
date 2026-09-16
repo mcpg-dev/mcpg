@@ -866,6 +866,18 @@ Control Plane attachment config. See `apps/gateway/src/runtime/cp/attach.rs` for
 | `state_dir` | string | `"./mcpg-cp-state"` | Where to persist agent creds (`agent-creds.json`) and the LKG cache. Defaults to `./mcpg-cp-state`. |
 | `url` | string |  | gRPC URL of the Control Plane (e.g. `"https://cp.example.com:7844"`). |
 
+### `CorsConfig`
+
+`gateway.server.cors` — who may call this gateway from a browser page.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `allow_credentials` | boolean | `false` | Allow cookies and TLS client certificates on cross-origin calls. MCP authenticates with a bearer token, which needs no credential mode, so this stays false unless a deployment front-ends the gateway with a cookie session. |
+| `allowed_headers` | array&lt;string&gt; | (see type) | Request headers a page may send. Defaults to the set MCP needs — content negotiation, the session and protocol headers, the SSE resume cursor, bearer auth, idempotency and trace context. Add to it for a header a plugin reads. |
+| `allowed_origins` | array&lt;string&gt; |  | Exact origins (`scheme://host[:port]`) a page may call from. No wildcard: `*` with credentials is refused by every browser, and without credentials it would publish a gateway to every page on the web. Compared case-insensitively, like the rebinding guard. |
+| `expose_headers` | array&lt;string&gt; | (see type) | Response headers a page may READ. A browser hides every other header from script, so the session id, the request id and the auth challenge have to be named here to be usable. |
+| `max_age_secs` | integer | `600` | How long a browser may cache the preflight answer, in seconds. |
+
 ### `CredentialsClusterConfig`
 
 | Field | Type | Default | Summary |
@@ -1814,7 +1826,9 @@ A named schema entry in the registry. Exactly one source must be provided.
 | `anonymous_rate_limit_per_min` | integer | `600` | Per-IP request-rate cap on the MCP endpoint for requests below cryptographically-verified trust — i.e. anonymous AND header-asserted identities (sustained requests/minute, with `anonymous_rate_limit_burst` headroom). A self-asserted `x-mcpg-subject-id` does NOT buy an exemption. Only Verified traffic (a real OIDC/JWKS/identity-plugin credential) skips this — it is attributable and metered per tenant. Defaults generous (600/min = 10 rps sustained per client IP), far above interactive agent use; `0` disables (e.g. when an upstream WAF throttles, or for single-IP load testing). |
 | `bind_address` | string | `"127.0.0.1:8787"` |  |
 | `browser_redirect_url` | string (optional) |  | Browser hand-off for the MCP endpoint. When set, a plain browser NAVIGATION to the MCP path — method GET or HEAD, `Accept` includes `text/html` and does not include `text/event-stream` — is answered with `303 See Other` to exactly this URL, before identity or any other processing. No conformant MCP client matches: JSON-RPC rides POST, and SSE GETs send `text/event-stream`, so the redirect only claims requests that today dead-end in a 405/406. The value is served literally — request data never enters the Location header. Typical target: a hosted inspector pre-filled with this gateway's URL. Must be `http`/`https`. |
+| `canonical_url` | string (optional) |  | The one URL this gateway is addressed by. When set, a request arriving on any OTHER host is answered `308 Permanent Redirect` to the same path and query under this URL's origin — the MCP endpoint and the OAuth metadata alike — so the deployment advertises exactly one resource identity no matter how many names resolve to it. |
 | `completion_rate_limit_per_sec` | integer (optional) |  | Per-session rate limit on `completion/complete` requests (cap per second). `None` disables. Guards against broken autocomplete UIs. |
+| `cors` | [`CorsConfig`](#corsconfig) (optional) |  | Cross-origin access for browser clients. Unset (the default) means the gateway answers no preflight, so a browser cannot call it directly at all — `allowed_origins` alone is the DNS-rebinding guard, which checks the `Origin` of requests that arrive rather than granting a browser permission to send them. A page must then reach the gateway through a same-origin proxy. |
 | `enforce_modern_request_meta` | boolean | `false` | Enforce the SEP-2575 per-request `_meta` identity triple (`io.modelcontextprotocol/{protocolVersion, clientInfo, clientCapabilities}`) on EVERY id-bearing modern (`2026-07-28`) request, not just `server/discover`. When false (the default), only `server/discover` requires the triple and other modern methods may carry minimal `_meta`. Has no effect on the `2025-11-25` wire. Opt-in so existing modern clients are unaffected until they adopt the triple. |
 | `extra_resource_uri_schemes` | array&lt;string&gt; | `[]` | Extra resource-URI schemes (beyond the built-in allow-list) treated as first-class by the resource normalizer. Matched case-insensitively. |
 | `health_check` | [`HealthCheckConfig`](#healthcheckconfig) | (see type) | Periodic prober for every binding's backend (SQL server reachability, gRPC endpoint, REST upstream, ...). Distinct from `health_path:` above — that's the gateway's own liveness endpoint for load balancers; this prober actively pings each binding's underlying service and updates `PluginState::{Active, Degraded}` based on results. |

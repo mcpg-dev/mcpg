@@ -2359,6 +2359,8 @@ async fn mcp_origin_is_rejected_when_not_allowed() {
                 anonymous_rate_limit_burst: 0,
                 trust_proxy_ip: false,
                 trust_subject_header: false,
+                cors: None,
+                canonical_url: None,
                 browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
@@ -5919,6 +5921,268 @@ async fn prm_resource_follows_the_request_host() {
         .await,
         "https://mcp.acme.example/mcp"
     );
+}
+
+/// `server.cors` is what lets a page call the gateway at all: the rebinding
+/// guard inspects an `Origin` that arrives, while a browser refuses to send
+/// the request until a preflight says it may. A listed origin is echoed
+/// (never `*`), an unlisted one gets no CORS headers, and `Vary: Origin` is
+/// always set so a cache cannot serve one page's answer to another.
+#[tokio::test]
+async fn cors_answers_preflight_for_listed_origins_only() {
+    let mut config = AppConfig::default();
+    config.gateway.server.allowed_origins = vec![
+        "https://app.example.com".to_owned(),
+        "https://other.example.com".to_owned(),
+    ];
+    config.gateway.server.cors = Some(crate::config::CorsConfig {
+        allowed_origins: vec!["https://app.example.com".to_owned()],
+        allowed_headers: vec!["content-type".to_owned(), "mcp-session-id".to_owned()],
+        expose_headers: vec!["mcp-session-id".to_owned()],
+        max_age_secs: 600,
+        allow_credentials: false,
+    });
+    let app = router(
+        finish_app_state(config, default_test_runtime()),
+        "/health",
+        "/mcp",
+    );
+    let preflight = |origin: &str| {
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/mcp")
+            .header("origin", origin)
+            .header("access-control-request-method", "POST")
+            .header(
+                "access-control-request-headers",
+                "content-type,mcp-session-id",
+            )
+            .body(Body::empty())
+            .expect("request");
+        app.clone().oneshot(req)
+    };
+
+    let allowed = preflight("https://app.example.com")
+        .await
+        .expect("response");
+    assert_eq!(allowed.status(), StatusCode::NO_CONTENT);
+    let h = allowed.headers();
+    assert_eq!(
+        h.get("access-control-allow-origin").unwrap(),
+        "https://app.example.com",
+        "the origin is echoed, never `*`"
+    );
+    assert!(
+        h.get("access-control-allow-methods")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("POST")
+    );
+    assert!(
+        h.get("access-control-allow-headers")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("mcp-session-id")
+    );
+    assert_eq!(h.get("access-control-max-age").unwrap(), "600");
+    assert!(h.get("access-control-allow-credentials").is_none());
+    assert!(
+        h.get(header::VARY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("origin")
+    );
+
+    // An origin the rebinding guard admits but CORS does not: answered, but
+    // with nothing the browser can act on.
+    let refused = preflight("https://other.example.com")
+        .await
+        .expect("response");
+    assert!(
+        refused
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none()
+    );
+    assert!(
+        refused
+            .headers()
+            .get(header::VARY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("origin")
+    );
+}
+
+/// A real (non-preflight) cross-origin response carries the echo and the
+/// exposed-header list, so script can read the session id it needs.
+#[tokio::test]
+async fn cors_exposes_headers_on_a_real_request() {
+    let mut config = AppConfig::default();
+    config.gateway.server.allowed_origins = vec!["https://app.example.com".to_owned()];
+    config.gateway.server.cors = Some(crate::config::CorsConfig {
+        allowed_origins: vec!["https://app.example.com".to_owned()],
+        allowed_headers: vec!["content-type".to_owned()],
+        expose_headers: vec!["mcp-session-id".to_owned(), "x-mcpg-request-id".to_owned()],
+        max_age_secs: 600,
+        allow_credentials: false,
+    });
+    let app = router(
+        finish_app_state(config, default_test_runtime()),
+        "/health",
+        "/mcp",
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .header("origin", "https://app.example.com")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("access-control-allow-origin").unwrap(),
+        "https://app.example.com"
+    );
+    assert!(
+        resp.headers()
+            .get("access-control-expose-headers")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("x-mcpg-request-id")
+    );
+}
+
+/// Without the block the gateway is not a browser client's gateway: no
+/// preflight answer, and no CORS headers anywhere.
+#[tokio::test]
+async fn no_cors_block_answers_no_preflight() {
+    let app = router(
+        finish_app_state(AppConfig::default(), default_test_runtime()),
+        "/health",
+        "/mcp",
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/mcp")
+                .header("origin", "http://localhost:3000")
+                .header("access-control-request-method", "POST")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_ne!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+}
+
+/// `server.canonical_url` gives the deployment one identity: a request on any
+/// other host is answered 308 to the same path under the canonical origin, so
+/// a client cannot discover — or mint a token for — a second resource. Probes
+/// keep answering on every host, because a kubelet reaches the pod by IP.
+#[tokio::test]
+async fn canonical_url_redirects_every_other_host() {
+    let mut config = AppConfig::default();
+    config.gateway.server.canonical_url = Some("https://mcp.acme.example/mcp".to_owned());
+    let app = router(
+        finish_app_state(config, default_test_runtime()),
+        "/health",
+        "/mcp",
+    );
+    let get_on = |host: &str, path: &str| {
+        let req = Request::builder()
+            .method("GET")
+            .uri(path)
+            .header("host", host)
+            .body(Body::empty())
+            .expect("request");
+        app.clone().oneshot(req)
+    };
+
+    // Another host: redirected, path and query preserved, method-safe status.
+    let resp = get_on(
+        "edge-1.mcpg.cloud",
+        "/.well-known/oauth-protected-resource/mcp",
+    )
+    .await
+    .expect("response");
+    assert_eq!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        resp.headers().get(header::LOCATION).unwrap(),
+        "https://mcp.acme.example/.well-known/oauth-protected-resource/mcp"
+    );
+
+    // The canonical host itself is served (404 here: no resource_metadata
+    // configured — the point is that it was not redirected).
+    let resp = get_on("mcp.acme.example", "/.well-known/oauth-protected-resource")
+        .await
+        .expect("response");
+    assert_ne!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+
+    // Port on the Host header does not make it a different host.
+    let resp = get_on("MCP.Acme.Example:443", "/health")
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Probes answer on any host — a kubelet carries the pod IP.
+    for path in ["/health", "/ready"] {
+        let resp = get_on("10.42.0.7:8787", path).await.expect("response");
+        assert_ne!(
+            resp.status(),
+            StatusCode::PERMANENT_REDIRECT,
+            "{path} must answer on the pod address"
+        );
+    }
+
+    // No Host at all: nothing to compare, so serve rather than redirect.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/ready")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_ne!(resp.status(), StatusCode::PERMANENT_REDIRECT);
+}
+
+/// Unset (the default): every host is served, nothing redirects.
+#[tokio::test]
+async fn no_canonical_url_serves_every_host() {
+    let app = router(
+        finish_app_state(AppConfig::default(), default_test_runtime()),
+        "/health",
+        "/mcp",
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .header("host", "anything.example")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 const TEST_PRM_URL: &str = "https://gateway.example.com/.well-known/oauth-protected-resource/mcp";

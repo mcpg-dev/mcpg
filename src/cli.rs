@@ -365,6 +365,18 @@ pub fn stdio_requested(args: &[String]) -> bool {
 /// exit code is propagated. An unknown subcommand whose binary isn't installed
 /// produces a helpful error rather than silently booting the gateway.
 pub fn dispatch_subcommand(name: &str, args: &[String]) -> anyhow::Result<()> {
+    // `config check` is answered here rather than delegated: it validates THIS
+    // binary's `AppConfig`, so the honest answer comes from the gateway that
+    // would boot it — and a gateway image that ships no `mcpg-config` could
+    // otherwise not run the one config command an operator reaches for first.
+    // Every other `config` subcommand (doc, explain, init, schema, secrets,
+    // wiring) belongs to the toolchain binary.
+    if name == "config" && args.first().is_some_and(|sub| sub == "check") {
+        match crate::config::check::run_code(args[1..].to_vec()) {
+            0 => return Ok(()),
+            code => std::process::exit(code.into()),
+        }
+    }
     exec_sibling(
         &format!("mcpg-{}", subcommand_binary_suffix(name)),
         args,

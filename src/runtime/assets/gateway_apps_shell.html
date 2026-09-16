@@ -148,11 +148,48 @@
   }
   function truthy(v) { return !(v == null || v === false || v === "" || v === 0); }
 
-  // ── host bridge: best-effort across SEP-1865 / OpenAI / mcp-ui hosts ──
+  // ── host bridge ──────────────────────────────────────────────────────
+  // SEP-1865 speaks JSON-RPC 2.0 over postMessage (the `2026-01-26` app
+  // dialect): the app opens with `ui/initialize`, announces itself with
+  // `ui/notifications/initialized`, calls tools with an ordinary `tools/call`
+  // request the host re-emits on the MCP wire, and receives results as
+  // `ui/notifications/tool-result`. `window.openai.*` is a host OBJECT rather
+  // than a competing dialect, so it is tried first where present and costs
+  // nothing where it is not.
+  const APP_PROTOCOL_VERSION = "2026-01-26";
+  let RPC_SEQ = 0;
+  const PENDING = new Map();
+  let HOST_CONTEXT = null;
+
+  function post(message) {
+    try { parent.postMessage(message, "*"); return true; } catch (_e) { return false; }
+  }
+  function notify(method, params) {
+    post({ jsonrpc: "2.0", method, params: params || {} });
+  }
+  /** Send a JSON-RPC request; resolves with the result, or null if the host
+   *  never answers (a host that does not implement the method, or none at
+   *  all — the app degrades rather than hanging). */
+  function request(method, params, timeoutMs) {
+    const id = "mcpg-" + (++RPC_SEQ);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { PENDING.delete(id); resolve(null); }, timeoutMs || 15000);
+      PENDING.set(id, (msg) => {
+        clearTimeout(timer);
+        PENDING.delete(id);
+        resolve(msg && msg.error ? null : (msg ? msg.result : null));
+      });
+      if (!post({ jsonrpc: "2.0", id, method, params: params || {} })) {
+        clearTimeout(timer); PENDING.delete(id); resolve(null);
+      }
+    });
+  }
   function callTool(name, params) {
     if (!name) return;
     try { if (window.openai && typeof window.openai.callTool === "function") { window.openai.callTool(name, params || {}); return; } } catch (_e) {}
-    try { parent.postMessage({ type: "tool", payload: { toolName: name, params: params || {} } }, "*"); } catch (_e) {}
+    request("tools/call", { name, arguments: params || {} }).then((result) => {
+      if (result) renderData(result);
+    });
   }
   function rowsFromResult(result) {
     if (!result) return null;
@@ -576,16 +613,30 @@
   function registerAppTools() {
     if (!appTools.length) return;
     const decls = appTools.map((t) => ({ name: t.name, description: t.description, inputSchema: { type: "object", additionalProperties: false } }));
-    // experimental, best-effort across host APIs — no-op if unsupported
+    // Host-object path only: the app dialect has no registration method, and
+    // inventing one taught apps a protocol no host speaks. What the agent may
+    // read from this app instead travels as model context below.
     try { if (window.openai && typeof window.openai.registerTools === "function") window.openai.registerTools(decls); } catch (_e) {}
-    try { parent.postMessage({ type: "ui/register-tools", tools: decls }, "*"); } catch (_e) {}
+    publishModelContext();
+  }
+  /** `ui/update-model-context`: what the agent should know about what the
+   *  person is looking at. Sent on load and whenever the app-readable state
+   *  changes, so a host that forwards it keeps the model in step. */
+  function publishModelContext() {
+    if (!appTools.length) return;
+    const context = {};
+    for (const t of appTools) {
+      const value = readAppToolSource(t.source);
+      if (value) context[t.name] = value;
+    }
+    if (Object.keys(context).length) notify("ui/update-model-context", { context });
   }
 
   // ── async tool call (for dynamic enum sourcing); degrades when the host
   //    has no request/response bridge ──
   async function callToolAsync(name, params) {
     try { if (window.openai && typeof window.openai.callTool === "function") return await window.openai.callTool(name, params || {}); } catch (_e) {}
-    return null;
+    return await request("tools/call", { name, arguments: params || {} });
   }
   function extractRows(res) {
     if (!res) return [];
@@ -742,22 +793,45 @@
   window.addEventListener("message", (ev) => {
     if (ev.source && ev.source !== window.parent) return;   // only the host frame
     const d = ev && ev.data; if (!d || typeof d !== "object") return;
-    if (d.type === "ui/notifications/tool-result" || d.type === "tool-result" || d.toolOutput || d.structuredContent || d.result) {
-      renderData(d.result || d.toolOutput || d);
+
+    // A response to something this app asked for.
+    if (d.id != null && PENDING.has(d.id)) { PENDING.get(d.id)(d); return; }
+
+    // Host notifications. `tool-result` is the one that carries data; the
+    // result shape has moved between drafts, so read the documented field and
+    // accept the payload itself when a host sends it bare.
+    if (d.method === "ui/notifications/tool-result") {
+      const p = d.params || {};
+      renderData(p.result != null ? p.result : (p.structuredContent != null ? p : null));
+      return;
+    }
+    if (d.method === "ui/notifications/host-context-changed") {
+      HOST_CONTEXT = (d.params || {}).hostContext || null;
+      return;
     }
   });
 
-  // register read-only App-Provided Tools + answer host tool-call requests
-  // (experimental; host-bridge-dependent, no-op when unsupported)
-  registerAppTools();
-  window.addEventListener("message", (ev) => {
-    if (ev.source && ev.source !== window.parent) return;
-    const d = ev && ev.data; if (!d || typeof d !== "object") return;
-    if ((d.type === "ui/tool-call" || d.type === "tool-call") && typeof d.name === "string") {
-      const t = appTools.find((x) => x.name === d.name);
-      if (t) { try { parent.postMessage({ type: "ui/tool-result", id: d.id, name: d.name, result: readAppToolSource(t.source) }, "*"); } catch (_e) {} }
-    }
+  // The handshake, then what this app can tell the model about itself. A host
+  // that answers neither leaves the app rendering its initial data, which is
+  // what it did before any of this.
+  request("ui/initialize", {
+    protocolVersion: APP_PROTOCOL_VERSION,
+    appCapabilities: { tools: appTools.length > 0 },
+  }).then((result) => {
+    HOST_CONTEXT = result && result.hostContext ? result.hostContext : null;
+    notify("ui/notifications/initialized", {});
+    registerAppTools();
+    reportSize();
   });
+
+  /** `ui/notifications/size-changed`, so a host can size the frame to the
+   *  content instead of guessing. Ignored by hosts that do not implement it. */
+  function reportSize() {
+    try {
+      const height = Math.ceil(document.documentElement.scrollHeight || 0);
+      if (height > 0) notify("ui/notifications/size-changed", { height });
+    } catch (_e) {}
+  }
 })();
 </script>
 </body>

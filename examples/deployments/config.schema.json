@@ -1836,6 +1836,69 @@
       ],
       "type": "object"
     },
+    "CorsConfig": {
+      "additionalProperties": false,
+      "description": "`gateway.server.cors` — who may call this gateway from a browser page.",
+      "properties": {
+        "allow_credentials": {
+          "default": false,
+          "description": "Allow cookies and TLS client certificates on cross-origin calls. MCP authenticates with a bearer token, which needs no credential mode, so this stays false unless a deployment front-ends the gateway with a cookie session.",
+          "type": "boolean"
+        },
+        "allowed_headers": {
+          "default": [
+            "content-type",
+            "accept",
+            "authorization",
+            "mcp-session-id",
+            "mcp-protocol-version",
+            "last-event-id",
+            "idempotency-key",
+            "traceparent",
+            "tracestate"
+          ],
+          "description": "Request headers a page may send. Defaults to the set MCP needs — content negotiation, the session and protocol headers, the SSE resume cursor, bearer auth, idempotency and trace context. Add to it for a header a plugin reads.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "allowed_origins": {
+          "description": "Exact origins (`scheme://host[:port]`) a page may call from. No wildcard: `*` with credentials is refused by every browser, and without credentials it would publish a gateway to every page on the web. Compared case-insensitively, like the rebinding guard.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "expose_headers": {
+          "default": [
+            "mcp-session-id",
+            "mcp-protocol-version",
+            "x-mcpg-request-id",
+            "www-authenticate",
+            "retry-after",
+            "idempotent-replayed",
+            "idempotent-replayed-at"
+          ],
+          "description": "Response headers a page may READ. A browser hides every other header from script, so the session id, the request id and the auth challenge have to be named here to be usable.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "max_age_secs": {
+          "default": 600,
+          "description": "How long a browser may cache the preflight answer, in seconds.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "allowed_origins"
+      ],
+      "type": "object"
+    },
     "CredentialsClusterConfig": {
       "additionalProperties": false,
       "properties": {
@@ -5462,6 +5525,13 @@
             "null"
           ]
         },
+        "canonical_url": {
+          "description": "The one URL this gateway is addressed by. When set, a request arriving on any OTHER host is answered `308 Permanent Redirect` to the same path and query under this URL's origin — the MCP endpoint and the OAuth metadata alike — so the deployment advertises exactly one resource identity no matter how many names resolve to it.\n\nThe point is OAuth, not tidiness: a client derives its token audience from the protected-resource document of the host it connected to, so a gateway reachable under two names either accepts two audiences or refuses tokens minted for the wrong one. Redirecting every other name to the canonical one leaves a single answer.\n\nOperational paths are exempt and keep serving on every host: the health path, `/ready`, `/runtime` and the metrics path — a kubelet probe carries the pod IP as its `Host` and must not be redirected.\n\nMust be an absolute `http(s)` URL. Typically the same value as `governance.access.resource_metadata.resource`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "completion_rate_limit_per_sec": {
           "default": null,
           "description": "Per-session rate limit on `completion/complete` requests (cap per second). `None` disables. Guards against broken autocomplete UIs.",
@@ -5471,6 +5541,17 @@
             "integer",
             "null"
           ]
+        },
+        "cors": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CorsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Cross-origin access for browser clients. Unset (the default) means the gateway answers no preflight, so a browser cannot call it directly at all — `allowed_origins` alone is the DNS-rebinding guard, which checks the `Origin` of requests that arrive rather than granting a browser permission to send them. A page must then reach the gateway through a same-origin proxy.\n\nSet this to let listed origins call the gateway from a page. Every origin here must also be admitted by `allowed_origins`: the guard runs first, and a CORS grant for an origin the guard refuses would be a permission the browser is given and the gateway then denies. Config validation refuses that combination rather than serving it."
         },
         "enforce_modern_request_meta": {
           "default": false,

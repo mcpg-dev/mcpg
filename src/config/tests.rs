@@ -455,6 +455,8 @@ fn validate_rejects_invalid_health_path() {
                 anonymous_rate_limit_burst: 0,
                 trust_proxy_ip: false,
                 trust_subject_header: false,
+                cors: None,
+                canonical_url: None,
                 browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
@@ -687,6 +689,8 @@ fn validate_rejects_invalid_mcp_path() {
                 anonymous_rate_limit_burst: 0,
                 trust_proxy_ip: false,
                 trust_subject_header: false,
+                cors: None,
+                canonical_url: None,
                 browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
@@ -741,6 +745,8 @@ fn validate_rejects_empty_allowed_origin() {
                 anonymous_rate_limit_burst: 0,
                 trust_proxy_ip: false,
                 trust_subject_header: false,
+                cors: None,
+                canonical_url: None,
                 browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
@@ -795,6 +801,8 @@ fn validate_rejects_zero_replay_window_limit() {
                 anonymous_rate_limit_burst: 0,
                 trust_proxy_ip: false,
                 trust_subject_header: false,
+                cors: None,
+                canonical_url: None,
                 browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
@@ -849,6 +857,8 @@ fn validate_rejects_zero_session_idle_timeout() {
                 anonymous_rate_limit_burst: 0,
                 trust_proxy_ip: false,
                 trust_subject_header: false,
+                cors: None,
+                canonical_url: None,
                 browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
@@ -4411,6 +4421,68 @@ fn jwks_audiences_list_stands_in_for_audience() {
         err.contains("audiences must not contain an empty entry"),
         "got: {err}"
     );
+}
+
+/// A CORS grant the rebinding guard would refuse is a contradiction: the
+/// browser is told it may call, and the gateway then answers 403. Config
+/// validation refuses the pair rather than serving it.
+#[test]
+fn cors_origin_must_be_admitted_by_the_rebinding_guard() {
+    let cors = |origins: Vec<&str>| {
+        Some(super::server::CorsConfig {
+            allowed_origins: origins.into_iter().map(str::to_owned).collect(),
+            allowed_headers: vec!["content-type".to_owned()],
+            expose_headers: vec![],
+            max_age_secs: 600,
+            allow_credentials: false,
+        })
+    };
+
+    // Guard admits it: valid.
+    let mut config = AppConfig::default();
+    config.gateway.server.allowed_origins = vec!["https://app.example.com".to_owned()];
+    config.gateway.server.cors = cors(vec!["https://app.example.com"]);
+    config
+        .validate()
+        .expect("a granted origin the guard admits is valid");
+
+    // Guard does not admit it: refused, and the message names the fix.
+    let mut config = AppConfig::default();
+    config.gateway.server.allowed_origins = vec!["https://other.example.com".to_owned()];
+    config.gateway.server.cors = cors(vec!["https://app.example.com"]);
+    let err = config.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("server.allowed_origins does not admit"),
+        "got: {err}"
+    );
+
+    // Empty guard list = loopback only, which is the default local-dev shape:
+    // a loopback grant is admitted, a public one is not.
+    let mut config = AppConfig::default();
+    config.gateway.server.cors = cors(vec!["http://localhost:3000"]);
+    config
+        .validate()
+        .expect("loopback is admitted by the default guard");
+
+    let mut config = AppConfig::default();
+    config.gateway.server.cors = cors(vec!["https://app.example.com"]);
+    assert!(
+        config.validate().is_err(),
+        "public origin needs an explicit allowed_origins entry"
+    );
+
+    // Shapes the browser never sends.
+    let mut config = AppConfig::default();
+    config.gateway.server.allowed_origins = vec!["*".to_owned()];
+    config.gateway.server.cors = cors(vec!["*"]);
+    let err = config.validate().unwrap_err().to_string();
+    assert!(err.contains("exact origins"), "got: {err}");
+
+    let mut config = AppConfig::default();
+    config.gateway.server.allowed_origins = vec!["https://app.example.com/app".to_owned()];
+    config.gateway.server.cors = cors(vec!["https://app.example.com/app"]);
+    let err = config.validate().unwrap_err().to_string();
+    assert!(err.contains("no path"), "got: {err}");
 }
 
 // -- SignalToggle::validate ------------------------------------
