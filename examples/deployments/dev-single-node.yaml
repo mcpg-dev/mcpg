@@ -38,11 +38,9 @@ cluster:
 # available.
 #
 # These pull from the public plugin channel at boot; keep the version in
-# step with the gateway you run. A deployment whose image bakes these
-# plugins can point `source.path` at
-# /usr/local/lib/mcpg/plugins/<id>/plugin.so instead and start with no
-# registry access at all — check the image first, since not every one
-# carries them.
+# step with the gateway you run. A self-built image that bundles these
+# plugins can point `source.path` at them instead and start with no
+# registry access at all — the published images bundle none.
 plugins:
   - id: dev.mcpg.backend.mock
     class: backend
