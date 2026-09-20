@@ -3,7 +3,13 @@
 # Publishes the @mcpg-dev/cli npm suite from published release artifacts:
 # every binary is downloaded from a GitHub Release of its own repository,
 # so npm serves exactly what the releases attested. Fires when this
-# repository publishes a Release, and by hand for re-runs or backfills.
+# repository's Release run completes green, when a release is published
+# by hand, and by hand for re-runs or backfills.
+#
+# The Release workflow publishes its record with the workflow's own token,
+# and GitHub raises no `release` event for anything that token does — so
+# the pipeline's own releases arrive here through `workflow_run`, and the
+# `release` trigger serves releases published by hand.
 #
 # Publishing needs the repository variable OSS_NPM_PUBLISH set 'true' and
 # the NPM_TOKEN secret; without them the run assembles and dry-packs only.
@@ -11,6 +17,9 @@
 name: Publish npm suite
 
 on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   release:
     types: [published]
   workflow_dispatch:
@@ -34,6 +43,9 @@ concurrency:
 
 jobs:
   publish:
+    # A red Release run still publishes its record with whatever attached;
+    # the suite needs every binary, so such a release waits for a hand-run.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -47,8 +59,15 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ inputs.version }}
+          RELEASE_REF: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
+          # A tag-triggered Release run names its tag; the suite then ships
+          # that version rather than whichever release is newest by now.
+          if [ -z "${VERSION:-}" ] && [ "${RELEASE_REF:-}" != "${RELEASE_REF#v}" ]; then
+            VERSION="${RELEASE_REF#v}"
+          fi
+          export VERSION
           DRY=true
           if [ "${{ vars.OSS_NPM_PUBLISH }}" = "true" ] \
             && [ -n "${NODE_AUTH_TOKEN:-}" ] \
