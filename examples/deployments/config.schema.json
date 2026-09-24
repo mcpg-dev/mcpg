@@ -41,7 +41,7 @@
           "default": 300,
           "description": "Resource-token lifetime, seconds (protocol ceiling 300).",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "scope_descriptions": {
@@ -54,7 +54,7 @@
         "signature_window": {
           "description": "Signature validity window advertised to agents, seconds. Mirror the identity plugin's `signature_window_secs` when overriding the 60 s default.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -162,15 +162,13 @@
               "type": "string"
             },
             "type": {
-              "enum": [
-                "static_bearer"
-              ],
+              "const": "static_bearer",
               "type": "string"
             }
           },
           "required": [
-            "bearer_token_env",
-            "type"
+            "type",
+            "bearer_token_env"
           ],
           "type": "object"
         },
@@ -189,24 +187,20 @@
               ]
             },
             "type": {
-              "enum": [
-                "trusted_header"
-              ],
+              "const": "trusted_header",
               "type": "string"
             }
           },
           "required": [
-            "header_name",
-            "type"
+            "type",
+            "header_name"
           ],
           "type": "object"
         },
         {
           "properties": {
             "type": {
-              "enum": [
-                "disabled"
-              ],
+              "const": "disabled",
               "type": "string"
             }
           },
@@ -495,7 +489,7 @@
           "default": 60000,
           "description": "Seconds beyond `deadline_at` during which late callbacks still authenticate. Defence-in-depth — the registry's own deadline timer already rejects late resolutions; this just keeps the URL valid for short retries. Default 60s.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "signing_key_env": {
@@ -704,17 +698,13 @@
       "description": "Operator policy when an audit-sink `emit` fails.",
       "oneOf": [
         {
+          "const": "fail_closed",
           "description": "(default) On emit failure, refuse to serve the triggering request. Compliance-safe: no action happens without a durable audit trail. Subtle: this can wedge the gateway if every registered sink is broken — operators should always configure at least one sink whose availability they actually monitor.",
-          "enum": [
-            "fail_closed"
-          ],
           "type": "string"
         },
         {
+          "const": "fail_open",
           "description": "On emit failure, log + continue. The triggering request completes even if the audit event does not persist. Dev / CI use only — a compliance auditor will not accept this as SOC2-clean.",
-          "enum": [
-            "fail_open"
-          ],
           "type": "string"
         }
       ]
@@ -755,38 +745,28 @@
       "description": "Identity-propagation mode: what the gateway presents to the upstream.",
       "oneOf": [
         {
+          "const": "none",
           "description": "No auth sent.",
-          "enum": [
-            "none"
-          ],
           "type": "string"
         },
         {
+          "const": "service_token",
           "description": "Static bearer token.",
-          "enum": [
-            "service_token"
-          ],
           "type": "string"
         },
         {
+          "const": "pass_through",
           "description": "Forward the inbound `Authorization` header verbatim.",
-          "enum": [
-            "pass_through"
-          ],
           "type": "string"
         },
         {
+          "const": "oauth_client_credentials",
           "description": "Machine-identity token via an OAuth provider.",
-          "enum": [
-            "oauth_client_credentials"
-          ],
           "type": "string"
         },
         {
+          "const": "oauth_impersonation",
           "description": "Per-caller token-exchange (RFC 8693).",
-          "enum": [
-            "oauth_impersonation"
-          ],
           "type": "string"
         }
       ]
@@ -821,7 +801,7 @@
           "default": 3600,
           "description": "Lifetime of minted access tokens, in seconds.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "allowed_scopes": {
@@ -847,7 +827,7 @@
           "default": 60,
           "description": "Clock-skew leeway applied to ID-JAG `exp`/`iat`/`nbf` validation, in seconds.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "enforce_single_use": {
@@ -1048,7 +1028,7 @@
           "default": null,
           "description": "Optional per-resource size hint (bytes) surfaced on `resources/list` entries. Meaningful only on `kind: resource` bindings; ignored elsewhere.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -1116,9 +1096,9 @@
         }
       },
       "required": [
-        "backend",
+        "name",
         "description",
-        "name"
+        "backend"
       ],
       "type": "object"
     },
@@ -1186,6 +1166,7 @@
       "type": "object"
     },
     "BackendImpl": {
+      "additionalProperties": true,
       "description": "Implementation backend, identified by `kind:` with an opaque flattened `spec`. The gateway enumerates NO plugin kinds: a binding names a `kind` (a loaded `BackendPlugin::kind()` string) and every other key flattens into `spec`, forwarded verbatim to the plugin's `register_profile` / `execute`. The plugin owns and validates the schema; the gateway resolves `kind` against the registry at boot and fails closed on unknown / non-backend kinds. Mirrors `WatchStrategyConfig::Plugin`.\n\n`spec` is an open object (no `deny_unknown_fields`); unknown keys are forwarded verbatim, so a spec-key typo is caught only by the owning plugin's `register_profile` (`InvalidSpec` at boot), not at config-load.",
       "properties": {
         "kind": {
@@ -1265,7 +1246,7 @@
         "cap_calls": {
           "description": "Call cap when `kind: call_count`. Required for that kind.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -1274,7 +1255,7 @@
         "cap_token_count": {
           "description": "Token cap when `kind: token_count`. Required for that kind.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -1316,7 +1297,8 @@
         "warn_at_pct": {
           "description": "Emit `governance.quota.warn` when drawdown crosses this percentage of the cap. Defaults to no warning. `0..=100`.",
           "format": "uint8",
-          "minimum": 0.0,
+          "maximum": 255,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -1454,11 +1436,15 @@
           ]
         },
         "instance_id": {
-          "description": "Server-assigned stable id. None for self-host. Read-only — set by the CP.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InstanceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Server-assigned stable id. None for self-host. Read-only — set by the CP."
         },
         "isolation": {
           "allOf": [
@@ -1529,17 +1515,13 @@
       "description": "Default isolation tier for the instance's placement.",
       "oneOf": [
         {
+          "const": "shared",
           "description": "Shares a namespace pool with other tenants (default).",
-          "enum": [
-            "shared"
-          ],
           "type": "string"
         },
         {
+          "const": "dedicated",
           "description": "Dedicated nodes / namespace for the tenant.",
-          "enum": [
-            "dedicated"
-          ],
           "type": "string"
         }
       ]
@@ -1595,10 +1577,8 @@
           "type": "string"
         },
         {
+          "const": "unspecified",
           "description": "No tier asserted (self-host / unmanaged).",
-          "enum": [
-            "unspecified"
-          ],
           "type": "string"
         }
       ]
@@ -1670,24 +1650,18 @@
       "description": "How coordinator health affects `/ready`. When `cluster.readiness_gate` is unset the effective value is kind-dependent — `off` for `single_node`, `degrade` for every other kind ([`ClusterConfig::effective_readiness_gate`]).",
       "oneOf": [
         {
+          "const": "off",
           "description": "Coordinator health never affects `/ready` (fail-open). The default for `kind: single_node`.",
-          "enum": [
-            "off"
-          ],
           "type": "string"
         },
         {
+          "const": "degrade",
           "description": "Surface a not-ready *check* in the readiness body when the coordinator is down, but keep the overall `/ready` status green. The default for every clustered (non-`single_node`) kind.",
-          "enum": [
-            "degrade"
-          ],
           "type": "string"
         },
         {
+          "const": "fail",
           "description": "`/ready` returns not-ready while the coordinator is unreachable.",
-          "enum": [
-            "fail"
-          ],
           "type": "string"
         }
       ]
@@ -1720,7 +1694,7 @@
         "max_concurrent": {
           "description": "Maximum simultaneous in-flight calls.",
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "on_exceeded": {
@@ -1732,7 +1706,7 @@
           "default": 30000,
           "description": "Timeout for queued callers when `on_exceeded: queue`. Default 30s.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "scope": {
@@ -1760,7 +1734,7 @@
           "default": 5000,
           "description": "Poll interval in milliseconds. Lower = faster reload after edit; higher = lower disk I/O. Default 5000 (5s) is imperceptible for config changes and trivial in I/O cost. Values below 1000 (1s) are clamped to 1000 at validate time with a warning — sub-second polling burns I/O for no human-perceivable benefit.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -1770,10 +1744,8 @@
       "description": "Conflict policy on a body-hash mismatch with a stored record. Today only `Reject` is implemented; `permissive_replay` is not offered.",
       "oneOf": [
         {
+          "const": "reject",
           "description": "Same key + different body hash → JSON-RPC error `-32010 IdempotencyConflict` (HTTP 422).",
-          "enum": [
-            "reject"
-          ],
           "type": "string"
         }
       ]
@@ -1807,7 +1779,7 @@
           "default": null,
           "description": "Seconds between heartbeats. Default 30s.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -1890,7 +1862,7 @@
           "default": 600,
           "description": "How long a browser may cache the preflight answer, in seconds.",
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -1972,14 +1944,14 @@
           "default": 3600000,
           "description": "Operator-side cap on per-entry TTL. Even if a plugin returns a 24-hour TTL, the cache evicts at this cap to limit blast radius from leaked / compromised credentials. Default 3600 (1 hour).",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "max_entries": {
           "default": 10000,
           "description": "Maximum number of `(identity, plugin, target)` entries kept in the L1 cache. LRU eviction past this. Default 10000 — at ~500 bytes per entry that's ~5MB worst case.",
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -2004,13 +1976,13 @@
         "max_output_bytes": {
           "default": 4096,
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "timeout_ms": {
           "default": 2000,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -2076,7 +2048,8 @@
           ],
           "items": {
             "format": "uint16",
-            "minimum": 0.0,
+            "maximum": 65535,
+            "minimum": 0,
             "type": "integer"
           },
           "type": "array"
@@ -2091,7 +2064,7 @@
         "max_response_bytes": {
           "default": 4096,
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "require_json_response": {
@@ -2101,7 +2074,7 @@
         "timeout_ms": {
           "default": 2000,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "url": {
@@ -2250,8 +2223,8 @@
         }
       },
       "required": [
-        "label_field",
         "tool",
+        "label_field",
         "value_field"
       ],
       "type": "object"
@@ -2286,7 +2259,7 @@
           "default": 300,
           "description": "Re-list the upstream's capabilities every N seconds even without a `list_changed` notification.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -2546,7 +2519,7 @@
         },
         "page_size": {
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -2642,66 +2615,48 @@
           "type": "string"
         },
         {
+          "const": "key_value",
           "description": "Dense label/value spec sheet (a compact `detail`).",
-          "enum": [
-            "key_value"
-          ],
           "type": "string"
         },
         {
+          "const": "code_viewer",
           "description": "Read-only syntax-highlight-free code/text viewer.",
-          "enum": [
-            "code_viewer"
-          ],
           "type": "string"
         },
         {
+          "const": "chart",
           "description": "Numeric series chart (bar/line) over the result columns.",
-          "enum": [
-            "chart"
-          ],
           "type": "string"
         },
         {
+          "const": "signature_pad",
           "description": "Canvas to draw a signature/sketch; submits a PNG data URL.",
-          "enum": [
-            "signature_pad"
-          ],
           "type": "string"
         },
         {
+          "const": "audio_recorder",
           "description": "Record audio (microphone) and submit the clip.",
-          "enum": [
-            "audio_recorder"
-          ],
           "type": "string"
         },
         {
+          "const": "camera_capture",
           "description": "Capture a still photo (camera) and submit it.",
-          "enum": [
-            "camera_capture"
-          ],
           "type": "string"
         },
         {
+          "const": "media_player",
           "description": "Play an audio/video asset referenced by the result.",
-          "enum": [
-            "media_player"
-          ],
           "type": "string"
         },
         {
+          "const": "image_gallery",
           "description": "Browse a set of images from the result.",
-          "enum": [
-            "image_gallery"
-          ],
           "type": "string"
         },
         {
+          "const": "file_upload",
           "description": "Select/drag files and submit their contents.",
-          "enum": [
-            "file_upload"
-          ],
           "type": "string"
         }
       ]
@@ -2958,7 +2913,7 @@
         "degraded_latency_threshold_ms": {
           "default": 1000,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "enabled": {
@@ -2968,19 +2923,19 @@
         "interval_ms": {
           "default": 30,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "timeout_ms": {
           "default": 2000,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "unhealthy_threshold": {
           "default": 3,
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -2999,21 +2954,21 @@
           "default": 3,
           "description": "Consecutive failures before flipping `Active` → `Degraded`. Default: 3.",
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "interval_ms": {
           "default": 30000,
           "description": "Milliseconds between probe cycles. Default: 30000 (30s).",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "probe_timeout_ms": {
           "default": 5000,
           "description": "Per-probe deadline in milliseconds. A plugin whose FFI call exceeds this is counted as a failure. Default: 5000 (5s).",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -3036,7 +2991,7 @@
           "default": 86400000,
           "description": "Default TTL applied to any reservation. Default 86_400_000 (24 hours) — matches Stripe's window.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "enabled": {
@@ -3048,7 +3003,7 @@
           "default": 604800000,
           "description": "Hard upper bound on per-record TTL. Default 604_800_000 (7 days). Future per-binding `idempotency.ttl_ms` overrides saturate at this cap.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "replay_revalidation": {
@@ -3094,24 +3049,18 @@
       "description": "Default scope strategy for idempotency records. Operator can widen to `per_tenant` (service-account dedupe) or narrow to `per_session` (ephemeral test harnesses).\n\nNote: `global` is intentionally NOT a variant — cross-tenant replay is a known anti-pattern, so we don't expose the footgun.",
       "oneOf": [
         {
+          "const": "per_session",
           "description": "All requests sharing one MCP session share the namespace. Useful for ephemeral test harnesses; resets on every re-initialize.",
-          "enum": [
-            "per_session"
-          ],
           "type": "string"
         },
         {
+          "const": "per_identity",
           "description": "All requests sharing one resolved identity (OIDC subject + auth provider) share the namespace. The default — matches Stripe / Square idempotency semantics.",
-          "enum": [
-            "per_identity"
-          ],
           "type": "string"
         },
         {
+          "const": "per_tenant",
           "description": "All requests sharing one tenant id share the namespace. Useful for service-to-service workloads where multiple service accounts retry the same operation.",
-          "enum": [
-            "per_tenant"
-          ],
           "type": "string"
         }
       ]
@@ -3156,6 +3105,10 @@
         }
       },
       "type": "object"
+    },
+    "InstanceId": {
+      "description": "Server-assigned stable instance id. Carried as an opaque string so the gateway never needs to parse it; the CP mints it (UUIDv7 today).",
+      "type": "string"
     },
     "JwksConfig": {
       "additionalProperties": false,
@@ -3355,17 +3308,13 @@
       "description": "Map rendering mode.",
       "oneOf": [
         {
+          "const": "plot",
           "description": "Coordinate plot on a canvas — zero network, no CSP delta.",
-          "enum": [
-            "plot"
-          ],
           "type": "string"
         },
         {
+          "const": "raster_tiles",
           "description": "Raster basemap tiles — needs `tile_url` + a CSP allowance.",
-          "enum": [
-            "raster_tiles"
-          ],
           "type": "string"
         }
       ]
@@ -3712,7 +3661,7 @@
           "default": 60000,
           "description": "Maximum time the gateway waits for the client's response to an elicitation prompt before giving up. Default 60 000.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -3850,7 +3799,7 @@
           "default": 30000,
           "description": "Maximum time the gateway waits for the client's roots-list response. Default 30 000.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -3864,7 +3813,7 @@
           "default": 60000,
           "description": "Maximum time the gateway waits for the client's sampling response. Default 60 000.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -3930,9 +3879,7 @@
           "description": "Fan-out to all subscribers (default, no filter).",
           "properties": {
             "scope": {
-              "enum": [
-                "all"
-              ],
+              "const": "all",
               "type": "string"
             }
           },
@@ -3945,9 +3892,7 @@
           "description": "Only notify subscribers whose `principal_id` matches the event's user context.",
           "properties": {
             "scope": {
-              "enum": [
-                "subject_id"
-              ],
+              "const": "subject_id",
               "type": "string"
             }
           },
@@ -3960,9 +3905,7 @@
           "description": "Only notify the originating session.",
           "properties": {
             "scope": {
-              "enum": [
-                "session_id"
-              ],
+              "const": "session_id",
               "type": "string"
             }
           },
@@ -3978,15 +3921,13 @@
               "type": "string"
             },
             "scope": {
-              "enum": [
-                "expression"
-              ],
+              "const": "expression",
               "type": "string"
             }
           },
           "required": [
-            "expression",
-            "scope"
+            "scope",
+            "expression"
           ],
           "type": "object"
         }
@@ -4207,7 +4148,7 @@
         "clock_skew_secs": {
           "default": 60,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "discovery_uri": {
@@ -4234,17 +4175,13 @@
       "description": "Policy for `deprecated` servers.",
       "oneOf": [
         {
+          "const": "serve_and_warn",
           "description": "Keep federating; log + count the deprecation.",
-          "enum": [
-            "serve_and_warn"
-          ],
           "type": "string"
         },
         {
+          "const": "exclude",
           "description": "Drop the federation (clients see `list_changed`).",
-          "enum": [
-            "exclude"
-          ],
           "type": "string"
         }
       ]
@@ -4396,7 +4333,7 @@
         "control_timeout_ms": {
           "description": "Control slot timeout override (ms). Applies to config-set, snapshot, version, register-profile, refresh, describe, list-peers, list-catalog, etc. Default: `FFI_CONTROL_TIMEOUT_DEFAULT_MS = 5_000`.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -4405,7 +4342,7 @@
         "data_timeout_ms": {
           "description": "Data slot timeout override (ms). Applies to execute, evaluate, transform, dispatch, http_route, sink-emit, etc. Default: `FFI_DATA_TIMEOUT_DEFAULT_MS = 30_000`.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -4414,7 +4351,7 @@
         "lifecycle_timeout_ms": {
           "description": "Lifecycle slot timeout override (ms). Applies to `make`, `manifest`, `shutdown`, `drop_instance`, health probes. Default: `FFI_LIFECYCLE_TIMEOUT_DEFAULT_MS = 1_000`.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -4423,7 +4360,7 @@
         "max_payload_bytes": {
           "description": "Max byte-length of any single `RString` returned by this plugin to the host. Overflow rejected with a slot-appropriate fallback + bumps `mcpg_plugin_payload_oversize_total`. Default: `FFI_MAX_PAYLOAD_BYTES = 262144` (256 KiB).",
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -4449,7 +4386,7 @@
         "max_body_bytes": {
           "description": "Per-entity override for `RouteSpec.max_body_bytes`. When set, the dispatcher uses this value instead of the plugin's declared cap — operator tightens (or relaxes) the plugin's spec without a plugin rebuild. `None` = use the plugin's declared value.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -4680,7 +4617,7 @@
           "default": null,
           "description": "Maximum fuel (instruction budget) per invocation (default: 10_000_000).",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -4690,7 +4627,7 @@
           "default": null,
           "description": "Maximum linear memory in megabytes (default: 64).",
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -4700,7 +4637,7 @@
           "default": null,
           "description": "Wall-clock timeout per invocation in milliseconds (default: 100).",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -4743,13 +4680,13 @@
         "max_entries": {
           "default": 10000,
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "ttl_ms": {
           "default": 60000,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -4875,7 +4812,7 @@
         "burst": {
           "description": "Bucket burst capacity — number of calls a caller can spend in quick succession before refill rate kicks in. Defaults to the per-second equivalent of `rate` (i.e., one second's worth).",
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -4928,7 +4865,7 @@
         "calls_per_minute": {
           "description": "Calls allowed per minute. Bucket refills at this rate.",
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -4976,31 +4913,23 @@
     "RegistryAuthMode": {
       "oneOf": [
         {
+          "const": "none",
           "description": "Anonymous reads (the generic spec's default).",
-          "enum": [
-            "none"
-          ],
           "type": "string"
         },
         {
+          "const": "bearer",
           "description": "`Authorization: Bearer <token>`.",
-          "enum": [
-            "bearer"
-          ],
           "type": "string"
         },
         {
+          "const": "headers",
           "description": "Arbitrary static headers (API-key style sub-registries).",
-          "enum": [
-            "headers"
-          ],
           "type": "string"
         },
         {
+          "const": "cred",
           "description": "Bearer minted by a credential-issuer plugin (`credential` is a `cred://` URI) under the gateway's machine identity.",
-          "enum": [
-            "cred"
-          ],
           "type": "string"
         }
       ]
@@ -5208,7 +5137,7 @@
           "default": 24,
           "description": "Hours between full crawls when `incremental` is on. Floor 1.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "incremental": {
@@ -5220,14 +5149,14 @@
           "default": 300,
           "description": "Seconds between crawls. Each crawl lists the registry's latest server versions in full (cursor-paginated), so deletions are observed without a separate backstop. Floor 30.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "max_servers": {
           "default": 100,
           "description": "Hard cap on federated servers from this registry. Servers beyond the cap (name-sorted) are skipped and reported — back-pressure against unbounded task/connection growth.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -5298,18 +5227,17 @@
       "description": "Operator-facing config for the gateway-managed LLM response cache. The cache backs `BackendHost::cache_get` / `cache_put`; chat + embedding bindings opt in per-binding via their own `cache.enabled: true` knob, the cache only exists at all if this config is non-disabled.\n\n`kind: in_process` is the default — content-addressed BLAKE3 LRU cache with 64 MiB byte cap, lost on restart. `kind: disabled` turns the cache off gateway-wide; per-binding `cache.enabled` becomes a no-op.",
       "oneOf": [
         {
+          "additionalProperties": false,
           "properties": {
             "kind": {
-              "enum": [
-                "in_process"
-              ],
+              "const": "in_process",
               "type": "string"
             },
             "max_bytes": {
               "default": 67108864,
               "description": "Maximum aggregate byte size kept in memory. LRU eviction past this. Default 64 MiB — embeddings are small (single-vec kilobytes) and chat outputs are modest (a few KB each), so a modest cap covers tens of thousands of cached calls.",
               "format": "uint",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             }
           },
@@ -5321,9 +5249,7 @@
         {
           "properties": {
             "kind": {
-              "enum": [
-                "disabled"
-              ],
+              "const": "disabled",
               "type": "string"
             }
           },
@@ -5342,7 +5268,7 @@
           "default": 2097152,
           "description": "Cap on a single upstream call's response, enforced gateway-side.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -5355,14 +5281,14 @@
           "default": 200,
           "description": "Initial backoff delay in milliseconds. Doubled on each subsequent retry.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "max_attempts": {
           "default": 3,
           "description": "Maximum number of retry attempts (not counting the initial attempt).",
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "retry_on_status_codes": {
@@ -5375,7 +5301,8 @@
           "description": "HTTP status codes that trigger a retry (only applicable to HTTP/gRPC/GraphQL bindings).",
           "items": {
             "format": "uint16",
-            "minimum": 0.0,
+            "maximum": 65535,
+            "minimum": 0,
             "type": "integer"
           },
           "type": "array"
@@ -5427,7 +5354,7 @@
           "default": 5000,
           "description": "Poll interval in milliseconds for `watch`. Values below 1000 are clamped to 1000 at spawn time (a warning is logged at validate time) — sub-second polling burns I/O for no operator-visible benefit.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "watch": {
@@ -5504,14 +5431,14 @@
           "default": 100,
           "description": "Burst allowance for `anonymous_rate_limit_per_min`.",
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "anonymous_rate_limit_per_min": {
           "default": 600,
           "description": "Per-IP request-rate cap on the MCP endpoint for requests below cryptographically-verified trust — i.e. anonymous AND header-asserted identities (sustained requests/minute, with `anonymous_rate_limit_burst` headroom). A self-asserted `x-mcpg-subject-id` does NOT buy an exemption. Only Verified traffic (a real OIDC/JWKS/identity-plugin credential) skips this — it is attributable and metered per tenant. Defaults generous (600/min = 10 rps sustained per client IP), far above interactive agent use; `0` disables (e.g. when an upstream WAF throttles, or for single-IP load testing).",
           "format": "uint32",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "bind_address": {
@@ -5536,7 +5463,7 @@
           "default": null,
           "description": "Per-session rate limit on `completion/complete` requests (cap per second). `None` disables. Guards against broken autocomplete UIs.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -5589,14 +5516,14 @@
           "default": 4,
           "description": "Maximum POST body accepted on the MCP endpoint, in MiB. Defaults to 4 MiB. `0` falls back to the default — an unbounded body is never acceptable on a public endpoint.",
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "max_sessions_per_tenant": {
           "default": 0,
           "description": "Per-tenant session quota. 0 = unlimited. The stricter of this and the global cap wins.\n\nA \"tenant\" is the trust-qualified principal, so the same subject string asserted by a header and verified by an IdP are separate tenants and cannot exhaust each other's quota.\n\nTwo limits worth knowing before setting this:\n\n- **It is a per-replica cap.** The counter lives in this process, so a fleet of N replicas admits up to N x this value per tenant, and a reconnect that lands on another replica starts fresh. Divide by the replica count if you need a fleet-wide ceiling. - **Anonymous callers share one bucket**, because an unauthenticated request carries nothing to separate them by. Aggregate anonymous usage is capped rather than per-caller usage; per-caller protection for anonymous traffic is `anonymous_rate_limit_per_min`, which meters by source IP.",
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "mcp_path": {
@@ -5611,13 +5538,13 @@
         "replay_window_limit": {
           "default": 16,
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "request_timeout_ms": {
           "default": 30000,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "revalidate_mutated_tool_arguments": {
@@ -5634,7 +5561,7 @@
           "default": null,
           "description": "Emit a server-initiated `ping` to each active session's SSE stream on this cadence. `None` or `0` disables. Reasonable value: 30s.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -5643,13 +5570,13 @@
         "session_idle_timeout_ms": {
           "default": 900000,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "shutdown_timeout_ms": {
           "default": 30000,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "tls": {
@@ -5725,7 +5652,7 @@
         "idle_timeout_secs": {
           "default": 600,
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         }
       },
@@ -5827,24 +5754,18 @@
       "description": "Signature verification policy for native plugin artefacts. The Ed25519 signature attached to the artefact (`<artifact>.sig` or the packaged `plugin.sig`) is the primary check; this policy governs behaviour when the signature is missing or invalid. Set per-plugin via `plugins[*].signature.policy:`, or as a gateway-wide default via `gateway.plugin_registry.default_signature_policy:`.",
       "oneOf": [
         {
+          "const": "disabled",
           "description": "Signature checks are skipped entirely. Development only; gateway emits a `governance.plugin.signature_policy_disabled` audit event for any entry that resolves to this policy so the choice is visible in the compliance trail.",
-          "enum": [
-            "disabled"
-          ],
           "type": "string"
         },
         {
+          "const": "warn",
           "description": "Log a warning for missing or invalid signatures but proceed with the load — ONLY while no trusted keys are configured. The built-in official key means an inheriting entry always has keys, so this behaves like `enforce` unless a config empties the trust set.",
-          "enum": [
-            "warn"
-          ],
           "type": "string"
         },
         {
+          "const": "enforce",
           "description": "Refuse to load any artefact whose signature is missing or does not verify against the configured trusted keys. The default: a stock gateway loads only signed plugins.",
-          "enum": [
-            "enforce"
-          ],
           "type": "string"
         }
       ]
@@ -5878,24 +5799,18 @@
       "description": "How to route events for a per-plugin signal toggle. Operator schema: `mode: inherit | replace | tee`.",
       "oneOf": [
         {
+          "const": "inherit",
           "description": "Inherit the global sink list — the same routing every other plugin's events use. Default.",
-          "enum": [
-            "inherit"
-          ],
           "type": "string"
         },
         {
+          "const": "replace",
           "description": "Route admitted events ONLY to the per-plugin `sinks` list. Skips the global sink fan-out entirely. Used for compliance carve-outs (audit logs stay inside the SIEM).",
-          "enum": [
-            "replace"
-          ],
           "type": "string"
         },
         {
+          "const": "tee",
           "description": "Tee — admitted events flow to BOTH the global sink list AND the per-plugin `sinks` list. Useful when an operator wants to keep default routing but additionally mirror a noisy plugin's events to a debugging sink.",
-          "enum": [
-            "tee"
-          ],
           "type": "string"
         }
       ]
@@ -5978,7 +5893,7 @@
           "default": 100,
           "description": "Maximum subscriptions per session (0 = unlimited).",
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "store": {
@@ -6002,7 +5917,7 @@
           "default": 30000,
           "description": "Poll cadence for synthesized resource updates. Watchers are subscriber-gated: no subscribers, no polling.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "resources_updated": {
@@ -6021,24 +5936,18 @@
       "description": "Gate on synthesized change notifications.",
       "oneOf": [
         {
+          "const": "auto",
           "description": "Synthesize only when the upstream demonstrably cannot push resource updates: the modern (`2026-07-28`) wire and the `stdio` transport. A legacy streamable-http upstream keeps its GET-SSE push path and is not polled.",
-          "enum": [
-            "auto"
-          ],
           "type": "string"
         },
         {
+          "const": "poll",
           "description": "Always poll, even for upstreams with a push channel (covers legacy servers that only emit `resources/updated` for subscriptions the gateway does not place upstream).",
-          "enum": [
-            "poll"
-          ],
           "type": "string"
         },
         {
+          "const": "off",
           "description": "Never synthesize.",
-          "enum": [
-            "off"
-          ],
           "type": "string"
         }
       ]
@@ -6049,9 +5958,7 @@
           "description": "Static list of completion values. Same shape as the shorthand bare-list but with explicit `kind` tag.",
           "properties": {
             "kind": {
-              "enum": [
-                "static"
-              ],
+              "const": "static",
               "type": "string"
             },
             "values": {
@@ -6079,15 +5986,13 @@
               "description": "Backend-specific opaque config. SQL passes `{ query: \"SELECT DISTINCT … LIKE :prefix || '%' …\", max_results?: u32 }`; future HTTP would pass `{ endpoint: \"…\" }`. The gateway does not inspect these fields — it forwards them to the backend, which routes internally."
             },
             "kind": {
-              "enum": [
-                "dynamic"
-              ],
+              "const": "dynamic",
               "type": "string"
             }
           },
           "required": [
-            "backend",
-            "kind"
+            "kind",
+            "backend"
           ],
           "type": "object"
         }
@@ -6101,28 +6006,28 @@
           "default": 1800000,
           "description": "Default TTL applied to any task created without an explicit `task.ttl` from the client. Used by `tasks/create` and the reaper.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "max_tasks_per_session": {
           "default": 256,
           "description": "Maximum concurrent tasks per session. Creation above this quota is rejected with JSON-RPC `-32603 Internal error` rather than silently succeeding. `0` disables the quota.",
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "reaper_interval_ms": {
           "default": 60000,
           "description": "Background reaper sweep interval. The reaper deletes records whose `created_at + ttl` has elapsed.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "result_wait_ms": {
           "default": 30000,
           "description": "Upper bound on a single `tasks/result` HTTP blocking wait. Clients that need longer-running tasks reconnect via GET SSE and `Last-Event-Id` until the task goes terminal.",
           "format": "uint64",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": "integer"
         },
         "store": {
@@ -6265,8 +6170,8 @@
         }
       },
       "required": [
-        "minimum_trust",
-        "tool_name"
+        "tool_name",
+        "minimum_trust"
       ],
       "type": "object"
     },
@@ -6464,8 +6369,8 @@
         }
       },
       "required": [
-        "fields",
-        "label"
+        "label",
+        "fields"
       ],
       "type": "object"
     },
@@ -6648,24 +6553,18 @@
       "description": "MCP wire revision the federation client speaks to an upstream.",
       "oneOf": [
         {
+          "const": "auto",
           "description": "Detect the upstream's wire at connect time (the default): attempt the modern `server/discover`, and fall back to the legacy `initialize` handshake when the peer rejects it (the SEP-2575 backward-compatibility probe). The detected wire is cached per federation for the engine's lifetime. Pin one of the dated revisions to skip probing. The `stdio` transport never probes (it is legacy-only).",
-          "enum": [
-            "auto"
-          ],
           "type": "string"
         },
         {
+          "const": "2025-11-25",
           "description": "Session-bound `2025-11-25` wire (`initialize` handshake, `Mcp-Session-Id`, no SEP-2243 headers) — byte-identical to the legacy federation client.",
-          "enum": [
-            "2025-11-25"
-          ],
           "type": "string"
         },
         {
+          "const": "2026-07-28",
           "description": "Stateless `2026-07-28` wire (no handshake / session, per-request `_meta` identity, SEP-2243 routing headers).",
-          "enum": [
-            "2026-07-28"
-          ],
           "type": "string"
         }
       ]
@@ -6696,17 +6595,13 @@
       "description": "Upstream wire transport.",
       "oneOf": [
         {
+          "const": "streamable_http",
           "description": "MCP Streamable HTTP (POST + SSE).",
-          "enum": [
-            "streamable_http"
-          ],
           "type": "string"
         },
         {
+          "const": "stdio",
           "description": "Local stdio child process.",
-          "enum": [
-            "stdio"
-          ],
           "type": "string"
         }
       ]
@@ -6767,27 +6662,25 @@
               "type": "array"
             },
             "kind": {
-              "enum": [
-                "oidc_jwks"
-              ],
+              "const": "oidc_jwks",
               "type": "string"
             },
             "max_staleness_secs": {
               "default": 3600,
               "format": "uint64",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             },
             "refresh_interval_secs": {
               "default": 300,
               "format": "uint64",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             },
             "timeout_ms": {
               "default": 2000,
               "format": "uint64",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             }
           },
@@ -6809,23 +6702,21 @@
               "type": "string"
             },
             "kind": {
-              "enum": [
-                "oauth_introspection"
-              ],
+              "const": "oauth_introspection",
               "type": "string"
             },
             "timeout_ms": {
               "default": 2000,
               "format": "uint64",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             }
           },
           "required": [
-            "client_id",
-            "client_secret_ref",
+            "kind",
             "introspection_url",
-            "kind"
+            "client_id",
+            "client_secret_ref"
           ],
           "type": "object"
         },
@@ -6856,42 +6747,40 @@
             "introspection_timeout_ms": {
               "default": 2000,
               "format": "uint64",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             },
             "introspection_url": {
               "type": "string"
             },
             "kind": {
-              "enum": [
-                "hybrid"
-              ],
+              "const": "hybrid",
               "type": "string"
             },
             "max_staleness_secs": {
               "default": 3600,
               "format": "uint64",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             },
             "refresh_interval_secs": {
               "default": 300,
               "format": "uint64",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             },
             "timeout_ms": {
               "default": 2000,
               "format": "uint64",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             }
           },
           "required": [
-            "client_id",
-            "client_secret_ref",
+            "kind",
             "introspection_url",
-            "kind"
+            "client_id",
+            "client_secret_ref"
           ],
           "type": "object"
         }
@@ -6905,13 +6794,11 @@
             "interval_ms": {
               "default": 60000,
               "format": "uint64",
-              "minimum": 0.0,
+              "minimum": 0,
               "type": "integer"
             },
             "type": {
-              "enum": [
-                "poll"
-              ],
+              "const": "poll",
               "type": "string"
             }
           },
@@ -6927,15 +6814,13 @@
               "type": "string"
             },
             "type": {
-              "enum": [
-                "nats_topic"
-              ],
+              "const": "nats_topic",
               "type": "string"
             }
           },
           "required": [
-            "subject",
-            "type"
+            "type",
+            "subject"
           ],
           "type": "object"
         },
@@ -6950,15 +6835,13 @@
               "type": "string"
             },
             "type": {
-              "enum": [
-                "kafka_topic"
-              ],
+              "const": "kafka_topic",
               "type": "string"
             }
           },
           "required": [
-            "topic",
-            "type"
+            "type",
+            "topic"
           ],
           "type": "object"
         },
@@ -6978,9 +6861,7 @@
               "type": "string"
             },
             "type": {
-              "enum": [
-                "webhook"
-              ],
+              "const": "webhook",
               "type": "string"
             }
           },
@@ -6990,12 +6871,11 @@
           "type": "object"
         },
         {
+          "additionalProperties": true,
           "description": "SQL polling watch — `dev.mcpg.watch.sql_polling` plugin runs a scalar tracking query on a cadence and emits an event when the returned scalar advances. Spec mirrors the `[bindings.sql]` shape (`driver`, `url`, optional `pool` / `session_vars`, required `query` block, `interval_ms`); see the SQL binding plugin docs for the full field list. Pass-through here keeps the spec the single source of truth in the plugin crate.",
           "properties": {
             "type": {
-              "enum": [
-                "sql_polling"
-              ],
+              "const": "sql_polling",
               "type": "string"
             }
           },
@@ -7012,9 +6892,7 @@
               "type": "string"
             },
             "type": {
-              "enum": [
-                "postgres_listen_notify"
-              ],
+              "const": "postgres_listen_notify",
               "type": "string"
             },
             "url": {
@@ -7023,13 +6901,14 @@
             }
           },
           "required": [
-            "channel",
             "type",
-            "url"
+            "url",
+            "channel"
           ],
           "type": "object"
         },
         {
+          "additionalProperties": true,
           "description": "Generic escape hatch — delegate to ANY loaded `watch_strategy` plugin by its `kind()` discriminator. Use this for custom watch plugins that have no dedicated typed variant above (e.g. the Twilio plugin's `twilio_inbound` strategy). The remaining fields flatten into the spec passed verbatim to the plugin's `watch()`, so the plugin owns and validates its own spec schema.\n\n`{ type: plugin, kind: twilio_inbound, kinds: [sms, voice] }`",
           "properties": {
             "kind": {
@@ -7037,15 +6916,13 @@
               "type": "string"
             },
             "type": {
-              "enum": [
-                "plugin"
-              ],
+              "const": "plugin",
               "type": "string"
             }
           },
           "required": [
-            "kind",
-            "type"
+            "type",
+            "kind"
           ],
           "type": "object"
         }
@@ -7076,10 +6953,8 @@
           "type": "string"
         },
         {
+          "const": "array",
           "description": "Repeatable list of scalar inputs → a JSON array value.",
-          "enum": [
-            "array"
-          ],
           "type": "string"
         }
       ]

@@ -389,9 +389,15 @@ pub fn open(
     }
 
     let cipher = derive_cipher(secret, &payload.kdf_salt)?;
+    let nonce = Nonce::try_from(payload.nonce.as_slice()).map_err(|_| {
+        malformed(format!(
+            "`nonce` is {} bytes, AES-GCM takes {NONCE_BYTES}",
+            payload.nonce.len()
+        ))
+    })?;
     let plaintext = cipher
         .decrypt(
-            Nonce::from_slice(&payload.nonce),
+            &nonce,
             Payload {
                 msg: &payload.ciphertext,
                 aad: aad.as_bytes(),

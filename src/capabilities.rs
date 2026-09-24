@@ -100,8 +100,12 @@ fn strip_doc_text(value: &mut serde_json::Value) {
 
 /// Build the manifest for this binary, scanning `dir` for baked plugins.
 pub fn manifest(baked_dir: &Path) -> CapabilityManifest {
-    let schema = serde_json::to_value(schemars::schema_for!(crate::config::AppConfig))
-        .expect("AppConfig schema serializes");
+    let schema = serde_json::to_value(
+        schemars::generate::SchemaSettings::draft07()
+            .into_generator()
+            .into_root_schema_for::<crate::config::AppConfig>(),
+    )
+    .expect("AppConfig schema serializes");
     let mut structural = schema.clone();
     strip_doc_text(&mut structural);
     let canonical = serde_json::to_vec(&structural).expect("schema value re-serializes compactly");

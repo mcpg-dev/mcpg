@@ -334,10 +334,10 @@ fn load_or_create_state_key(dir: &Path) -> anyhow::Result<String> {
         }
     }
     let key = {
-        use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _, aead::OsRng};
+        use chacha20poly1305::{ChaCha20Poly1305, aead::Generate as _};
         // 32 CSPRNG bytes; the cipher type is only borrowed for its
-        // correctly sized `generate_key`.
-        let bytes = ChaCha20Poly1305::generate_key(&mut OsRng);
+        // correctly sized key.
+        let bytes = chacha20poly1305::aead::Key::<ChaCha20Poly1305>::generate();
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     };
     std::fs::write(&path, &key).with_context(|| format!("write {}", path.display()))?;

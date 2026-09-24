@@ -539,8 +539,7 @@ impl AppConfig {
         let value = serde_json::to_value(self).expect("AppConfig serialises");
         let canonical = canonicalize_json(&value);
         let bytes = serde_json::to_vec(&canonical).expect("canonical serialises");
-        let digest = Sha256::digest(&bytes);
-        format!("{digest:x}")
+        hex::encode(Sha256::digest(&bytes))
     }
 
     /// Parse and validate a YAML config string (for admin config:validate endpoint).

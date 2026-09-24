@@ -420,7 +420,7 @@ mod tests {
         let ciphertext = Aes256Gcm::new_from_slice(&key)
             .unwrap()
             .encrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::from(nonce),
                 AeadPayload {
                     msg: plaintext.as_bytes(),
                     aad: aad.as_bytes(),

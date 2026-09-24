@@ -40,7 +40,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+use chacha20poly1305::aead::{Aead, Generate, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use parking_lot::Mutex;
 use uuid::Uuid;
@@ -202,7 +202,7 @@ impl RequestStateCodec {
     /// Construct a codec from a raw 32-byte ChaCha20-Poly1305 key
     /// and a KV store backing the handle path.
     pub fn new(key: [u8; 32], store: Arc<dyn RequestStateStore>) -> Self {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(&Key::from(key));
         Self {
             cipher,
             inline_threshold: DEFAULT_INLINE_THRESHOLD_BYTES,
@@ -222,11 +222,9 @@ impl RequestStateCodec {
     /// boot when the operator did not configure an explicit key.
     pub fn ephemeral_key() -> [u8; 32] {
         let mut key = [0u8; 32];
-        // ChaCha20Poly1305's KeyInit::generate_key uses OsRng under
-        // the hood; reuse that via the cipher's own generator so
-        // we don't pull in a parallel `rand` dependency.
-        let g = ChaCha20Poly1305::generate_key(&mut OsRng);
-        key.copy_from_slice(g.as_slice());
+        // The cipher's own key generator draws from the OS, so no
+        // parallel `rand` dependency is needed here.
+        key.copy_from_slice(Key::generate().as_slice());
         key
     }
 
@@ -280,7 +278,7 @@ impl RequestStateCodec {
     }
 
     fn encode_inline(&self, payload: &[u8], aad: &[u8]) -> Result<String, RequestStateError> {
-        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let nonce = chacha20poly1305::aead::Nonce::<ChaCha20Poly1305>::generate();
         let ciphertext = self
             .cipher
             .encrypt(&nonce, Payload { msg: payload, aad })
@@ -295,16 +293,15 @@ impl RequestStateCodec {
         let buf = URL_SAFE_NO_PAD
             .decode(b64)
             .map_err(|e| RequestStateError::InvalidPayload(format!("base64: {e}")))?;
-        if buf.len() < 12 {
+        let Some((nonce_bytes, ciphertext)) = buf.split_first_chunk::<12>() else {
             return Err(RequestStateError::InvalidPayload(
                 "ciphertext shorter than nonce".to_owned(),
             ));
-        }
-        let (nonce_bytes, ciphertext) = buf.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        };
+        let nonce = Nonce::from(*nonce_bytes);
         self.cipher
             .decrypt(
-                nonce,
+                &nonce,
                 Payload {
                     msg: ciphertext,
                     aad,

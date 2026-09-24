@@ -267,6 +267,7 @@ impl DemoBackend {
                 resource: Some(format!("upstream://{}", self.config.endpoint)),
                 outcome: AuditOutcome::Failure,
                 request_id: Some(request.request_id.clone()),
+                upstream_request_id: None,
                 node_id: None,
                 details: serde_json::json!({
                     "reason": err.to_string(),

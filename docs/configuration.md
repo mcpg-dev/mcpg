@@ -733,7 +733,7 @@ Operator-facing client-cert acceptance mode.
 | `allow_anonymous` | boolean | `false` | Publish-time acknowledgement that this managed instance intentionally serves `/mcp` WITHOUT a configured token verifier (an anonymous / public MCP server). The CP publish guard requires EITHER a verifier (`governance.access.jwks` / `governance.access.oidc_oauth`) OR this opt-out, so a tenant can't expose an unauthenticated gateway on the public edge by omission. The gateway runtime does not read this field — it is a declaration the publish guard checks. |
 | `custom_domains` | array&lt;string&gt; |  | Additional customer-owned hostnames that resolve to this instance (CNAME → the instance edge). Developer-owned; each must be a valid DNS hostname. Empty for the default-domain-only case. |
 | `environment` | string (optional) |  | Environment slug (dev / staging / prod …). |
-| `instance_id` | string (optional) |  | Server-assigned stable id. None for self-host. Read-only — set by the CP. |
+| `instance_id` | [`InstanceId`](#instanceid) (optional) |  | Server-assigned stable id. None for self-host. Read-only — set by the CP. |
 | `isolation` | [`CloudIsolation`](#cloudisolation) | `"shared"` | Isolation tier for placement. |
 | `name` | string (optional) |  | Human-friendly display name for the instance. |
 | `provenance` | [`CloudProvenance`](#cloudprovenance) | `{}` | Server-managed placement provenance. Stamped by the provisioner/operator; ignored / overwritten if hand-written. |
@@ -1179,6 +1179,12 @@ Which capability surfaces to import.
 | --- | --- | --- | --- |
 | `bind` | string (optional) |  | host:port of the inspector's web UI + API (single origin). Defaults to the inspector's own `127.0.0.1:7846`. |
 | `enabled` | boolean | `false` | Supervise an `mcpg-inspector` sidecar. `--inspector` flips this on for a single run. |
+
+### `InstanceId`
+
+Server-assigned stable instance id. Carried as an opaque string so the gateway never needs to parse it; the CP mints it (UUIDv7 today).
+
+Type: string
 
 ### `JwksConfig`
 

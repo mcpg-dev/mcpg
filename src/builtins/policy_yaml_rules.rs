@@ -150,7 +150,7 @@ impl YamlRulesPolicyEngine {
         let effective_source = doc.source.clone().unwrap_or_else(|| source_label.clone());
         let mut h = Sha256::new();
         h.update(yaml.as_bytes());
-        let version_hash = format!("sha256:{:x}", h.finalize());
+        let version_hash = format!("sha256:{}", hex::encode(h.finalize()));
         let loaded_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         Ok(Arc::new(Self {
             manifest: PluginManifest {

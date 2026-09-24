@@ -197,7 +197,7 @@ impl SecretsSource {
             h.update(value);
             h.update(b"\n");
         }
-        format!("{:x}", h.finalize())
+        hex::encode(h.finalize())
     }
 }
 
@@ -337,7 +337,7 @@ mod tests {
         std::fs::write(dir.path().join("not-a-key"), "dash").unwrap();
         std::fs::create_dir(dir.path().join("SUBDIR")).unwrap();
         let src = source_over(dir.path());
-        let expected = format!("{:x}", Sha256::digest(b"A=1\nB=2\nUNUSED=x\n"));
+        let expected = hex::encode(Sha256::digest(b"A=1\nB=2\nUNUSED=x\n"));
         assert_eq!(src.digest(), expected, "unreferenced keys count too");
 
         src.lookup("B").unwrap();

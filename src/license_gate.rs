@@ -199,7 +199,7 @@ mod tests {
         use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
         use jsonwebtoken::{EncodingKey, Header};
 
-        let signing = SigningKey::generate(&mut rand::rngs::OsRng);
+        let signing = SigningKey::generate(&mut rand::rng());
         let pem = signing
             .verifying_key()
             .to_public_key_pem(Default::default())

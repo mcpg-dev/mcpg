@@ -125,7 +125,7 @@ fn yaml_to_json(v: serde_yaml::Value) -> Result<serde_json::Value, ConfigError> 
 fn digest(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("sha256:{:x}", h.finalize())
+    format!("sha256:{}", hex::encode(h.finalize()))
 }
 
 fn now_rfc3339() -> String {
