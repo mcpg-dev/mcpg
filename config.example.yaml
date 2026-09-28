@@ -704,20 +704,42 @@ governance:
 #               client_secret_ref: env:MCPG_HYBRID_SECRET
 #               introspection_timeout_ms: 2000
 #
-# --- OAuth 2.1 Protected Resource Metadata (RFC 9728, T6-01) ---
-# When governance.access is configured, MCPG auto-serves GET /.well-known/oauth-protected-resource
-# with authorization_servers derived from OIDC provider issuers.
-# Use resource_metadata for explicit control:
+# --- OAuth 2.1 Protected Resource Metadata (RFC 9728) ---
+# GET /.well-known/oauth-protected-resource (and its path-aware form) is
+# served only with resource_metadata set; without it the endpoint answers 404,
+# because the gateway never guesses its public URL. An empty
+# authorization_servers is derived: the embedded authorization server's issuer
+# first, then the oidc_oauth issuers, then jwks.issuer.
 #
 #   resource_metadata:
 #     resource: https://gateway.example.com/mcp
 #     authorization_servers:
 #       - https://auth.example.com/
 #     scopes_supported:
-#       - openid
 #       - tools
 #     bearer_methods_supported:
 #       - header
+#
+# --- Embedded authorization server (enterprise-managed authorization) ---
+# Redeems ID-JAGs from a trusted enterprise IdP (Okta Cross App Access) at
+# POST /oauth/token and verifies the access tokens it mints. Needs
+# resource_metadata; the issuer is a bare https origin, exactly the Issuer URL
+# entered at the IdP.
+#
+#   require_authentication: true
+#   resource_metadata:
+#     resource: https://gateway.example.com/mcp
+#   authorization_server:
+#     issuer: https://gateway.example.com
+#     signing_keys:
+#       - alg: ES256
+#         private_key: ${env.MCPG_AS_SIGNING_KEY}
+#     trusted_idps:
+#       - issuer: https://example.okta.com
+#         allowed_algs: [RS256]
+#     clients:
+#       - client_id: claude-ema
+#         client_secret: ${env.CLAUDE_EMA_SECRET}
 
 # --- Redis configuration ---
 # Redis is wired through `cluster.kind: redis` only. There is no separate
@@ -1021,11 +1043,14 @@ governance:
 #       providers:                       # ≥1 issuer
 #         - issuer: https://auth.example.com
 #           audiences: ["mcpg"]
-#           verification:                # JWKS | OauthIntrospection | Hybrid
-#             jwks: { refresh_interval_secs: 3600, allowed_algs: ["RS256"], allow_hmac: false }
+#           verification:                # kind: oidc_jwks | oauth_introspection | hybrid
+#             kind: oidc_jwks
+#             refresh_interval_secs: 3600
+#             allowed_algs: ["RS256"]
+#             allow_hmac: false
 #           claim_mappings: { subject_claim: sub, role_claim_paths: ["realm_access.roles"] }
 #           clock_skew_secs: 60
-#       token_source: { kind: authorization }   # bearer extraction
+#       token_source: { kind: authorization_bearer }   # bearer extraction
 #   # - id: dev.mcpg.identity.api-key  # libmcpg_plugin_identity_api_key.so | token_sources[], keys[], resolution{trust_level=verified}
 #   # - id: dev.mcpg.identity.basic    # libmcpg_plugin_identity_basic.so   | users[], username_case=insensitive, resolution{}
 #   # - id: dev.mcpg.identity.mtls     # libmcpg_plugin_identity_mtls.so    | sources[] (xfcc|dn_string|custom_header), extraction{mode}, identities{}

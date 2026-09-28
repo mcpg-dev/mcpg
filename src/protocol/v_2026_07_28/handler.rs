@@ -294,7 +294,7 @@ impl ProtocolHandler for Handler {
 
         match operation {
             ProtocolOperation::Lifecycle(LifecycleOperation::Discover { request_id, .. }) => {
-                let result = build_discover_result(services);
+                let result = build_discover_result(services, &ctx.transport);
                 let result_value = match serde_json::to_value(&result) {
                     Ok(v) => v,
                     Err(error) => {
@@ -1136,6 +1136,61 @@ mcp:
             }
             other => panic!("expected JsonRpcSuccess, got {other:?}"),
         }
+    }
+
+    /// `server/discover` declares the Enterprise-Managed Authorization
+    /// extension over HTTP when the embedded authorization server is
+    /// configured, and never over stdio.
+    #[tokio::test]
+    async fn dispatch_discover_declares_ema_extension_with_an_authorization_server() {
+        async fn discover(cfg: &str, transport: crate::runtime::TransportKind) -> Option<Value> {
+            let h = Handler::new();
+            let cfg: crate::config::AppConfig =
+                serde_yaml::from_str(cfg).expect("test AppConfig YAML parses");
+            let services = SharedServices::with_no_runtime(Arc::new(cfg));
+            let mut ctx = make_test_request_context();
+            ctx.transport = transport;
+            let msg = h
+                .parse(serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+                    "params": { "protocolVersion": "2026-07-28", "clientInfo": { "name": "t", "version": "0" } }
+                }))
+                .expect("parse ok");
+            match h.dispatch(&ctx, msg, &services).await.response {
+                ProtocolResponse::JsonRpcSuccess(success) => {
+                    success.result["capabilities"]["extensions"]
+                        .get("io.modelcontextprotocol/enterprise-managed-authorization")
+                        .cloned()
+                }
+                other => panic!("expected JsonRpcSuccess, got {other:?}"),
+            }
+        }
+        let ema = r#"
+governance:
+  access:
+    resource_metadata:
+      resource: https://mcp.example.com/mcp
+    authorization_server:
+      issuer: https://mcp.example.com
+      signing_secret: ema-signing-secret-0123456789abcdef
+      trusted_idps:
+        - issuer: https://acme.okta.com
+      clients:
+        - client_id: mcp-client
+"#;
+
+        assert_eq!(
+            discover(ema, crate::runtime::TransportKind::Http).await,
+            Some(serde_json::json!({}))
+        );
+        assert_eq!(
+            discover(ema, crate::runtime::TransportKind::Stdio).await,
+            None
+        );
+        assert_eq!(
+            discover("{}", crate::runtime::TransportKind::Http).await,
+            None
+        );
     }
 
     #[tokio::test]

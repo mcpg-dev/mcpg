@@ -1,0 +1,146 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: enterprise-managed-auth
+# -----------------------------------
+# Enterprise-managed authorization (MCP extension
+# io.modelcontextprotocol/enterprise-managed-authorization), which Okta
+# ships as Cross App Access and Agent SSO. The gateway's embedded
+# authorization server redeems the ID-JAGs Okta issues to an MCP client
+# (Claude, VS Code) at POST /oauth/token and mints access tokens for this
+# gateway only. Users never see a consent page here: Okta policy decides.
+#
+# Core feature, no license needed. Interactive sign-in and calling Cross
+# App Access upstreams are separate: see interactive-login-okta.yaml.
+#
+# Okta admin fields → keys below:
+#   Resource app > Resource Server > Cross App Access
+#                  > Issuer URL                     → authorization_server.issuer
+#                  > Audience/tenant ID             → (none: leave it empty)
+#   AI agent > Resource connection
+#                  > Resource indicator             → resource_metadata.resource
+#                  > AI agent's client ID
+#                    registered in this app         → authorization_server.clients[].client_id
+#                  > Scopes                         → allowed_scopes / scopes_supported
+#   Okta domain                                     → trusted_idps[].issuer
+# `claude-ema` is the client's ID at this gateway, which you choose; it is
+# not an Okta client ID.
+#
+# Required env vars:
+#   MCPG_NATS_URL          — tls://nats.mcpg.svc:4222
+#   MCPG_CLUSTER_STATE_KEY — URL-safe-base64 32-byte key, same on every
+#                            replica; seals the single-use ledger of ID-JAGs
+#   MCPG_AS_SIGNING_KEY    — P-256 PKCS#8 PEM that signs the gateway's
+#                            access tokens, same on every replica
+#   CLAUDE_EMA_SECRET      — client secret of the MCP client registered below
+#
+# Check: mcpg config check --deny-warnings enterprise-managed-auth.yaml
+# Boot:  MCPG_CONFIG=enterprise-managed-auth.yaml mcpg
+
+gateway:
+  server:
+    bind_address: "0.0.0.0:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    allowed_origins:
+      - "https://mcp.acme.example"
+    # Real client IPs for the per-IP budget of /oauth/token, and the
+    # forwarded host for the resource the metadata names.
+    trust_proxy_ip: true
+    # One public name: other hosts are redirected here.
+    canonical_url: "https://mcp.acme.example"
+
+cluster:
+  kind: nats
+  servers:
+    - "${env.MCPG_NATS_URL}"
+  node:
+    id: "${env.HOSTNAME}"
+  jetstream:
+    replicas: 3
+    storage: file
+    state_bucket: "mcpg-prod"
+  # Also seals the ID-JAG replay ledger, which every replica shares: an
+  # assertion redeemed on one replica is refused on every other. On
+  # `kind: single_node` the ledger lives in the process and does not
+  # survive a restart.
+  state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
+
+governance:
+  access:
+    # Anonymous requests to /mcp get 401 with the resource metadata URL.
+    # That 401 is what starts an EMA client's token exchange.
+    require_authentication: true
+    resource_metadata:
+      # The Resource indicator of the Okta resource connection, exactly.
+      resource: "https://mcp.acme.example/mcp"
+      scopes_supported: ["mcp:tools"]
+      # authorization_servers is left empty: it derives the issuer below.
+    authorization_server:
+      # A bare https origin: the Okta Issuer URL of the resource app, which
+      # becomes the ID-JAG `aud`. It cannot change in Okta without
+      # resetting the connection.
+      issuer: "https://mcp.acme.example"
+      signing_keys:
+        - alg: ES256
+          kid: "as-2026-09"
+          private_key: "${env.MCPG_AS_SIGNING_KEY}"
+      # Okta counts 250 ID-JAGs per user, resource app and month on SSO
+      # plans; one ID-JAG buys one access token of this lifetime.
+      access_token_ttl_secs: 3600
+      allowed_scopes: ["mcp:tools"]
+      trusted_idps:
+        # The Okta ORG authorization server. Custom authorization servers
+        # (/oauth2/...) issue no ID-JAGs.
+        - issuer: "https://acme.okta.com"
+          allowed_hosts: ["acme.okta.com"]
+          allowed_algs: ["RS256"]
+          # Only this client may redeem ID-JAGs from Okta.
+          allowed_clients: ["claude-ema"]
+          # Okta ID-JAGs carry no groups, and `sub` (the Okta user ID) is the
+          # subject by default. To copy another claim for policy, add
+          # claim_mappings.attribute_claim_mappings.
+      clients:
+        # "AI agent's client ID registered in this app" in the Okta
+        # resource connection. No redirect_uris: ID-JAG redemption only.
+        - client_id: "claude-ema"
+          client_secret: "${env.CLAUDE_EMA_SECRET}"
+          token_endpoint_auth_method: client_secret_basic
+      # Every user of this client gets these roles for policy.
+      client_roles:
+        "claude-ema": ["ai-agent"]
+  audit:
+    enabled: true
+    sinks:
+      - kind: dev.mcpg.builtin.audit.local-file
+        config:
+          path: "/var/log/mcpg/audit.log"
+
+plugins:
+  - id: dev.mcpg.backend.http
+    class: backend
+    source:
+      # Your mirror of the plugin channel; keep it in step with the gateway.
+      oci: "registry.acme.example/mcpg/plugins/backend-http:0.1.0"
+    granted_capabilities: [network_outbound]
+
+mcp:
+  capabilities:
+    tools:
+      - name: crm.lookup
+        description: Look up a customer record.
+        governance:
+          minimum_trust: verified
+          # A caller whose token lacks it gets 403 insufficient_scope.
+          required_scopes: ["mcp:tools"]
+          allow_if: '"ai-agent" in identity.roles'
+        backend:
+          kind: http
+          url: "https://crm.internal.example/lookup"
+          method: post
+
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }

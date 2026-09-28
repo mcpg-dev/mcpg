@@ -73,10 +73,16 @@ pub struct ServerConfig {
     /// Burst allowance for `anonymous_rate_limit_per_min`.
     #[serde(default = "default_anonymous_rate_limit_burst")]
     pub anonymous_rate_limit_burst: u32,
-    /// Trust `X-Forwarded-For` for the client IP used by the anonymous rate
-    /// limit. Set ONLY when a trusted reverse proxy / edge fronts this gateway
-    /// (the managed-cloud Envoy edge does) — the header is spoofable
-    /// otherwise. When false (default) the TCP peer address is used.
+    /// Trust the headers a fronting proxy sets: the first `X-Forwarded-For`
+    /// hop is the client IP of the anonymous rate limit and of the embedded
+    /// authorization server's per-IP budgets (`/oauth/token`,
+    /// `/oauth/revoke`, `/oauth/register` and the sign-in pages), and the
+    /// first `X-Forwarded-Host` is the host that selects the protected
+    /// resource identifier in the resource metadata and in the
+    /// `WWW-Authenticate` challenge. Set ONLY when a trusted reverse proxy /
+    /// edge fronts this gateway (the managed-cloud Envoy edge does) — the
+    /// headers are spoofable otherwise. When false (default) the TCP peer
+    /// address and the `Host` header are used.
     #[serde(default)]
     pub trust_proxy_ip: bool,
     /// Trust the `x-mcpg-subject-id` request header as a header-asserted
@@ -750,13 +756,13 @@ pub struct CorsConfig {
     pub allowed_origins: Vec<String>,
     /// Request headers a page may send. Defaults to the set MCP needs —
     /// content negotiation, the session and protocol headers, the SSE resume
-    /// cursor, bearer auth, idempotency and trace context. Add to it for a
-    /// header a plugin reads.
+    /// cursor, bearer auth, the DPoP proof, idempotency and trace context.
+    /// Add to it for a header a plugin reads.
     #[serde(default = "default_cors_allowed_headers")]
     pub allowed_headers: Vec<String>,
     /// Response headers a page may READ. A browser hides every other header
-    /// from script, so the session id, the request id and the auth challenge
-    /// have to be named here to be usable.
+    /// from script, so the session id, the request id, the auth challenge
+    /// and the DPoP nonce have to be named here to be usable.
     #[serde(default = "default_cors_expose_headers")]
     pub expose_headers: Vec<String>,
     /// How long a browser may cache the preflight answer, in seconds.
@@ -781,6 +787,7 @@ fn default_cors_allowed_headers() -> Vec<String> {
         "idempotency-key",
         "traceparent",
         "tracestate",
+        "dpop",
     ]
     .iter()
     .map(|h| (*h).to_owned())
@@ -796,6 +803,7 @@ fn default_cors_expose_headers() -> Vec<String> {
         "retry-after",
         "idempotent-replayed",
         "idempotent-replayed-at",
+        "dpop-nonce",
     ]
     .iter()
     .map(|h| (*h).to_owned())

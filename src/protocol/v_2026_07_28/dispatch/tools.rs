@@ -1,14 +1,16 @@
 //! `tools` dispatch arms for MCP revision `2026-07-28`.
 
+use crate::protocol::shared::error::INVALID_PARAMS_CODE;
 use crate::protocol::shared::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcErrorBody, JsonRpcSuccess, ProtocolHttpResponse,
     ProtocolResponse,
 };
 use crate::protocol::v_2026_07_28::dispatch::mrtr::{
-    dispatch_mrtr_resumption, extract_mrtr_resumption, extract_mrtr_resumption_from_params,
+    LinkResumption, dispatch_mrtr_resumption, extract_mrtr_resumption,
+    extract_mrtr_resumption_from_params, resume_connect_link,
 };
 use crate::protocol::v_2026_07_28::dispatch::support::{
-    handler_internal_error, stamp_complete_result_type,
+    handler_client_error, handler_internal_error, stamp_complete_result_type,
 };
 use crate::protocol::v_2026_07_28::dispatch::tasks::client_declared_tasks_extension;
 use crate::protocol::v_2026_07_28::wire::tools::{
@@ -151,6 +153,27 @@ pub(crate) async fn dispatch_tools_call(
     };
     let runtime = runtime_handle.load();
 
+    // The retry of a call that offered a link to store the caller's IdP
+    // sign-in runs the call again, as the user answered the link.
+    match resume_connect_link(
+        ctx,
+        &runtime,
+        &params.name,
+        params.request_state.as_deref(),
+        params.input_responses.as_ref(),
+        params.meta.as_ref(),
+    )
+    .await
+    {
+        LinkResumption::NotALink => {}
+        LinkResumption::Resumed => {
+            return run_tools_call(ctx, &runtime, request_id, params).await;
+        }
+        LinkResumption::Refused(message) => {
+            return handler_client_error(Some(request_id), 400, INVALID_PARAMS_CODE, message);
+        }
+    }
+
     // MRTR resumption. The spec (SEP-2322) puts
     // `requestState` + `inputResponses` at the top level of params;
     // earlier MCPG drafts stashed them under `_meta`. Accept both
@@ -165,6 +188,17 @@ pub(crate) async fn dispatch_tools_call(
         return dispatch_mrtr_resumption(ctx, services, request_id, mrtr_meta).await;
     }
 
+    run_tools_call(ctx, &runtime, request_id, params).await
+}
+
+/// Run `tools/call` through the version-blind runtime and project its
+/// result onto the modern wire.
+async fn run_tools_call(
+    ctx: &RequestContext,
+    runtime: &crate::runtime::GatewayRuntime,
+    request_id: Value,
+    params: ModernToolCallParams,
+) -> ProtocolHttpResponse {
     // SEP-2663 live materialization. Tasks are
     // server-directed: the gateway elects async execution on a
     // per-request basis. The decision is:

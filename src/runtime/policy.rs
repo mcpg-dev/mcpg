@@ -789,8 +789,28 @@ fn build_policy_identity_map(ctx: &ToolPolicyContext) -> CelValue {
             map: Arc::new(attrs_map),
         }),
     );
+    map.insert(
+        CelKey::String("authorization_details".to_owned().into()),
+        authorization_details_value(&ctx.attributes),
+    );
 
     CelValue::Map(CelMap { map: Arc::new(map) })
+}
+
+/// `identity.authorization_details`: the RFC 9396 details a token of the
+/// embedded authorization server is limited to, as a list of maps; empty
+/// when the caller carries none, or none that read as a list of objects.
+fn authorization_details_value(
+    attributes: &std::collections::BTreeMap<String, String>,
+) -> CelValue {
+    use crate::runtime::authorization_server::rar::{
+        AUTHORIZATION_DETAILS_ATTRIBUTE, AuthorizationDetails,
+    };
+    attributes
+        .get(AUTHORIZATION_DETAILS_ATTRIBUTE)
+        .and_then(|value| AuthorizationDetails::from_attribute(value))
+        .and_then(|details| cel::to_value(details.entries()).ok())
+        .unwrap_or_else(|| CelValue::List(Vec::new().into()))
 }
 
 #[cfg(test)]
@@ -1399,6 +1419,71 @@ mod tests {
         let ctx_wrong =
             verified_context_with_claims(vec![], vec![], vec![], vec![("department", "sales")]);
         assert!(!policy.evaluate(&ctx_wrong).unwrap());
+    }
+
+    /// `identity.authorization_details` lists the RFC 9396 details of the
+    /// caller's token, read from its attribute, so a rule can require one
+    /// that covers the call; a caller without details gets an empty list.
+    #[test]
+    fn cel_policy_reads_the_authorization_details_of_the_caller() {
+        let policy = CelToolAccessPolicy::compile(
+            r#"identity.authorization_details.exists(d, d.type == "mcp_tool" && "tools/call" in d.actions && d.identifier == tool_name)"#
+                .to_owned(),
+            "test".to_owned(),
+        )
+        .unwrap();
+        let details = r#"[{"type":"mcp_tool","actions":["tools/call"],"identifier":"admin.delete","limits":{"max":3}}]"#;
+        let ctx = verified_context_with_claims(
+            vec![],
+            vec![],
+            vec![],
+            vec![("authorization_details", details)],
+        );
+        assert!(policy.evaluate(&ctx).unwrap());
+
+        let other_tool = details.replace("admin.delete", "admin.read");
+        let ctx = verified_context_with_claims(
+            vec![],
+            vec![],
+            vec![],
+            vec![("authorization_details", other_tool.as_str())],
+        );
+        assert!(!policy.evaluate(&ctx).unwrap());
+
+        let without = verified_context_with_claims(vec![], vec![], vec![], vec![]);
+        assert!(!policy.evaluate(&without).unwrap());
+        for unreadable in ["not json", r#"{"type":"mcp_tool"}"#, "[1, 2]"] {
+            let ctx = verified_context_with_claims(
+                vec![],
+                vec![],
+                vec![],
+                vec![("authorization_details", unreadable)],
+            );
+            assert!(!policy.evaluate(&ctx).unwrap(), "{unreadable}");
+        }
+        let empty = CelToolAccessPolicy::compile(
+            "size(identity.authorization_details) == 0".to_owned(),
+            "test".to_owned(),
+        )
+        .unwrap();
+        assert!(empty.evaluate(&without).unwrap());
+    }
+
+    #[test]
+    fn policy_cache_key_follows_the_authorization_details() {
+        let with = |details: &str| {
+            verified_context_with_claims(
+                vec![],
+                vec![],
+                vec![],
+                vec![("authorization_details", details)],
+            )
+            .cache_key()
+        };
+        assert_ne!(
+            with(r#"[{"type":"mcp_tool","actions":["tools/call"]}]"#),
+            with(r#"[{"type":"mcp_tool","actions":["tools/list"]}]"#)
+        );
     }
 
     #[test]

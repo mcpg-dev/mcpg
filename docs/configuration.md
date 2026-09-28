@@ -272,7 +272,7 @@ Every field on the root `AppConfig`, alphabetised. Click a type to jump to its p
 | `feature_flags` | [`FeatureFlagsConfig`](#featureflagsconfig) | (see type) | Operator-controlled strictness / compatibility flags. Every flag defaults off; flipping one is an explicit acknowledgement that the operator is taking on the risk the default protects against. Collapsing them into this block lets them show up in the curated reference + JSON Schema and audit-emit when active. |
 | `gateway` | [`GatewayConfig`](#gatewayconfig) | (see type) | `gateway:` umbrella — the binary's network face: listener (`server`), admin surface (`admin`), Control Plane attachment (`control_plane`). |
 | `governance` | [`GovernanceConfig`](#governanceconfig) | (see type) | `governance:` umbrella — tool-call lifecycle: identity (`access`) → authorization (`policy`) → human gate (`approvals`) → evidence (`audit`). Co-located under one umbrella so the governance story reads as a coherent block. |
-| `license` | [`LicenseConfig`](#licenseconfig) | (see type) | `license:` — offline license token (or the non-production declaration) for standalone deployments; the plugin load gate refuses entitlement-gated plugins the resolved envelope does not admit. Ignored when `gateway.control_plane` is attached. |
+| `license` | [`LicenseConfig`](#licenseconfig) | (see type) | `license:` — offline license token (or the non-production declaration). The license gate refuses entitlement-gated plugins and feature-gated config blocks (interactive sign-in) the resolved envelope does not admit. With `gateway.control_plane` attached the control plane admits the plugins, while the config blocks are still checked here unless the managed-cloud platform rendered the config. |
 | `mcp` | [`McpConfig`](#mcpconfig) | (see type) | `mcp:` namespace — the MCP protocol surface. Two children: `capabilities:` (tools / prompts / resources / resource_templates / tasks / elicitation / sampling / roots — what the server advertises in `initialize`) and `configurations:` (sessions / pipelines / subscriptions / delivery / cancellation — runtime-emergent state). Capability persistence (`store:` / `bus:`) defaults to `kind: cluster` — the cluster coordinator's primitive — and can be overridden per capability with `kind: memory` / `file`. |
 | `observability` | [`ObservabilityConfig`](#observabilityconfig) | (see type) | All observability concerns — log/metric/trace emission, the binding-backend health prober, and the sink fan-out routing for telemetry / log events. Sub-fields all default to safe single-node values so the block is fully optional. |
 | `plugins` | array&lt;[`PluginEntryConfig`](#pluginentryconfig)&gt; | `[]` | Loaded plugin entries — flat array, no wrapper. Each entry is self-contained (id / class / source / signature / config / limits / enforce / granted_capabilities / observability / http_route / disabled). Identity / policy / credential / catalog / cluster plugins all dispatch via the `class:` field. An empty array is the kill switch — no plugins are loaded. |
@@ -315,10 +315,11 @@ Where the AAuth resource signing key comes from — exactly one source.
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `authorization_server` | [`AuthorizationServerConfig`](#authorizationserverconfig) (optional) |  | Embedded Enterprise-Managed Authorization server (MCP `io.modelcontextprotocol/enterprise-managed-authorization`). When set, the gateway acts as the OAuth Resource Authorization Server for ID-JAG grants: it serves RFC 8414 metadata at `GET /.well-known/oauth-authorization-server` advertising the `urn:ietf:params:oauth:grant-profile:id-jag` grant profile, and redeems Identity Assertion JWT Authorization Grants issued by the configured trusted enterprise IdPs at `POST /oauth/token` (`urn:ietf:params:oauth:grant-type:jwt-bearer`), minting audience-restricted access tokens the gateway itself accepts. Only this grant is supported — there is no authorization endpoint, no refresh tokens, and no dynamic client registration. |
+| `authorization_server` | [`AuthorizationServerConfig`](#authorizationserverconfig) (optional) |  | Embedded Enterprise-Managed Authorization server (MCP `io.modelcontextprotocol/enterprise-managed-authorization`). When set, the gateway acts as the OAuth Resource Authorization Server for ID-JAG grants: it serves RFC 8414 metadata at `GET /.well-known/oauth-authorization-server` advertising the `urn:ietf:params:oauth:grant-profile:id-jag` grant profile, and redeems Identity Assertion JWT Authorization Grants issued by the configured trusted enterprise IdPs at `POST /oauth/token` (`urn:ietf:params:oauth:grant-type:jwt-bearer`), minting audience-restricted access tokens the gateway itself accepts. With a `trusted_idps[].login` block it also signs users in interactively: an authorization endpoint (`authorization_code` with PKCE) that sends the user to that IdP, rotating refresh tokens, and optional dynamic client registration (see `interactive`). Without one there is no authorization endpoint, no refresh token and no registration endpoint. Requires `resource_metadata`, which is how clients discover this server. |
 | `jwks` | [`JwksConfig`](#jwksconfig) (optional) |  |  |
-| `oidc_oauth` | [`OidcOAuthConfig`](#oidcoauthconfig) (optional) |  |  |
-| `resource_metadata` | [`OAuthResourceMetadataConfig`](#oauthresourcemetadataconfig) (optional) |  | OAuth 2.1 Protected Resource Metadata (RFC 9728). When set, enables `GET /.well-known/oauth-protected-resource`. If omitted but oidc_oauth providers are configured, metadata is auto-derived. |
+| `oidc_oauth` | [`OidcOAuthConfig`](#oidcoauthconfig) (optional) |  | Inbound OIDC: verifies Bearer tokens against each provider. A provider's `claim_mappings.attribute_claim_mappings` may not map to an attribute that only a credential of this gateway sets (`token_issuer`, `grant_type`, `grant_id`, `dpop_jkt`, `authorization_details`, `authorization_details_types`) or to a name starting with `subject_token`: such a configuration is refused at load, whether DPoP and authorization details are on or not. An identity plugin's attributes of those six names are dropped. |
+| `require_authentication` | boolean | `false` | Refuse every MCP request (`POST`, `GET` and `DELETE` on the MCP path, every JSON-RPC method including `initialize`, `*/list` and `server/discover`) from a caller below `verified` with HTTP 401 and the `WWW-Authenticate: Bearer resource_metadata="…"` challenge. An OAuth or EMA client that authenticates only after a 401 starts its flow from that challenge; with this off, an anonymous `initialize` succeeds and such a client never authenticates. A request whose `Origin` is not allowed is still refused with 403 first. Only the MCP path is covered: the well-known metadata, the embedded authorization server's `/oauth/*` endpoints (`token`, `jwks`, `revoke`, `register`, `authorize`, `consent`, `callback`, `connect`), the AAuth resource endpoints, health, readiness, metrics, `/runtime`, `/v0.1/servers`, the `/webhooks/*` callbacks and the plugin HTTP routes (`/plugins/{id}/{entity}` and override paths) stay open to anonymous callers, each gated as it is without this key. Needs at least one verifier: `jwks`, `oidc_oauth`, `authorization_server` or an `identity_provider` plugin. |
+| `resource_metadata` | [`OAuthResourceMetadataConfig`](#oauthresourcemetadataconfig) (optional) |  | OAuth 2.1 Protected Resource Metadata (RFC 9728), served at `GET /.well-known/oauth-protected-resource` and its path-aware form. Without it that endpoint answers 404: the gateway never guesses its public `resource` from the bind address. Required with `authorization_server`. |
 
 ### `AdminAuthConfig`
 
@@ -522,7 +523,9 @@ How MCPG authenticates to the upstream.
 | --- | --- | --- | --- |
 | `credential` | string (optional) |  | Credential-issuer reference for `oauth_client_credentials`: a standard `cred://<plugin_id>/<target>` URI, e.g. `cred://dev.mcpg.credential.oauth-client-credentials/notion`. The referenced issuer plugin mints + refreshes the upstream bearer; no client secret lives in the federation config. |
 | `credential_config` | any |  | Per-issuance config object forwarded verbatim to the credential issuer on the OAuth modes (a template issuer's `audience` / `resource` / `redeem_token_url` overrides). Registry OAuth discovery populates this on synthesized federations; hand-written federations may set it to steer a template provider without a per-target issuer entry. |
+| `import` | [`AuthConfig`](#authconfig) (optional) |  | Credential for the upstream sessions that run without a caller: the catalogue import, its `list_changed` and TTL refreshes, and the notification listener. `mode` must be `service_token` or `oauth_client_credentials`. Tool calls, resource reads and prompt fetches never use it; they keep the outer `mode`. Unset, those sessions authenticate with the outer `mode` when it needs no caller, and connect anonymously for `pass_through` and `oauth_impersonation`. The imported catalogue is what this credential can list, so per-user tool visibility upstream is not reflected in it. |
 | `mode` | [`AuthMode`](#authmode) | `"none"` |  |
+| `subject_token` | [`SubjectToken`](#subjecttoken) |  | `oauth_impersonation` only: the subject token the credential issuer exchanges. `caller_bearer` (the default) is the caller's own bearer token; a token this gateway minted is never sent upstream, so a caller who signed in here, or redeemed an ID-JAG here, is refused with it. `idp_refresh_token` and `idp_id_token` are the caller's enterprise IdP sign-in the gateway keeps (the refresh token, or an ID token kept fresh with it), for an Okta Cross App Access upstream through `dev.mcpg.credential.oauth-id-jag`; they need a `governance.access.authorization_server.trusted_idps[].login` block, `credential` must name `dev.mcpg.credential.oauth-id-jag` or `dev.mcpg.credential.oauth-token-exchange` (the issuers that send the stored token only to the IdP that issued it), and that issuer's IdP token URL and client must be the login's. A caller with no stored sign-in gets an error naming `/oauth/connect`, where they sign in once. Refused inside `import`, whose sessions have no caller. |
 | `token` | string (optional) |  | Static bearer token for `service_token` (supports `${env.X}`). |
 
 ### `AuthMode`
@@ -541,14 +544,57 @@ Identity-propagation mode: what the gateway presents to the upstream.
 
 - **`oauth_impersonation`** — Per-caller token-exchange (RFC 8693).
 
+### `AuthorizationDetailLocations`
+
+What the `locations` of an authorization details object may name.
+
+**Variants:**
+
+- **`resource`** — A resource identifier of this server.
+
+- **`any`** — Any string.
+
+### `AuthorizationDetailsConfig`
+
+Rich Authorization Requests (RFC 9396) at the embedded authorization server (`governance.access.authorization_server.authorization_details`). Off while `types` is empty: an ID-JAG that carries `authorization_details` is then refused (`invalid_grant`), and the `authorization_details` request parameter is ignored. Turn it on only after every replica runs a build that knows this block: a replica without it drops the details of a sign-in's grant when it rotates the grant's refresh token, and the grant's next tokens carry none.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `max_entries` | integer | `16` | Most objects one `authorization_details` array may hold (1–64). The array is also limited to 8 KiB of JSON. |
+| `types` | array&lt;[`AuthorizationDetailsTypeConfig`](#authorizationdetailstypeconfig)&gt; | `[]` | The authorization details types this server accepts. Non-empty turns RFC 9396 on: the `authorization_details` parameter of the authorization endpoint (shown on the consent page, which is then always shown unless the client's `consent` is `skip`, and never remembered) and of the token endpoint (which may only narrow what was granted); the `authorization_details` claim of an ID-JAG (every object must be valid, or the assertion is refused with `invalid_grant`); the granted details in the token response and in the access token's `authorization_details` claim; the identity attributes `authorization_details` (compact JSON, which audit records carry only as `keyed-blake3:` and its digest under a key derived from the first signing key, so the value cannot be guessed back from it) and `authorization_details_types` (the distinct types, space-separated), and the policy binding `identity.authorization_details`, a list of maps (for example `identity.authorization_details.exists(d, d.type == "mcp_tool" && "tools/call" in d.actions)`); and `authorization_details_types_supported` in the authorization server metadata and the protected resource metadata. A parameter that fails a rule is refused with `invalid_authorization_details`. An authorization request with details and no `scope` is granted no scope. |
+
+### `AuthorizationDetailsTypeConfig`
+
+One authorization details type the server accepts.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `actions` | array&lt;string&gt; (optional) |  | The values `actions` may hold. Unset: any. |
+| `datatypes` | array&lt;string&gt; (optional) |  | The values `datatypes` may hold. Unset: any. |
+| `description` | string (optional) |  | What the consent page shows for an object of this type (1–120 characters). Defaults to the type. |
+| `locations` | [`AuthorizationDetailLocations`](#authorizationdetaillocations) | `"resource"` | What `locations` may name: `resource` (the default), one of this server's resource identifiers (`resource_metadata.resource` and its `additional_resources`, a trailing `/` ignored); or `any` value. |
+| `privileges` | array&lt;string&gt; (optional) |  | The values `privileges` may hold. Unset: any. |
+| `schema` | any |  | A JSON Schema every object of this type must satisfy, inline. Local `$ref`s only; its depth and size are bounded. Without it, an object may carry only `type`, `locations`, `actions`, `datatypes`, `identifier` and `privileges` (RFC 9396 §2.2); with it, any member the schema admits. `locations`, `actions`, `datatypes` and `privileges` are arrays of at most 64 non-empty strings and `identifier` is a string either way. |
+| `type` | string |  | The RFC 9396 `type`, compared exactly: 1–256 characters, no whitespace or control characters, each type listed once. |
+
 ### `AuthorizationServerClientConfig`
 
 One OAuth client registered with the embedded authorization server.
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `client_id` | string |  | The client identifier the enterprise IdP binds into ID-JAGs (`client_id` claim). For MCP clients identifying via a Client ID Metadata Document, this is the document URL. |
-| `client_secret` | string (optional) |  | Client secret for `client_secret_basic` / `client_secret_post` authentication. Supply via `${env.X}`. Omit to register a public client (`token_endpoint_auth_method: none`). |
+| `accept_token_endpoint_audience` | boolean | `false` | `private_key_jwt`: also accept an assertion whose `aud` is the token endpoint URL (`{issuer}/oauth/token`), as clients written for Okta send it. Otherwise `aud` must be the issuer exactly, its only value. |
+| `allow_private_network` | boolean | `false` | Local-development escape hatch for `jwks_uri`: permit `http://` and private/loopback addresses. Production deployments leave this `false`. |
+| `client_id` | string |  | The client identifier the enterprise IdP binds into ID-JAGs (`client_id` claim). For an MCP client that identifies with a Client ID Metadata Document, the document URL: this entry then stands in for the document, which is never fetched. |
+| `client_name` | string (optional) |  | The client's name on the consent page (1–80 characters). Defaults to the `client_id`. |
+| `client_secret` | string (optional) |  | Shared secret for `client_secret_basic` / `client_secret_post`. Supply via `${env.X}` or `${secret.NAME}`. |
+| `consent` | [`ClientConsent`](#clientconsent) | `"auto"` | When the consent page is shown before sign-in: `auto` (the default) skips it when every redirect URI is `https://` and asks otherwise; `always` asks every time; `skip` never asks and is refused with a loopback redirect URI. A request with `prompt=consent` always asks. |
+| `dpop_bound_access_tokens` | boolean | `false` | RFC 9449 §5.2: every token request of this client must carry a DPoP proof, and every token it receives is bound to the proof's key. A request without one is refused. Requires `dpop.enabled`. |
+| `grant_types` | array&lt;[`ClientGrantType`](#clientgranttype)&gt; (optional) |  | The grants this client may use: `urn:ietf:params:oauth:grant-type:jwt-bearer` (ID-JAG redemption), `authorization_code` (interactive sign-in, which needs `redirect_uris` and a `trusted_idps[].login` block) and `refresh_token` (which needs `authorization_code`). Defaults to jwt-bearer alone without `redirect_uris`, and to `[authorization_code, refresh_token]` with them. |
+| `jwks` | any |  | `private_key_jwt`: the client's public keys inline, as an object with a `keys` array or the same document as a JSON string (for example `${env.CLIENT_JWKS}`). |
+| `jwks_uri` | string (optional) |  | `private_key_jwt`: URL of the client's JSON Web Key Set. Fetched keys are reused for 5 minutes and refetched on an unknown `kid` at most every 30 seconds; `https://` only, no redirects, at most 1 MiB. Mutually exclusive with `jwks`. |
+| `redirect_uris` | array&lt;string&gt; | `[]` | Interactive sign-in: where authorization responses may be sent (at most 10, each once). `https://` URIs match byte for byte (case, port, trailing `/` and percent-encoding included). `http://` only on `127.0.0.1`, `[::1]` or `localhost`, written so, where any port matches (RFC 8252 §7.3): a native client picks its port at run time, so register it without one. A loopback URI's path and query are compared as written, so they may not hold dot segments or characters a browser rewrites. ASCII only, with no fragment, userinfo, wildcard, backslash or private-use scheme. A client with one URI that is not loopback may omit `redirect_uri` in its request. |
+| `token_endpoint_auth_method` | [`ClientAuthMethod`](#clientauthmethod) (optional) |  | How the client authenticates at the token endpoint: `client_secret_basic` (HTTP Basic), `client_secret_post` (`client_id` and `client_secret` form fields), `private_key_jwt` (a signed `client_assertion`, RFC 7523) or `none` (a public client). Defaults to both secret methods when `client_secret` is set, to `private_key_jwt` when `jwks` or `jwks_uri` is set, else to `none`. A request that authenticates any other way is refused (`invalid_client`). A `private_key_jwt` assertion carries `iss` and `sub` equal to the `client_id`, `aud` equal to the issuer, an `exp` at most 5 minutes ahead and a `jti` that is accepted once; it is signed with `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384` or `EdDSA`. |
 
 ### `AuthorizationServerConfig`
 
@@ -556,15 +602,24 @@ Embedded EMA authorization server (`governance.access.authorization_server`).
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `access_token_ttl_secs` | integer | `3600` | Lifetime of minted access tokens, in seconds. |
-| `allowed_scopes` | array&lt;string&gt; (optional) |  | When set, the scopes granted on minted tokens are the intersection of the ID-JAG's `scope` claim with this list (the resource server may narrow, never widen, IdP-granted scopes). When omitted, IdP-granted scopes pass through unchanged. |
-| `clients` | array&lt;[`AuthorizationServerClientConfig`](#authorizationserverclientconfig)&gt; | `[]` | OAuth clients allowed to redeem ID-JAGs at the token endpoint. Clients with a `client_secret` authenticate via `client_secret_basic` or `client_secret_post`; clients without one are public (`none`) — register an MCP client's Client ID Metadata Document URL as its `client_id` for that case. The ID-JAG's `client_id` claim must match the presenting client either way. |
-| `clock_skew_secs` | integer | `60` | Clock-skew leeway applied to ID-JAG `exp`/`iat`/`nbf` validation, in seconds. |
-| `enforce_single_use` | boolean | `true` | Enforce single-use ID-JAG redemption per instance: a `jti` seen once is refused until the assertion expires. Defense-in-depth on top of the assertion's short lifetime. |
-| `issuer` | string |  | This authorization server's issuer identifier (RFC 8414). MUST be the canonical external `http(s)` origin the gateway is reached at — enterprise IdPs bind ID-JAGs to it as the `aud` claim, compared exactly. Also the `iss` of every access token this server mints. |
-| `resource` | string (optional) |  | Resource identifier minted access tokens are audience-restricted to (RFC 8707). Defaults to `governance.access.resource_metadata.resource` when that block is configured, else to `issuer`. An ID-JAG carrying a `resource` claim must match this value or redemption fails with `invalid_target`. |
-| `signing_secret` | string |  | HS256 signing secret for minted access tokens (≥ 32 bytes). Supply via `${env.X}`. Every gateway instance in a cluster must share this value so any instance can verify tokens minted by any other. |
-| `trusted_idps` | array&lt;[`TrustedIdpConfig`](#trustedidpconfig)&gt; | `[]` | Enterprise IdPs trusted to issue ID-JAGs. An assertion whose `iss` is not listed here is refused (`invalid_grant`). |
+| `access_token_ttl_secs` | integer | `3600` | Lifetime of minted access tokens, in seconds (1–86400). The IdP cannot revoke a minted token, and without interactive sign-in (which adds `POST /oauth/revoke`) neither can its client, so it stays valid for up to this long after the IdP revokes the user; values above 3600 draw a warning. A longer lifetime means fewer ID-JAG exchanges, which matters where the IdP meters them (Okta: 250 ID-JAGs per user, per resource app, per month). |
+| `allowed_scopes` | array&lt;string&gt; (optional) |  | When set, the scopes granted on minted tokens are the intersection of the ID-JAG's `scope` claim with this list (the resource server may narrow, never widen, IdP-granted scopes). When omitted, IdP-granted scopes pass through unchanged. A `scope` parameter on the token request narrows the grant further to the requested scopes. Requested scopes this server does not know — listed neither here, in `resource_metadata.scopes_supported`, nor in the ID-JAG — are ignored, and a request that names no known scope counts as one without `scope`. A request whose known scopes the grant holds none of is refused with `invalid_scope`. |
+| `authorization_details` | [`AuthorizationDetailsConfig`](#authorizationdetailsconfig) | (see type) | Rich Authorization Requests (RFC 9396): grants and access tokens limited to fine-grained `authorization_details` of the types listed here. Off while `types` is empty. |
+| `client_id_metadata_documents` | [`ClientIdMetadataDocumentsConfig`](#clientidmetadatadocumentsconfig) | (see type) | OAuth Client ID Metadata Documents (`draft-ietf-oauth-client-id-metadata-document`): an MCP client identifies itself with the `https://` URL of a JSON document that describes it, instead of a registration. |
+| `client_roles` | map&lt;string, array&lt;string&gt;&gt; | `{}` | Roles added to `identity.roles` of every caller whose access token was minted for a client, keyed by `client_id`: a `clients[].client_id`, or a metadata document URL that `client_id_metadata_documents.allowed_hosts` admits. They apply to every user of the client, so they describe the client (for example `ai-agent`) rather than grant any one user something. Read on each request, so a change also applies to tokens already issued. |
+| `clients` | array&lt;[`AuthorizationServerClientConfig`](#authorizationserverclientconfig)&gt; | `[]` | OAuth clients registered here: clients that redeem ID-JAGs at the token endpoint and clients that sign users in (`redirect_uris`, `grant_types`), each authenticating with its `token_endpoint_auth_method`. An ID-JAG's `client_id` claim must name the authenticated client. A request that uses more than one client authentication method is refused (`invalid_request`). A failed client authentication answers `invalid_client` with 401 and a `Basic` challenge after HTTP Basic, else with 400 (RFC 6749 §5.2). May be empty when `client_id_metadata_documents.allowed_hosts` admits clients by their metadata document instead. |
+| `clock_skew_secs` | integer | `60` | Clock-skew leeway applied to ID-JAG `exp`/`iat`/`nbf` validation and to the expiry of minted tokens, in seconds (at most 300). |
+| `dpop` | [`DpopConfig`](#dpopconfig) | (see type) | DPoP (RFC 9449): access tokens bound to a key the client proves it holds. Off by default. |
+| `enforce_single_use` | boolean | `true` | Enforce single-use ID-JAG redemption: an assertion (`iss` and `jti`) redeemed once is refused until it expires. Redemptions are recorded in the cluster coordinator's key-value store, so a replay is refused on every instance of a clustered deployment and across configuration reloads. When that store cannot be reached, redemption answers `temporarily_unavailable` rather than admit an unrecorded assertion. |
+| `interactive` | [`InteractiveLoginConfig`](#interactiveloginconfig) (optional) |  | Settings of interactive sign-in, which a `trusted_idps[].login` block turns on; every key has a default. Refused without such a block. Requires a license with the `sso.interactive_login` feature. |
+| `issuer` | string |  | This authorization server's issuer identifier (RFC 8414): the external origin the gateway is reached at, `scheme://host[:port]`, with no path. The metadata and token endpoints are served at the root of that origin. Enterprise IdPs bind every ID-JAG to it as the `aud` claim, compared exactly, so it must be exactly the value entered as the authorization server's issuer in the IdP (Okta: the resource app's Issuer URL, which cannot change without resetting the connection), a trailing `/` included: an issuer that ends in `/` is published and compared with it. Also the `iss` of every access token this server mints. One issuer serves every resource identifier in `resource_metadata`, including `additional_resources`: keep it on the canonical origin. Use `https://`; `http://` draws a warning outside loopback, since clients send assertions and client secrets to the token endpoint. |
+| `max_assertion_lifetime_secs` | integer | `600` | Longest ID-JAG lifetime (`exp` − `iat`) accepted, in seconds (1–3600). Together with `clock_skew_secs` it also bounds how old an accepted assertion's `iat` can be. Okta issues ID-JAGs for 300 seconds. |
+| `rate_limit_per_min` | integer | `120` | Refused token requests allowed per minute from one client IP address at `POST /oauth/token`, which `POST /oauth/revoke` and `POST /oauth/register` share. Every request takes from the budget and a successful redemption gives it back, so only refused requests (a bad assertion or client credential, an unknown client) spend it; the budget refills continuously and a full minute's worth may arrive at once. While it is spent, requests from that address are answered `429` with `Retry-After` and the OAuth error `temporarily_unavailable`. The client IP is the first `X-Forwarded-For` hop when `gateway.server.trust_proxy_ip` is set, else the connection's peer, so behind a proxy without `trust_proxy_ip` every client shares one budget. Clients behind one egress address — a NAT, or a hosted MCP client calling from its own servers — also share it. `0` disables the limit. |
+| `require_scope` | boolean | `false` | Refuse a redemption whose granted scope set is empty with `invalid_scope`, instead of minting a token without scopes. |
+| `resource` | string (optional) |  | Resource identifier (RFC 8707) minted access tokens are audience-restricted to when neither the token request nor the ID-JAG names a `resource`. Defaults to `governance.access.resource_metadata.resource`; keep it one of the resource identifiers `resource_metadata` advertises. A `resource` named by the token request or the ID-JAG must be this value, `resource_metadata.resource` or one of its `additional_resources` (a trailing `/` is ignored); a request's `resource` must also be among the ID-JAG's when it carries any. The token is minted for the one named, and the token response returns it as `resource`. Any other value fails with `invalid_target`. |
+| `signing_keys` | array&lt;[`SigningKeyConfig`](#signingkeyconfig)&gt; | `[]` | Keys that sign and verify minted access tokens. The first entry signs every new token; every entry verifies the tokens that carry its `kid`, so a key rotation lists the new key first and keeps the old one until the tokens it signed have expired (`access_token_ttl_secs`). A token whose `kid` is not listed is refused. The public keys of the asymmetric entries (`ES256`, `EdDSA`, `RS256`) are published at `GET /oauth/jwks`, advertised as `jwks_uri` in the authorization server metadata, so other resource servers can verify the tokens; an HS256 secret is never published. Every gateway instance in a cluster must carry the same keys. |
+| `signing_secret` | string (optional) |  | HS256 signing secret for minted access tokens (≥ 32 bytes), a shorthand for one `signing_keys` entry `{alg: HS256, secret: …}`. Supply via `${env.X}` or `${secret.NAME}`. Set this or `signing_keys`, not both. To rotate to other keys without invalidating the tokens this secret minted, move it into `signing_keys` as an HS256 entry without a `kid`, after the new signing key. |
+| `trusted_idps` | array&lt;[`TrustedIdpConfig`](#trustedidpconfig)&gt; | `[]` | Enterprise IdPs trusted to issue ID-JAGs, and, for the one entry with a `login` block, to sign users in; at least one is required. An assertion whose `iss` is not listed here is refused (`invalid_grant`). The access tokens minted for an IdP's users are refused as soon as the IdP is removed, or its `allowed_clients` or `required_tenant` no longer admit them, and those minted for a client as soon as it can no longer authenticate here. |
 
 ### `BackendAnnotationsConfig`
 
@@ -714,6 +769,17 @@ Direct `tools/call` always runs the full pre-dispatch stack; the child path an L
 | `scope_claim_paths` | array&lt;string&gt; | (see type) |  |
 | `subject_claim` | string | `"sub"` |  |
 
+### `ClientAuthMethod`
+
+A token endpoint client authentication method (RFC 7591 §2).
+
+**Allowed values:**
+
+- `client_secret_basic`
+- `client_secret_post`
+- `private_key_jwt`
+- `none`
+
 ### `ClientCertMode`
 
 Operator-facing client-cert acceptance mode.
@@ -724,13 +790,48 @@ Operator-facing client-cert acceptance mode.
 - `optional`
 - `mandatory`
 
+### `ClientConsent`
+
+When a registered client's user sees the consent page.
+
+**Variants:**
+
+- **`auto`** — Skip it when every redirect URI is `https://`, else ask.
+
+- **`always`** — Always ask.
+
+- **`skip`** — Never ask; refused for a client with a loopback redirect URI, which any local program can receive.
+
+### `ClientGrantType`
+
+A grant type a registered client may use.
+
+**Variants:**
+
+- **`urn:ietf:params:oauth:grant-type:jwt-bearer`** — Redeem an ID-JAG (`urn:ietf:params:oauth:grant-type:jwt-bearer`).
+
+- **`authorization_code`** — Interactive sign-in with PKCE.
+
+- **`refresh_token`** — Refresh an interactive grant.
+
+### `ClientIdMetadataDocumentsConfig`
+
+Client ID Metadata Documents at the embedded authorization server (`governance.access.authorization_server.client_id_metadata_documents`).
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `allow_private_network` | boolean | `false` | Local-development escape hatch: permit `http://` document and key URLs and private/loopback addresses. Production deployments leave this `false`. |
+| `allowed_hosts` | array&lt;string&gt; | `[]` | Hosts whose `https://` `client_id` URLs are accepted without a `clients[]` entry (an exact host, or a parent domain of it). The gateway fetches such a document with no redirects and at most 5 KiB, requires its `client_id` to equal the URL exactly, and reads `token_endpoint_auth_method` from it: `none`, or `private_key_jwt` with the document's `jwks` or `jwks_uri`, whose host must also be listed here. Without the member, a document that publishes keys is `private_key_jwt` and one that publishes none is `none`. A shared-secret method is refused. While `dpop.enabled`, a document's `dpop_bound_access_tokens` (RFC 9449 §5.2) is read: any value but `false` requires a DPoP proof on every token request of the client. The `client_id` URL must be in canonical form (lower-case host, no default port, no dot segments). A document is reused for its `Cache-Control: max-age`, kept between 60 seconds and 24 hours (5 minutes without one). A `clients[]` entry with the same `client_id` takes precedence, and its document is never fetched. Empty = registered clients only. |
+| `enabled` | boolean (optional) |  | Advertise `client_id_metadata_document_supported: true` in the authorization server metadata, and resolve unregistered URL `client_id`s on `allowed_hosts`. An MCP client such as Claude identifies with its metadata document URL only when the metadata advertises this and `none` among the token endpoint authentication methods. Defaults to `true` when a `clients[].client_id` is an `https://` URL or `allowed_hosts` is set, else `false`. |
+| `redirect_uri_policy` | [`RedirectUriPolicy`](#redirecturipolicy) | `"same_host"` | Interactive sign-in: which `https://` redirect URIs a document may list. `same_host` (the default): only on exactly the host of its `client_id` URL. `allowed_hosts`: on any host `allowed_hosts` admits. Loopback redirect URIs (`http://127.0.0.1`, `http://[::1]`, `http://localhost`, any port) are always allowed; the consent page is then shown on every sign-in. A listed URI that breaks the rule is never matched. A document signs users in only when it carries `client_name` and `redirect_uris`, `response_types` is absent or `["code"]`, and `grant_types` (`[authorization_code]` when absent) holds `authorization_code`; the client gets refresh tokens only when `grant_types` also holds `refresh_token`. Sign-in reads a document only while it is fresh, and fetches it again (at most every 30 seconds) when a requested redirect URI is missing from it. |
+
 ### `CloudConfig`
 
 `cloud:` — present only on managed-fleet (mcpg.cloud) instances. Absent for self-host; every field defaults so a bare `cloud: {}` is inert.
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `allow_anonymous` | boolean | `false` | Publish-time acknowledgement that this managed instance intentionally serves `/mcp` WITHOUT a configured token verifier (an anonymous / public MCP server). The CP publish guard requires EITHER a verifier (`governance.access.jwks` / `governance.access.oidc_oauth`) OR this opt-out, so a tenant can't expose an unauthenticated gateway on the public edge by omission. The gateway runtime does not read this field — it is a declaration the publish guard checks. |
+| `allow_anonymous` | boolean | `false` | Publish-time acknowledgement that this managed instance intentionally serves `/mcp` WITHOUT a configured token verifier (an anonymous / public MCP server). The CP publish guard requires EITHER a verifier (`governance.access.jwks` / `governance.access.oidc_oauth` / `governance.access.authorization_server`) OR this opt-out, so a tenant can't expose an unauthenticated gateway on the public edge by omission. The gateway runtime does not read this field — it is a declaration the publish guard checks. |
 | `custom_domains` | array&lt;string&gt; |  | Additional customer-owned hostnames that resolve to this instance (CNAME → the instance edge). Developer-owned; each must be a valid DNS hostname. Empty for the default-domain-only case. |
 | `environment` | string (optional) |  | Environment slug (dev / staging / prod …). |
 | `instance_id` | [`InstanceId`](#instanceid) (optional) |  | Server-assigned stable id. None for self-host. Read-only — set by the CP. |
@@ -852,6 +953,16 @@ Conflict policy on a body-hash mismatch with a stored record. Today only `Reject
 
 - **`reject`** — Same key + different body hash → JSON-RPC error `-32010 IdempotencyConflict` (HTTP 422).
 
+### `ConsentConfig`
+
+The consent page (`interactive.consent`). It is shown to every dynamically registered client, to every metadata-document client and to a registered client whose redirect URIs are not all https (see `clients[].consent`), before the user is sent to the IdP.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `remember_days` | integer | `30` | How long an approval is remembered in the approving browser, in days (0–365; `0` never remembers). The browser keeps it in a cookie sealed with the state key (`__Host-mcpg_consent`), so it cannot be read or forged, and a replaced state key forgets it. Only approvals for an `https://` redirect URI of a registered (`clients[]`) or metadata-document client are remembered, for that exact client, redirect URI and set of scopes; a loopback redirect URI or a dynamically registered client asks every time. `prompt=consent` always asks. |
+| `scope_descriptions` | map&lt;string, string&gt; | `{}` | A description shown next to each scope, keyed by scope. Every key must be a scope this server grants (`allowed_scopes`, else `resource_metadata.scopes_supported`); each description is at most 200 characters. |
+| `service_name` | string (optional) |  | The heading of the consent and connect pages (1–80 characters). Defaults to the issuer's host. |
+
 ### `ControlPlaneAttachConfig`
 
 Control Plane attachment config. See `apps/gateway/src/runtime/cp/attach.rs` for the wiring logic.
@@ -873,9 +984,9 @@ Control Plane attachment config. See `apps/gateway/src/runtime/cp/attach.rs` for
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `allow_credentials` | boolean | `false` | Allow cookies and TLS client certificates on cross-origin calls. MCP authenticates with a bearer token, which needs no credential mode, so this stays false unless a deployment front-ends the gateway with a cookie session. |
-| `allowed_headers` | array&lt;string&gt; | (see type) | Request headers a page may send. Defaults to the set MCP needs — content negotiation, the session and protocol headers, the SSE resume cursor, bearer auth, idempotency and trace context. Add to it for a header a plugin reads. |
+| `allowed_headers` | array&lt;string&gt; | (see type) | Request headers a page may send. Defaults to the set MCP needs — content negotiation, the session and protocol headers, the SSE resume cursor, bearer auth, the DPoP proof, idempotency and trace context. Add to it for a header a plugin reads. |
 | `allowed_origins` | array&lt;string&gt; |  | Exact origins (`scheme://host[:port]`) a page may call from. No wildcard: `*` with credentials is refused by every browser, and without credentials it would publish a gateway to every page on the web. Compared case-insensitively, like the rebinding guard. |
-| `expose_headers` | array&lt;string&gt; | (see type) | Response headers a page may READ. A browser hides every other header from script, so the session id, the request id and the auth challenge have to be named here to be usable. |
+| `expose_headers` | array&lt;string&gt; | (see type) | Response headers a page may READ. A browser hides every other header from script, so the session id, the request id, the auth challenge and the DPoP nonce have to be named here to be usable. |
 | `max_age_secs` | integer | `600` | How long a browser may cache the preflight answer, in seconds. |
 
 ### `CredentialsClusterConfig`
@@ -896,7 +1007,7 @@ Defaults are safe for single-node deploys; multi-instance deploys with per-calle
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `cluster` | [`CredentialsClusterConfig`](#credentialsclusterconfig) | (see type) | Optional cluster pub/sub wrapper. When `enabled: true` AND a `cluster_backend` is bound, the gateway wraps the L1 cache with `ClusteredCredentialCache` so every peer instance sees Issued / Revoked events. Drops to local-only behaviour with a warning when `enabled: true` but no coordinator is bound. |
-| `key_attributes` | array&lt;string&gt; |  | Identity attribute (token-claim) names folded into the credential-cache key so callers differing only by these claims (commonly the tenant claim) get separate cached credentials. The caller's `subject_token` (stamped by `oauth_impersonation`) is ALWAYS folded when present — impersonated credentials never share across bearers, with or without this setting. Empty (default) excludes other attributes from the key — set this to your tenant claim name(s) when a `credential_issuer` derives its principal from an attribute claim, otherwise those callers share one credential. In a clustered cache every peer MUST set the same `key_attributes` (the published event hash is computed with it) — divergence silently produces per-node cache misses, the same all-peers-agree constraint that already governs the hash algorithm. |
+| `key_attributes` | array&lt;string&gt; |  | Identity attribute (token-claim) names folded into the credential-cache key so callers differing only by these claims (commonly the tenant claim) get separate cached credentials. The caller's `subject_token` (stamped by `oauth_impersonation`) is ALWAYS folded when present — impersonated credentials never share across bearers, with or without this setting. A subject token from the caller's stored IdP sign-in (`subject_token: idp_refresh_token` or `idp_id_token`) is folded as the sign-in it belongs to instead, so a token the IdP rotates keeps the cached credential. Empty (default) excludes other attributes from the key — set this to your tenant claim name(s) when a `credential_issuer` derives its principal from an attribute claim, otherwise those callers share one credential. In a clustered cache every peer MUST set the same `key_attributes` (the published event hash is computed with it) — divergence silently produces per-node cache misses, the same all-peers-agree constraint that already governs the hash algorithm. |
 | `max_cache_ttl_ms` | integer | `3600000` | Operator-side cap on per-entry TTL. Even if a plugin returns a 24-hour TTL, the cache evicts at this cap to limit blast radius from leaked / compromised credentials. Default 3600 (1 hour). |
 | `max_entries` | integer | `10000` | Maximum number of `(identity, plugin, target)` entries kept in the L1 cache. LRU eviction past this. Default 10000 — at ~500 bytes per entry that's ~5MB worst case. |
 
@@ -970,6 +1081,45 @@ Top-level `debug:` block — diagnostic tools surface only. The master switch li
 - `summary`
 - `redacted`
 - `full`
+
+### `DpopConfig`
+
+DPoP (RFC 9449) at the embedded authorization server (`governance.access.authorization_server.dpop`). Off by default: the token endpoint then ignores `DPoP` headers and the `dpop_jkt` parameter, and an ID-JAG bound to a key (`cnf`) is refused. Turn it on only after every replica runs a build that knows this block: a replica without it drops the key binding of a sign-in's grant when it rotates the grant's refresh token.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `allowed_algs` | array&lt;string&gt; | (see type) | JWS algorithms a proof may be signed with, published as `dpop_signing_alg_values_supported`: `ES256`, `ES384`, `EdDSA`, `PS256`, `PS384`, `PS512`, `RS256`, `RS384` and `RS512`, each at most once. HMAC algorithms are refused: a proof is verified with the public key it carries. An RSA proof key must have at least 2048 bits. |
+| `enabled` | boolean | `false` | Bind tokens to the client's key. The token endpoint reads one `DPoP` proof header per request: a token issued with a valid proof carries `cnf.jkt` and `token_type: DPoP`, and one issued without a proof stays a Bearer token. An ID-JAG with `cnf.jkt` is redeemed only with a proof of that key (`invalid_grant` otherwise). The authorization endpoint reads `dpop_jkt` (RFC 9449 §10), and the code is then redeemed only with a proof of that key. A public client's refresh token is bound to its proof key; a confidential client's is not. The resource (`/mcp` and every endpoint that takes this server's tokens) accepts a bound token with `Authorization: DPoP` and a `DPoP` proof of its key for that request (method, URL, `ath`, single use); a Bearer token keeps working with the `Bearer` scheme. The caller then carries the key's thumbprint as the `dpop_jkt` identity attribute, which a policy can require. The authorization server metadata and the protected resource metadata publish `dpop_signing_alg_values_supported`. A token bound to a key is never accepted with the `Bearer` scheme, even after DPoP is turned off. |
+| `nonce` | [`DpopNonceMode`](#dpopnoncemode) | `"off"` | Server-provided nonces (RFC 9449 §8 and §9): `off`; `token_endpoint`, where a proof at `POST /oauth/token` must carry a current nonce or the request answers 400 `use_dpop_nonce` with a fresh `DPoP-Nonce` header, and every token response carries the current one; or `always`, which also covers the resource: a proof there without a current nonce is answered 401 `WWW-Authenticate: DPoP error="use_dpop_nonce"` with a fresh `DPoP-Nonce`. Nonces need no store: they are derived from the access-token signing keys, so every replica accepts every other replica's, and they follow a rotation of `signing_keys`. |
+| `nonce_lifetime_secs` | integer | `300` | How long one nonce window lasts, in seconds (30–3600). A nonce is accepted in the window it was issued in and in the next one, both widened by `clock_skew_secs`, so replicas whose clocks differ by up to that accept each other's nonces. |
+| `proof_max_age_secs` | integer | `60` | How old a proof may be, in seconds (1–300): it is accepted while its `iat` lies between `proof_max_age_secs` plus `clock_skew_secs` in the past and `clock_skew_secs` in the future. Each proof is accepted once: its `jti` is recorded in the replay ledger every replica shares for `proof_max_age_secs` plus twice `clock_skew_secs`. |
+| `required` | boolean | `false` | Issue and accept only DPoP-bound tokens of this authorization server: a token request without a proof is refused, with `invalid_grant` for an ID-JAG (ID-JAG §9.8.1.2) and `invalid_dpop_proof` for an authorization code or a refresh token; the resource refuses a token of this server bound to no key, one issued before this was set included; and a 401 to a caller without a credential carries a second `WWW-Authenticate: DPoP` challenge. Credentials that another verifier accepts (an `oidc_oauth` provider, `jwks` or an identity plugin) are not affected, so the protected resource metadata publishes `dpop_bound_access_tokens_required: true` only while this server is the one verifier of access tokens and the only authorization server listed, and `false` otherwise. Requires `enabled`. |
+
+### `DpopNonceMode`
+
+Where a DPoP proof must carry a server-provided nonce.
+
+**Variants:**
+
+- **`off`** — No nonce is required.
+
+- **`token_endpoint`** — At the token endpoint.
+
+- **`always`** — At the token endpoint and at the resource.
+
+### `DynamicClientRegistrationConfig`
+
+Dynamic client registration (`interactive.dynamic_client_registration`, RFC 7591) at `POST /oauth/register`, for MCP clients that have neither a `clients[]` entry nor a Client ID Metadata Document. A registered client is public (`token_endpoint_auth_method: none`, PKCE), may use only `authorization_code` and, when it registers it, `refresh_token`, never redeems ID-JAGs, always sees the consent page (an approval is never remembered), and never satisfies a non-empty `trusted_idps[].allowed_clients`. What a client registers is its own claim (RFC 7591 §5): the gateway keeps its redirect URIs, grant types, `client_name` (shown on the consent page as unverified), `application_type` and, while `dpop.enabled`, `dpop_bound_access_tokens` (RFC 9449 §5.2), and ignores every other member, logos and URLs included. A registration is kept sealed like every sign-in record and removed after `client_ttl_secs` without use; the client is then unknown, and a grant of it is revoked when the client next presents one of that grant's tokens at the token or revocation endpoint.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `allow_open` | boolean | `false` | Accept registrations without an initial access token, from anyone who can reach the gateway. |
+| `allowed_redirect_hosts` | array&lt;string&gt; | `[]` | Hosts an `https://` redirect URI of a registration may use: an exact host, or a parent domain of it. Empty = loopback redirect URIs only (`http://127.0.0.1`, `http://[::1]`, `http://localhost`, any port). An `https://` URI on another host is left out of the registration, whose answer lists the URIs kept (RFC 7591 §3.2.1); a registration with none left, or one that lists a malformed URI, a private-use scheme or `http://` off loopback, is refused (`invalid_redirect_uri`). A URI whose host is later removed from this list stops matching. |
+| `client_ttl_secs` | integer | `2592000` | A registration unused for this long is removed, in seconds (86400–7776000). Only a successful use restarts it: a code issued to the client, a code or refresh token it redeemed, or a token of its own it revoked. |
+| `enabled` | boolean | `false` | Serve `POST /oauth/register` and advertise it as the `registration_endpoint`. Needs `initial_access_tokens` or `allow_open`. |
+| `initial_access_tokens` | array&lt;string&gt; | `[]` | Bearer tokens that authorize a registration (RFC 7591 §3, `Authorization: Bearer <token>`), each at least 32 bytes. Supply via `${secret.NAME}`; the server keeps only their SHA-256 digests. A request that presents a token not listed is refused, with `allow_open` too. |
+| `max_clients` | integer | `1000` | Most registrations kept at once, across replicas (1–100000). A registration beyond it is answered `503` until older ones are removed. |
+| `registrations_per_hour_per_ip` | integer | `20` | Registrations accepted from one client IP address per clock hour, counted across replicas; the IP is found as for `authorization_server.rate_limit_per_min`. A registration beyond it is answered `429` with `Retry-After`. `0` = unlimited. |
 
 ### `EnumSource`
 
@@ -1162,6 +1312,16 @@ Note: `global` is intentionally NOT a variant — cross-tenant replay is a known
 
 - **`per_tenant`** — All requests sharing one tenant id share the namespace. Useful for service-to-service workloads where multiple service accounts retry the same operation.
 
+### `IdpSessionsConfig`
+
+The stored IdP sign-in (`interactive.idp_sessions`): one per user, shared by every MCP client of that user, used only toward the IdP token endpoint that issued it (to check the sign-in, and as the RFC 8693 subject token of an `idp_refresh_token` or `idp_id_token` federation). It is never given to an MCP client.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `connect_page` | boolean | `true` | Serve `/oauth/connect`, where a user who reaches the gateway with an ID-JAG signs in once so federations can use their IdP sign-in. It also lets a federated tool call of a caller with no stored sign-in answer with a link to it (MCP URL-mode elicitation), when the client declares `elicitation.url`: the link is for that caller only, and a sign-in as anyone else through it stores nothing. |
+| `max_age_secs` | integer (optional) |  | Longest a stored sign-in is kept, in seconds (3600–31536000); each successful refresh at the IdP restarts it. Defaults to `refresh_tokens.absolute_ttl_secs`. |
+| `revoke_superseded` | boolean | `true` | Revoke at the IdP (RFC 7009) a replaced IdP refresh token of another IdP subject the claim mappings name the same user, when the IdP has a revocation endpoint. A replaced token of the same subject is never revoked: some IdPs (Keycloak, PingFederate) revoke per user and client, which would end the new sign-in too. |
+
 ### `ImportConfig`
 
 Which capability surfaces to import.
@@ -1185,6 +1345,43 @@ Which capability surfaces to import.
 Server-assigned stable instance id. Carried as an opaque string so the gateway never needs to parse it; the CP mints it (UUIDv7 today).
 
 Type: string
+
+### `InteractiveLoginConfig`
+
+Settings of interactive sign-in (`governance.access.authorization_server.interactive`). Every key has a default, so the block is needed only to change one; it is refused without a `trusted_idps[].login` entry. Requires a license with the `sso.interactive_login` feature.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `access_token_ttl_secs` | integer | `900` | Lifetime of the access tokens issued through sign-in, in seconds (60–3600, and at most `refresh_tokens.idle_ttl_secs`). ID-JAG redemptions keep `authorization_server.access_token_ttl_secs`. A revoked grant's access tokens are refused within `revocation_check_interval_secs`; a short lifetime also bounds how long a stolen one works. |
+| `authorization_code_ttl_secs` | integer | `60` | Lifetime of an authorization code, in seconds (10–600). A code is redeemed once; a second redemption revokes the grant it issued. |
+| `consent` | [`ConsentConfig`](#consentconfig) | (see type) | The consent page shown before the user is sent to the IdP. |
+| `dynamic_client_registration` | [`DynamicClientRegistrationConfig`](#dynamicclientregistrationconfig) | (see type) | RFC 7591 dynamic client registration at `POST /oauth/register`. |
+| `idp_sessions` | [`IdpSessionsConfig`](#idpsessionsconfig) | (see type) | The stored IdP sign-in of each user. |
+| `rate_limit_per_min` | integer | `120` | Requests allowed per minute from one client IP address across the browser endpoints (`/oauth/authorize`, `/oauth/consent`, `/oauth/callback`, `/oauth/connect`); the IP is found as for `authorization_server.rate_limit_per_min`. `0` disables the limit. |
+| `refresh_tokens` | [`RefreshTokensConfig`](#refreshtokensconfig) | (see type) | Refresh tokens issued to MCP clients that signed in. |
+| `revocation_check_interval_secs` | integer | `10` | How often each replica reads the revoked grants other replicas wrote, in seconds (2–60): a revoked grant's access tokens are refused everywhere within this long. |
+| `state_keys` | array&lt;[`StateKeyConfig`](#statekeyconfig)&gt; | `[]` | Keys that seal every stored record (XChaCha20-Poly1305), newest first: the first seals, every entry opens, so a rotation prepends the new key and keeps the old one for `refresh_tokens.absolute_ttl_secs`. Unset, the key derives from `cluster.state_encryption_key_env` when that is set. Otherwise a file store generates a key on first start and keeps it at `state.key` inside the store directory, readable by the gateway's user only (mode 0600) and never logged: back it up with the store, since the stored sign-ins cannot be opened without it. To move that key here, list it with kid `generated` and the file's contents as its `secret`. A memory store uses a key that lives as long as the process. The cluster store refuses to start without a key from here or the cluster. |
+| `store` | [`InteractiveStoreConfig`](#interactivestoreconfig) (optional) |  | Where grants, refresh tokens and stored IdP sign-ins live. Unset: the cluster coordinator's key-value store when `cluster.kind` is not `single_node`; on a single node, a file store in the default `store.dir`, so users stay signed in across restarts. Every record is sealed with the state key (`state_keys`). |
+| `transaction_ttl_secs` | integer | `600` | Time a user has to approve consent and sign in at the IdP, in seconds (60–1800). Also the lifetime of the sign-in `state`. |
+
+### `InteractiveStoreConfig`
+
+Where interactive sign-in state lives (`interactive.store`).
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `dir` | string (optional) |  | `file` only: the directory. Defaults to `$MCPG_STATE_DIR/oauth`; else `/var/lib/mcpg/oauth` where `/var/lib/mcpg` exists (the container image; the operator's runtime volume, which lasts as long as the pod; the Helm chart's volume with `persistence.enabled`); else `~/.mcpg/oauth`. A gateway that cannot open it refuses to start. It is created readable by the gateway's user only, and one gateway process at a time opens it (a second one refuses to start). Every write is flushed to disk before it counts, expired records are removed every minute, and at most 200000 records (256 MiB) are kept: sign-ins beyond that answer 503. |
+| `kind` | [`InteractiveStoreKind`](#interactivestorekind) |  | `cluster` (the cluster coordinator's key-value store; on `single_node` that is process memory), `memory` (process memory: every restart signs every user out) or `file` (a directory on local disk). A `memory` or `file` store holds one replica's state only, so it is refused when `cluster.kind` is not `single_node`. |
+
+### `InteractiveStoreKind`
+
+Kind of `interactive.store`.
+
+**Allowed values:**
+
+- `cluster`
+- `memory`
+- `file`
 
 ### `JwksConfig`
 
@@ -1214,10 +1411,41 @@ The `config:` field is a free-form JSON object passed to the resolved handle (bu
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `non_production_use` | boolean | `false` | Declares this deployment non-production. Entitlement-gated plugins then load without a token under their license's free non-production grant (development, testing, evaluation, staging), with a boot warning naming them. Production use still requires an entitling token. |
+| `non_production_use` | boolean | `false` | Declares this deployment non-production. Entitlement-gated plugins and feature-gated config blocks (interactive sign-in at the embedded authorization server) then load without a token under their license's free non-production grant (development, testing, evaluation, staging), with a boot warning naming them. Production use still requires an entitling token. |
 | `pubkey_pem` | string (optional) |  | Trusted license-signing public key (SPKI PEM, Ed25519) — the verification anchor for the configured token (`mcpg-license keygen --public-out`). Required when a token is configured; an unverifiable token refuses boot rather than silently degrading to community. |
 | `token` | string (optional) |  | The signed license JWT, inline (commonly `${env.MCPG_LICENSE}`). Exactly one of `token` / `token_file` may be set. |
 | `token_file` | string (optional) |  | Path to a file holding the signed license JWT (e.g. a mounted secret). Exactly one of `token` / `token_file` may be set. |
+
+### `LoginAssertionAudience`
+
+The `aud` of the client assertion.
+
+**Variants:**
+
+- **`token_endpoint`** — The URL of the IdP endpoint the assertion is posted to: the token endpoint, or the revocation endpoint when revoking.
+
+- **`issuer`** — The IdP's issuer identifier.
+
+### `LoginClientAuth`
+
+How the gateway authenticates at the IdP token endpoint.
+
+**Allowed values:**
+
+- `client_secret_basic`
+- `client_secret_post`
+- `private_key_jwt`
+
+### `LoginSigningAlg`
+
+JWS algorithm of the client assertion the gateway signs.
+
+**Allowed values:**
+
+- `RS256`
+- `PS256`
+- `ES256`
+- `EdDSA`
 
 ### `LogsConfig`
 
@@ -1387,10 +1615,10 @@ Configuration for the OAuth Protected Resource Metadata endpoint (RFC 9728).
 | --- | --- | --- | --- |
 | `additional_resources` | array&lt;string&gt; | `[]` | Further resource identifiers this gateway is reached at — one per extra hostname (a custom domain in front of the same instance). A client compares the published `resource` with the URL it connected to (RFC 9728 §3.3), so the metadata document and the `WWW-Authenticate` challenge name whichever of `resource` and these matches the request's `Host`; a request for an unlisted host gets the canonical `resource`. Each entry is validated like `resource`. |
 | `allow_loopback_resource` | boolean | `false` | Local-development escape hatch: permit a loopback `resource` (`localhost` / `127.0.0.1` / `[::1]`). A wildcard host (`0.0.0.0` / `[::]`) is NEVER a valid resource identifier and is refused even with this set. Production deployments leave this `false` and configure the canonical public URL. |
-| `authorization_servers` | array&lt;string&gt; | `[]` | Authorization server URLs. If empty, derived from OIDC provider issuers. |
+| `authorization_servers` | array&lt;string&gt; | `[]` | Authorization server issuer URLs published in the metadata. When empty, derived from the configured verifiers: the `authorization_server` issuer first, then the `oidc_oauth` provider issuers, then `jwks.issuer`; with interactive sign-in (a `trusted_idps[].login` entry) the `authorization_server` issuer alone, since a client signs in at the first one listed. An explicit list is published as written, so with `authorization_server` it must name that issuer exactly as configured there, a trailing `/` included, or EMA clients cannot discover it. |
 | `bearer_methods_supported` | array&lt;string&gt; | (see type) | Bearer token presentation methods. Defaults to `["header"]`. |
 | `resource` | string |  | The protected resource's canonical resource identifier (RFC 8707 `resource` / RFC 9728 `resource`). MUST be the real external, absolute URL clients reach the gateway at — the same value the authorization server binds tokens to as `aud`. A wildcard (`0.0.0.0`), bare loopback (`localhost`/`127.0.0.1`/`[::1]`), or derived `bind_address` value is refused at boot: it would publish a `resource` that does not match the audience the tokens carry, so audience-bound validation silently fails. Set the canonical public URL explicitly, or opt into the loopback form for local development with `allow_loopback_resource: true`. |
-| `scopes_supported` | array&lt;string&gt; | `[]` | Scopes supported by this resource. |
+| `scopes_supported` | array&lt;string&gt; | `[]` | Scopes supported by this resource. Also sent as the `scope` parameter of the `WWW-Authenticate` challenge on an unauthenticated 401, as the scopes a client requests first; one that is not an RFC 6749 scope token (a space, `"`, `\`, a control or non-ASCII character) is left out of the challenge. |
 
 ### `ObservabilityConfig`
 
@@ -1637,6 +1865,31 @@ One named rate-limit policy.
 | --- | --- | --- | --- |
 | `calls_per_minute` | integer |  | Calls allowed per minute. Bucket refills at this rate. |
 
+### `RedirectUriPolicy`
+
+How the `https://` redirect URIs of a Client ID Metadata Document are admitted.
+
+**Variants:**
+
+- **`same_host`** — On exactly the host of the document's `client_id` URL.
+
+- **`allowed_hosts`** — On any host `allowed_hosts` admits.
+
+### `RefreshTokensConfig`
+
+Refresh tokens (`interactive.refresh_tokens`). Every refresh rotates the token; presenting a spent one revokes the whole grant.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `absolute_ttl_secs` | integer | `2592000` | A grant expires this long after sign-in however it is used, in seconds (`idle_ttl_secs`–7776000; default 30 days). |
+| `enabled` | boolean | `true` | Issue refresh tokens to clients whose grant types include `refresh_token`. |
+| `idle_ttl_secs` | integer | `1209600` | A grant unused for this long expires, in seconds (3600–7776000; default 14 days). |
+| `idp_unavailable_grace_secs` | integer | `3600` | How long refreshes keep working while the IdP cannot be reached, in seconds past the last successful check (0–86400). |
+| `max_grants_per_principal` | integer | `50` | Grants one user may hold at once (1–1000); a new grant beyond it revokes the user's oldest. |
+| `reuse_grace_secs` | integer | `0` | How long a spent refresh token may be presented again and receive the same successor, in seconds (0–60). `0` treats any second use as theft and revokes the grant. |
+| `revalidate_interval_secs` | integer (optional) |  | How often a refresh checks the IdP sign-in, in seconds (60–86400). Defaults to `access_token_ttl_secs`. |
+| `revalidate_with_idp` | boolean | `true` | Check the user's IdP sign-in on refresh: the stored IdP refresh token is redeemed at the IdP at most every `revalidate_interval_secs`, and a user the IdP no longer accepts loses every grant. While on, a sign-in without an IdP refresh token gets no gateway refresh token. |
+
 ### `RegistryAuthConfig`
 
 Consumer auth presented to the registry API.
@@ -1853,7 +2106,7 @@ A named schema entry in the registry. Exactly one source must be provided.
 | `tls` | [`TlsConfig`](#tlsconfig) (optional) |  |  |
 | `transport` | [`TransportMode`](#transportmode) | `"http"` |  |
 | `transports` | array&lt;[`KindRef`](#kindref)&gt; |  | Additional plugin-supplied transports started at boot alongside the primary HTTP / stdio listener (which continues to be governed by `transport:` and `bind_address:`). Each entry is a [`KindRef`] — `kind:` resolves to either a built-in transport keyword (today only `dev.mcpg.builtin.transport.memory` is wired; `builtin-http` / `builtin-stdio` map to the in-tree HTTP / stdio paths and don't need a list entry) or a registered Transport plugin id. The plugin's `Transport::start(config, dispatcher)` runs once per list entry; transports that fail to start halt the boot. Empty list = no extra transports beyond the primary listener — today's default. |
-| `trust_proxy_ip` | boolean | `false` | Trust `X-Forwarded-For` for the client IP used by the anonymous rate limit. Set ONLY when a trusted reverse proxy / edge fronts this gateway (the managed-cloud Envoy edge does) — the header is spoofable otherwise. When false (default) the TCP peer address is used. |
+| `trust_proxy_ip` | boolean | `false` | Trust the headers a fronting proxy sets: the first `X-Forwarded-For` hop is the client IP of the anonymous rate limit and of the embedded authorization server's per-IP budgets (`/oauth/token`, `/oauth/revoke`, `/oauth/register` and the sign-in pages), and the first `X-Forwarded-Host` is the host that selects the protected resource identifier in the resource metadata and in the `WWW-Authenticate` challenge. Set ONLY when a trusted reverse proxy / edge fronts this gateway (the managed-cloud Envoy edge does) — the headers are spoofable otherwise. When false (default) the TCP peer address and the `Host` header are used. |
 | `trust_subject_header` | boolean | `false` | Trust the `x-mcpg-subject-id` request header as a header-asserted identity. The header carries no proof of who the caller is, so when false (default) it is IGNORED and such requests resolve to Anonymous — only a verified credential (OIDC/JWKS/identity plugin) yields a non-anonymous principal. Set true ONLY behind a trusted upstream that authenticates the caller and injects this header. |
 | `tunnel` | [`TunnelConfig`](#tunnelconfig) (optional) |  | Reverse-tunnel egress: dial out to an MCPG-Cloud relay and serve this gateway's MCP surface through the tunnel. `mcpg --tunnel` populates this. Absent / `enabled: false` = no tunnel. |
 | `tunnel_federation` | [`TunnelFederationConfig`](#tunnelfederationconfig) (optional) |  | Reverse-federation ingress: how this gateway reaches same-org `tunnel://<name>` federation upstreams through the relay's federation ingress. Independent of `tunnel` (egress) — a gateway can federate other gateways' tunnels without dialing one of its own. |
@@ -1915,6 +2168,28 @@ Signature verification policy for native plugin artefacts. The Ed25519 signature
 
 - **`enforce`** — Refuse to load any artefact whose signature is missing or does not verify against the configured trusted keys. The default: a stock gateway loads only signed plugins.
 
+### `SigningAlgorithm`
+
+JWS algorithm of an access-token signing key.
+
+**Allowed values:**
+
+- `HS256`
+- `ES256`
+- `EdDSA`
+- `RS256`
+
+### `SigningKeyConfig`
+
+One key of `authorization_server.signing_keys`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `alg` | [`SigningAlgorithm`](#signingalgorithm) |  | JWS algorithm: `HS256` (shared secret), `ES256` (P-256), `EdDSA` (Ed25519) or `RS256` (RSA, at least 2048 bits). |
+| `kid` | string (optional) |  | Key identifier, stamped as the `kid` header of the tokens this key signs and published with its public key. Defaults to the RFC 7638 thumbprint of an asymmetric key, and to an identifier derived from the secret of an HS256 key (the same one `signing_secret` uses). |
+| `private_key` | string (optional) |  | `ES256`, `EdDSA` and `RS256`: the PEM-encoded private key, PKCS#8 (`-----BEGIN PRIVATE KEY-----`, as `openssl genpkey` writes it; an RSA key may also be PKCS#1). Supply via `${secret.NAME}`, which reads the file verbatim, or `${env.X}`. |
+| `secret` | string (optional) |  | HS256 only: the shared secret, at least 32 bytes. Supply via `${env.X}` or `${secret.NAME}`. |
+
 ### `SinkConfig`
 
 One sink in an observability signal's `sinks: [...]` list. The `kind:` field dispatches to a built-in factory (`stderr`, `stdout`, `file`, `otlp`, `prometheus`) or to a plugin id (any other value is looked up in the plugin registry at boot).
@@ -1940,6 +2215,15 @@ How to route events for a per-plugin signal toggle. Operator schema: `mode: inhe
 - **`replace`** — Route admitted events ONLY to the per-plugin `sinks` list. Skips the global sink fan-out entirely. Used for compliance carve-outs (audit logs stay inside the SIEM).
 
 - **`tee`** — Tee — admitted events flow to BOTH the global sink list AND the per-plugin `sinks` list. Useful when an operator wants to keep default routing but additionally mirror a noisy plugin's events to a debugging sink.
+
+### `StateKeyConfig`
+
+One sealing key of `interactive.state_keys`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `kid` | string |  | Key identifier recorded with every record it seals (`[A-Za-z0-9._-]`, 1–64 characters), unique in the list. |
+| `secret` | string |  | The key material: 32 bytes, URL-safe base64 (`openssl rand -base64 32 \| tr '+/' '-_'`). Supply via `${secret.NAME}` or `${env.X}`. |
 
 ### `StorageConfig`
 
@@ -1970,6 +2254,18 @@ Recognised `kind` values: `cluster`, `memory`, `file`. (`redis` and `nats` are n
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `kind` | string |  |  |
+
+### `SubjectToken`
+
+The subject token an `oauth_impersonation` credential issuer exchanges.
+
+**Variants:**
+
+- **`caller_bearer`** — The caller's bearer token, as presented to the gateway.
+
+- **`idp_refresh_token`** — The refresh token of the caller's stored enterprise IdP sign-in.
+
+- **`idp_id_token`** — An ID token of the caller's stored enterprise IdP sign-in.
 
 ### `SubscriptionsConfig`
 
@@ -2100,16 +2396,56 @@ Transport mode determines whether MCPG runs as an HTTP server or a stdio JSON-RP
 - `header_asserted`
 - `verified`
 
+### `TrustedIdpClaimMappingConfig`
+
+Claim mapping of one trusted IdP's ID-JAGs (`trusted_idps[].claim_mappings`): the `oidc_oauth` `claim_mappings` shape without `scope_claim_paths`, because a minted token's scopes are the ones the grant allows. Paths are dotted (`realm_access.roles`); a list claim is an array of strings or a space-separated string.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `attribute_claim_mappings` | map&lt;string, string&gt; | `{}` | String claims copied into `identity.attributes`, as `{claim path: attribute name}`, for example `{acr: acr}`. The attributes the gateway sets itself (`client_id`, `idp`, `token_issuer`, `email`, `actor`, `tenant`, `amr`, the `grant_type`, `grant_id` and `auth_time` of interactive sign-in, `dpop_jkt` of a token presented with a DPoP proof, `authorization_details` and `authorization_details_types` of a token limited to authorization details, and every name starting with `subject_token`, which it reserves for a credential issuer) cannot be mapped to. |
+| `group_claim_paths` | array&lt;string&gt; | `[]` | Claims whose values become `identity.groups`, in order, without duplicates. |
+| `role_claim_paths` | array&lt;string&gt; | `[]` | Claims whose values become `identity.roles`, before any `client_roles` of the client. |
+| `subject_claim` | string | `"sub"` | The string claim that identifies the user: the minted token's `sub` and the principal's subject. An ID-JAG without it is refused (`invalid_grant`). `act` (the actor, never the user) and claims that identify no user (`client_id`, `iss`, `aud`, `jti`) are refused. A claim other than `sub`, such as `email`, can be reassigned to another person by the IdP. |
+
 ### `TrustedIdpConfig`
 
 One enterprise IdP trusted to issue ID-JAGs.
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `allow_private_network` | boolean | `false` | Local-development escape hatch: permit `http://` and private/loopback IdP addresses. Production deployments leave this `false`. |
+| `allow_private_network` | boolean | `false` | Local-development escape hatch: permit `http://` and private/loopback IdP addresses, including a host name that resolves to one. Production deployments leave this `false`. |
+| `allowed_algs` | array&lt;string&gt; | (see type) | JWS algorithms accepted on this IdP's ID-JAGs: any of `RS256`, `RS384`, `RS512`, `PS256`, `PS384`, `PS512`, `ES256`, `ES384`, `EdDSA`, and by default all of them. An assertion signed with another algorithm is refused (`invalid_grant`). HMAC algorithms are never accepted. List only the IdP's own algorithm to refuse any other (Okta signs with `RS256`). With `login`, the same list applies to the ID tokens of sign-in. |
+| `allowed_clients` | array&lt;string&gt; | `[]` | The clients this IdP may issue ID-JAGs for, and with `login` the clients whose users may sign in through it: `clients[].client_id` values, or metadata document URLs that `client_id_metadata_documents.allowed_hosts` admits. An assertion from this IdP presented by another client is refused (`invalid_grant`). A dynamically registered client never satisfies a non-empty list. Empty = every client. |
 | `allowed_hosts` | array&lt;string&gt; | `[]` | Optional host allowlist for discovery/JWKS fetches (exact or subdomain match). Empty = any public host. |
-| `issuer` | string |  | The IdP's issuer identifier, compared exactly against the ID-JAG `iss` claim. |
-| `jwks_uri` | string (optional) |  | JWKS endpoint override. When omitted, the JWKS URI is taken from the IdP's OIDC discovery document (`{issuer}/.well-known/openid-configuration`). |
+| `claim_mappings` | [`TrustedIdpClaimMappingConfig`](#trustedidpclaimmappingconfig) | (see type) | Which ID-JAG claims (and, with `login`, ID token claims) name the user and become their groups, roles and attributes. The mapped values travel in the minted access token, so `identity.groups`, `identity.roles` and `identity.attributes` in `governance.policy` see them on every MCP request made with it. Okta's published ID-JAGs carry no group claim, so there is nothing to map groups from; policy can match Okta callers on `identity.attributes['client_id']`, and on `['email']` when the ID-JAG carries one. |
+| `issuer` | string |  | The IdP's issuer identifier, compared exactly (a trailing `/` included) against the ID-JAG `iss` claim and against the `issuer` of the IdP's discovery document. Okta's org authorization server issues ID-JAGs as `https://{yourOktaDomain}`, without a trailing `/`. |
+| `jwks` | any |  | The IdP's JSON Web Key Set (RFC 7517), inline: an object with a `keys` array, or the same document as a JSON string (for example `${env.IDP_JWKS}`). For an IdP the gateway cannot reach: no discovery or JWKS request is made, and a key rotation at the IdP needs a config change. Mutually exclusive with `jwks_uri`. |
+| `jwks_uri` | string (optional) |  | JWKS endpoint override. When neither this nor `jwks` is set, the JWKS URI is taken from the IdP's OIDC discovery document (`{issuer}/.well-known/openid-configuration`) or, when the IdP serves none, from its RFC 8414 metadata (`/.well-known/oauth-authorization-server`); the document's `issuer` must equal `issuer`. Fetched keys are reused for 5 minutes; while the IdP cannot be reached or answers with a server error, a timeout or a rate limit, the last key set that was fetched keeps verifying for up to an hour, after which redemption answers `temporarily_unavailable`. Any other client error is a configuration problem, which redemption names (`invalid_grant`). Redirects and responses above 1 MiB are refused. |
+| `login` | [`TrustedIdpLoginConfig`](#trustedidploginconfig) (optional) |  | The gateway's OIDC client at this IdP, which turns on interactive sign-in through it (at most one entry). Its users are the same principals as this IdP's ID-JAG users, and the IdP keeps accepting ID-JAGs. |
+| `principal_issuer` | string (optional) |  | Make this IdP's users the same principals as the SSO users of the OIDC provider with this issuer (`governance.access.oidc_oauth` or the `dev.mcpg.identity.oidc` plugin), such as the Okta custom authorization server that signs the enterprise's SSO access tokens. An EMA caller is then reported with `identity.issuer` set to this value and `identity.auth_provider` set to `oidc_oauth:<this value>`, exactly as that provider reports its own users, so sessions, tasks, idempotency and quotas are shared between the two ways in, provided both name the user with the same subject (see `claim_mappings.subject_claim`, and the provider's own `subject_claim`; for Okta, `uid` there and the default `sub` here). Tell EMA callers apart by `identity.attributes['token_issuer']`. Unset: principals are namespaced by this IdP's `issuer`, with `auth_provider` `ema`. No two IdPs may share a value. |
+| `required_tenant` | string (optional) |  | For a multi-tenant IdP: the `tenant` claim every ID-JAG (and, with `login`, every ID token) from it must carry, compared exactly. An assertion without it or with another value is refused (`invalid_grant`). Unset, a `tenant` claim is accepted as it comes and joins the principal namespace, since a multi-tenant IdP's `sub` is unique only within a tenant: the caller is reported with `identity.issuer` set to `{issuer}#{tenant}` (unless `principal_issuer` is set). |
+
+### `TrustedIdpLoginConfig`
+
+The gateway's own OIDC client at a trusted IdP (`governance.access.authorization_server.trusted_idps[].login`). Its presence turns interactive sign-in on through that IdP; at most one entry may have it. The IdP's `issuer`, `allowed_hosts`, `allow_private_network`, `allowed_algs` (the ID token signature), `claim_mappings`, `allowed_clients`, `required_tenant` and `principal_issuer` apply to sign-in exactly as to ID-JAGs, so a user who signs in and the same user arriving with an ID-JAG are one principal. The IdP keeps accepting ID-JAGs. Register `{authorization_server.issuer}/oauth/callback` as the sign-in redirect URI of this client at the IdP (`mcpg config check` prints it). For Okta Cross App Access the issuer is the org authorization server (`https://{org}.okta.com`) and this client is the OIDC app linked to the AI agent. Requires a license with the `sso.interactive_login` feature.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `assertion_audience` | [`LoginAssertionAudience`](#loginassertionaudience) (optional) |  | `private_key_jwt`: the assertion's `aud`: `token_endpoint` (the default: the URL of the endpoint the assertion is posted to, the token endpoint or, when a stored sign-in is revoked, the revocation endpoint, as Okta requires) or `issuer` (the IdP's issuer identifier). |
+| `authorization_endpoint` | string (optional) |  | The IdP authorization endpoint. Unless this, `token_endpoint` and `revocation_endpoint` are all set, the endpoints are read from the IdP's OIDC discovery document (`{issuer}/.well-known/ openid-configuration`, then the RFC 8414 form), whose `issuer` must equal the configured one exactly. Each endpoint must be `https://` on the entry's `allowed_hosts` (`http://` and private addresses only with `allow_private_network`). |
+| `authorize_params` | map&lt;string, string&gt; | `{}` | Extra parameters for the IdP authorization request, such as `acr_values` or `domain_hint`. The parameters the gateway sets itself (`response_type`, `client_id`, `redirect_uri`, `scope`, `state`, `nonce`, `code_challenge`, `code_challenge_method`, `request`, `request_uri`, `response_mode`, `prompt`, `max_age`, `login_hint`) are refused. |
+| `client_auth` | [`LoginClientAuth`](#loginclientauth) (optional) |  | How the gateway authenticates at the IdP token endpoint: `client_secret_basic`, `client_secret_post` or `private_key_jwt`. Defaults to `private_key_jwt` when `private_key` is set and to `client_secret_basic` when `client_secret` is set. The gateway is always a confidential client here, so a stolen IdP refresh token is useless without this credential. |
+| `client_id` | string |  | The client identifier the IdP issued to the gateway (1–255 characters). |
+| `client_secret` | string (optional) |  | Shared secret for the two secret methods, at least 16 bytes. Supply via `${secret.NAME}` or `${env.X}`. Set this or `private_key`, not both. |
+| `display_name` | string (optional) |  | The IdP's name on the consent and connect pages (1–60 characters). Defaults to the IdP's host. |
+| `key_id` | string (optional) |  | `private_key_jwt`: the `kid` header of the client assertion (at most 128 characters). Unset, the assertion carries no `kid`. |
+| `max_age_secs` | integer (optional) |  | Longest time since the user last authenticated at the IdP that a sign-in accepts, in seconds (0–86400). Sent as `max_age`; the ID token must then carry `auth_time`. Unset, any session is accepted. |
+| `private_key` | string (optional) |  | `private_key_jwt`: the PEM private key the client assertion is signed with (PKCS#8, or PKCS#1 for RSA), parsed and trial-signed at load. Supply via `${secret.NAME}`, which reads the file verbatim, or `${env.X}`. |
+| `revocation_endpoint` | string (optional) |  | The IdP's RFC 7009 revocation endpoint, where a replaced or abandoned IdP refresh token is revoked. See `authorization_endpoint`. |
+| `scopes` | array&lt;string&gt; | (see type) | Scopes requested at the IdP. Must include `openid`; at most 20, each once. Without `offline_access` the IdP issues no refresh token, so the gateway issues none while `refresh_tokens. revalidate_with_idp` is on and `idp_refresh_token` federations cannot work. |
+| `signing_alg` | [`LoginSigningAlg`](#loginsigningalg) (optional) |  | `private_key_jwt`: the assertion's JWS algorithm, `RS256`, `PS256`, `ES256` or `EdDSA`. Defaults to the one the key type implies (RSA: `RS256`, P-256: `ES256`, Ed25519: `EdDSA`); a value the key cannot sign with is refused at load. |
+| `timeout_ms` | integer | `5000` | Timeout of each request to the IdP, in milliseconds (500–10000). |
+| `token_endpoint` | string (optional) |  | The IdP token endpoint, where authorization codes are redeemed and the stored sign-in is refreshed. See `authorization_endpoint`. |
 
 ### `TrustedKeyConfig`
 

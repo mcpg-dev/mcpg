@@ -98,6 +98,9 @@ mcp:
                                     #   | oauth_client_credentials | oauth_impersonation
           token: "${env.SVC_TOKEN}"            # for service_token
           credential: "cred://<plugin_id>/<provider>"   # for the oauth_* modes
+          import:                   # optional catalogue credential (import, refresh, listener)
+            mode: service_token     #   service_token | oauth_client_credentials
+            token: "${env.CATALOGUE_TOKEN}"
 
         upstream_safety:
           allow_private_backends: false   # permit private/loopback upstream addresses (SSRF guard)
@@ -219,13 +222,20 @@ plugins:
         idp_token_url: https://idp.acme.example/oauth2/token
         client_id: mcpg-fleet
         client_secret: ${env.IDP_SECRET}
-        audience_template: "https://{target}.mcp.acme.internal"
-        redeem_token_url_template: "https://{target}.mcp.acme.internal/oauth2/token"
+        subject_token_type: id_token      # required: what the callers' bearers are
+        audience_template: "https://{target_slug}.mcp.acme.internal"
+        redeem_token_url_template: "https://{target_slug}.mcp.acme.internal/oauth2/token"
 ```
 
 For each caller and server, the issuer exchanges the caller's bearer
 (RFC 8693) for an ID-JAG assertion with the server's expanded audience,
-then redeems it (RFC 7523) at the server's expanded token endpoint. An
+then redeems it (RFC 7523) at the server's expanded token endpoint.
+`{target_slug}` is the server name reduced to hostname characters
+(`com.acme/crm` becomes `com-acme-crm`). A raw `{target}` in the host of
+`redeem_token_url_template` refuses any name with other characters than
+letters, digits, `.` and `-`, so registry names such as `com.acme/crm`
+need `{target_slug}` (with `{target}` there, this example refuses to
+load). An
 exact `providers` entry always beats the template, and targets outside
 `allowed_targets` fail closed. `oauth-token-exchange` supports the same
 `target_template` shape (`token_url` + `audience_template` /
@@ -233,8 +243,10 @@ exact `providers` entry always beats the template, and targets outside
 
 #### OAuth discovery (`defaults.oauth_discovery`)
 
-When each server's authorization server is not known a priori, let the
-syncer discover it (the client half of MCP authorization):
+When a server's resource identifier and token endpoint are not known a
+priori, let the syncer discover them (the client half of MCP
+authorization). For `oauth-id-jag` the authorization server's issuer
+still comes from the issuer config; discovery confirms it (see below):
 
 ```yaml
 mcp:
@@ -254,10 +266,46 @@ protected-resource metadata (on the server's own URL; the document's
 server's RFC 8414 metadata (issuer must round-trip), then injects the
 derived values onto the synthesized federation as
 `upstream.auth.credential_config` —
-`{audience, resource, redeem_token_url}` — which the engine forwards to
-the credential issuer on every issuance (the template issuers' per-call
-overrides). Both fetches are SSRF-guarded like the crawl itself:
-https-only, pinned DNS, private addresses only under
+`{audience, resource, redeem_token_url, issuer}` — which the engine
+forwards to the credential issuer on every issuance (the template
+issuers' per-call overrides). `resource` is the protected resource's
+RFC 9728 identifier, `redeem_token_url` the AS `token_endpoint`, and
+`issuer` the AS issuer exactly as its metadata states it. What
+`audience` names depends on the issuer plugin:
+
+- `dev.mcpg.credential.oauth-id-jag`: the **AS issuer**. Hop 1 asks the
+  IdP for an ID-JAG addressed to the upstream authorization server
+  (ID-JAG §4.3), and that server refuses one whose `aud` is not its own
+  issuer. The MCP resource travels separately as `resource`.
+- Every other OAuth issuer: the **resource**, because the token it
+  obtains goes to the MCP server itself.
+
+The metadata is the upstream's own document, so it cannot widen what the
+issuer is configured for. `oauth-id-jag` keeps the operator's
+`audience` / `audience_template` authoritative: a discovered issuer that
+differs from it by more than a trailing `/` fails the issuance with
+`Misconfigured` before the IdP is called (discovery supplies the exact
+spelling, and the token endpoint on the same origin). Otherwise an
+upstream could name a sibling authorization server on the same host,
+for example another custom authorization server on one Okta tenant, and
+receive a token issued for it. `redeem_token_url` must share its origin
+with the configured endpoint.
+
+For an `oauth-id-jag` federation the authorization server must also
+offer ID-JAG redemption: `urn:ietf:params:oauth:grant-type:jwt-bearer`
+in `grant_types_supported`, or
+`urn:ietf:params:oauth:grant-profile:id-jag` in
+`authorization_grant_profiles_supported` with no grant list that leaves
+out jwt-bearer. The profile is only recommended (ID-JAG §7.2), so an AS
+that lists the grant without it federates with a warning
+(`mcpg_registry_oauth_discovery_warning_total{reason="id_jag_profile_missing"}`).
+A server whose AS offers neither is skipped
+(`mcpg_registry_server_skipped_total{reason="no_id_jag_support"}`)
+rather than sent ID-JAGs it has not said it can redeem; the previous
+snapshot does not keep it alive, because the AS answered.
+
+Both fetches are SSRF-guarded like the crawl itself: https-only, pinned
+DNS, no redirects, private addresses only under
 `upstream_safety.allow_private_backends`. If discovery fails for a
 server, its previously discovered metadata is reused; a server with no
 discovered metadata at all is skipped
@@ -265,7 +313,10 @@ discovered metadata at all is skipped
 
 `credential_config` is an ordinary federation field too — a
 hand-written federation can pin it explicitly (and a
-`servers.<name>.auth` override carrying one bypasses discovery):
+`servers.<name>.auth` override carrying one bypasses discovery and its
+grant check). For `oauth-id-jag`, `audience` is the upstream AS issuer
+and must match the provider's configured `audience`, and `resource` is
+the MCP server:
 
 ```yaml
 mcp:
@@ -277,7 +328,8 @@ mcp:
           mode: oauth_impersonation
           credential: "cred://dev.mcpg.credential.oauth-id-jag/crm"
           credential_config:
-            audience: https://crm.acme.example/mcp
+            audience: https://as.crm.acme.example        # upstream AS issuer
+            resource: https://crm.acme.example/mcp      # upstream MCP server
             redeem_token_url: https://as.crm.acme.example/oauth2/token
 ```
 
@@ -414,7 +466,8 @@ upstream:
 ### `pass_through`
 Forward the **inbound caller's** `Authorization` bearer verbatim. The bearer is
 captured per request in memory only — never persisted to the pipeline store or
-logged. At import/listen time (no caller) the upstream is listed anonymously.
+logged. At import/listen time (no caller) the upstream is listed anonymously,
+unless you set a [catalogue credential](#catalogue-credential-authimport).
 
 ```yaml
 upstream:
@@ -422,6 +475,14 @@ upstream:
 ```
 
 Use when the upstream already understands your clients' tokens.
+
+A bearer the gateway minted itself is never forwarded: an access token from
+the embedded authorization server (enterprise-managed authorization) or the
+supervised inspector's credential. Only this gateway can validate it, and an
+upstream that received it could replay it here. Such a call fails before any
+request to the upstream; the gateway log names the fix. For those callers,
+use `service_token`, `oauth_client_credentials`, or `oauth_impersonation`
+with the caller's [stored enterprise sign-in](#stored-sign-in).
 
 ### `oauth_client_credentials` — machine identity
 MCPG mints a machine token via the gateway's **credential-issuer subsystem**
@@ -457,7 +518,8 @@ MCPG exchanges the **caller's** inbound bearer for an upstream token (RFC 8693
 token exchange), so the upstream sees the *end user*. Backed by the
 `oauth-token-exchange` issuer plugin. Per-caller (cached per caller); at
 import/listen (no caller) the upstream is listed anonymously, like
-`pass_through`.
+`pass_through`, unless you set a
+[catalogue credential](#catalogue-credential-authimport).
 
 ```yaml
 plugins:
@@ -486,9 +548,21 @@ mcp:
 > plugin and are never logged.
 
 Impersonation requires a **verified** caller: the issuer plugins refuse
-anonymous and header-asserted identities, so only callers that passed
-cryptographic verification (OIDC, JWKS, or the embedded EMA
-authorization server) can be exchanged on-behalf-of.
+anonymous and header-asserted identities. Only callers that signed in
+with a token an external identity provider issued, verified through
+OIDC or JWKS, can be exchanged on-behalf-of. A caller of enterprise-managed
+authorization presents an access token the embedded authorization
+server minted, and the supervised inspector presents a credential the
+gateway minted. Neither can be exchanged: only this gateway can
+validate them. This holds when the IdP sets `principal_issuer` too,
+although such a caller then has the same `issuer` and `auth_provider` as
+an OIDC caller. The call fails before any request to the token service
+or the upstream, and the gateway log names the fix: exchange the caller's
+[stored enterprise sign-in](#stored-sign-in) instead
+(`subject_token: idp_refresh_token`), authenticate the upstream with
+`service_token` or `oauth_client_credentials`, or have callers sign in
+with a token their identity provider issued. The issuer plugins refuse
+such a caller with `Misconfigured` as well.
 
 #### Cross-App Access (ID-JAG) upstreams
 
@@ -513,6 +587,7 @@ plugins:
           idp_token_url: https://acme.okta.com/oauth2/v1/token   # enterprise IdP
           client_id: mcpg-gateway
           client_secret: "${env.OKTA_MCPG_CLIENT_SECRET}"
+          subject_token_type: id_token                           # required; see below
           audience: https://auth.partner.example                 # upstream's AS issuer
           resource: https://mcp.partner.example                  # upstream MCP server
           scopes: ["tools:invoke"]
@@ -528,6 +603,182 @@ mcp:
           credential: cred://dev.mcpg.credential.oauth-id-jag/partner
 ```
 
+`subject_token_type` states what the caller's bearer is, and by default
+`oauth_impersonation` sends that bearer as the subject token.
+Okta's Cross App Access exchanges only an ID token or a refresh token,
+and it accepts an ID token only when the token was issued to this
+`client_id` (`aud` = `mcpg-gateway`). This example therefore works only
+when callers present such an Okta ID token as their bearer. A typical
+MCP client presents an OAuth access token, which Okta refuses with
+`invalid_grant`. With users signing in to the gateway, present their
+[stored enterprise sign-in](#stored-sign-in) instead.
+
+Enterprise-managed upstreams usually refuse `initialize` and `tools/list`
+without a token, so give the federation a
+[catalogue credential](#catalogue-credential-authimport) as well.
+
+#### <a id="stored-sign-in"></a>The caller's stored enterprise sign-in (`subject_token`)
+
+When users sign in to the gateway itself (interactive sign-in, a `login`
+block on a `governance.access.authorization_server.trusted_idps` entry),
+the gateway keeps each user's IdP sign-in: one per user, for every MCP
+client of that user. `upstream.auth.subject_token` makes an
+`oauth_impersonation` federation exchange that sign-in instead of the
+caller's bearer:
+
+| `subject_token` | Subject token the issuer exchanges |
+|---|---|
+| `caller_bearer` (default) | the caller's own bearer |
+| `idp_refresh_token` | the user's stored IdP refresh token (what Okta Cross App Access takes) |
+| `idp_id_token` | an ID token of the stored sign-in, refreshed at the IdP first when it has less than 60 s left |
+
+```yaml
+plugins:
+  - id: dev.mcpg.credential.oauth-id-jag
+    config:
+      providers:
+        partner:
+          idp_token_url: https://acme.okta.com/oauth2/v1/token   # the login client's IdP
+          client_id: 0oa-mcpg-agent                              # the login client
+          client_auth: private_key_jwt
+          private_key: "${secret.OKTA_AGENT_KEY}"
+          subject_token_type: refresh_token
+          audience: https://auth.partner.example
+          redeem_token_url: https://auth.partner.example/oauth/token
+
+mcp:
+  federations:
+    - name: partner
+      upstream:
+        url: https://mcp.partner.example/mcp
+        auth:
+          mode: oauth_impersonation
+          credential: cred://dev.mcpg.credential.oauth-id-jag/partner
+          subject_token: idp_refresh_token
+          import:
+            mode: oauth_client_credentials
+            credential: cred://dev.mcpg.credential.oauth-client-credentials/partner-catalogue
+```
+
+- Every caller of the user presents it: a client that signed in to the
+  gateway, a client that redeemed an ID-JAG here, and an SSO caller the
+  IdP's `principal_issuer` joins to the same user. The gateway picks the
+  sign-in by the caller's principal; the caller's bearer is never sent.
+- The stored token goes only to the IdP that issued it. `credential` must
+  name `dev.mcpg.credential.oauth-id-jag` or
+  `dev.mcpg.credential.oauth-token-exchange` (directly, or as the `ref` of
+  a `plugins[]` entry): validation refuses any other issuer plugin, which
+  could send the token anywhere, and the gateway refuses one again at
+  call time, before the sign-in is read. Those two refuse the call before
+  any request unless the provider's `idp_token_url` (`token_url`) and
+  `client_id` are the gateway's login client's, and `idp_issuer`
+  (`sts_issuer`), when set, is its IdP. `mcpg config check` warns about
+  such a mismatch.
+- A caller with no stored sign-in, for example a client that only ever
+  redeemed ID-JAGs, is refused before any request, and so is a caller
+  that is not verified. The failed call names where the user stores one:
+  `{issuer}/oauth/connect`, a page that signs the user in at the IdP once
+  (`idp_sessions.connect_page`, on by default).
+- Only a caller whose principal a sign-in through the login IdP is
+  stored under can ever present one: an ID-JAG caller of that IdP (of any
+  tenant, unless `required_tenant` pins one), or an SSO caller of the
+  provider its `principal_issuer` names. Any other caller (another IdP,
+  an SSO provider no `principal_issuer` joins, the supervised inspector)
+  is told that none can be stored for them, without the connect page or
+  a link.
+- A client that declares URL-mode elicitation (`elicitation.url`) gets a
+  link to store the sign-in instead of the failed `tools/call`
+  ([URL-mode elicitation](#stored-sign-in-links)).
+- The upstream token is cached per user and sign-in, so the IdP rotating
+  the stored refresh token costs no new exchange.
+- It needs interactive sign-in: validation refuses `idp_*` without a
+  `login` block, and inside `auth.import`, whose sessions have no caller.
+  The catalogue sessions connect anonymously unless `auth.import` is set.
+- Registry-synced federations accept it in `defaults.auth` and
+  `servers.<name>.auth`.
+
+#### <a id="stored-sign-in-links"></a>A link to store the sign-in (URL-mode elicitation)
+
+When a verified caller has no stored sign-in and its client declared
+`elicitation.url`, the `tools/call` answers with a link that stores it,
+in the shape of the negotiated MCP version:
+
+| Version | Answer | How the client continues |
+|---|---|---|
+| `2025-11-25` | JSON-RPC error `-32042` whose `data.elicitations` holds one URL-mode elicitation (`mode`, `elicitationId`, `url`, `message`); the error's own `message` repeats that text and the link, for a client that shows only it | The session receives `notifications/elicitation/complete` with the `elicitationId` once the user completes the link, and the client retries the call |
+| `2026-07-28` | `InputRequiredResult` whose `inputRequests.connect_sign_in` is a URL-mode `elicitation/create` (no id), with a `requestState` | The client retries with the `requestState` and its answer in `inputResponses`: `accept` waits up to 10 s (a third of `request_timeout_ms` at most) for the user's sign-in to be stored; `decline` or `cancel` returns the failed call; no answer offers the same link again. A `requestState` whose link expired runs the call again: it succeeds when the sign-in is stored, else offers a link |
+
+- The link is `{issuer}/oauth/connect?e=<id>`. The id is random and names
+  nobody; the link carries no token and does not sign anyone in.
+- The link is for the caller's principal only. The user opens it, confirms
+  on the connect page and signs in at the IdP. When the IdP names another
+  user, nothing is stored, the page says so, and
+  `mcpg.as.connect_refused` is audited. A link is completed once, and
+  lives as long as a sign-in transaction (`transaction_ttl_secs`).
+- A retry on the same MCP session is offered the link that session is
+  pending, so the store holds one link per user and session. A user is
+  offered at most 20 new links per `transaction_ttl_secs`; past that, a
+  call fails with the message that names the connect page.
+- The `requestState` is sealed with the sign-in state key and bound to the
+  caller and the tool; another user or another tool cannot present it.
+- The message next to the link names the federation only when its name
+  is plain (`[A-Za-z0-9._-]`, at most 128 characters); a registry-synced
+  name with any other text reads as "a federated tool".
+- No link is offered when `idp_sessions.connect_page` is off, to a caller
+  no sign-in can be stored for (see above), to a caller that is not
+  verified, for a call with an idempotency key, for a call run as a task,
+  or for `resources/read` and `prompts/get`; those calls fail with the
+  message that names the connect page, or says none can be stored.
+
+### Catalogue credential (`auth.import`)
+
+Some upstream sessions have no caller: the catalogue import at boot and
+reload, the `list_changed` and TTL refreshes, and the notification
+listener. With `pass_through` and `oauth_impersonation` there is nothing
+to forward or exchange, so these sessions are anonymous by default. An
+upstream that requires a token to list its tools refuses them, and the
+federation imports nothing: MCPG logs a warning that names
+`upstream.auth.import` and counts
+`mcpg_federation_import_failed_total{reason="unauthorized"}`.
+
+`upstream.auth.import` gives those sessions their own credential:
+
+```yaml
+mcp:
+  federations:
+    - name: partner
+      upstream:
+        url: https://mcp.partner.example/mcp
+        auth:
+          mode: oauth_impersonation                 # tool calls: the caller
+          credential: cred://dev.mcpg.credential.oauth-id-jag/partner
+          import:                                   # catalogue: the gateway
+            mode: oauth_client_credentials          # or service_token + token
+            credential: cred://dev.mcpg.credential.oauth-client-credentials/partner-catalogue
+```
+
+- `mode` is `service_token` (with `token`) or `oauth_client_credentials`
+  (with `credential`, and optionally `credential_config`). The
+  caller-derived modes and a nested `import` fail validation.
+- Only the catalogue sessions use it. Tool calls, resource reads and
+  prompt fetches keep the outer `mode`: an impersonated call carries the
+  caller's exchanged token, and a call without a caller bearer never
+  falls back to the catalogue credential.
+- It works with every outer mode, for example a read-only listing token
+  next to an `oauth_client_credentials` machine identity.
+- The imported catalogue is what this credential can list. Per-user
+  differences in what the upstream shows are not reflected: every caller
+  sees the same federated catalogue (still narrowed by `filter` and
+  `governance`), and a tool the upstream withholds from a caller fails
+  when that caller invokes it.
+- Registry-synced federations accept `defaults.auth.import` and
+  `servers.<name>.auth.import`. `{server}` expands inside
+  `import.credential` as it does in `auth.credential`, so a
+  `target_template` issuer mints a catalogue token per server. OAuth
+  discovery does not fill `import.credential_config`, and a
+  `service_token` in `defaults.auth.import` goes to every server the
+  registry lists.
+
 ### Choosing
 | Want | Mode |
 |---|---|
@@ -537,6 +788,8 @@ mcp:
 | Upstream understands your clients' tokens | `pass_through` |
 | Upstream must see the end user (per-user authz/audit) | `oauth_impersonation` |
 | Enterprise-governed upstream (Cross-App Access / ID-JAG) | `oauth_impersonation` + `oauth-id-jag` issuer |
+| The same, for users who sign in to the gateway | add `subject_token: idp_refresh_token` |
+| A caller-derived mode against an upstream that requires a token to list tools | add `auth.import` |
 
 ---
 
@@ -709,10 +962,24 @@ re-probe); changed/removed ones re-establish.
 | `mcpg_oauth_token_exchange_error_total{provider}` | failed exchanges |
 | `mcpg_oauth_token_cache_hit_total{provider}` | client-credentials cache hits |
 | `mcpg_credential_cache_total{plugin_id,outcome}` | host credential-cache hit/miss |
+| `mcpg_federation_import_failed_total{reason}` | failed catalogue imports and refreshes; `unauthorized` = the upstream answered 401/403, `error` = anything else |
+| `mcpg_federation_subject_token_total{mode,outcome}` | calls of `idp_refresh_token` / `idp_id_token` federations; `used` = the issuer exchanged the stored sign-in, `not_linked` = the caller has none, `refused` = the caller, the sign-in or the issuer plugin cannot be used, or the issuer refused the exchange, `unavailable` = the sign-in state, the issuer or the IdP cannot be reached now |
+| `mcpg_federation_connect_link_total{outcome}` | links offered to callers with no stored sign-in; `offered` = a new link, `resumed` = the pending link of a retry or of the session, `limited` = the user was offered as many new links as one link lifetime allows, `unavailable` = the sign-in state could not store one |
+| `mcpg_federation_url_elicitation_total{protocol_version}` | tool calls answered with a link, by MCP version |
+| `mcpg_as_connect_total{purpose,outcome}` | the connect page; `purpose` = `connect` or `link`, `outcome` = `shown`, `refused`, `approved` or `denied` |
+| `mcpg_registry_server_skipped_total{registry,reason}` | registry servers left unfederated; `oauth_discovery` = no metadata ever discovered, `no_id_jag_support` = an `oauth-id-jag` server whose AS does not offer jwt-bearer |
+| `mcpg_registry_oauth_discovery_warning_total{registry,reason}` | servers federated despite a discovery warning; `id_jag_profile_missing` = the AS lists jwt-bearer but not the id-jag grant profile |
 
 Federation also emits structured logs (`target: mcpg::runtime::federation::…`)
 for import success/failure, list_changed refresh, and credential resolution
-(never the token itself).
+(never the token itself). A call refused for its stored sign-in (every
+outcome but `used`, an exchange the issuer refused or that failed
+included) is audited as `mcpg.federation.idp_subject_token`, with the
+federation, the mode and the reason (the issuer's, for an exchange);
+never the token. A link completed
+by another user than the one it was offered to is audited as
+`mcpg.as.connect_refused`, with the user who signed in and the principal
+the link was for; never the link id.
 
 ---
 
@@ -833,6 +1100,7 @@ mcp:
 | Symptom | Likely cause |
 |---|---|
 | Federated tools missing from `tools/list` | caller below `minimum_trust` (they're hidden), or import failed — check `mcpg::runtime::federation` logs |
+| `upstream refused the anonymous catalogue session` warning, import fails with HTTP 401 | a `pass_through` / `oauth_impersonation` upstream requires a token to list tools; set [`auth.import`](#catalogue-credential-authimport) |
 | `oauth_* requires auth.credential (a cred:// URI)` at boot | set `auth.credential` to `cred://<plugin_id>/<provider>` |
 | `no credential_issuer plugin id=…` at dispatch | the referenced issuer plugin isn't configured under `plugins` |
 | stdio federation rejected at boot | set `upstream_safety.allow_stdio: true` and a `command` |

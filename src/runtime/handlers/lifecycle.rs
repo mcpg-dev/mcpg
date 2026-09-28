@@ -117,6 +117,16 @@ impl GatewayRuntime {
                             apps.clone(),
                         );
                     }
+                    // Enterprise-Managed Authorization is an HTTP-transport
+                    // auth flow; stdio carries no bearer.
+                    if self.ema_authorization_server.is_some()
+                        && request_context.transport == TransportKind::Http
+                    {
+                        map.insert(
+                            crate::runtime::authorization_server::EXTENSION_ID.to_owned(),
+                            serde_json::json!({}),
+                        );
+                    }
                     if map.is_empty() { None } else { Some(map) }
                 };
                 let result = InitializeResult {

@@ -7,6 +7,7 @@
 //! `WWW-Authenticate` challenge).
 
 use super::*;
+use crate::runtime::authorization_server::dpop::{DPOP_JKT_ATTRIBUTE, DPOP_SCHEME, DpopChallenge};
 
 pub(crate) fn map_gateway_response(response: GatewayResponse) -> Response {
     let request_id = response.request_id.clone();
@@ -210,6 +211,35 @@ pub(crate) fn resource_metadata_url(
         .unwrap_or_else(|| RELATIVE_PRM_PATH.to_owned())
 }
 
+/// The `scope` an unauthenticated 401 challenge names: the resource's
+/// `scopes_supported` that are valid scope tokens, space-separated. `None`
+/// when there are none.
+pub(crate) fn challenge_scope(config: &crate::config::AppConfig) -> Option<String> {
+    config
+        .governance
+        .access
+        .resource_metadata
+        .as_ref()
+        .map(|rm| {
+            rm.scopes_supported
+                .iter()
+                .map(String::as_str)
+                .filter(|scope| is_scope_token(scope))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|scope| !scope.is_empty())
+}
+
+/// RFC 6749 §3.3 `scope-token`: `1*( %x21 / %x23-5B / %x5D-7E )`, the
+/// only scopes a `scope` auth-param can carry.
+fn is_scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|b| matches!(b, 0x21 | 0x23..=0x5B | 0x5D..=0x7E))
+}
+
 /// The hostname a request arrived for, as `host[:port]`: the first
 /// `X-Forwarded-Host` value when the operator trusts the fronting proxy
 /// (`server.trust_proxy_ip`, the same switch as for `X-Forwarded-For`),
@@ -234,11 +264,11 @@ pub(crate) fn request_host(headers: &HeaderMap, trust_proxy: bool) -> Option<Str
         .map(str::to_owned)
 }
 
-/// Complete the identity gate's `Bearer error="invalid_token"` challenge
-/// with the `resource_metadata` pointer (RFC 9728 §5.1) so a client whose
-/// credential was refused can re-discover the authorization server. Only
-/// a 401 carrying a `WWW-Authenticate` value without the pointer is
-/// touched.
+/// Complete the identity gate's `Bearer error="invalid_token"` or
+/// `DPoP error="…"` challenge with the `resource_metadata` pointer (RFC
+/// 9728 §5.1) so a client whose credential was refused can re-discover the
+/// authorization server. Only a 401 carrying a `WWW-Authenticate` value
+/// without the pointer is touched.
 pub(crate) fn with_resource_metadata_pointer(mut response: Response, url: &str) -> Response {
     if response.status() != axum::http::StatusCode::UNAUTHORIZED {
         return response;
@@ -251,7 +281,10 @@ pub(crate) fn with_resource_metadata_pointer(mut response: Response, url: &str) 
     else {
         return response;
     };
-    if existing.contains("resource_metadata=") || !existing.starts_with("Bearer") {
+    let dpop = existing
+        .strip_prefix(DPOP_SCHEME)
+        .is_some_and(|rest| rest.starts_with(' '));
+    if existing.contains("resource_metadata=") || !(existing.starts_with("Bearer") || dpop) {
         return response;
     }
     let url = sanitize_header_quotes(url);
@@ -268,7 +301,8 @@ pub(crate) fn with_resource_metadata_pointer(mut response: Response, url: &str) 
 /// responses.
 ///
 /// - **401**: a `Bearer resource_metadata="…"` challenge so an
-///   unauthenticated client can discover the authorization server.
+///   unauthenticated client can discover the authorization server, plus
+///   `scope="…"` when `scope` (see [`challenge_scope`]) is given.
 /// - **403 + [`INSUFFICIENT_SCOPE_HEADER`]**: a step-up challenge
 ///   `Bearer resource_metadata="…", error="insufficient_scope", scope="a b c"`
 ///   per RFC 6750 §3.1 / SEP-2350. A bare 403 (ordinary authorization
@@ -296,12 +330,21 @@ pub(crate) fn with_resource_metadata_pointer(mut response: Response, url: &str) 
 /// `AAuth-Requirement` and `WWW-Authenticate` are independent fields — the
 /// draft is explicit that a response MAY carry both. Existing AAuth headers
 /// (e.g. a plugin-minted `Signature-Error` path) are left untouched.
+///
+/// `dpop` is set while the embedded authorization server takes DPoP (RFC
+/// 9449). A caller that authenticated with a DPoP-bound token gets the
+/// challenge in the `DPoP` scheme with its `algs` (§7.1). While only bound
+/// tokens are accepted, every other 401 carries a second
+/// `WWW-Authenticate: DPoP algs="…", resource_metadata="…"` field after the
+/// Bearer one; otherwise the challenges are the Bearer ones alone.
 pub(crate) fn with_www_authenticate_challenge(
     response: Response,
     auth_enabled: bool,
     resource_metadata: &str,
+    scope: Option<&str>,
     aauth: Option<AauthChallenge<'_>>,
     caller: Option<&crate::runtime::RequestIdentity>,
+    dpop: Option<DpopChallenge<'_>>,
 ) -> Response {
     // The scope hint is read here (before it is stripped below) so the AAuth
     // step-up can name the scopes the caller lacks.
@@ -335,6 +378,9 @@ pub(crate) fn with_www_authenticate_challenge(
     let header_value = if status == axum::http::StatusCode::UNAUTHORIZED {
         // Quote-sanitize the URL so the header value stays well-formed.
         let url = sanitize_header_quotes(resource_metadata);
+        let bare = || HeaderValue::from_str(&format!("Bearer resource_metadata=\"{url}\"")).ok();
+        // A 401 always carries a challenge (RFC 9110 §15.5.2): one whose
+        // scope cannot be sent in a header falls back to the bare form.
         match &insufficient_scope {
             Some(scope) => {
                 let scope = sanitize_header_quotes(scope);
@@ -342,8 +388,25 @@ pub(crate) fn with_www_authenticate_challenge(
                     "Bearer resource_metadata=\"{url}\", error=\"insufficient_scope\", scope=\"{scope}\""
                 ))
                 .ok()
+                .or_else(|| {
+                    HeaderValue::from_str(&format!(
+                        "Bearer resource_metadata=\"{url}\", error=\"insufficient_scope\""
+                    ))
+                    .ok()
+                })
+                .or_else(bare)
             }
-            None => HeaderValue::from_str(&format!("Bearer resource_metadata=\"{url}\"")).ok(),
+            None => match scope {
+                Some(scope) => {
+                    let scope = sanitize_header_quotes(scope);
+                    HeaderValue::from_str(&format!(
+                        "Bearer resource_metadata=\"{url}\", scope=\"{scope}\""
+                    ))
+                    .ok()
+                    .or_else(bare)
+                }
+                None => bare(),
+            },
         }
     } else if status == axum::http::StatusCode::FORBIDDEN {
         // SEP-2350 step-up: only a 403 that names the missing scopes is a
@@ -363,12 +426,41 @@ pub(crate) fn with_www_authenticate_challenge(
         None
     };
 
-    if let Some(value) = header_value {
-        response
-            .headers_mut()
-            .insert(axum::http::header::WWW_AUTHENTICATE, value);
+    let Some(value) = header_value else {
+        return response;
+    };
+    let dpop_caller = caller.is_some_and(|identity| {
+        identity.is_gateway_minted() && identity.attributes().contains_key(DPOP_JKT_ATTRIBUTE)
+    });
+    let value = match dpop {
+        Some(dpop) if dpop_caller => in_dpop_scheme(&value, dpop.algs).unwrap_or(value),
+        _ => value,
+    };
+    response
+        .headers_mut()
+        .insert(axum::http::header::WWW_AUTHENTICATE, value);
+    if status == axum::http::StatusCode::UNAUTHORIZED
+        && !dpop_caller
+        && let Some(dpop) = dpop.filter(|dpop| dpop.required)
+    {
+        let url = sanitize_header_quotes(resource_metadata);
+        if let Ok(value) = HeaderValue::from_str(&format!(
+            "{DPOP_SCHEME} algs=\"{}\", resource_metadata=\"{url}\"",
+            dpop.algs
+        )) {
+            response
+                .headers_mut()
+                .append(axum::http::header::WWW_AUTHENTICATE, value);
+        }
     }
     response
+}
+
+/// `challenge`, a `Bearer …` challenge, in the `DPoP` scheme with `algs`
+/// (RFC 9449 §7.1).
+fn in_dpop_scheme(challenge: &HeaderValue, algs: &str) -> Option<HeaderValue> {
+    let params = challenge.to_str().ok()?.strip_prefix("Bearer ")?;
+    HeaderValue::from_str(&format!("{DPOP_SCHEME} {params}, algs=\"{algs}\"")).ok()
 }
 
 /// What the AAuth challenge needs: the resource role (its `access_mode`,

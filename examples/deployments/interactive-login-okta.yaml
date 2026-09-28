@@ -1,0 +1,199 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: interactive-login-okta
+# ----------------------------------
+# One gateway, one embedded authorization server, Okta as the enterprise IdP:
+#   - EMA clients (Claude with Okta Cross App Access) redeem ID-JAGs at
+#     /oauth/token;
+#   - interactive MCP clients (Claude Code, VS Code, mcpg inspector) sign their
+#     user in through Okta with authorization_code + PKCE;
+#   - an upstream protected by Cross App Access is called for each user with
+#     the user's stored Okta refresh token as the RFC 8693 subject token.
+#
+# Needs a license with the `sso.interactive_login` feature (enterprise): a
+# standalone gateway refuses to boot with a `login` or `interactive` block
+# without it, unless `license.non_production_use: true`.
+#
+# At Okta: register https://mcp.acme.example/oauth/callback as the sign-in
+# redirect URI of the OIDC app linked to the mcpg AI agent (`mcpg config
+# check` prints it), with the authorization_code and refresh_token grants.
+#
+# Required env vars:
+#   MCPG_NATS_URL          — tls://nats.mcpg.svc:4222
+#   MCPG_STATE_KEY         — URL-safe-base64 32-byte state key, same on every
+#                            replica; it also seals the stored Okta sign-ins
+#   MCPG_AS_SIGNING_KEY    — P-256 PKCS#8 PEM signing the gateway's tokens
+#   OKTA_AGENT_KEY         — RSA PKCS#8 PEM of the Okta agent app
+#   CLAUDE_EMA_SECRET      — client secret of the Claude EMA client
+#   VENDOR_CLIENT_KEY      — PEM the gateway authenticates with at the vendor
+#
+# Boot:  MCPG_CONFIG=interactive-login-okta.yaml mcpg
+
+gateway:
+  server:
+    bind_address: "0.0.0.0:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    allowed_origins:
+      - "https://mcp.acme.example"
+    # Real client IPs for the per-IP budgets of the sign-in endpoints.
+    trust_proxy_ip: true
+    # Other hosts are redirected here before any sign-in cookie is set.
+    canonical_url: "https://mcp.acme.example"
+
+cluster:
+  kind: nats
+  servers:
+    - "${env.MCPG_NATS_URL}"
+  node:
+    id: "${env.HOSTNAME}"
+  jetstream:
+    replicas: 3
+    storage: file
+    state_bucket: "mcpg-prod"
+  # Seals every coordinator-held record. Sign-in state (grants, refresh
+  # tokens, stored Okta sign-ins) lives on the coordinator too, sealed with a
+  # key derived from this one. On `kind: single_node` it lives in a sealed
+  # file store instead (`interactive.store.dir`; by default under
+  # $MCPG_STATE_DIR, else /var/lib/mcpg).
+  state_encryption_key_env: "MCPG_STATE_KEY"
+
+license:
+  token_file: "/etc/mcpg/license/license.jwt"
+  pubkey_pem: "${env.MCPG_LICENSE_PUBKEY}"
+
+governance:
+  access:
+    # Anonymous /mcp gets 401 with the resource metadata, where every client
+    # starts its sign-in.
+    require_authentication: true
+    resource_metadata:
+      resource: "https://mcp.acme.example/mcp"
+      scopes_supported: ["mcp:tools"]
+      # authorization_servers is left empty: it derives the issuer below.
+    authorization_server:
+      # A bare https origin; also the Issuer URL of this resource app at Okta.
+      issuer: "https://mcp.acme.example"
+      signing_keys:
+        - alg: ES256
+          kid: "as-2026-09"
+          private_key: "${env.MCPG_AS_SIGNING_KEY}"
+      # ID-JAG (EMA) tokens only; tokens from sign-in use
+      # interactive.access_token_ttl_secs.
+      access_token_ttl_secs: 3600
+      allowed_scopes: ["mcp:tools"]
+      trusted_idps:
+        # The Okta ORG authorization server: it issues the ID-JAGs, and users
+        # sign in through it. Custom authorization servers issue no ID-JAGs.
+        - issuer: "https://acme.okta.com"
+          allowed_hosts: ["acme.okta.com"]
+          allowed_algs: ["RS256"]
+          claim_mappings:
+            group_claim_paths: ["groups"]
+          login:
+            # The OIDC app linked to the mcpg AI agent, which is also the
+            # requesting app of Cross App Access.
+            client_id: "0oa1mcpgagent"
+            private_key: "${env.OKTA_AGENT_KEY}"
+            key_id: "mcpg-2026-09"
+            # Okta wants the token endpoint URL as the assertion audience.
+            assertion_audience: token_endpoint
+            display_name: "Acme Okta"
+            # scopes default to [openid, profile, email, offline_access].
+      client_id_metadata_documents:
+        # Claude, Claude Code and VS Code identify with their metadata
+        # document URL.
+        allowed_hosts: ["claude.ai", "vscode.dev"]
+        # Their https redirect URIs must be on the client_id host.
+        redirect_uri_policy: same_host
+      clients:
+        # The EMA client: ID-JAG redemption only.
+        - client_id: "claude-ema"
+          client_secret: "${env.CLAUDE_EMA_SECRET}"
+        # An operator-registered command-line client. A loopback redirect URI
+        # matches any port, and its user always sees the consent page.
+        - client_id: "acme-mcp-cli"
+          client_name: "Acme MCP CLI"
+          token_endpoint_auth_method: none
+          redirect_uris: ["http://127.0.0.1/callback"]
+          # grant_types default to [authorization_code, refresh_token].
+      # Every value below is the default except service_name and the scope
+      # description.
+      interactive:
+        access_token_ttl_secs: 900
+        authorization_code_ttl_secs: 60
+        transaction_ttl_secs: 600
+        rate_limit_per_min: 120
+        revocation_check_interval_secs: 10
+        consent:
+          # https redirect URIs of registered and metadata-document clients
+          # only; loopback and dynamically registered clients ask each time.
+          remember_days: 30
+          service_name: "Acme MCP Gateway"
+          scope_descriptions:
+            "mcp:tools": "Use the tools this gateway exposes"
+        refresh_tokens:
+          enabled: true
+          idle_ttl_secs: 1209600
+          absolute_ttl_secs: 2592000
+          reuse_grace_secs: 0
+          max_grants_per_principal: 50
+          revalidate_with_idp: true
+          idp_unavailable_grace_secs: 3600
+        idp_sessions:
+          revoke_superseded: true
+          # A user who reaches the gateway with an ID-JAG signs in once at
+          # /oauth/connect so the vendor federation can act for them.
+          connect_page: true
+        dynamic_client_registration:
+          enabled: false
+
+plugins:
+  - id: dev.mcpg.credential.oauth-id-jag
+    class: credential_issuer
+    source:
+      # Your mirror of the plugin channel; keep it in step with the gateway.
+      oci: "registry.acme.example/mcpg/plugins/credential-oauth-id-jag:0.1.0"
+    # It calls Okta and the vendor's token endpoint.
+    granted_capabilities: [network_outbound]
+    config:
+      providers:
+        vendor:
+          # Must be the login client's token endpoint and client: the stored
+          # sign-in is exchanged only where it was issued.
+          idp_token_url: "https://acme.okta.com/oauth2/v1/token"
+          idp_issuer: "https://acme.okta.com"
+          client_id: "0oa1mcpgagent"
+          client_auth: private_key_jwt
+          private_key: "${env.OKTA_AGENT_KEY}"
+          key_id: "mcpg-2026-09"
+          # The login block takes its algorithm from the key; this provider
+          # signs RS256 unless told otherwise. ES256 for a P-256 key.
+          signing_alg: RS256
+          subject_token_type: refresh_token
+          audience: "https://auth.vendor.example"
+          resource: "https://mcp.vendor.example/mcp"
+          scopes: ["tools.read"]
+          redeem_token_url: "https://auth.vendor.example/oauth/token"
+          redeem_client_id: "acme-mcpg"
+          redeem_client_auth: private_key_jwt
+          redeem_private_key: "${env.VENDOR_CLIENT_KEY}"
+
+mcp:
+  federations:
+    - name: vendor
+      upstream:
+        url: "https://mcp.vendor.example/mcp"
+        auth:
+          mode: oauth_impersonation
+          credential: "cred://dev.mcpg.credential.oauth-id-jag/vendor"
+          # The user's stored Okta refresh token. A user with none gets an
+          # error naming /oauth/connect.
+          subject_token: idp_refresh_token
+
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }

@@ -39,6 +39,22 @@ use retry::*;
 // runtime modules through their own `super::` path.
 use super::{delivery_bus, expr, pipeline_store, safe_dns};
 
+/// The failed tool call of a federation whose upstream credential needs
+/// the caller's stored sign-in: `message`, which the gateway wrote for the
+/// caller, names where to store one and no upstream detail.
+fn not_linked_result(request: &BackendInvocationRequest, message: &str) -> ToolCallResult {
+    ToolCallResult {
+        content: vec![ToolContent::text(format!(
+            "federated tool '{}' failed: {message} (request id: {})",
+            request.tool_name,
+            request.context.request_id.as_str()
+        ))],
+        structured_content: None,
+        is_error: true,
+        meta: None,
+    }
+}
+
 /// Returns `"debug_tool"` for built-in MCPG tools, `"operator_binding"` for operator-defined bindings.
 fn backend_kind(tool_name: &str) -> &'static str {
     if tool_name.starts_with("mcpg.") {
@@ -55,7 +71,7 @@ use crate::{
     },
     config::{BackendConfig, PipelineBackendConfig, PipelineSqlTxStepConfig},
     protocol::{ToolCallResult, ToolContent},
-    runtime::{RequestContext, RuntimeSnapshot},
+    runtime::{RequestContext, RuntimeSnapshot, federation::upstream::UpstreamError},
 };
 
 // `sql_tx`/`sql_await` resolve the `sql` backend from the plugin
@@ -1114,6 +1130,8 @@ impl ExecutionDispatcher {
                         let caller_identity = request.context.identity.clone();
                         let session_id = request.context.session_id.clone();
                         let caller_bearer = request.context.inbound_bearer.clone();
+                        let caller_request_id = request.context.request_id.as_str().to_owned();
+                        let connect_link = Arc::clone(&request.context.connect_link);
                         // Forward the client's progress token so upstream
                         // progress correlates for the client.
                         let progress_token = request.progress_token.clone();
@@ -1132,12 +1150,17 @@ impl ExecutionDispatcher {
                                     session_id: session_id.as_deref(),
                                     bearer: caller_bearer.as_deref(),
                                     identity: Some(&caller_identity),
+                                    request_id: Some(&caller_request_id),
+                                    connect_link: Some(&connect_link),
                                 },
                                 progress_token.as_ref(),
                             ))
                         });
                         match outcome {
                             Ok(value) => federated_value_to_result(value),
+                            Err(UpstreamError::NotLinked { message }) => {
+                                not_linked_result(request, &message)
+                            }
                             Err(e) => {
                                 // Opaque client message + correlation id. The
                                 // detailed `UpstreamError` can carry upstream

@@ -92,6 +92,11 @@ impl GatewayRuntime {
                 Arc::clone(&self.plugin_registry),
                 Arc::clone(&self.credential_cache),
             )
+            .with_idp_sessions(
+                self.ema_authorization_server.clone().map(
+                    |server| -> Arc<dyn federation::idp_sessions::IdpSessionSource> { server },
+                ),
+            )
             .with_notifier(
                 Arc::clone(&self.session_store),
                 Arc::clone(&self.delivery_bus),

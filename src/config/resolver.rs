@@ -93,6 +93,34 @@ pub async fn resolve_config_value(
     Ok(report)
 }
 
+/// `governance.access.authorization_server` with every string leaf
+/// resolved through [`resolve_config_value`], then validated again so the
+/// key and secret checks that skip a `${…}` placeholder at load judge the
+/// value itself. `None` without the block.
+///
+/// The result is for the embedded authorization server alone: the config
+/// the gateway keeps, serves and hashes still carries the placeholders.
+pub async fn resolve_authorization_server(
+    config: &super::AppConfig,
+    registry: &PluginRegistry,
+    secrets: &SecretsSource,
+) -> Result<Option<super::AuthorizationServerConfig>> {
+    const AT: &str = "governance.access.authorization_server";
+    let Some(ref server) = config.governance.access.authorization_server else {
+        return Ok(None);
+    };
+    let mut value = serde_json::to_value(server).with_context(|| format!("{AT}: serialise"))?;
+    resolve_config_value(&mut value, registry, secrets)
+        .await
+        .context(AT)?;
+    let resolved: super::AuthorizationServerConfig =
+        serde_json::from_value(value).with_context(|| format!("{AT}: resolved values"))?;
+    resolved
+        .validate()
+        .context("once its `${env.…}` and `${secret.…}` are resolved")?;
+    Ok(Some(resolved))
+}
+
 /// Collect the env-var names referenced by `${env.NAME}` (CEL interpolation)
 /// and `env://NAME` (secret-ref) string forms anywhere in `value`. The opt-in
 /// post-boot env scrub (`server.scrub_process_env_after_boot`) uses this on the

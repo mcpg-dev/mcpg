@@ -1,11 +1,12 @@
-//! `license:` — the offline license token for standalone deployments.
+//! `license:` — the offline license token.
 //!
-//! CP-attached gateways never read this block: their entitlements are
-//! enforced by the control plane at plugin-set bind. A standalone
-//! gateway resolves its claims envelope from here (or falls back to the
-//! built-in community tier) and the plugin load gate
-//! (`crate::license_gate`) refuses entitlement-gated plugins the
-//! envelope does not admit.
+//! The gateway resolves its claims envelope from here (or falls back to
+//! the built-in community tier) and the license gate
+//! (`crate::license_gate`) refuses entitlement-gated plugins and
+//! feature-gated config blocks the envelope does not admit. A CP-attached
+//! gateway's plugins are admitted by the control plane's plugin-set bind
+//! instead, and so are the config blocks of a config the managed-cloud
+//! platform rendered, which its publish guard checked.
 
 use std::path::PathBuf;
 
@@ -33,10 +34,11 @@ pub struct LicenseConfig {
     pub pubkey_pem: Option<String>,
 
     /// Declares this deployment non-production. Entitlement-gated
-    /// plugins then load without a token under their license's free
-    /// non-production grant (development, testing, evaluation,
-    /// staging), with a boot warning naming them. Production use still
-    /// requires an entitling token.
+    /// plugins and feature-gated config blocks (interactive sign-in at the
+    /// embedded authorization server) then load without a token under
+    /// their license's free non-production grant (development, testing,
+    /// evaluation, staging), with a boot warning naming them. Production
+    /// use still requires an entitling token.
     #[serde(default)]
     pub non_production_use: bool,
 }

@@ -19,12 +19,17 @@ use super::*;
 ///
 /// Runs for every route. A request with no `Origin` is not cross-origin and is
 /// passed through untouched — that is every non-browser client, which is most
-/// of them.
+/// of them. So is every request to an interactive sign-in page
+/// ([`BROWSER_ONLY_PATHS`](crate::runtime::authorization_server::BROWSER_ONLY_PATHS)):
+/// no CORS headers there, whatever the origin.
 pub(crate) async fn cors_layer(
     cfg: std::sync::Arc<crate::config::CorsConfig>,
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    if crate::runtime::authorization_server::BROWSER_ONLY_PATHS.contains(&req.uri().path()) {
+        return next.run(req).await;
+    }
     let Some(origin) = req
         .headers()
         .get(axum::http::header::ORIGIN)

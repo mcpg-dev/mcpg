@@ -2210,6 +2210,7 @@ fn validate_accepts_valid_jwks_auth_config() {
         governance: GovernanceConfig {
             access: AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2236,6 +2237,7 @@ fn validate_accepts_minimal_jwks_auth_config() {
         governance: GovernanceConfig {
             access: AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2262,6 +2264,7 @@ fn validate_rejects_jwks_without_url_or_keys() {
         governance: GovernanceConfig {
             access: AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2289,6 +2292,7 @@ fn validate_rejects_non_http_jwks_url() {
         governance: GovernanceConfig {
             access: AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2316,6 +2320,7 @@ fn validate_rejects_whitespace_only_jwks_issuer() {
         governance: GovernanceConfig {
             access: AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2343,6 +2348,7 @@ fn validate_rejects_empty_jwks_header_name() {
         governance: GovernanceConfig {
             access: AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2370,6 +2376,7 @@ fn validate_accepts_jwks_with_inline_keys_json() {
         governance: GovernanceConfig {
             access: AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2388,6 +2395,301 @@ fn validate_accepts_jwks_with_inline_keys_json() {
         ..AppConfig::default()
     };
     assert!(config.validate().is_ok());
+}
+
+const EMA_AUTHORIZATION_SERVER_YAML: &str = r#"
+governance:
+  access:
+    authorization_server:
+      issuer: https://mcp.example.com
+      signing_secret: ema-signing-secret-0123456789abcdef
+      trusted_idps:
+        - issuer: https://acme.okta.com
+      clients:
+        - client_id: mcp-client
+"#;
+
+const EMA_RESOURCE_METADATA_YAML: &str = r#"
+governance:
+  access:
+    resource_metadata:
+      resource: https://mcp.example.com/mcp
+"#;
+
+/// EMA clients discover the embedded authorization server only through
+/// the protected resource metadata, so the server without it is refused
+/// with the key to set.
+#[test]
+fn validate_requires_resource_metadata_with_an_authorization_server() {
+    let err = AppConfig::load_from_yaml_str(EMA_AUTHORIZATION_SERVER_YAML)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("governance.access.authorization_server requires")
+            && err.contains("governance.access.resource_metadata.resource"),
+        "{err}"
+    );
+
+    let config = AppConfig::load_from_yaml_strs(&[
+        EMA_AUTHORIZATION_SERVER_YAML,
+        EMA_RESOURCE_METADATA_YAML,
+    ])
+    .expect("the authorization server with its metadata validates");
+    assert!(config.governance.access.authorization_server.is_some());
+}
+
+/// Keys added to the embedded authorization server keep an existing config
+/// valid and default to the documented values.
+#[test]
+fn authorization_server_policy_keys_default() {
+    let config = AppConfig::load_from_yaml_strs(&[
+        EMA_AUTHORIZATION_SERVER_YAML,
+        EMA_RESOURCE_METADATA_YAML,
+    ])
+    .expect("valid");
+    let authz = config
+        .governance
+        .access
+        .authorization_server
+        .expect("authorization_server");
+    assert_eq!(authz.max_assertion_lifetime_secs, 600);
+    assert!(!authz.require_scope);
+    let idp = &authz.trusted_idps[0];
+    // Every asymmetric algorithm, so an IdP that signs with RS384 or ES384
+    // keeps working without a config change.
+    assert_eq!(
+        idp.allowed_algs,
+        [
+            "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "EdDSA"
+        ]
+    );
+    assert!(idp.allowed_clients.is_empty());
+    assert!(idp.required_tenant.is_none());
+    assert!(idp.jwks.is_none());
+    assert_eq!(
+        idp.claim_mappings,
+        crate::config::TrustedIdpClaimMappingConfig::default()
+    );
+    assert_eq!(idp.claim_mappings.subject_claim, "sub");
+    assert!(idp.principal_issuer.is_none());
+    assert!(authz.client_roles.is_empty());
+    assert_eq!(authz.rate_limit_per_min, 120);
+    assert_eq!(
+        authz.client_id_metadata_documents,
+        crate::config::ClientIdMetadataDocumentsConfig::default()
+    );
+    assert!(!authz.client_id_metadata_documents_enabled());
+    let client = &authz.clients[0];
+    assert!(client.token_endpoint_auth_method.is_none());
+    assert_eq!(
+        client.effective_auth_methods(),
+        Some(&[crate::config::ClientAuthMethod::None][..])
+    );
+}
+
+/// The client authentication keys as an operator writes them.
+#[test]
+fn authorization_server_client_authentication_keys_parse() {
+    let clients = r#"
+governance:
+  access:
+    authorization_server:
+      rate_limit_per_min: 30
+      client_id_metadata_documents:
+        allowed_hosts: [claude.ai]
+      clients:
+        - client_id: portal
+          client_secret: portal-secret
+          token_endpoint_auth_method: client_secret_basic
+        - client_id: agent
+          token_endpoint_auth_method: private_key_jwt
+          jwks_uri: https://agent.example.com/jwks.json
+          accept_token_endpoint_audience: true
+        - client_id: https://claude.ai/oauth/claude-code-client-metadata
+          token_endpoint_auth_method: none
+"#;
+    let config = AppConfig::load_from_yaml_strs(&[
+        EMA_AUTHORIZATION_SERVER_YAML
+            .replace("        - client_id: mcp-client\n", "")
+            .as_str(),
+        EMA_RESOURCE_METADATA_YAML,
+        clients,
+    ])
+    .expect("valid");
+    let authz = config
+        .governance
+        .access
+        .authorization_server
+        .expect("authorization_server");
+    assert_eq!(authz.rate_limit_per_min, 30);
+    assert!(authz.client_id_metadata_documents_enabled());
+    assert!(authz.knows_client("https://agents.claude.ai/client.json"));
+    assert!(!authz.knows_client("https://claude.ai.evil.example/client.json"));
+    let methods: Vec<_> = authz
+        .clients
+        .iter()
+        .map(|client| client.effective_auth_methods())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            Some(&[crate::config::ClientAuthMethod::ClientSecretBasic][..]),
+            Some(&[crate::config::ClientAuthMethod::PrivateKeyJwt][..]),
+            Some(&[crate::config::ClientAuthMethod::None][..]),
+        ]
+    );
+    assert!(authz.clients[1].accept_token_endpoint_audience);
+}
+
+const EMA_IDENTITY_CLAIMS_YAML: &str = r#"
+governance:
+  access:
+    authorization_server:
+      trusted_idps:
+        - issuer: https://acme.okta.com
+          principal_issuer: https://acme.okta.com/oauth2/default
+          claim_mappings:
+            group_claim_paths: [groups]
+            role_claim_paths: [realm_access.roles]
+            attribute_claim_mappings:
+              acr: acr
+      client_roles:
+        mcp-client: [ai-agent]
+"#;
+
+/// The identity-claim keys as an operator writes them.
+#[test]
+fn authorization_server_identity_claim_keys_parse() {
+    let config = AppConfig::load_from_yaml_strs(&[
+        EMA_AUTHORIZATION_SERVER_YAML,
+        EMA_RESOURCE_METADATA_YAML,
+        EMA_IDENTITY_CLAIMS_YAML,
+    ])
+    .expect("valid");
+    let authz = config
+        .governance
+        .access
+        .authorization_server
+        .expect("authorization_server");
+    let idp = &authz.trusted_idps[0];
+    assert_eq!(
+        idp.principal_issuer.as_deref(),
+        Some("https://acme.okta.com/oauth2/default")
+    );
+    assert_eq!(idp.claim_mappings.subject_claim, "sub");
+    assert_eq!(idp.claim_mappings.group_claim_paths, ["groups"]);
+    assert_eq!(idp.claim_mappings.role_claim_paths, ["realm_access.roles"]);
+    assert_eq!(idp.claim_mappings.attribute_claim_mappings["acr"], "acr");
+    assert_eq!(authz.client_roles["mcp-client"], ["ai-agent"]);
+}
+
+/// Scopes of a minted token come from the grant, so the `oidc_oauth`
+/// mapping's `scope_claim_paths` has no place here and is refused rather
+/// than ignored.
+#[test]
+fn trusted_idp_claim_mappings_refuse_scope_claim_paths() {
+    let yaml = EMA_IDENTITY_CLAIMS_YAML.replace(
+        "            group_claim_paths: [groups]\n",
+        "            group_claim_paths: [groups]\n            scope_claim_paths: [scp]\n",
+    );
+    let err = format!(
+        "{:#}",
+        AppConfig::load_from_yaml_strs(&[
+            EMA_AUTHORIZATION_SERVER_YAML,
+            EMA_RESOURCE_METADATA_YAML,
+            yaml.as_str(),
+        ])
+        .unwrap_err()
+    );
+    assert!(err.contains("scope_claim_paths"), "{err}");
+}
+
+/// The issuer is compared exactly by the IdP and must be the root the
+/// metadata and token endpoints are served at. An issuer ending in `/` is
+/// that root (RFC 8414 §3.1) and loads.
+#[test]
+fn authorization_server_issuer_with_a_path_is_refused() {
+    let yaml = EMA_AUTHORIZATION_SERVER_YAML.replace(
+        "issuer: https://mcp.example.com",
+        "issuer: https://mcp.example.com/",
+    );
+    let config = AppConfig::load_from_yaml_strs(&[yaml.as_str(), EMA_RESOURCE_METADATA_YAML])
+        .expect("a trailing slash origin loads");
+    assert_eq!(
+        config
+            .governance
+            .access
+            .authorization_server
+            .expect("authorization_server")
+            .issuer,
+        "https://mcp.example.com/"
+    );
+    for (issuer, expected) in [
+        ("https://mcp.example.com/as", "without a path"),
+        ("https://mcp.example.com//", "without a path"),
+    ] {
+        let yaml = EMA_AUTHORIZATION_SERVER_YAML.replace(
+            "issuer: https://mcp.example.com",
+            &format!("issuer: {issuer}"),
+        );
+        let err = AppConfig::load_from_yaml_strs(&[yaml.as_str(), EMA_RESOURCE_METADATA_YAML])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("governance.access.authorization_server.issuer") && err.contains(expected),
+            "{issuer}: {err}"
+        );
+    }
+}
+
+/// The embedded authorization server is a bearer verifier: responses carry
+/// the `WWW-Authenticate` challenge with it as the only one.
+#[test]
+fn access_is_enabled_by_any_bearer_verifier() {
+    assert!(!AccessConfig::default().is_enabled());
+    let config = AppConfig::load_from_yaml_strs(&[
+        EMA_AUTHORIZATION_SERVER_YAML,
+        EMA_RESOURCE_METADATA_YAML,
+    ])
+    .expect("valid");
+    assert!(config.governance.access.jwks.is_none());
+    assert!(config.governance.access.oidc_oauth.is_none());
+    assert!(config.governance.access.is_enabled());
+}
+
+#[test]
+fn require_authentication_defaults_off() {
+    let access: AccessConfig = serde_yaml::from_str("jwks: null").expect("access parses");
+    assert!(!access.require_authentication);
+}
+
+/// Refusing every caller below verified needs something that verifies
+/// one; without it the gateway would refuse everybody.
+#[test]
+fn require_authentication_needs_a_verifier() {
+    let strict = "governance:\n  access:\n    require_authentication: true\n";
+    let err = AppConfig::load_from_yaml_str(strict)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("governance.access.require_authentication")
+            && err.contains("identity_provider plugin"),
+        "{err}"
+    );
+
+    let header_trust = "gateway:\n  server:\n    trust_subject_header: true\n";
+    assert!(
+        AppConfig::load_from_yaml_strs(&[strict, header_trust]).is_err(),
+        "a header-asserted caller is still below verified"
+    );
+
+    let config = AppConfig::load_from_yaml_strs(&[
+        EMA_AUTHORIZATION_SERVER_YAML,
+        EMA_RESOURCE_METADATA_YAML,
+        strict,
+    ])
+    .expect("the embedded authorization server verifies callers");
+    assert!(config.governance.access.require_authentication);
 }
 
 #[test]

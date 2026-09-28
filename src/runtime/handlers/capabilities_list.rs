@@ -774,11 +774,22 @@ impl GatewayRuntime {
                             session_id: session_id.as_deref(),
                             bearer: caller_bearer.as_deref(),
                             identity: Some(&caller_identity),
+                            request_id: Some(request_context.request_id.as_str()),
+                            connect_link: None,
                         },
                     ))
                 });
                 match outcome {
                     Ok(value) => federated_prompt_get_result(value),
+                    Err(crate::runtime::federation::upstream::UpstreamError::NotLinked {
+                        message,
+                    }) => Err(invocation::SurfaceDecodeError::BackendError {
+                        message: format!(
+                            "federated prompt '{}' failed: {message} (request id: {})",
+                            params.name,
+                            request_context.request_id.as_str()
+                        ),
+                    }),
                     Err(e) => {
                         // The upstream error carries issuer diagnostics — a
                         // preview of the raw Vault response body, provider
@@ -946,11 +957,22 @@ impl GatewayRuntime {
                             session_id: session_id.as_deref(),
                             bearer: caller_bearer.as_deref(),
                             identity: Some(&caller_identity),
+                            request_id: Some(request_context.request_id.as_str()),
+                            connect_link: None,
                         },
                     ))
                 });
                 match outcome {
                     Ok(value) => Ok(federated_resource_read_result(value)),
+                    Err(crate::runtime::federation::upstream::UpstreamError::NotLinked {
+                        message,
+                    }) => Err(invocation::SurfaceDecodeError::BackendError {
+                        message: format!(
+                            "federated resource '{}' failed: {message} (request id: {})",
+                            params.uri,
+                            request_context.request_id.as_str()
+                        ),
+                    }),
                     Err(e) => {
                         // Same operator-only diagnostics as the prompt path.
                         tracing::warn!(

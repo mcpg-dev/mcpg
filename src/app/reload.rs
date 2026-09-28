@@ -48,7 +48,7 @@ pub(crate) async fn reload_with_config(
         .resolve_schema_refs(config_dir.as_deref())
         .await?;
 
-    crate::license_gate::enforce_plugin_license_gate(&new_config)?;
+    crate::license_gate::enforce_license_gate(&new_config)?;
 
     // Registry auto-federation composes here — the single point every
     // reload trigger passes through — so a CP push or file reload can
@@ -92,6 +92,7 @@ pub(crate) async fn reload_with_config(
         quota_gate,
         resolved_secret_refs,
         secrets_digest,
+        authorization_server,
     } = build_plugin_registry(
         &mut new_config,
         jwt_verifier.as_ref(),
@@ -337,7 +338,16 @@ pub(crate) async fn reload_with_config(
 
     new_runtime.set_content_stores(content_stores.clone());
     new_runtime.set_secrets_digest(secrets_digest);
-    new_runtime.set_ema_authorization_server(build_ema_authorization_server(&new_config)?);
+    {
+        let old_runtime = state.runtime.load();
+        new_runtime.set_ema_authorization_server(wire_ema_authorization_server(
+            &with_resolved_authorization_server(&new_config, authorization_server),
+            cluster_backend.as_ref(),
+            &state_cipher,
+            &tenant_seg,
+            old_runtime.ema_authorization_server(),
+        )?);
+    }
     new_runtime.set_aauth_resource(crate::app::auth_wiring::build_aauth_resource(&new_config)?);
     #[cfg(feature = "governance-quotas")]
     new_runtime.set_quota_gate(quota_gate.clone());

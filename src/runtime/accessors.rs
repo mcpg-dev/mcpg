@@ -91,6 +91,11 @@ impl GatewayRuntime {
         self.jwt_verifier.as_ref()
     }
 
+    /// The path of the MCP endpoint (`server.mcp_path`).
+    pub fn mcp_path(&self) -> &str {
+        &self.mcp_path
+    }
+
     pub fn ema_authorization_server(
         &self,
     ) -> Option<&crate::runtime::authorization_server::AuthorizationServer> {
@@ -99,11 +104,14 @@ impl GatewayRuntime {
 
     /// Install the embedded EMA authorization server. Called once right
     /// after construction (and after each config-reload rebuild),
-    /// before the runtime is shared.
+    /// before the runtime is shared. The plugin registry digests audit
+    /// records' authorization details under the server's key from then on.
     pub fn set_ema_authorization_server(
         &mut self,
         server: Option<std::sync::Arc<crate::runtime::authorization_server::AuthorizationServer>>,
     ) {
+        self.plugin_registry
+            .set_audit_digest_key(server.as_deref().map(|server| server.audit_digest_key()));
         self.ema_authorization_server = server;
     }
 

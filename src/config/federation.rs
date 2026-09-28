@@ -311,17 +311,69 @@ pub struct AuthConfig {
     /// per-target issuer entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_config: Option<serde_json::Value>,
+    /// `oauth_impersonation` only: the subject token the credential issuer
+    /// exchanges. `caller_bearer` (the default) is the caller's own bearer
+    /// token; a token this gateway minted is never sent upstream, so a
+    /// caller who signed in here, or redeemed an ID-JAG here, is refused
+    /// with it. `idp_refresh_token` and `idp_id_token` are the caller's
+    /// enterprise IdP sign-in the gateway keeps (the refresh token, or an
+    /// ID token kept fresh with it), for an Okta Cross App Access upstream
+    /// through `dev.mcpg.credential.oauth-id-jag`; they need a
+    /// `governance.access.authorization_server.trusted_idps[].login`
+    /// block, `credential` must name `dev.mcpg.credential.oauth-id-jag` or
+    /// `dev.mcpg.credential.oauth-token-exchange` (the issuers that send
+    /// the stored token only to the IdP that issued it), and that issuer's
+    /// IdP token URL and client must be the login's. A caller with no
+    /// stored sign-in gets an error naming `/oauth/connect`, where they
+    /// sign in once. Refused inside `import`, whose sessions have no
+    /// caller.
+    #[serde(default, skip_serializing_if = "SubjectToken::is_caller_bearer")]
+    pub subject_token: SubjectToken,
+    /// Credential for the upstream sessions that run without a caller:
+    /// the catalogue import, its `list_changed` and TTL refreshes, and
+    /// the notification listener. `mode` must be `service_token` or
+    /// `oauth_client_credentials`. Tool calls, resource reads and prompt
+    /// fetches never use it; they keep the outer `mode`. Unset, those
+    /// sessions authenticate with the outer `mode` when it needs no
+    /// caller, and connect anonymously for `pass_through` and
+    /// `oauth_impersonation`. The imported catalogue is what this
+    /// credential can list, so per-user tool visibility upstream is not
+    /// reflected in it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<Box<AuthConfig>>,
 }
 
 impl AuthConfig {
     pub(crate) fn validate(&self, path: &str) -> Result<()> {
+        self.validate_at(&format!("{path}.upstream.auth"))?;
+        if let Some(import) = &self.import {
+            let at = format!("{path}.upstream.auth.import");
+            if !import.subject_token.is_caller_bearer() {
+                bail!(
+                    "{at}: `subject_token` is refused here — catalogue sessions have no caller \
+                     whose enterprise sign-in could be presented"
+                );
+            }
+            if !import.mode.authenticates_without_caller() {
+                bail!(
+                    "{at}: mode must be `service_token` or `oauth_client_credentials`; \
+                     catalogue sessions have no caller to forward or impersonate"
+                );
+            }
+            if import.import.is_some() {
+                bail!("{at}: `import` does not nest");
+            }
+            import.validate_at(&at)?;
+        }
+        Ok(())
+    }
+
+    fn validate_at(&self, at: &str) -> Result<()> {
         match self.mode {
             AuthMode::None | AuthMode::PassThrough => {}
             AuthMode::ServiceToken => {
                 if self.token.as_deref().unwrap_or("").is_empty() {
-                    bail!(
-                        "{path}.upstream.auth: mode `service_token` requires a non-empty `token`"
-                    );
+                    bail!("{at}: mode `service_token` requires a non-empty `token`");
                 }
             }
             // Both OAuth modes resolve their bearer through a credential-issuer
@@ -338,7 +390,7 @@ impl AuthConfig {
                         .is_none()
                 {
                     bail!(
-                        "{path}.upstream.auth: mode `{:?}` requires `credential` as a cred://<plugin_id>/<target> URI",
+                        "{at}: mode `{:?}` requires `credential` as a cred://<plugin_id>/<target> URI",
                         self.mode
                     );
                 }
@@ -347,9 +399,52 @@ impl AuthConfig {
         if let Some(config) = &self.credential_config
             && !config.is_object()
         {
-            bail!("{path}.upstream.auth: `credential_config` must be a JSON object");
+            bail!("{at}: `credential_config` must be a JSON object");
+        }
+        if !self.subject_token.is_caller_bearer() && self.mode != AuthMode::OauthImpersonation {
+            bail!(
+                "{at}: `subject_token: {}` applies only to mode `oauth_impersonation`, which \
+                 exchanges a subject token for the upstream's",
+                self.subject_token.as_str()
+            );
         }
         Ok(())
+    }
+}
+
+/// The subject token an `oauth_impersonation` credential issuer exchanges.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectToken {
+    /// The caller's bearer token, as presented to the gateway.
+    #[default]
+    CallerBearer,
+    /// The refresh token of the caller's stored enterprise IdP sign-in.
+    IdpRefreshToken,
+    /// An ID token of the caller's stored enterprise IdP sign-in.
+    IdpIdToken,
+}
+
+impl SubjectToken {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CallerBearer => "caller_bearer",
+            Self::IdpRefreshToken => "idp_refresh_token",
+            Self::IdpIdToken => "idp_id_token",
+        }
+    }
+
+    #[must_use]
+    pub fn is_caller_bearer(&self) -> bool {
+        *self == Self::CallerBearer
+    }
+
+    /// Whether this reads the caller's stored IdP sign-in.
+    #[must_use]
+    pub fn is_idp_session(self) -> bool {
+        matches!(self, Self::IdpRefreshToken | Self::IdpIdToken)
     }
 }
 
@@ -370,6 +465,15 @@ pub enum AuthMode {
     OauthClientCredentials,
     /// Per-caller token-exchange (RFC 8693).
     OauthImpersonation,
+}
+
+impl AuthMode {
+    /// Whether this mode presents a credential without a caller: the
+    /// modes `auth.import` accepts.
+    #[must_use]
+    pub fn authenticates_without_caller(self) -> bool {
+        matches!(self, Self::ServiceToken | Self::OauthClientCredentials)
+    }
 }
 
 /// SSRF / DNS-rebinding posture for the upstream URL. Mirrors the HTTP
@@ -873,6 +977,152 @@ upstream:
       redeem_token_url: "https://as.example.com/oauth2/token"
 "#);
         ok.validate().expect("object credential_config validates");
+    }
+
+    #[test]
+    fn import_credential_accepts_the_modes_that_need_no_caller() {
+        let service_token = cfg(r#"
+name: crm
+upstream:
+  url: "https://crm.example.com/mcp"
+  auth:
+    mode: oauth_impersonation
+    credential: "cred://dev.mcpg.credential.oauth-id-jag/crm"
+    import: { mode: service_token, token: "catalogue-token" }
+"#);
+        service_token
+            .validate()
+            .expect("service_token import credential validates");
+        let import = service_token
+            .upstream
+            .auth
+            .import
+            .as_deref()
+            .expect("import");
+        assert!(matches!(import.mode, AuthMode::ServiceToken));
+        assert_eq!(import.token.as_deref(), Some("catalogue-token"));
+
+        let client_credentials = cfg(r#"
+name: crm
+upstream:
+  url: "https://crm.example.com/mcp"
+  auth:
+    mode: pass_through
+    import:
+      mode: oauth_client_credentials
+      credential: "cred://dev.mcpg.credential.oauth-client-credentials/crm-catalogue"
+      credential_config: { audience: "https://crm.example.com/mcp" }
+"#);
+        client_credentials
+            .validate()
+            .expect("oauth_client_credentials import credential validates");
+
+        // Unset keeps the anonymous catalogue session.
+        assert!(cfg(minimal()).upstream.auth.import.is_none());
+    }
+
+    #[test]
+    fn import_credential_rejects_caller_modes_and_nesting() {
+        for mode in ["none", "pass_through", "oauth_impersonation"] {
+            let c = cfg(&format!(
+                r#"
+name: crm
+upstream:
+  url: "https://crm.example.com/mcp"
+  auth:
+    mode: oauth_impersonation
+    credential: "cred://dev.mcpg.credential.oauth-id-jag/crm"
+    import: {{ mode: {mode}, credential: "cred://dev.mcpg.credential.oauth-id-jag/crm" }}
+"#
+            ));
+            let err = c.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("mcp.federations[crm].upstream.auth.import")
+                    && err.contains("no caller"),
+                "{mode}: {err}"
+            );
+        }
+
+        let nested = cfg(r#"
+name: crm
+upstream:
+  url: "https://crm.example.com/mcp"
+  auth:
+    mode: pass_through
+    import:
+      mode: service_token
+      token: "catalogue-token"
+      import: { mode: service_token, token: "deeper" }
+"#);
+        assert!(
+            nested
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("does not nest")
+        );
+    }
+
+    #[test]
+    fn import_credential_is_validated_like_the_outer_block() {
+        let no_token = cfg(r#"
+name: crm
+upstream:
+  url: "https://crm.example.com/mcp"
+  auth:
+    mode: pass_through
+    import: { mode: service_token }
+"#);
+        assert_eq!(
+            no_token.validate().unwrap_err().to_string(),
+            "mcp.federations[crm].upstream.auth.import: mode `service_token` requires a non-empty `token`"
+        );
+
+        let bad_uri = cfg(r#"
+name: crm
+upstream:
+  url: "https://crm.example.com/mcp"
+  auth:
+    mode: pass_through
+    import: { mode: oauth_client_credentials, credential: "crm-catalogue" }
+"#);
+        let err = bad_uri.validate().unwrap_err().to_string();
+        assert!(
+            err.starts_with("mcp.federations[crm].upstream.auth.import:")
+                && err.contains("cred://<plugin_id>/<target>"),
+            "{err}"
+        );
+
+        let bad_config = cfg(r#"
+name: crm
+upstream:
+  url: "https://crm.example.com/mcp"
+  auth:
+    mode: pass_through
+    import:
+      mode: oauth_client_credentials
+      credential: "cred://dev.mcpg.credential.oauth-client-credentials/crm"
+      credential_config: "not-an-object"
+"#);
+        assert!(
+            bad_config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("upstream.auth.import: `credential_config` must be a JSON object")
+        );
+
+        let unknown_key: Result<FederationConfig, _> = serde_yaml::from_str(
+            r#"
+name: crm
+upstream:
+  url: "https://crm.example.com/mcp"
+  auth:
+    mode: pass_through
+    import: { mode: service_token, token: "t", scopes: ["read"] }
+"#,
+        );
+        assert!(unknown_key.is_err(), "unknown import keys are rejected");
     }
 
     #[test]

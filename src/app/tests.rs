@@ -2335,3 +2335,322 @@ plugins:
     assert!(!err.contains("s3cret-value"), "{err}");
     assert!(!err.contains("libconsumer.so"), "{err}");
 }
+
+// ── where the EMA authorization server records redeemed ID-JAGs ──────
+
+fn ema_app_config(cluster_kind: &str) -> AppConfig {
+    let mut config: AppConfig = serde_yaml::from_str(
+        r#"
+governance:
+  access:
+    resource_metadata:
+      resource: https://mcp.example.com/mcp
+    authorization_server:
+      issuer: https://mcp.example.com
+      signing_secret: ema-signing-secret-0123456789abcdef
+      trusted_idps:
+        - issuer: https://acme.okta.com
+      clients:
+        - client_id: mcp-client
+"#,
+    )
+    .expect("config parses");
+    config.cluster.kind = cluster_kind.to_owned();
+    config
+}
+
+fn plaintext_state() -> StateEncryption {
+    StateEncryption {
+        cipher: None,
+        allow_plaintext_reads: false,
+    }
+}
+
+fn single_node_coordinator() -> Arc<dyn mcpg_cluster_api::ClusterBackend> {
+    crate::builtins::cluster_single_node::SingleNodeClusterBackend::new()
+}
+
+#[test]
+fn a_clustered_ema_ledger_is_the_coordinators_kv() {
+    let coordinator = single_node_coordinator();
+    let ledger = ema_replay_ledger(
+        &ema_app_config("redis"),
+        Some(&coordinator),
+        &plaintext_state(),
+        &None,
+        None,
+    );
+    assert!(!ledger.is_process_local());
+    let coordinator_kv = crate::runtime::authorization_server::ReplayLedger::shared(
+        coordinator
+            .key_value_store()
+            .expect("the coordinator exposes a KV"),
+    );
+    assert!(ledger.shares_store_with(&coordinator_kv));
+}
+
+/// A reload rebuilds the single-node coordinator with an empty KV, so the
+/// in-process ledger passes from the replaced server to its successor.
+#[test]
+fn a_single_node_ema_ledger_survives_a_reload() {
+    let config = ema_app_config("single_node");
+    let at_boot = wire_ema_authorization_server(
+        &config,
+        Some(&single_node_coordinator()),
+        &plaintext_state(),
+        &None,
+        None,
+    )
+    .expect("wires")
+    .expect("configured");
+    assert!(at_boot.replay_ledger().is_process_local());
+    let after_reload = wire_ema_authorization_server(
+        &config,
+        Some(&single_node_coordinator()),
+        &plaintext_state(),
+        &None,
+        Some(&at_boot),
+    )
+    .expect("wires")
+    .expect("configured");
+    assert!(
+        after_reload
+            .replay_ledger()
+            .shares_store_with(at_boot.replay_ledger())
+    );
+}
+
+#[test]
+fn no_ema_server_is_wired_without_its_config() {
+    let wired = wire_ema_authorization_server(
+        &AppConfig::default(),
+        Some(&single_node_coordinator()),
+        &plaintext_state(),
+        &None,
+        None,
+    )
+    .expect("wires");
+    assert!(wired.is_none());
+}
+
+/// An EMA config whose signing secret is `signing_secret` and whose one
+/// client authenticates with `${secret.EMA_CLIENT_SECRET}` from `dir`.
+fn ema_config_with_placeholders(signing_secret: &str, dir: &std::path::Path) -> AppConfig {
+    serde_yaml::from_str(&format!(
+        r#"
+gateway:
+  secrets:
+    dir: "{dir}"
+    watch: false
+governance:
+  access:
+    resource_metadata:
+      resource: https://mcp.example.com/mcp
+    authorization_server:
+      issuer: https://mcp.example.com
+      signing_secret: "{signing_secret}"
+      trusted_idps:
+        - issuer: https://acme.okta.com
+      clients:
+        - client_id: mcp-client
+          client_secret: "${{secret.EMA_CLIENT_SECRET}}"
+"#,
+        dir = dir.display(),
+    ))
+    .expect("config parses")
+}
+
+/// A token request of `mcp-client` with `client_secret`, whose assertion
+/// fails only after client authentication.
+fn ema_client_attempt(
+    client_secret: &str,
+) -> crate::runtime::authorization_server::TokenRequestForm {
+    crate::runtime::authorization_server::TokenRequestForm {
+        grant_type: Some("urn:ietf:params:oauth:grant-type:jwt-bearer".to_owned()),
+        assertion: Some("not-a-jwt".to_owned()),
+        client_id: Some("mcp-client".to_owned()),
+        client_secret: Some(client_secret.to_owned()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn the_ema_server_is_built_from_resolved_env_and_mounted_secrets() {
+    const SIGNING_ENV: &str = "MCPGTEST_EMA_SIGNING_SECRET";
+    const SIGNING_VALUE: &str = "resolved-signing-secret-0123456789abcdef";
+    const CLIENT_SECRET: &str = "mounted-client-secret-value";
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("EMA_CLIENT_SECRET"), CLIENT_SECRET).expect("write secret");
+    // SAFETY: test-only; no other test reads this variable.
+    unsafe { std::env::set_var(SIGNING_ENV, SIGNING_VALUE) };
+
+    let mut config = ema_config_with_placeholders("${env.MCPGTEST_EMA_SIGNING_SECRET}", dir.path());
+    config.validate().expect("the placeholders pass validation");
+    let bundle = build_plugin_registry(&mut config, None, None)
+        .await
+        .unwrap_or_else(|e| panic!("registry builds: {e:#}"));
+    let resolved = bundle.authorization_server.expect("configured");
+    assert_eq!(resolved.signing_secret.as_deref(), Some(SIGNING_VALUE));
+    assert_eq!(
+        resolved.clients[0].client_secret.as_deref(),
+        Some(CLIENT_SECRET)
+    );
+    let kept = config
+        .governance
+        .access
+        .authorization_server
+        .as_ref()
+        .expect("still configured");
+    assert_eq!(
+        kept.clients[0].client_secret.as_deref(),
+        Some("${secret.EMA_CLIENT_SECRET}"),
+        "the config the gateway keeps holds the placeholder, never the value"
+    );
+
+    let server = wire_ema_authorization_server(
+        &with_resolved_authorization_server(&config, Some(resolved)),
+        Some(&single_node_coordinator()),
+        &plaintext_state(),
+        &None,
+        None,
+    )
+    .expect("wires")
+    .expect("configured");
+    let authenticated = server
+        .handle_token_request(ema_client_attempt(CLIENT_SECRET), None)
+        .await
+        .expect_err("the assertion is refused");
+    assert_eq!(
+        authenticated.error, "invalid_grant",
+        "the mounted value authenticates the client: {}",
+        authenticated.description
+    );
+    let placeholder = server
+        .handle_token_request(ema_client_attempt("${secret.EMA_CLIENT_SECRET}"), None)
+        .await
+        .expect_err("the placeholder is not the secret");
+    assert_eq!(placeholder.error, "invalid_client");
+    unsafe { std::env::remove_var(SIGNING_ENV) };
+}
+
+#[tokio::test]
+async fn a_resolved_ema_signing_secret_is_held_to_the_hs256_floor() {
+    const SIGNING_ENV: &str = "MCPGTEST_EMA_SHORT_SIGNING_SECRET";
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("EMA_CLIENT_SECRET"),
+        "mounted-client-secret-value",
+    )
+    .expect("write secret");
+    // SAFETY: test-only; no other test reads this variable.
+    unsafe { std::env::set_var(SIGNING_ENV, "short-value") };
+
+    let mut config =
+        ema_config_with_placeholders("${env.MCPGTEST_EMA_SHORT_SIGNING_SECRET}", dir.path());
+    config
+        .validate()
+        .expect("a placeholder is not judged by its length");
+    let error = match build_plugin_registry(&mut config, None, None).await {
+        Ok(_) => panic!("an 11-byte HS256 secret must refuse the boot"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("at least 32 bytes"), "{error}");
+    assert!(
+        !error.contains("short-value"),
+        "the error never echoes a secret: {error}"
+    );
+    unsafe { std::env::remove_var(SIGNING_ENV) };
+}
+
+#[tokio::test]
+async fn an_unset_ema_env_var_refuses_the_boot_and_names_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        dir.path().join("EMA_CLIENT_SECRET"),
+        "mounted-client-secret-value",
+    )
+    .expect("write secret");
+    let mut config =
+        ema_config_with_placeholders("${env.MCPGTEST_EMA_SIGNING_SECRET_NEVER_SET}", dir.path());
+    let error = match build_plugin_registry(&mut config, None, None).await {
+        Ok(_) => panic!("an unset variable must refuse the boot"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("governance.access.authorization_server"),
+        "{error}"
+    );
+    assert!(
+        error.contains("MCPGTEST_EMA_SIGNING_SECRET_NEVER_SET"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_shared_ema_ledger_is_not_carried_into_a_single_node_reload() {
+    let coordinator = single_node_coordinator();
+    let clustered = ema_app_config("redis");
+    let shared = ema_replay_ledger(
+        &clustered,
+        Some(&coordinator),
+        &plaintext_state(),
+        &None,
+        None,
+    );
+    let server = build_ema_authorization_server(&clustered, shared.clone())
+        .expect("builds")
+        .expect("configured");
+    let after_reload = ema_replay_ledger(
+        &ema_app_config("single_node"),
+        Some(&coordinator),
+        &plaintext_state(),
+        &None,
+        Some(&server),
+    );
+    assert!(after_reload.is_process_local());
+    assert!(!after_reload.shares_store_with(&shared));
+}
+
+#[test]
+fn a_coordinator_without_a_kv_keeps_the_ema_ledger_in_process() {
+    let ledger = ema_replay_ledger(
+        &ema_app_config("redis"),
+        None,
+        &plaintext_state(),
+        &None,
+        None,
+    );
+    assert!(ledger.is_process_local());
+}
+
+/// A reload runs on every registry sync pass, so the per-replica single
+/// use of a cluster without a shared KV is reported at boot, and on a
+/// reload only when the server it replaces shared a ledger.
+#[test]
+fn a_per_replica_ledger_is_reported_once() {
+    let degraded = ema_app_config("redis");
+    assert!(per_replica_ledger_is_news(None), "at boot");
+    let at_boot = wire_ema_authorization_server(&degraded, None, &plaintext_state(), &None, None)
+        .expect("wires")
+        .expect("configured");
+    assert!(
+        !per_replica_ledger_is_news(Some(&at_boot)),
+        "not again on a reload that keeps it"
+    );
+
+    let coordinator = single_node_coordinator();
+    let shared = wire_ema_authorization_server(
+        &degraded,
+        Some(&coordinator),
+        &plaintext_state(),
+        &None,
+        None,
+    )
+    .expect("wires")
+    .expect("configured");
+    assert!(!shared.replay_ledger().is_process_local());
+    assert!(
+        per_replica_ledger_is_news(Some(&shared)),
+        "a shared ledger lost on reload"
+    );
+}

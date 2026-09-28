@@ -28,7 +28,11 @@ pub struct CredentialsConfig {
     /// (commonly the tenant claim) get separate cached credentials.
     /// The caller's `subject_token` (stamped by `oauth_impersonation`)
     /// is ALWAYS folded when present — impersonated credentials never
-    /// share across bearers, with or without this setting.
+    /// share across bearers, with or without this setting. A subject
+    /// token from the caller's stored IdP sign-in (`subject_token:
+    /// idp_refresh_token` or `idp_id_token`) is folded as the sign-in it
+    /// belongs to instead, so a token the IdP rotates keeps the cached
+    /// credential.
     /// Empty (default) excludes other attributes from the key — set this to
     /// your tenant claim name(s) when a `credential_issuer` derives its
     /// principal from an attribute claim, otherwise those callers share

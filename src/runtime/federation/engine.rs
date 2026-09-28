@@ -18,6 +18,7 @@ use crate::backends::{
     FederatedResourceTemplate, FederatedTool, PromptArgument, PromptDescriptor, PromptRoute,
     ResourceDescriptor, ResourceRoute, ToolDescriptor,
 };
+use crate::config::federation::{AuthConfig, SubjectToken};
 use crate::config::{AuthMode, FederationConfig, SynthesizeMode, UpstreamTransport};
 use crate::protocol::{
     ClientCapabilities, JSONRPC_VERSION, ListChangedNotification, ResourceTemplate,
@@ -31,9 +32,11 @@ use crate::runtime::session_store::{SessionPhase, SessionStore};
 use crate::runtime::subscription_store::SubscriptionStore;
 use mcpg_plugin_host::PluginRegistry;
 use mcpg_plugin_host::credential_cache_clustered::CredentialCacheKind;
+use mcpg_plugin_protocol::credential::{CredentialError, CredentialIssuer};
 use mcpg_plugin_protocol::types::PluginIdentity;
 
 use super::bridge::ServerRequestBridge;
+use super::idp_sessions::{self, IdpSessionSource, SubjectTokenOutcome};
 use super::upstream::{
     McpUpstream, UpstreamConnectOptions, UpstreamError, UpstreamServerRequestHandler,
     connect_upstream,
@@ -119,6 +122,11 @@ pub struct FederationCaller<'a> {
     /// impersonation modes issue credentials under it, so issuer trust
     /// gates and cache keys see the real subject.
     pub identity: Option<&'a crate::runtime::RequestIdentity>,
+    /// The gateway request the dispatch serves, for its audit records.
+    pub request_id: Option<&'a str>,
+    /// Where a request that may answer with a URL-mode elicitation
+    /// receives the link a caller with no stored sign-in is offered.
+    pub connect_link: Option<&'a idp_sessions::ConnectLinkSlot>,
 }
 
 /// A per-caller upstream session. Keyed by
@@ -155,13 +163,37 @@ impl Satellite {
 /// credential derives from the caller's own bearer, a fingerprint of
 /// that bearer joins the key so two tokens of the same principal (e.g.
 /// different scopes, or a mid-session rotation) never share an upstream
-/// session.
-fn satellite_caller_key(fed: &FederationConfig, caller: &FederationCaller<'_>) -> String {
+/// session. A mode that presents the principal's stored IdP sign-in
+/// joins its kind and a digest of the rest of what the credential cache
+/// keys the upstream credential on (the caller's roles, groups, scopes
+/// and folded attributes) instead: the upstream session outlives the
+/// caller's gateway access token, and two callers of one principal that
+/// resolve different upstream credentials keep separate sessions.
+fn satellite_caller_key(
+    fed: &FederationConfig,
+    caller: &FederationCaller<'_>,
+    key_attributes: &[String],
+) -> String {
     let mut key = caller
         .principal
         .or(caller.session_id)
         .unwrap_or_default()
         .to_owned();
+    let auth = &fed.upstream.auth;
+    if auth.mode == AuthMode::OauthImpersonation
+        && let Some(kind) = idp_sessions::subject_token_kind(auth.subject_token)
+    {
+        key.push_str("#v");
+        key.push_str(kind.as_str());
+        if let Some(identity) = caller.identity {
+            key.push_str("#i");
+            key.push_str(&idp_sessions::credential_key_digest(
+                identity,
+                key_attributes,
+            ));
+        }
+        return key;
+    }
     if matches!(
         fed.upstream.auth.mode,
         AuthMode::PassThrough | AuthMode::OauthImpersonation
@@ -176,6 +208,48 @@ fn satellite_caller_key(fed: &FederationConfig, caller: &FederationCaller<'_>) -
         }
     }
     key
+}
+
+/// Why a credential issuer yielded no bearer.
+#[derive(Debug)]
+enum IssueFailure {
+    /// The credential subsystem is not wired.
+    NotWired,
+    /// The issuer refused or failed.
+    Refused(CredentialError),
+    /// The issuer answered without a token value.
+    NoValue,
+}
+
+impl IssueFailure {
+    fn into_upstream(self) -> UpstreamError {
+        UpstreamError::Connect(self.to_string())
+    }
+
+    /// The outcome of presenting a stored sign-in that ended in `self`: the
+    /// issuer refused it, or it could not be exchanged now.
+    fn subject_token_outcome(&self) -> SubjectTokenOutcome {
+        match self {
+            Self::Refused(
+                CredentialError::Misconfigured { .. } | CredentialError::NotAuthorized { .. },
+            )
+            | Self::NotWired => SubjectTokenOutcome::Refused,
+            Self::Refused(CredentialError::Backend { .. } | CredentialError::Throttled { .. })
+            | Self::NoValue => SubjectTokenOutcome::Unavailable,
+        }
+    }
+}
+
+impl std::fmt::Display for IssueFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotWired => {
+                f.write_str("oauth credential modes require the credential subsystem (not wired)")
+            }
+            Self::Refused(error) => write!(f, "credential issue failed: {error}"),
+            Self::NoValue => f.write_str("credential issuer returned no token value"),
+        }
+    }
 }
 
 /// What the engine needs to resolve `oauth_client_credentials` bearers
@@ -428,6 +502,9 @@ pub(crate) struct FederationEngine {
     /// runtime), `None` in unit tests. Required only by federations using
     /// `oauth_client_credentials`.
     credentials: Option<FederationCredentials>,
+    /// The IdP sign-ins the gateway keeps per user, for federations whose
+    /// `subject_token` presents one. `None` without interactive sign-in.
+    idp_sessions: Option<Arc<dyn IdpSessionSource>>,
     /// Client-notification sink. `Some` in production; `None` in unit tests
     /// (re-import still happens, the client broadcast is just skipped).
     notifier: Option<Arc<FederationNotifier>>,
@@ -496,6 +573,7 @@ impl FederationEngine {
             gateway_via: gateway_via.into(),
             satellites: DashMap::new(),
             credentials: None,
+            idp_sessions: None,
             notifier: None,
             server_request_bridge: None,
             imported: Mutex::new(HashMap::new()),
@@ -531,6 +609,15 @@ impl FederationEngine {
         cache: Arc<CredentialCacheKind>,
     ) -> Self {
         self.credentials = Some(FederationCredentials { registry, cache });
+        self
+    }
+
+    /// Attach the store of the IdP sign-ins the gateway keeps per user, so
+    /// `subject_token: idp_refresh_token` and `idp_id_token` federations
+    /// can present the caller's.
+    #[must_use]
+    pub fn with_idp_sessions(mut self, source: Option<Arc<dyn IdpSessionSource>>) -> Self {
+        self.idp_sessions = source;
         self
     }
 
@@ -603,6 +690,7 @@ impl FederationEngine {
                     );
                 }
                 Err(e) => {
+                    record_import_failure(fed, &e);
                     tracing::error!(
                         federation = %fed.name,
                         error = %e,
@@ -650,6 +738,7 @@ impl FederationEngine {
                 Some(changed)
             }
             Err(e) => {
+                record_import_failure(&fed, &e);
                 tracing::warn!(
                     federation = %fed_name, error = %e,
                     "single-federation re-import failed; keeping previous capabilities"
@@ -720,7 +809,7 @@ impl FederationEngine {
         ),
         UpstreamError,
     > {
-        let bearer = self.bearer_for(fed, FederationCaller::default()).await?;
+        let bearer = self.catalog_bearer(fed).await?;
         let upstream = connect_upstream(self.connect_opts(fed, None, bearer).await?).await?;
         self.record_detected_wire(fed, upstream.as_ref());
         let listed_tools = if fed.import.tools {
@@ -956,47 +1045,311 @@ impl FederationEngine {
             .unwrap_or_default()
     }
 
-    /// Bearer credential for an upstream session. `service_token` uses
-    /// the static token; `pass_through` forwards the inbound caller's
-    /// bearer (only present at dispatch — `None` at import time);
-    /// `oauth_client_credentials` mints a machine token via the
-    /// credential-issuer subsystem (cached + auto-refreshed);
-    /// `oauth_impersonation` exchanges the caller's bearer for an upstream
-    /// token via the same subsystem (the caller bearer is the RFC 8693
-    /// subject token) — and, like `pass_through`, has no caller to
-    /// impersonate at import/listen time, so it lists anonymously then;
-    /// `none` => no auth.
+    /// Bearer credential for a dispatch session (tool call, resource
+    /// read, prompt fetch) on behalf of `caller`. Never consults
+    /// `auth.import`.
     async fn bearer_for(
         &self,
         fed: &FederationConfig,
         caller: FederationCaller<'_>,
     ) -> Result<Option<String>, UpstreamError> {
-        match fed.upstream.auth.mode {
-            AuthMode::ServiceToken => Ok(fed.upstream.auth.token.clone()),
-            AuthMode::PassThrough => Ok(caller.bearer.map(str::to_owned)),
+        self.bearer_for_auth(&fed.name, &fed.upstream.auth, caller)
+            .await
+    }
+
+    /// Bearer credential for the sessions that have no caller: import,
+    /// re-import and the notification listener. `auth.import` wins when
+    /// set; otherwise the outer mode resolves without a caller, which is
+    /// anonymous for `pass_through` and `oauth_impersonation`.
+    async fn catalog_bearer(
+        &self,
+        fed: &FederationConfig,
+    ) -> Result<Option<String>, UpstreamError> {
+        match fed.upstream.auth.import.as_deref() {
+            Some(import) if import.mode.authenticates_without_caller() => {
+                self.bearer_for_auth(&fed.name, import, FederationCaller::default())
+                    .await
+            }
+            Some(_) => Err(UpstreamError::Connect(
+                "auth.import supports only service_token and oauth_client_credentials".into(),
+            )),
+            None => self.bearer_for(fed, FederationCaller::default()).await,
+        }
+    }
+
+    /// Bearer credential one `auth` block yields. `service_token` uses
+    /// the static token; `pass_through` forwards the inbound caller's
+    /// bearer; `oauth_client_credentials` mints a machine token via the
+    /// credential-issuer subsystem (cached + auto-refreshed);
+    /// `oauth_impersonation` exchanges the caller's bearer for an upstream
+    /// token via the same subsystem (the caller bearer is the RFC 8693
+    /// subject token), or, per `subject_token`, the caller's stored IdP
+    /// sign-in. The two caller-derived modes yield no bearer when there
+    /// is no caller, and refuse a caller whose bearer this gateway minted
+    /// unless the stored sign-in is exchanged instead; `none` => no auth.
+    async fn bearer_for_auth(
+        &self,
+        federation: &str,
+        auth: &AuthConfig,
+        caller: FederationCaller<'_>,
+    ) -> Result<Option<String>, UpstreamError> {
+        match auth.mode {
+            AuthMode::ServiceToken => Ok(auth.token.clone()),
+            AuthMode::PassThrough => {
+                refuse_gateway_minted(auth.mode, &caller)?;
+                Ok(caller.bearer.map(str::to_owned))
+            }
             AuthMode::OauthClientCredentials => self
-                .resolve_oauth_credential(fed, machine_identity())
+                .resolve_oauth_credential(auth, machine_identity())
                 .await
                 .map(Some),
-            AuthMode::OauthImpersonation => match caller.bearer {
-                // Dispatch: exchange the caller's bearer (the subject
-                // token) under the caller's resolved identity — issuer
-                // plugins gate on its trust level and the credential
-                // cache keys on its subject/scopes.
-                Some(bearer) => self
-                    .resolve_oauth_credential(fed, impersonation_identity(caller.identity, bearer))
-                    .await
-                    .map(Some),
-                // Import / listen: no caller to impersonate — list anonymously
-                // (same as `pass_through`).
-                None => Ok(None),
-            },
+            AuthMode::OauthImpersonation => {
+                if let Some(kind) = idp_sessions::subject_token_kind(auth.subject_token) {
+                    return self.vault_bearer(federation, auth, caller, kind).await;
+                }
+                refuse_gateway_minted(auth.mode, &caller)?;
+                match caller.bearer {
+                    // Exchange the caller's bearer (the subject token) under
+                    // the caller's resolved identity — issuer plugins gate on
+                    // its trust level and the credential cache keys on its
+                    // subject/scopes.
+                    Some(bearer) => self
+                        .resolve_oauth_credential(
+                            auth,
+                            impersonation_identity(caller.identity, bearer),
+                        )
+                        .await
+                        .map(Some),
+                    None => Ok(None),
+                }
+            }
             AuthMode::None => Ok(None),
         }
     }
 
+    /// The upstream bearer the credential issuer of `auth` mints from the
+    /// caller's stored IdP sign-in of `kind`. Sessions without a caller
+    /// connect anonymously, as with the caller's own bearer. A caller with
+    /// no usable stored sign-in is refused before any request, and so is a
+    /// caller that is not verified: only the principal of a verified caller
+    /// names whose sign-in to read.
+    async fn vault_bearer(
+        &self,
+        federation: &str,
+        auth: &AuthConfig,
+        caller: FederationCaller<'_>,
+        kind: crate::runtime::authorization_server::vault::SubjectTokenKind,
+    ) -> Result<Option<String>, UpstreamError> {
+        use crate::runtime::authorization_server::vault::IdpSubjectToken;
+        let mode = auth.subject_token;
+        let Some(identity) = caller.identity else {
+            if caller.bearer.is_none() {
+                return Ok(None);
+            }
+            idp_sessions::count(mode, SubjectTokenOutcome::Refused);
+            return Err(UpstreamError::Connect(format!(
+                "federation `{federation}` presents the caller's stored enterprise sign-in \
+                 (`subject_token: {}`), which needs a resolved caller identity",
+                mode.as_str()
+            )));
+        };
+        let principal = match identity {
+            crate::runtime::RequestIdentity::Verified { .. } => identity.synthetic_principal_key(),
+            _ => None,
+        };
+        let Some(principal) = principal else {
+            let reason = "the caller is not verified";
+            idp_sessions::count(mode, SubjectTokenOutcome::Refused);
+            self.audit_subject_token(
+                federation,
+                mode,
+                SubjectTokenOutcome::Refused,
+                reason,
+                caller,
+            )
+            .await;
+            return Err(UpstreamError::Connect(format!(
+                "federation `{federation}` presents the caller's stored enterprise sign-in \
+                 (`subject_token: {}`), which only a verified caller has, and {reason}",
+                mode.as_str()
+            )));
+        };
+        let Some(source) = self.idp_sessions.as_deref() else {
+            idp_sessions::count(mode, SubjectTokenOutcome::Refused);
+            return Err(UpstreamError::Connect(format!(
+                "federation `{federation}` presents the caller's stored enterprise sign-in \
+                 (`subject_token: {}`), but this gateway keeps none: configure interactive \
+                 sign-in with a governance.access.authorization_server.trusted_idps[].login block",
+                mode.as_str()
+            )));
+        };
+        let (issuer, target) = match self.vault_issuer(federation, auth) {
+            Ok(found) => found,
+            Err((reason, error)) => {
+                idp_sessions::count(mode, SubjectTokenOutcome::Refused);
+                self.audit_subject_token(
+                    federation,
+                    mode,
+                    SubjectTokenOutcome::Refused,
+                    &reason,
+                    caller,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        let (outcome, reason, message) = match source.subject_token(&principal, kind).await {
+            IdpSubjectToken::Linked(token) => {
+                let identity = idp_sessions::vault_identity(identity, &token);
+                match self
+                    .issue_oauth_credential(auth, &issuer, target, identity)
+                    .await
+                {
+                    Ok(bearer) => {
+                        idp_sessions::count(mode, SubjectTokenOutcome::Used);
+                        return Ok(Some(bearer));
+                    }
+                    Err(failure) => {
+                        let reason = failure.to_string();
+                        (
+                            failure.subject_token_outcome(),
+                            reason.clone(),
+                            format!("federation `{federation}`: {reason}"),
+                        )
+                    }
+                }
+            }
+            IdpSubjectToken::NoLogin => {
+                let reason = "no trusted IdP of the authorization server has a login block";
+                (
+                    SubjectTokenOutcome::Refused,
+                    reason.to_owned(),
+                    format!(
+                        "federation `{federation}` presents the caller's stored enterprise \
+                         sign-in, but {reason}"
+                    ),
+                )
+            }
+            IdpSubjectToken::NotLinked { reason, events } => {
+                self.audit_grant_events(&events, caller.request_id).await;
+                let ended = !events.is_empty();
+                if let Some(slot) = caller.connect_link {
+                    idp_sessions::offer_link(
+                        federation,
+                        source,
+                        identity,
+                        &principal,
+                        slot,
+                        caller.session_id,
+                    )
+                    .await;
+                }
+                (
+                    SubjectTokenOutcome::NotLinked,
+                    reason.to_owned(),
+                    idp_sessions::not_linked_message(federation, source, identity, ended),
+                )
+            }
+            IdpSubjectToken::Unusable { reason } => (
+                SubjectTokenOutcome::Refused,
+                reason.to_owned(),
+                format!("federation `{federation}`: {reason}"),
+            ),
+            IdpSubjectToken::Unavailable { reason } => (
+                SubjectTokenOutcome::Unavailable,
+                reason.clone(),
+                format!(
+                    "federation `{federation}`: the caller's stored enterprise sign-in cannot be \
+                     read now, retry shortly: {reason}"
+                ),
+            ),
+        };
+        idp_sessions::count(mode, outcome);
+        self.audit_subject_token(federation, mode, outcome, &reason, caller)
+            .await;
+        Err(match outcome {
+            SubjectTokenOutcome::NotLinked => UpstreamError::NotLinked { message },
+            _ => UpstreamError::Connect(message),
+        })
+    }
+
+    /// The credential issuer of `auth` and its target, when it may be handed
+    /// a stored sign-in: one of [`IDP_VAULT_ISSUERS`], which exchange it only
+    /// at the token endpoint that issued it. Else why not, for the audit
+    /// record, and the error.
+    ///
+    /// [`IDP_VAULT_ISSUERS`]: crate::config::interactive_login::IDP_VAULT_ISSUERS
+    fn vault_issuer<'a>(
+        &self,
+        federation: &str,
+        auth: &'a AuthConfig,
+    ) -> Result<(Arc<dyn CredentialIssuer>, &'a str), (String, UpstreamError)> {
+        use crate::config::interactive_login::IDP_VAULT_ISSUERS;
+        let (issuer, target) = self.oauth_issuer(auth).map_err(|error| {
+            let reason = match error {
+                UpstreamError::Connect(ref reason) => reason.clone(),
+                _ => "the credential issuer cannot be resolved".to_owned(),
+            };
+            (reason, error)
+        })?;
+        let manifest = issuer.manifest().id.as_str();
+        if IDP_VAULT_ISSUERS.contains(&manifest) {
+            return Ok((issuer, target));
+        }
+        let reason = format!(
+            "credential issuer `{manifest}` may not be handed a stored sign-in: only {} send it \
+             solely to the token endpoint that issued it",
+            IDP_VAULT_ISSUERS.join(" and ")
+        );
+        let error = UpstreamError::Connect(format!(
+            "federation `{federation}` presents the caller's stored enterprise sign-in \
+             (`subject_token: {}`), but {reason}",
+            auth.subject_token.as_str()
+        ));
+        Err((reason, error))
+    }
+
+    /// Record that `federation` could not present the stored sign-in of
+    /// `caller`. Without the credential subsystem there is no audit sink.
+    async fn audit_subject_token(
+        &self,
+        federation: &str,
+        mode: SubjectToken,
+        outcome: SubjectTokenOutcome,
+        reason: &str,
+        caller: FederationCaller<'_>,
+    ) {
+        let Some(creds) = self.credentials.as_ref() else {
+            return;
+        };
+        let actor = caller
+            .identity
+            .map(crate::runtime::plugin_identity_from_request_identity)
+            .unwrap_or_else(machine_identity);
+        let event =
+            idp_sessions::audit_event(federation, mode, outcome, reason, actor, caller.request_id);
+        let _ = creds.registry.emit_audit_event(&event).await;
+    }
+
+    /// Record what reading a stored sign-in did to the user's grants: the
+    /// IdP ended the sign-in, so it and the user's grants are gone.
+    async fn audit_grant_events(
+        &self,
+        events: &[crate::runtime::authorization_server::grants::GrantEvent],
+        request_id: Option<&str>,
+    ) {
+        let Some(creds) = self.credentials.as_ref() else {
+            return;
+        };
+        for event in events {
+            let mut audit = event.event(request_id.unwrap_or_default());
+            audit.request_id = request_id.map(str::to_owned);
+            let _ = creds.registry.emit_audit_event(&audit).await;
+        }
+    }
+
     /// Resolve an OAuth bearer through the credential-issuer
-    /// subsystem. The federation's `auth.credential` is a standard
+    /// subsystem. `auth.credential` is a standard
     /// `cred://<plugin_id>/<target>` URI; we look up the issuer plugin and
     /// `get_or_issue` (host-cached per identity). `identity` is the fixed
     /// machine identity for `oauth_client_credentials` (one shared token per
@@ -1005,15 +1358,27 @@ impl FederationEngine {
     /// Secrets / subject tokens stay inside the issuer plugin.
     async fn resolve_oauth_credential(
         &self,
-        fed: &FederationConfig,
+        auth: &AuthConfig,
         identity: PluginIdentity,
     ) -> Result<String, UpstreamError> {
+        let (issuer, target) = self.oauth_issuer(auth)?;
+        self.issue_oauth_credential(auth, &issuer, target, identity)
+            .await
+            .map_err(IssueFailure::into_upstream)
+    }
+
+    /// The credential issuer `auth.credential` names
+    /// (`cred://<plugin_id>/<target>`), and the target.
+    fn oauth_issuer<'a>(
+        &self,
+        auth: &'a AuthConfig,
+    ) -> Result<(Arc<dyn CredentialIssuer>, &'a str), UpstreamError> {
         let creds = self.credentials.as_ref().ok_or_else(|| {
             UpstreamError::Connect(
                 "oauth credential modes require the credential subsystem (not wired)".into(),
             )
         })?;
-        let uri = fed.upstream.auth.credential.as_deref().ok_or_else(|| {
+        let uri = auth.credential.as_deref().ok_or_else(|| {
             UpstreamError::Connect(
                 "oauth credential modes require auth.credential (a cred:// URI)".into(),
             )
@@ -1029,22 +1394,28 @@ impl FederationEngine {
         let issuer = creds.registry.credential_issuer(plugin_id).ok_or_else(|| {
             UpstreamError::Connect(format!("no credential_issuer plugin id={plugin_id:?}"))
         })?;
+        Ok((issuer, target))
+    }
+
+    /// The bearer `issuer` mints for `identity` and `target`, through the
+    /// host credential cache.
+    async fn issue_oauth_credential(
+        &self,
+        auth: &AuthConfig,
+        issuer: &Arc<dyn CredentialIssuer>,
+        target: &str,
+        identity: PluginIdentity,
+    ) -> Result<String, IssueFailure> {
+        let creds = self.credentials.as_ref().ok_or(IssueFailure::NotWired)?;
         // Per-call issuer config from the federation (registry OAuth
         // discovery / operator overrides for template issuers).
-        let call_config = fed
-            .upstream
-            .auth
-            .credential_config
-            .clone()
-            .unwrap_or(Value::Null);
+        let call_config = auth.credential_config.clone().unwrap_or(Value::Null);
         let issued = creds
             .cache
-            .get_or_issue(&issuer, &identity, target, &call_config)
+            .get_or_issue(issuer, &identity, target, &call_config)
             .await
-            .map_err(|e| UpstreamError::Connect(format!("credential issue failed: {e}")))?;
-        issued.value.ok_or_else(|| {
-            UpstreamError::Connect("credential issuer returned no token value".into())
-        })
+            .map_err(IssueFailure::Refused)?;
+        issued.value.ok_or(IssueFailure::NoValue)
     }
 
     /// Dispatch a federated tool call: get-or-create the caller's satellite
@@ -1143,7 +1514,14 @@ impl FederationEngine {
             .iter()
             .find(|f| f.name == source)
             .ok_or_else(|| UpstreamError::Connect(format!("unknown federation '{source}'")))?;
-        let key = (satellite_caller_key(fed, &caller), source.to_owned());
+        let key_attributes = self
+            .credentials
+            .as_ref()
+            .map_or(&[][..], |creds| creds.cache.local().key_attributes());
+        let key = (
+            satellite_caller_key(fed, &caller, key_attributes),
+            source.to_owned(),
+        );
         // Resolve the bearer on every dispatch (cheap: a static clone,
         // the caller's own token, or a credential-cache lookup) so a
         // rotated credential replaces the satellite instead of riding
@@ -1364,7 +1742,7 @@ impl FederationEngine {
     /// Open one notification stream and process pushes until it ends.
     async fn listen_once(&self, fed: &FederationConfig) -> Result<(), UpstreamError> {
         use futures::StreamExt;
-        let bearer = self.bearer_for(fed, FederationCaller::default()).await?;
+        let bearer = self.catalog_bearer(fed).await?;
         let upstream = connect_upstream(self.connect_opts(fed, None, bearer).await?).await?;
         self.record_detected_wire(fed, upstream.as_ref());
         // The trait returns a boxed (Unpin) stream, so no `pin_mut!` needed.
@@ -1565,6 +1943,46 @@ impl FederationEngine {
     }
 }
 
+/// Metric label for a failed catalogue import: `unauthorized` when the
+/// upstream refused the session with 401 or 403, `error` otherwise.
+fn import_failure_reason(error: &UpstreamError) -> &'static str {
+    match error {
+        UpstreamError::Http {
+            status: 401 | 403, ..
+        } => "unauthorized",
+        _ => "error",
+    }
+}
+
+/// Whether an `unauthorized` import of `fed` is the anonymous catalogue
+/// session of a caller-derived mode, which `auth.import` fixes.
+fn needs_import_credential(fed: &FederationConfig, error: &UpstreamError) -> bool {
+    import_failure_reason(error) == "unauthorized"
+        && fed.upstream.auth.import.is_none()
+        && matches!(
+            fed.upstream.auth.mode,
+            AuthMode::PassThrough | AuthMode::OauthImpersonation
+        )
+}
+
+/// Count a failed catalogue import, and name `auth.import` when the
+/// upstream refused an anonymous catalogue session.
+fn record_import_failure(fed: &FederationConfig, error: &UpstreamError) {
+    metrics::counter!(
+        "mcpg_federation_import_failed_total",
+        "reason" => import_failure_reason(error)
+    )
+    .increment(1);
+    if needs_import_credential(fed, error) {
+        tracing::warn!(
+            federation = %fed.name,
+            mode = ?fed.upstream.auth.mode,
+            "upstream refused the anonymous catalogue session; set upstream.auth.import \
+             to a service_token or oauth_client_credentials credential to list it"
+        );
+    }
+}
+
 /// Map operator-config trust level to the runtime trust level (the same
 /// mapping the native binding path uses).
 fn trust_from_config(level: crate::config::policy::TrustLevelConfig) -> RequestTrustLevel {
@@ -1594,6 +2012,47 @@ pub(crate) fn machine_identity() -> PluginIdentity {
     }
 }
 
+/// Refuse a caller-derived mode (`pass_through`, `oauth_impersonation`) for
+/// a caller whose bearer this gateway minted. Only this gateway can
+/// validate that bearer, so no token service can exchange it, and an
+/// upstream that received it could replay it here (MCP Security
+/// Considerations, Access Token Privilege Restriction).
+fn refuse_gateway_minted(
+    mode: AuthMode,
+    caller: &FederationCaller<'_>,
+) -> Result<(), UpstreamError> {
+    if !caller
+        .identity
+        .is_some_and(crate::runtime::RequestIdentity::is_gateway_minted)
+    {
+        return Ok(());
+    }
+    let (refused, stored_sign_in) = match mode {
+        AuthMode::PassThrough => (
+            "forwarded upstream (`pass_through`)",
+            "set upstream.auth.mode to `oauth_impersonation` with \
+             upstream.auth.subject_token: idp_refresh_token",
+        ),
+        _ => (
+            "exchanged for an upstream token (`oauth_impersonation`)",
+            "set upstream.auth.subject_token: idp_refresh_token",
+        ),
+    };
+    Err(UpstreamError::Connect(format!(
+        "a token minted by this gateway cannot be {refused}; {stored_sign_in} to exchange the \
+         caller's stored enterprise sign-in instead, set upstream.auth.mode to `service_token` \
+         or `oauth_client_credentials`, or have callers sign in with a token their identity \
+         provider issued"
+    )))
+}
+
+/// Attributes of the identity handed to a credential issuer that only this
+/// engine may set: every name starting with `subject_token`. A caller
+/// attribute with one of them (a mapped claim, say) is dropped: it must
+/// not supply the subject token or claim the issuers'
+/// `subject_token_source = "idp_vault"` exception.
+pub(crate) const ISSUER_SUBJECT_ATTRIBUTES: [&str; 7] = idp_sessions::VAULT_ATTRIBUTES;
+
 /// Per-caller identity for `oauth_impersonation`: the caller's fully
 /// resolved transport identity (subject, trust level, scopes — the
 /// credential-cache key and the issuer trust gate both read them) with
@@ -1621,11 +2080,16 @@ fn impersonation_identity(
             attributes: std::collections::BTreeMap::new(),
         },
     };
+    idp_sessions::strip_subject_attributes(&mut plugin_identity);
     plugin_identity
         .attributes
         .insert("subject_token".to_owned(), subject_token.to_owned());
     plugin_identity
 }
+
+#[cfg(test)]
+#[path = "engine_idp_tests.rs"]
+mod idp_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1696,11 +2160,11 @@ mod tests {
         format!("http://{addr}/mcp")
     }
 
-    fn empty_policy() -> Arc<ArcSwap<FederatedToolPolicies>> {
+    pub(super) fn empty_policy() -> Arc<ArcSwap<FederatedToolPolicies>> {
         Arc::new(ArcSwap::from_pointee(FederatedToolPolicies::default()))
     }
 
-    fn fed_config(url: &str) -> FederationConfig {
+    pub(super) fn fed_config(url: &str) -> FederationConfig {
         serde_yaml::from_str(&format!(
             r#"
 name: notion
@@ -1720,6 +2184,8 @@ filter: {{ exclude_tools: ["internal_*"] }}
             session_id,
             bearer,
             identity: None,
+            request_id: None,
+            connect_link: None,
         }
     }
 
@@ -2131,6 +2597,8 @@ import: {{ resources: true }}
                         session_id: Some("shared-sess"),
                         bearer: None,
                         identity: None,
+                        request_id: None,
+                        connect_link: None,
                     },
                     None,
                 )
@@ -2161,6 +2629,8 @@ import: {{ resources: true }}
                         session_id: Some(session),
                         bearer: None,
                         identity: None,
+                        request_id: None,
+                        connect_link: None,
                     },
                     None,
                 )
@@ -2195,6 +2665,8 @@ import: {{ resources: true }}
                         session_id: Some("sess-1"),
                         bearer: Some(bearer),
                         identity: None,
+                        request_id: None,
+                        connect_link: None,
                     },
                     None,
                 )
@@ -2214,7 +2686,10 @@ import: {{ resources: true }}
                 session_id: Some("sess-1"),
                 bearer: Some("tok"),
                 identity: None,
+                request_id: None,
+                connect_link: None,
             },
+            &[],
         );
         assert_eq!(with_principal, "verified::idp::iss::alice");
 
@@ -2225,7 +2700,10 @@ import: {{ resources: true }}
                 session_id: Some("sess-1"),
                 bearer: Some("tok"),
                 identity: None,
+                request_id: None,
+                connect_link: None,
             },
+            &[],
         );
         assert_eq!(session_fallback, "sess-1");
 
@@ -2238,7 +2716,10 @@ import: {{ resources: true }}
                 session_id: None,
                 bearer: Some("tok-a"),
                 identity: None,
+                request_id: None,
+                connect_link: None,
             },
+            &[],
         );
         let keyed_b = satellite_caller_key(
             &pass_through,
@@ -2247,7 +2728,10 @@ import: {{ resources: true }}
                 session_id: None,
                 bearer: Some("tok-b"),
                 identity: None,
+                request_id: None,
+                connect_link: None,
             },
+            &[],
         );
         assert!(keyed_a.starts_with("verified::idp::iss::alice#b"));
         assert_ne!(keyed_a, keyed_b);
@@ -2545,6 +3029,770 @@ import: {{ resources: true }}
                 .contains("auth=Bearer exchanged-caller-xyz"),
             "expected the exchanged caller token at the upstream, got {result:?}"
         );
+    }
+
+    pub(super) fn stub_manifest(id: &str) -> mcpg_plugin_protocol::manifest::PluginManifest {
+        use mcpg_plugin_protocol::manifest::{PluginClass, PluginManifest};
+        PluginManifest {
+            id: id.into(),
+            version: "0.0.1".into(),
+            name: id.into(),
+            plugin_class: PluginClass::CredentialIssuer,
+            protocol_version: mcpg_plugin_protocol::PROTOCOL_VERSION.into(),
+            license: None,
+            required_capabilities: vec![],
+            tags: vec![],
+            provides: vec![],
+            provides_schemes: vec![],
+            module_path_prefix: "stub".into(),
+            backend_profile: None,
+        }
+    }
+
+    /// The client-credentials stub as `stub.oauth` (mints `tok-oauth-123`)
+    /// and the token-exchange stub as `stub.exchange` (mints
+    /// `exchanged-<subject>`), behind a local credential cache.
+    fn stub_credentials() -> (Arc<PluginRegistry>, Arc<CredentialCacheKind>) {
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_credential_issuer(
+                Arc::new(StubIssuer {
+                    manifest: stub_manifest("stub.oauth"),
+                }),
+                mcpg_plugin_protocol::PluginTier::Native,
+            )
+            .expect("register stub.oauth");
+        registry
+            .register_credential_issuer(
+                Arc::new(ExchangeStubIssuer {
+                    manifest: stub_manifest("stub.exchange"),
+                }),
+                mcpg_plugin_protocol::PluginTier::Native,
+            )
+            .expect("register stub.exchange");
+        let cache = Arc::new(CredentialCacheKind::Local(Arc::new(
+            mcpg_plugin_host::credential_cache::CredentialCache::default(),
+        )));
+        (Arc::new(registry), cache)
+    }
+
+    /// `(method, Authorization)` pairs an auth-gated mock accepted; the
+    /// GET notification stream records as method `GET`.
+    pub(super) type SeenAuth = Arc<Mutex<Vec<(String, String)>>>;
+
+    pub(super) fn seen_for(seen: &SeenAuth, method: &str) -> Vec<String> {
+        seen.lock()
+            .expect("seen lock")
+            .iter()
+            .filter(|(m, _)| m == method)
+            .map(|(_, auth)| auth.clone())
+            .collect()
+    }
+
+    /// A mock that answers 401 to every request without an
+    /// `Authorization` header, as enterprise-managed upstreams do for
+    /// `initialize` and `tools/list`. Accepted requests are recorded and
+    /// served by `mock_handler`; the GET stream pushes one
+    /// `tools/list_changed`.
+    pub(super) async fn spawn_auth_gated_mock() -> (String, SeenAuth) {
+        let seen = SeenAuth::default();
+        let post_seen = Arc::clone(&seen);
+        let get_seen = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/mcp",
+            post(
+                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let seen = Arc::clone(&post_seen);
+                    async move {
+                        let Some(auth) = headers
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned)
+                        else {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        };
+                        let method = body
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned();
+                        seen.lock().expect("seen lock").push((method, auth));
+                        mock_handler(headers, Json(body)).await
+                    }
+                },
+            )
+            .get(move |headers: axum::http::HeaderMap| {
+                let seen = Arc::clone(&get_seen);
+                async move {
+                    let Some(auth) = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned)
+                    else {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    };
+                    seen.lock()
+                        .expect("seen lock")
+                        .push(("GET".to_owned(), auth));
+                    let frame = format!(
+                        "data: {}\n\n",
+                        json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" })
+                    );
+                    let mut resp = Response::new(axum::body::Body::from(frame));
+                    resp.headers_mut().insert(
+                        axum::http::header::CONTENT_TYPE,
+                        "text/event-stream".parse().unwrap(),
+                    );
+                    resp
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/mcp"), seen)
+    }
+
+    /// An `oauth_impersonation` federation (per-call bearer from
+    /// `stub.exchange`) with an optional catalogue credential.
+    fn impersonating_fed(url: &str, import: Option<AuthConfig>) -> FederationConfig {
+        let mut fed = fed_config(url);
+        fed.upstream.auth.mode = AuthMode::OauthImpersonation;
+        fed.upstream.auth.credential = Some("cred://stub.exchange/notion".into());
+        fed.upstream.auth.import = import.map(Box::new);
+        fed
+    }
+
+    fn service_token_import(token: &str) -> AuthConfig {
+        AuthConfig {
+            mode: AuthMode::ServiceToken,
+            token: Some(token.to_owned()),
+            ..AuthConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn import_credential_lists_an_auth_gated_upstream_while_calls_impersonate() {
+        let (url, seen) = spawn_auth_gated_mock().await;
+        let (registry, cache) = stub_credentials();
+        let cap = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![impersonating_fed(
+                &url,
+                Some(service_token_import("import-tok")),
+            )],
+            cap.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        )
+        .with_credentials(registry, cache);
+
+        engine.import_all().await;
+        let names: Vec<String> = cap.tools().into_iter().map(|t| t.name).collect();
+        assert!(names.contains(&"notion.search".to_owned()), "{names:?}");
+        let listed = seen_for(&seen, "tools/list");
+        assert!(!listed.is_empty(), "tools/list never reached the upstream");
+        assert!(
+            listed.iter().all(|auth| auth == "Bearer import-tok"),
+            "the catalogue must be listed with the import credential, saw {listed:?}"
+        );
+
+        let result = engine
+            .call_tool(
+                "notion",
+                "search",
+                None,
+                caller(Some("sess-1"), Some("caller-xyz")),
+                None,
+            )
+            .await
+            .expect("call_tool");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("auth=Bearer exchanged-caller-xyz"),
+            "a tool call must carry the caller's exchanged token, got {result:?}"
+        );
+        assert_eq!(
+            seen_for(&seen, "tools/call"),
+            vec!["Bearer exchanged-caller-xyz".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn without_import_credential_an_auth_gated_upstream_imports_nothing() {
+        let (url, seen) = spawn_auth_gated_mock().await;
+        let (registry, cache) = stub_credentials();
+        let fed = impersonating_fed(&url, None);
+        let cap = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![fed.clone()],
+            cap.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        )
+        .with_credentials(registry, cache);
+
+        engine.import_all().await;
+        assert!(cap.tools().is_empty());
+        assert!(seen.lock().expect("seen lock").is_empty());
+
+        let err = match engine.import_one(&fed).await {
+            Ok(_) => panic!("an anonymous import of an auth-gated upstream must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, UpstreamError::Http { status: 401, .. }),
+            "got {err:?}"
+        );
+        assert!(needs_import_credential(&fed, &err));
+    }
+
+    #[tokio::test]
+    async fn client_credentials_import_mints_the_catalogue_bearer() {
+        let (url, seen) = spawn_auth_gated_mock().await;
+        let (registry, cache) = stub_credentials();
+        let import = AuthConfig {
+            mode: AuthMode::OauthClientCredentials,
+            credential: Some("cred://stub.oauth/notion-catalogue".into()),
+            ..AuthConfig::default()
+        };
+        let cap = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![impersonating_fed(&url, Some(import))],
+            cap.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        )
+        .with_credentials(registry, cache);
+
+        engine.import_all().await;
+        assert!(cap.tools().iter().any(|t| t.name == "notion.search"));
+        let listed = seen_for(&seen, "tools/list");
+        assert!(!listed.is_empty(), "tools/list never reached the upstream");
+        assert!(
+            listed.iter().all(|auth| auth == "Bearer tok-oauth-123"),
+            "saw {listed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_without_a_caller_bearer_never_borrows_the_import_credential() {
+        let (url, seen) = spawn_auth_gated_mock().await;
+        let (registry, cache) = stub_credentials();
+        let cap = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![impersonating_fed(
+                &url,
+                Some(service_token_import("import-tok")),
+            )],
+            cap.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        )
+        .with_credentials(registry, cache);
+
+        let err = engine
+            .call_tool("notion", "search", None, caller(Some("sess-1"), None), None)
+            .await
+            .expect_err("a caller with no bearer has nothing to impersonate");
+        assert!(
+            matches!(err, UpstreamError::Http { status: 401, .. }),
+            "got {err:?}"
+        );
+        assert!(
+            !seen
+                .lock()
+                .expect("seen lock")
+                .iter()
+                .any(|(_, auth)| auth.contains("import-tok")),
+            "the import credential reached a dispatch session"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_and_its_reimport_use_the_import_credential() {
+        let (url, seen) = spawn_auth_gated_mock().await;
+        let mut fed = fed_config(&url);
+        fed.upstream.auth.mode = AuthMode::PassThrough;
+        fed.upstream.auth.import = Some(Box::new(service_token_import("import-tok")));
+        let cap = CapabilityRegistry::default();
+        let engine = Arc::new(FederationEngine::new(
+            vec![fed],
+            cap.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        ));
+
+        engine.spawn_listeners();
+
+        let mut imported = false;
+        for _ in 0..40 {
+            if cap.tools().iter().any(|t| t.name == "notion.search") {
+                imported = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            imported,
+            "the listener's list_changed re-import never landed"
+        );
+        let streamed = seen_for(&seen, "GET");
+        assert!(!streamed.is_empty());
+        assert!(streamed.iter().all(|auth| auth == "Bearer import-tok"));
+        assert!(
+            seen_for(&seen, "tools/list")
+                .iter()
+                .all(|auth| auth == "Bearer import-tok")
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_bearer_refuses_an_import_mode_that_needs_a_caller() {
+        let cap = CapabilityRegistry::default();
+        let engine =
+            FederationEngine::new(Vec::new(), cap.federated_overlay(), empty_policy(), "via-1");
+        let mut fed = fed_config("http://127.0.0.1:1/mcp");
+        fed.upstream.auth.import = Some(Box::new(AuthConfig {
+            mode: AuthMode::PassThrough,
+            ..AuthConfig::default()
+        }));
+        assert!(matches!(
+            engine.catalog_bearer(&fed).await,
+            Err(UpstreamError::Connect(_))
+        ));
+
+        fed.upstream.auth.import = Some(Box::new(service_token_import("import-tok")));
+        assert_eq!(
+            engine
+                .catalog_bearer(&fed)
+                .await
+                .expect("bearer")
+                .as_deref(),
+            Some("import-tok")
+        );
+    }
+
+    pub(super) const SSO_ISSUER: &str = "https://acme.okta.com/oauth2/default";
+
+    /// A caller as the HTTP transport resolves it: `source` names the
+    /// credential; `issuer` and `auth_provider` are those an OIDC provider
+    /// with `SSO_ISSUER` reports, which is also what an EMA caller whose IdP
+    /// sets `principal_issuer` reports.
+    pub(super) fn sso_principal(
+        source: &str,
+        attributes: &[(&str, &str)],
+    ) -> crate::runtime::RequestIdentity {
+        crate::runtime::RequestIdentity::Verified {
+            subject_id: "user-42".to_owned(),
+            issuer: SSO_ISSUER.to_owned(),
+            auth_provider: format!("oidc_oauth:{SSO_ISSUER}"),
+            source: source.to_owned(),
+            roles: Vec::new(),
+            groups: Vec::new(),
+            scopes: Vec::new(),
+            attributes: attributes
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        }
+    }
+
+    /// The identities a recording issuer was asked to issue for, in order.
+    type Issued = Arc<Mutex<Vec<PluginIdentity>>>;
+
+    fn issuances(issued: &Issued) -> Vec<PluginIdentity> {
+        issued.lock().expect("issued lock").clone()
+    }
+
+    /// The token-exchange stub as `stub.exchange` (mints
+    /// `exchanged-<subject>`), recording the identity of each issuance.
+    fn recording_exchange() -> (Arc<PluginRegistry>, Arc<CredentialCacheKind>, Issued) {
+        struct RecordingExchange {
+            manifest: mcpg_plugin_protocol::manifest::PluginManifest,
+            issued: Issued,
+        }
+        #[async_trait::async_trait]
+        impl mcpg_plugin_protocol::credential::CredentialIssuer for RecordingExchange {
+            fn manifest(&self) -> &mcpg_plugin_protocol::manifest::PluginManifest {
+                &self.manifest
+            }
+            async fn issue(
+                &self,
+                identity: &PluginIdentity,
+                _target: &str,
+                _config: &Value,
+            ) -> Result<
+                mcpg_plugin_protocol::credential::IssuedCredential,
+                mcpg_plugin_protocol::credential::CredentialError,
+            > {
+                self.issued
+                    .lock()
+                    .expect("issued lock")
+                    .push(identity.clone());
+                let subject = identity
+                    .attributes
+                    .get("subject_token")
+                    .cloned()
+                    .unwrap_or_default();
+                Ok(
+                    mcpg_plugin_protocol::credential::IssuedCredential::from_value(
+                        format!("exchanged-{subject}"),
+                        60,
+                    ),
+                )
+            }
+        }
+        let issued = Issued::default();
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_credential_issuer(
+                Arc::new(RecordingExchange {
+                    manifest: stub_manifest("stub.exchange"),
+                    issued: Arc::clone(&issued),
+                }),
+                mcpg_plugin_protocol::PluginTier::Native,
+            )
+            .expect("register stub.exchange");
+        let cache = Arc::new(CredentialCacheKind::Local(Arc::new(
+            mcpg_plugin_host::credential_cache::CredentialCache::default(),
+        )));
+        (Arc::new(registry), cache, issued)
+    }
+
+    /// A wiremock that fails any request it receives, and its `/mcp` URL.
+    pub(super) async fn untouchable_upstream() -> (wiremock::MockServer, String) {
+        let upstream = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let url = format!("{}/mcp", upstream.uri());
+        (upstream, url)
+    }
+
+    /// Dispatch one tool call for `identity` presenting `bearer`, through a
+    /// federation in `mode`, and return the refusal.
+    async fn refused_call(
+        mode: AuthMode,
+        identity: &crate::runtime::RequestIdentity,
+        bearer: &str,
+    ) -> (String, usize, usize) {
+        let (upstream, url) = untouchable_upstream().await;
+        let (registry, cache, issued) = recording_exchange();
+        let mut fed = impersonating_fed(&url, None);
+        fed.upstream.auth.mode = mode;
+        let cap = CapabilityRegistry::default();
+        let engine =
+            FederationEngine::new(vec![fed], cap.federated_overlay(), empty_policy(), "via-1")
+                .with_credentials(registry, cache);
+        let principal = identity.synthetic_principal_key();
+        let err = engine
+            .call_tool(
+                "notion",
+                "search",
+                None,
+                FederationCaller {
+                    principal: principal.as_deref(),
+                    session_id: Some("sess-1"),
+                    bearer: Some(bearer),
+                    identity: Some(identity),
+                    request_id: None,
+                    connect_link: None,
+                },
+                None,
+            )
+            .await
+            .expect_err("a gateway-minted caller must be refused");
+        let UpstreamError::Connect(message) = err else {
+            panic!("expected a connect-stage refusal, got {err:?}");
+        };
+        let upstream_calls = upstream
+            .received_requests()
+            .await
+            .expect("request recording")
+            .len();
+        (message, issuances(&issued).len(), upstream_calls)
+    }
+
+    /// An EMA caller whose IdP sets `principal_issuer` looks like an OIDC
+    /// caller by issuer and `auth_provider`; its gateway-minted bearer is
+    /// still never handed to the token service or the upstream.
+    #[tokio::test]
+    async fn oauth_impersonation_refuses_a_gateway_minted_caller_before_any_request() {
+        let ema = sso_principal(
+            crate::runtime::EMA_ACCESS_TOKEN_SOURCE,
+            &[("token_issuer", "https://mcp.acme.example")],
+        );
+        let inspector = sso_principal(crate::runtime::INSPECTOR_TOKEN_SOURCE, &[]);
+        for identity in [&ema, &inspector] {
+            let (message, issued, upstream_calls) =
+                refused_call(AuthMode::OauthImpersonation, identity, "gw-minted-at").await;
+            assert!(
+                message.contains("minted by this gateway")
+                    && message.contains("oauth_impersonation"),
+                "{message}"
+            );
+            assert!(
+                message.contains("oauth_client_credentials")
+                    && message.contains("upstream.auth.subject_token: idp_refresh_token"),
+                "names the fixes: {message}"
+            );
+            assert!(!message.contains("gw-minted-at"), "{message}");
+            assert_eq!(issued, 0, "the credential issuer was called");
+            assert_eq!(upstream_calls, 0, "the upstream was called");
+        }
+    }
+
+    #[tokio::test]
+    async fn pass_through_refuses_a_gateway_minted_caller_before_any_request() {
+        let ema = sso_principal(
+            crate::runtime::EMA_ACCESS_TOKEN_SOURCE,
+            &[("token_issuer", "https://mcp.acme.example")],
+        );
+        let (message, issued, upstream_calls) =
+            refused_call(AuthMode::PassThrough, &ema, "gw-minted-at").await;
+        assert!(
+            message.contains("minted by this gateway") && message.contains("pass_through"),
+            "{message}"
+        );
+        assert!(
+            message.contains("service_token")
+                && message.contains(
+                    "`oauth_impersonation` with upstream.auth.subject_token: idp_refresh_token"
+                ),
+            "names the fixes: {message}"
+        );
+        assert!(!message.contains("gw-minted-at"), "{message}");
+        assert_eq!(issued, 0);
+        assert_eq!(
+            upstream_calls, 0,
+            "the gateway-minted bearer reached the upstream"
+        );
+    }
+
+    /// The refusal keys on how the caller authenticated, not on who it is:
+    /// an OIDC caller with the same issuer and subject is still exchanged.
+    #[tokio::test]
+    async fn oauth_impersonation_still_exchanges_an_external_oidc_caller() {
+        let (url, seen) = spawn_auth_gated_mock().await;
+        let (registry, cache, issued) = recording_exchange();
+        let cap = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![impersonating_fed(&url, None)],
+            cap.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        )
+        .with_credentials(registry, cache);
+        let sso = sso_principal("authorization:oidc_oauth", &[]);
+        assert!(!sso.is_gateway_minted());
+        let principal = sso.synthetic_principal_key();
+        let result = engine
+            .call_tool(
+                "notion",
+                "search",
+                None,
+                FederationCaller {
+                    principal: principal.as_deref(),
+                    session_id: Some("sess-1"),
+                    bearer: Some("okta-at"),
+                    identity: Some(&sso),
+                    request_id: None,
+                    connect_link: None,
+                },
+                None,
+            )
+            .await
+            .expect("call_tool");
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("auth=Bearer exchanged-okta-at"),
+            "got {result:?}"
+        );
+        assert_eq!(issuances(&issued).len(), 1);
+        assert_eq!(
+            seen_for(&seen, "tools/call"),
+            vec!["Bearer exchanged-okta-at".to_owned()]
+        );
+    }
+
+    /// A caller attribute named like one the engine sets for an issuer (a
+    /// mapped claim, say) never reaches the issuer: the subject token is
+    /// the caller's bearer, and `subject_token_source` is the engine's
+    /// alone to set.
+    #[tokio::test]
+    async fn a_callers_subject_attributes_never_reach_the_issuer() {
+        let mapped = [
+            ("token_issuer", "https://mcp.acme.example"),
+            ("subject_token_source", "idp_vault"),
+            ("subject_token", "mapped-claim"),
+            ("acr", "mfa"),
+        ];
+        let expect_engine_subject = |identity: &PluginIdentity, bearer: &str| {
+            let attributes = &identity.attributes;
+            assert_eq!(
+                attributes.get("subject_token").map(String::as_str),
+                Some(bearer)
+            );
+            assert!(
+                !attributes.contains_key("subject_token_source"),
+                "{attributes:?}"
+            );
+            assert_eq!(attributes["token_issuer"], "https://mcp.acme.example");
+            assert_eq!(attributes["acr"], "mfa");
+        };
+
+        let ema = sso_principal(crate::runtime::EMA_ACCESS_TOKEN_SOURCE, &mapped);
+        expect_engine_subject(
+            &impersonation_identity(Some(&ema), "gw-minted-at"),
+            "gw-minted-at",
+        );
+
+        let (url, seen) = spawn_auth_gated_mock().await;
+        let (registry, cache, issued) = recording_exchange();
+        let cap = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![impersonating_fed(&url, None)],
+            cap.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        )
+        .with_credentials(registry, cache);
+        let sso = sso_principal("authorization:oidc_oauth", &mapped);
+        let principal = sso.synthetic_principal_key();
+        engine
+            .call_tool(
+                "notion",
+                "search",
+                None,
+                FederationCaller {
+                    principal: principal.as_deref(),
+                    session_id: Some("sess-1"),
+                    bearer: Some("okta-at"),
+                    identity: Some(&sso),
+                    request_id: None,
+                    connect_link: None,
+                },
+                None,
+            )
+            .await
+            .expect("call_tool");
+        let recorded = issuances(&issued);
+        assert_eq!(recorded.len(), 1);
+        expect_engine_subject(&recorded[0], "okta-at");
+        assert_eq!(
+            seen_for(&seen, "tools/call"),
+            vec!["Bearer exchanged-okta-at".to_owned()]
+        );
+    }
+
+    /// Only the caller-derived modes refuse a gateway-minted caller: a
+    /// federation that authenticates with its own credential still serves
+    /// it, and the caller's bearer never reaches the upstream.
+    #[tokio::test]
+    async fn a_gateway_minted_caller_still_dispatches_with_the_federations_own_credential() {
+        let ema = sso_principal(
+            crate::runtime::EMA_ACCESS_TOKEN_SOURCE,
+            &[("token_issuer", "https://mcp.acme.example")],
+        );
+        let inspector = sso_principal(crate::runtime::INSPECTOR_TOKEN_SOURCE, &[]);
+        for identity in [&ema, &inspector] {
+            for mode in [AuthMode::ServiceToken, AuthMode::OauthClientCredentials] {
+                let (url, seen) = spawn_auth_gated_mock().await;
+                let (registry, cache, issued) = recording_exchange();
+                let mut fed = fed_config(&url);
+                fed.upstream.auth.mode = mode;
+                fed.upstream.auth.token = Some("static-tok".into());
+                fed.upstream.auth.credential = Some("cred://stub.exchange/notion".into());
+                let cap = CapabilityRegistry::default();
+                let engine = FederationEngine::new(
+                    vec![fed],
+                    cap.federated_overlay(),
+                    empty_policy(),
+                    "via-1",
+                )
+                .with_credentials(registry, cache);
+                let principal = identity.synthetic_principal_key();
+                engine
+                    .call_tool(
+                        "notion",
+                        "search",
+                        None,
+                        FederationCaller {
+                            principal: principal.as_deref(),
+                            session_id: Some("sess-1"),
+                            bearer: Some("gw-minted-at"),
+                            identity: Some(identity),
+                            request_id: None,
+                            connect_link: None,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{mode:?}: {e:?}"));
+                // The recording stub mints `exchanged-<subject>`; the machine
+                // identity carries no subject token.
+                let (bearer, issued_for) = match mode {
+                    AuthMode::ServiceToken => ("Bearer static-tok", Vec::new()),
+                    _ => ("Bearer exchanged-", vec![machine_identity()]),
+                };
+                assert_eq!(
+                    seen_for(&seen, "tools/call"),
+                    vec![bearer.to_owned()],
+                    "{mode:?}"
+                );
+                assert_eq!(issuances(&issued), issued_for, "{mode:?}");
+                assert!(
+                    !seen
+                        .lock()
+                        .expect("seen lock")
+                        .iter()
+                        .any(|(_, auth)| auth.contains("gw-minted-at")),
+                    "{mode:?}: the caller's bearer reached the upstream"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn import_failures_are_classified_and_hinted() {
+        let unauthorized = UpstreamError::Http {
+            status: 401,
+            jsonrpc_code: None,
+        };
+        let forbidden = UpstreamError::Http {
+            status: 403,
+            jsonrpc_code: None,
+        };
+        let server_error = UpstreamError::Http {
+            status: 500,
+            jsonrpc_code: None,
+        };
+        assert_eq!(import_failure_reason(&unauthorized), "unauthorized");
+        assert_eq!(import_failure_reason(&forbidden), "unauthorized");
+        assert_eq!(import_failure_reason(&server_error), "error");
+        assert_eq!(
+            import_failure_reason(&UpstreamError::Connect("refused".into())),
+            "error"
+        );
+
+        let mut fed = fed_config("http://127.0.0.1:1/mcp");
+        // `none` lists anonymously on purpose; there is no caller mode
+        // for `auth.import` to stand in for.
+        assert!(!needs_import_credential(&fed, &unauthorized));
+        for mode in [AuthMode::PassThrough, AuthMode::OauthImpersonation] {
+            fed.upstream.auth.mode = mode;
+            assert!(needs_import_credential(&fed, &unauthorized));
+            assert!(!needs_import_credential(&fed, &server_error));
+        }
+        fed.upstream.auth.import = Some(Box::new(service_token_import("import-tok")));
+        assert!(!needs_import_credential(&fed, &unauthorized));
     }
 
     /// Mock that serves the normal POST endpoint plus a GET SSE stream which

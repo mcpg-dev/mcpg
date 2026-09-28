@@ -59,6 +59,7 @@ impl TlsInfoExtUnwrap for TlsInfoExt {
 mod cors;
 mod discovery;
 mod identity;
+mod oauth_browser;
 mod probes;
 mod response;
 mod sse;
@@ -67,17 +68,22 @@ mod webhooks;
 
 pub(crate) use discovery::{
     aauth_authorize_handler, aauth_jwks_handler, aauth_resource_metadata_handler,
-    aauth_revoke_handler, oauth_authorization_server_metadata_handler,
-    oauth_protected_resource_handler, oauth_token_handler, served_registry_list_handler,
-    served_registry_version_handler,
+    aauth_revoke_handler, oauth_authorization_server_metadata_handler, oauth_jwks_handler,
+    oauth_protected_resource_handler, oauth_register_handler, oauth_revoke_handler,
+    oauth_token_handler, served_registry_list_handler, served_registry_version_handler,
 };
 pub(crate) use identity::{build_full_request_context, lift_idempotency_key_header};
+pub(crate) use oauth_browser::{
+    oauth_authorize_handler, oauth_browser_method_not_allowed, oauth_callback_handler,
+    oauth_connect_decision_handler, oauth_connect_handler, oauth_consent_handler,
+};
 pub(crate) use probes::{health_handler, metrics_handler, readiness_handler, runtime_handler};
 pub(crate) use response::{
-    INSUFFICIENT_SCOPE_DATA_KEY, map_gateway_response, map_protocol_error_response,
-    map_protocol_error_with_status, map_sse_events, map_transport_rejection,
-    reject_method_on_modern_wire, request_host, resource_metadata_url, with_request_id_header,
-    with_resource_metadata_pointer, with_session_id_header, with_www_authenticate_challenge,
+    INSUFFICIENT_SCOPE_DATA_KEY, challenge_scope, map_gateway_response,
+    map_protocol_error_response, map_protocol_error_with_status, map_sse_events,
+    map_transport_rejection, reject_method_on_modern_wire, request_host, resource_metadata_url,
+    with_request_id_header, with_resource_metadata_pointer, with_session_id_header,
+    with_www_authenticate_challenge,
 };
 pub(crate) use sse::{
     ResourceSubscriptionGuard, SlottedEventStream, SseStreamSlot, acquire_sse_slot,
@@ -92,7 +98,7 @@ pub(crate) use validate::{
 pub(crate) use webhooks::{webhook_approval_resolution_handler, webhook_resource_updated_handler};
 // Reached only from this transport's test module.
 #[cfg(test)]
-pub(crate) use identity::{build_request_context, plugin_identity_to_request};
+pub(crate) use identity::{CredentialOrigin, build_request_context, plugin_identity_to_request};
 #[cfg(test)]
 pub(crate) use response::INSUFFICIENT_SCOPE_HEADER;
 #[cfg(test)]
@@ -185,8 +191,8 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
 
     let mut router = Router::new()
         .route(health_path, get(health_handler))
-        .route("/ready", get(readiness_handler))
-        .route("/runtime", get(runtime_handler))
+        .route(probes::READINESS_PATH, get(readiness_handler))
+        .route(probes::RUNTIME_PATH, get(runtime_handler))
         .route(
             mcp_path,
             get(mcp_get_handler)
@@ -261,32 +267,68 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         super::http_route::mount_override_routes(router, state.runtime.load().plugin_registry())
             .expect("override-mode http_route wiring");
 
-    // OAuth 2.1 Protected Resource Metadata (RFC 9728).
-    // Only mounted when auth configuration provides issuer info. Both the
-    // root well-known path and the RFC 9728 §3.1 path-aware form
-    // (`/.well-known/oauth-protected-resource/{*path}`) are served so a
-    // client that derives the metadata URL from a resource carrying a
-    // path component finds it.
-    if config.governance.access.resource_metadata.is_some()
-        || config.governance.access.oidc_oauth.is_some()
-        || config
-            .governance
-            .access
-            .jwks
-            .as_ref()
-            .and_then(|j| j.issuer.as_ref())
-            .is_some()
-    {
-        router = router
-            .route(
-                "/.well-known/oauth-protected-resource",
-                get(oauth_protected_resource_handler),
-            )
-            .route(
-                "/.well-known/oauth-protected-resource/{*resource_path}",
-                get(oauth_protected_resource_handler),
-            );
-    }
+    // OAuth 2.1 Protected Resource Metadata (RFC 9728) and the embedded EMA
+    // authorization server (RFC 8414 metadata, the token endpoint and its
+    // JWKS, and interactive sign-in's pages, RFC 7009 revocation and RFC 7591
+    // registration). Mounted
+    // unconditionally: each handler reads the live config or runtime and
+    // answers 404 while its block is unset, so a hot reload that adds or
+    // removes one takes effect without a restart. The PRM is
+    // served at the root and at the RFC 9728 §3.1 path-aware form so a
+    // client that derives the metadata URL from a resource carrying a path
+    // component finds it.
+    router = router
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_protected_resource_handler),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/{*resource_path}",
+            get(oauth_protected_resource_handler),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth_authorization_server_metadata_handler),
+        )
+        .route(
+            crate::runtime::authorization_server::TOKEN_PATH,
+            post(oauth_token_handler),
+        )
+        .route(
+            crate::runtime::authorization_server::JWKS_PATH,
+            get(oauth_jwks_handler),
+        )
+        .route(
+            crate::runtime::authorization_server::revocation::REVOCATION_PATH,
+            post(oauth_revoke_handler),
+        )
+        .route(
+            crate::runtime::authorization_server::dcr::REGISTRATION_PATH,
+            post(oauth_register_handler),
+        )
+        .route(
+            crate::runtime::authorization_server::interactive::AUTHORIZE_PATH,
+            get(oauth_authorize_handler)
+                .head(oauth_browser_method_not_allowed)
+                .fallback(oauth_browser_method_not_allowed),
+        )
+        .route(
+            crate::runtime::authorization_server::interactive::CONSENT_PATH,
+            post(oauth_consent_handler).fallback(oauth_browser_method_not_allowed),
+        )
+        .route(
+            crate::runtime::authorization_server::interactive::CALLBACK_PATH,
+            get(oauth_callback_handler)
+                .head(oauth_browser_method_not_allowed)
+                .fallback(oauth_browser_method_not_allowed),
+        )
+        .route(
+            crate::runtime::authorization_server::interactive::CONNECT_PATH,
+            get(oauth_connect_handler)
+                .post(oauth_connect_decision_handler)
+                .head(oauth_browser_method_not_allowed)
+                .fallback(oauth_browser_method_not_allowed),
+        );
 
     // AAuth resource metadata (draft-hardt-oauth-aauth-protocol). Mounted
     // only when `server.aauth_resource_metadata` is configured; the same
@@ -312,23 +354,10 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
             );
     }
 
-    // Embedded EMA authorization server (RFC 8414 metadata + the
-    // jwt-bearer/ID-JAG token endpoint). Mounted only when
-    // `governance.access.authorization_server` is configured.
-    if config.governance.access.authorization_server.is_some() {
-        router = router
-            .route(
-                "/.well-known/oauth-authorization-server",
-                get(oauth_authorization_server_metadata_handler),
-            )
-            .route("/oauth/token", post(oauth_token_handler));
-    }
-
     // MCP-Registry surface (v0.1 API): one entry describing this
     // gateway, so registry-driven client policies can discover MCPG as
     // their approved server. Mounted only when
-    // `mcp.registry.enabled` (a restart-time toggle, like the
-    // well-known mounts).
+    // `mcp.registry.enabled` (a restart-time toggle).
     if config.mcp.registry.enabled {
         router = router
             .route("/v0.1/servers", get(served_registry_list_handler))
@@ -367,7 +396,10 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
     let canonical = config.gateway.server.canonical_url.clone();
     if let Some(canonical) = canonical {
         let exempt: Vec<String> = std::iter::once(health_path.to_owned())
-            .chain(["/ready".to_owned(), "/runtime".to_owned()])
+            .chain([
+                probes::READINESS_PATH.to_owned(),
+                probes::RUNTIME_PATH.to_owned(),
+            ])
             .chain(metrics_path.clone())
             .collect();
         let trust_proxy = config.gateway.server.trust_proxy_ip;
@@ -407,8 +439,15 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(
             handle_router_panic,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(request_span))
         .with_state(state)
+}
+
+/// The span every request runs in, with the method and the path only. A
+/// query string can carry an authorization code or `state` (RFC 6749
+/// §10.5), so the URI is never recorded whole.
+fn request_span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
+    tracing::debug_span!("request", method = %req.method(), path = %req.uri().path())
 }
 
 /// Answer `308` to the canonical origin when a request arrives on another host.
@@ -641,10 +680,17 @@ async fn mcp_handler(
         Err(resp) => return refused_credential_response(resp, &config, &headers),
     };
 
+    // The preflight first: a foreign `Origin` is a 403 (MCP Streamable
+    // HTTP), whether or not the caller must authenticate.
     let client_accepts_sse = match mcp_post_preflight(&headers, &config, peer, &request_context) {
         Ok(accepts_sse) => accepts_sse,
         Err(rejection) => return rejection,
     };
+    if let Some(response) =
+        authentication_required_response(&runtime, &config, &headers, &request_context)
+    {
+        return response;
+    }
 
     let body: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -784,6 +830,64 @@ fn refused_credential_response(
 ) -> Response {
     let host = request_host(headers, config.gateway.server.trust_proxy_ip);
     with_resource_metadata_pointer(response, &resource_metadata_url(config, host.as_deref()))
+}
+
+/// `governance.access.require_authentication`: a caller below verified is
+/// refused before any MCP work, with the 401 challenge an OAuth or EMA
+/// client starts its flow from. `None` lets the request through.
+fn authentication_required_response(
+    runtime: &crate::runtime::GatewayRuntime,
+    config: &crate::config::AppConfig,
+    headers: &HeaderMap,
+    request_context: &RequestContext,
+) -> Option<Response> {
+    if !config.governance.access.require_authentication
+        || !request_context.identity.is_below_verified()
+    {
+        return None;
+    }
+    metrics::counter!("mcpg_authentication_required_total").increment(1);
+    tracing::debug!(
+        request_id = %request_context.request_id.as_str(),
+        "caller below verified refused by governance.access.require_authentication"
+    );
+    let response = (
+        axum::http::StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {
+                "code": -32000,
+                "message": "authentication required",
+            },
+        })),
+    )
+        .into_response();
+    let host = request_host(headers, config.gateway.server.trust_proxy_ip);
+    let caller = Some(&request_context.identity);
+    let aauth = runtime
+        .aauth_resource()
+        .map(|resource| response::AauthChallenge {
+            resource,
+            identity: caller,
+        });
+    // A 401 must carry a challenge (RFC 9110 §15.5.2), so the Bearer one is
+    // sent even when only an identity plugin verifies callers.
+    let response = with_www_authenticate_challenge(
+        response,
+        true,
+        &resource_metadata_url(config, host.as_deref()),
+        challenge_scope(config).as_deref(),
+        aauth,
+        caller,
+        runtime
+            .ema_authorization_server()
+            .and_then(|server| server.dpop_challenge()),
+    );
+    Some(with_request_id_header(
+        response,
+        &request_context.request_id,
+    ))
 }
 
 /// A request's dispatch either produced a runtime result the response tail has
@@ -1088,6 +1192,7 @@ async fn finish_response(
     // `resource` equal to the URL it used.
     let host = request_host(headers, config.gateway.server.trust_proxy_ip);
     let prm_url = resource_metadata_url(config, host.as_deref());
+    let scope = challenge_scope(config);
     let caller = Some(&request_context.identity);
     // The AAuth challenge context: the resource role plus the caller — an
     // AAuth caller short on scope is stepped up with a resource token.
@@ -1097,6 +1202,9 @@ async fn finish_response(
             resource,
             identity: caller,
         });
+    let dpop_challenge = runtime
+        .ema_authorization_server()
+        .and_then(|server| server.dpop_challenge());
     // SEP-2567/2575: a 2026-07-28 server MUST NOT surface `Mcp-Session-Id`
     // on the wire. The synthetic operational session still exists
     // internally (clustering / MRTR resume / delivery re-keying) but is
@@ -1172,8 +1280,10 @@ async fn finish_response(
                         map_gateway_response(response),
                         auth_enabled,
                         &prm_url,
+                        scope.as_deref(),
                         aauth_challenge,
                         caller,
+                        dpop_challenge,
                     );
                     return resp;
                 }
@@ -1214,8 +1324,10 @@ async fn finish_response(
                         map_gateway_response(response),
                         auth_enabled,
                         &prm_url,
+                        scope.as_deref(),
                         aauth_challenge,
                         caller,
+                        dpop_challenge,
                     );
                     return with_session_id_header(resp, session_id_for_header.as_deref());
                 }
@@ -1241,8 +1353,10 @@ async fn finish_response(
                         map_gateway_response(response),
                         auth_enabled,
                         &prm_url,
+                        scope.as_deref(),
                         aauth_challenge,
                         caller,
+                        dpop_challenge,
                     ),
                 };
                 return with_session_id_header(resp, session_id_for_header.as_deref());
@@ -1326,8 +1440,10 @@ async fn finish_response(
                 map_gateway_response(response),
                 auth_enabled,
                 &prm_url,
+                scope.as_deref(),
                 aauth_challenge,
                 caller,
+                dpop_challenge,
             );
             let resp = with_session_id_header(resp, session_id_for_header.as_deref());
             wire.apply_protocol_version_header(resp)
@@ -1640,6 +1756,11 @@ async fn mcp_get_handler(
     ) {
         return response;
     }
+    if let Some(response) =
+        authentication_required_response(&runtime, &config, &headers, &request_context)
+    {
+        return response;
+    }
     // SEP-2575: a 2026-07-28 server has no server-push GET stream
     // (`subscriptions/listen` over POST replaces it) — answer 405.
     // Legacy GET (SSE delivery) is unchanged.
@@ -1919,6 +2040,11 @@ async fn mcp_delete_handler(
         &config.gateway.server.allowed_origins,
         &request_context.request_id,
     ) {
+        return response;
+    }
+    if let Some(response) =
+        authentication_required_response(&runtime, &config, &headers, &request_context)
+    {
         return response;
     }
     // SEP-2567/2575: the modern wire has no protocol-level sessions to

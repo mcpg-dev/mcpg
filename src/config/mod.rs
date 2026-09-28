@@ -36,6 +36,7 @@ pub mod governance;
 pub mod guardrails;
 pub mod health_check;
 pub mod inspector;
+pub mod interactive_login;
 pub mod license;
 pub mod mcp;
 pub mod observability;
@@ -48,6 +49,7 @@ pub mod schema;
 pub mod schema_safety;
 pub mod secret_scan;
 pub mod secrets;
+pub mod sender_constraint;
 pub mod server;
 pub mod source;
 pub mod storage;
@@ -58,8 +60,9 @@ pub mod webhook;
 pub mod wiring;
 
 pub use access::{
-    AccessConfig, AuthorizationServerClientConfig, AuthorizationServerConfig, JwksConfig,
-    OAuthResourceMetadataConfig, TrustedIdpConfig,
+    AccessConfig, AuthorizationServerClientConfig, AuthorizationServerConfig, ClientAuthMethod,
+    ClientIdMetadataDocumentsConfig, JwksConfig, OAuthResourceMetadataConfig, SigningAlgorithm,
+    SigningKeyConfig, TrustedIdpClaimMappingConfig, TrustedIdpConfig,
 };
 pub use admin::{AdminAuthConfig, AdminConfig, DisclosureLevel};
 pub use approvals::ApprovalsConfig;
@@ -89,18 +92,24 @@ pub use debug::{
     DebugToolExposureConfig, DebugToolsConfig,
 };
 pub use diagnostics::{
-    reachable_trust_ceiling, trust_ceiling_remedy, unreachable_trust_bindings,
-    warn_unreachable_binding_trust,
+    access_posture_warnings, reachable_trust_ceiling, trust_ceiling_remedy,
+    unreachable_trust_bindings, warn_access_posture, warn_unreachable_binding_trust,
 };
 pub use feature_flags::FeatureFlagsConfig;
 pub use federation::{
-    AuthMode, FederationConfig, SynthesizeMode, UpstreamProtocolVersion, UpstreamTransport,
+    AuthMode, FederationConfig, SubjectToken, SynthesizeMode, UpstreamProtocolVersion,
+    UpstreamTransport,
 };
 pub use gateway::{ConfigWatchConfig, GatewayConfig};
 pub use governance::GovernanceConfig;
 pub use guardrails::{GuardrailHookConfig, GuardrailOnError, GuardrailsConfig};
 pub use health_check::HealthCheckConfig;
 pub use inspector::InspectorSidecarConfig;
+pub use interactive_login::{
+    ClientConsent, ClientGrantType, InteractiveLoginConfig, InteractiveStoreConfig,
+    InteractiveStoreKind, LoginAssertionAudience, LoginClientAuth, LoginSigningAlg,
+    RedirectUriPolicy, StateKeyConfig, TrustedIdpLoginConfig, interactive_login_summary,
+};
 pub use license::LicenseConfig;
 pub use mcp::{
     McpCapabilitiesConfig, McpConfig, McpConfigurationsConfig, McpElicitationConfig,
@@ -121,6 +130,10 @@ pub use quotas::{
 };
 pub use schema::SchemaEntry;
 pub use secrets::{SecretsConfig, SecretsSource};
+pub use sender_constraint::{
+    AuthorizationDetailLocations, AuthorizationDetailsConfig, AuthorizationDetailsTypeConfig,
+    DpopConfig, DpopNonceMode,
+};
 pub use server::{
     AauthResourceMetadataConfig, AauthSigningKeyConfig, ClientCertMode, CorsConfig, ServerConfig,
     TlsConfig, TransportMode, TunnelConfig, TunnelExposure, TunnelFederationConfig,
@@ -268,9 +281,11 @@ pub struct AppConfig {
     pub credentials: CredentialsConfig,
 
     /// `license:` — offline license token (or the non-production
-    /// declaration) for standalone deployments; the plugin load gate
-    /// refuses entitlement-gated plugins the resolved envelope does
-    /// not admit. Ignored when `gateway.control_plane` is attached.
+    /// declaration). The license gate refuses entitlement-gated plugins
+    /// and feature-gated config blocks (interactive sign-in) the resolved
+    /// envelope does not admit. With `gateway.control_plane` attached the
+    /// control plane admits the plugins, while the config blocks are still
+    /// checked here unless the managed-cloud platform rendered the config.
     #[serde(default)]
     pub license: LicenseConfig,
 
@@ -817,6 +832,16 @@ impl AppConfig {
         self.mcp.validate()?;
         self.observability.validate()?;
         self.governance.validate()?;
+        if self.governance.access.require_authentication
+            && reachable_trust_ceiling(self) != TrustLevelConfig::Verified
+        {
+            return Err(anyhow::anyhow!(
+                "governance.access.require_authentication refuses every caller below verified, \
+                 but nothing here can verify one: configure governance.access.jwks, \
+                 governance.access.oidc_oauth, governance.access.authorization_server or an \
+                 identity_provider plugin"
+            ));
+        }
         self.validate_binding_quota_refs()?;
         self.validate_binding_policy_conflicts()?;
         self.feature_flags.validate()?;
@@ -833,6 +858,7 @@ impl AppConfig {
         // Same fail-closed clustered-credential rule the boot path enforces,
         // surfaced at pre-flight so `config validate` catches it too.
         self.credentials.cluster.validate()?;
+        interactive_login::validate_interactive_login(self)?;
         Ok(())
     }
 

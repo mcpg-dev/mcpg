@@ -97,7 +97,8 @@ pub struct CloudConfig {
     /// Publish-time acknowledgement that this managed instance intentionally
     /// serves `/mcp` WITHOUT a configured token verifier (an anonymous / public
     /// MCP server). The CP publish guard requires EITHER a verifier
-    /// (`governance.access.jwks` / `governance.access.oidc_oauth`) OR this
+    /// (`governance.access.jwks` / `governance.access.oidc_oauth` /
+    /// `governance.access.authorization_server`) OR this
     /// opt-out, so a tenant can't expose an unauthenticated gateway on the
     /// public edge by omission. The gateway runtime does not read this field —
     /// it is a declaration the publish guard checks.

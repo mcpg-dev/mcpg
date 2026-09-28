@@ -6,6 +6,11 @@
 
 use super::*;
 
+/// Path of the readiness probe.
+pub(crate) const READINESS_PATH: &str = "/ready";
+/// Path of the runtime snapshot.
+pub(crate) const RUNTIME_PATH: &str = "/runtime";
+
 /// JSON body returned by the health endpoint.
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct HealthResponse {
@@ -32,7 +37,7 @@ pub(crate) async fn health_handler(
         tls_info.into_inner(),
         config.gateway.server.trust_subject_header,
         &axum::http::Method::GET,
-        None,
+        Some(config.gateway.server.health_path.as_str()),
         None,
     )
     .await
@@ -110,7 +115,7 @@ pub(crate) async fn readiness_handler(
         tls_info.into_inner(),
         config.gateway.server.trust_subject_header,
         &axum::http::Method::GET,
-        None,
+        Some(READINESS_PATH),
         None,
     )
     .await
@@ -138,7 +143,7 @@ pub(crate) async fn runtime_handler(
         tls_info.into_inner(),
         config.gateway.server.trust_subject_header,
         &axum::http::Method::GET,
-        None,
+        Some(RUNTIME_PATH),
         None,
     )
     .await

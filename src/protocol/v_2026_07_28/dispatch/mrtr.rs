@@ -48,6 +48,124 @@ pub(crate) fn extract_mrtr_resumption_from_params(
     })
 }
 
+/// What the retry of a `tools/call` that offered the caller a link to
+/// store their IdP sign-in comes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinkResumption {
+    /// The request carries no `requestState` of a link.
+    NotALink,
+    /// The call runs again; the request context holds the user's answer.
+    Resumed,
+    /// The `requestState` of a link that does not verify for this caller
+    /// and tool, or unreadable `inputResponses`.
+    Refused(&'static str),
+}
+
+/// How the user answered the link a `requestState` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkAnswer {
+    /// They opened it (`accept`).
+    Accepted,
+    /// They declined or dismissed it, or the client could not show it.
+    Declined,
+    /// The retry carries no answer for it.
+    Unanswered,
+}
+
+fn link_answer(input_responses: Option<&Value>) -> Result<LinkAnswer, &'static str> {
+    use crate::protocol::v_2026_07_28::wire::mrtr::{InputResponseValue, InputResponses};
+    use crate::runtime::authorization_server::connect::LINK_INPUT_KEY;
+    let Some(input_responses) = input_responses else {
+        return Ok(LinkAnswer::Unanswered);
+    };
+    let mut responses =
+        InputResponses::from_value(input_responses).map_err(|_| "invalid inputResponses")?;
+    Ok(match responses.entries.remove(LINK_INPUT_KEY) {
+        None => LinkAnswer::Unanswered,
+        Some(InputResponseValue::Err { .. }) => LinkAnswer::Declined,
+        Some(InputResponseValue::Ok(result)) => {
+            match result.get("action").and_then(Value::as_str) {
+                Some("accept") => LinkAnswer::Accepted,
+                Some("decline" | "cancel") => LinkAnswer::Declined,
+                _ => LinkAnswer::Unanswered,
+            }
+        }
+    })
+}
+
+/// Take the retry of a `tools/call` of `tool` whose earlier attempt
+/// offered the caller a link to store their IdP sign-in (a URL-mode
+/// elicitation): its `requestState` must open under the sign-in state keys
+/// and name a link offered to this caller for this tool (SEP-2322: state is
+/// attacker-controlled). An accepted link is waited for a short while; a
+/// declined one is not offered again; an unanswered one is offered again
+/// while it is pending; one that expired runs the call again as a new
+/// request would. `requestState` and `inputResponses` are read from
+/// params, else from `_meta`, as for any MRTR resumption.
+pub(crate) async fn resume_connect_link(
+    ctx: &RequestContext,
+    runtime: &crate::runtime::GatewayRuntime,
+    tool: &str,
+    request_state: Option<&str>,
+    input_responses: Option<&Value>,
+    meta: Option<&Value>,
+) -> LinkResumption {
+    use crate::protocol::v_2026_07_28::wire::mrtr::{
+        META_KEY_INPUT_RESPONSES, META_KEY_REQUEST_STATE,
+    };
+    use crate::runtime::authorization_server::connect::{
+        LINK_REQUEST_STATE_PREFIX, LinkStateCheck,
+    };
+    let meta = meta.and_then(Value::as_object);
+    let (request_state, input_responses) = match request_state {
+        Some(request_state) => (request_state, input_responses),
+        None => match meta
+            .and_then(|meta| meta.get(META_KEY_REQUEST_STATE))
+            .and_then(Value::as_str)
+        {
+            Some(request_state) => (
+                request_state,
+                meta.and_then(|meta| meta.get(META_KEY_INPUT_RESPONSES)),
+            ),
+            None => return LinkResumption::NotALink,
+        },
+    };
+    if !request_state.starts_with(LINK_REQUEST_STATE_PREFIX) {
+        return LinkResumption::NotALink;
+    }
+    let refused = LinkResumption::Refused(
+        "requestState does not name a link offered to this caller for this tool",
+    );
+    let principal = match ctx.identity {
+        crate::runtime::RequestIdentity::Verified { .. } => ctx.identity.synthetic_principal_key(),
+        _ => None,
+    };
+    let (Some(server), Some(principal)) = (runtime.ema_authorization_server(), principal) else {
+        return refused;
+    };
+    // A link that expired was still offered to this caller for this tool:
+    // the call runs again, and succeeds or offers a new link.
+    let link = match server.open_link_request_state(request_state, &principal, tool) {
+        LinkStateCheck::Valid(link) => Some(link),
+        LinkStateCheck::Expired => None,
+        LinkStateCheck::Refused => return refused,
+    };
+    match (link_answer(input_responses), link) {
+        (Err(reason), _) => return LinkResumption::Refused(reason),
+        (Ok(LinkAnswer::Declined), _) => ctx.connect_link.decline(),
+        (Ok(_), None) => {}
+        (Ok(LinkAnswer::Accepted), Some(link)) => {
+            let status = server
+                .await_link(&link, &principal, server.link_resume_wait())
+                .await;
+            tracing::debug!(status = ?status, "the retry of a call that offered a link");
+            ctx.connect_link.resume(link);
+        }
+        (Ok(LinkAnswer::Unanswered), Some(link)) => ctx.connect_link.resume(link),
+    }
+    LinkResumption::Resumed
+}
+
 /// Translate an MRTR resumption (`_meta.requestState` +
 /// `_meta.inputResponses`) into the legacy `ServerRequestResponse`
 /// machinery so the pipeline picks up where it suspended.

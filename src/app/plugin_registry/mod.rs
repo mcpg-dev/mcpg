@@ -104,6 +104,10 @@ pub(crate) struct PluginBundle {
     /// config referenced none. Published on the runtime so the
     /// control-plane status report can say which secret set is live.
     pub secrets_digest: String,
+    /// `governance.access.authorization_server` with its `${env.X}`,
+    /// secret-provider URIs and `${secret.NAME}` resolved, for the embedded
+    /// authorization server alone; `None` without the block.
+    pub authorization_server: Option<crate::config::AuthorizationServerConfig>,
 }
 
 pub(crate) async fn build_plugin_registry(
@@ -564,7 +568,7 @@ pub(crate) async fn build_plugin_registry(
 
     // Register the JWKS/JWT identity plugin when a verifier is configured.
     // The identity chain runs in-order; first `Resolved` wins. When
-    // `access.oauth` also configures OIDC, that provider ships as a signed
+    // `governance.access.oidc_oauth` also configures OIDC, that provider ships as a signed
     // cdylib loaded by the `plugins[]` loop below; its presence is enforced
     // once the loop has run.
     if let Some(verifier) = jwt_verifier {
@@ -1653,12 +1657,13 @@ pub(crate) async fn build_plugin_registry(
             .any(|id| id == crate::runtime::identity::oidc::PLUGIN_ID)
     {
         anyhow::bail!(
-            "`access.oauth` configures OIDC identity, but no identity plugin is \
-             registered under {id:?}. It ships as a cdylib the image does not \
-             carry: add a `plugins[]` entry naming it, `source.oci` for the \
-             published artifact or `source.path` for a local build. Refusing to \
-             boot rather than serve requests with the configured identity \
-             provider missing.",
+            "`governance.access.oidc_oauth` configures OIDC identity, but no \
+             identity plugin is registered under {id:?}. It ships as a cdylib the \
+             image does not carry: add a `plugins[]` entry naming it, with \
+             `source.oci` for the published artifact or `source.path` for a local \
+             build, and the same `providers` under its `config`. Refusing to boot \
+             rather than serve requests with the configured identity provider \
+             missing.",
             id = crate::runtime::identity::oidc::PLUGIN_ID,
         );
     }
@@ -1756,9 +1761,13 @@ pub(crate) async fn build_plugin_registry(
         .auto_bind_config_provider_schemes()
         .with_context(|| "auto-binding config_provider schemes")?;
 
+    let authorization_server =
+        crate::config::resolver::resolve_authorization_server(config, &registry, &secrets).await?;
+
     // Opt-in post-boot env scrub (`server.scrub_process_env_after_boot`): all
     // config-origin secret resolution is now done (plugin entries + bindings +
-    // pipeline steps) and the env secret provider holds its boot snapshot, so
+    // pipeline steps + the embedded authorization server) and the env secret
+    // provider holds its boot snapshot, so
     // remove every process-env var the config referenced via `${env.X}` or
     // `env://X`. A loaded cdylib can then no longer read those secrets through a
     // direct `std::env::var` / shared-process-env read; the host's own env://
@@ -1934,6 +1943,7 @@ pub(crate) async fn build_plugin_registry(
         quota_gate,
         resolved_secret_refs,
         secrets_digest: secrets.digest(),
+        authorization_server,
     })
 }
 

@@ -2418,6 +2418,22 @@ impl GatewayRuntime {
                         let snapshot = route
                             .needs_runtime_snapshot()
                             .then(|| self.runtime_snapshot());
+                        // A federated call whose caller has no stored IdP
+                        // sign-in may answer with a link that stores it
+                        // (URL-mode elicitation), when the client declared
+                        // URL mode and no idempotency record awaits the
+                        // call's result.
+                        let may_offer_link = !idempotency_reserved
+                            && matches!(
+                                route,
+                                crate::backends::BackendInvocationRoute::Federated { .. }
+                            )
+                            && execution_request
+                                .client_capabilities
+                                .supports_elicitation_url()
+                            && request_context.connect_link.open(
+                                super::connect_link::connect_link_notify_session(request_context),
+                            );
                         let mut result = if stream_eligible {
                             self.execution_dispatcher
                                 .dispatch_tool_call_streaming(route, &execution_request, snapshot)
@@ -2429,6 +2445,17 @@ impl GatewayRuntime {
                                 snapshot,
                             )
                         };
+                        if may_offer_link
+                            && let Some(elicitation) = request_context.connect_link.take_offered()
+                            && let Some(response) = self.connect_link_response(
+                                request_context,
+                                request_id.clone(),
+                                &params.name,
+                                &elicitation,
+                            )
+                        {
+                            return response;
+                        }
                         let binding_duration = binding_start.elapsed();
                         let binding_elapsed = binding_duration.as_secs_f64();
                         let outcome = if result.is_error { "error" } else { "success" };

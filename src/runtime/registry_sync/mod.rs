@@ -20,6 +20,9 @@ use crate::app::AppState;
 use crate::config::AppConfig;
 use crate::config::federation::{AuthMode, FederationConfig};
 use crate::config::registry::{McpRegistryConfig, RegistryAuthMode};
+use mcpg_mcp_client::auth::{
+    CredentialFlow, DiscoveredOauth, GRANT_PROFILE_ID_JAG, GRANT_TYPE_JWT_BEARER, IdJagSupport,
+};
 
 use client::{EntryStatus, RegistryClient};
 use map::{SkipReason, federation_for_entry};
@@ -580,6 +583,59 @@ async fn resolve_cred_bearer(
         })
 }
 
+/// Plugin id of the ID-JAG credential issuer.
+const ID_JAG_ISSUER: &str = "dev.mcpg.credential.oauth-id-jag";
+
+/// Why OAuth discovery left a server unfederated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiscoverySkip {
+    /// The metadata chain failed and no earlier snapshot exists.
+    Failed(String),
+    /// The federation redeems ID-JAGs, but its authorization server's
+    /// metadata does not offer the jwt-bearer grant.
+    NoIdJagSupport { issuer: String },
+}
+
+impl DiscoverySkip {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Failed(_) => "oauth_discovery",
+            Self::NoIdJagSupport { .. } => "no_id_jag_support",
+        }
+    }
+}
+
+impl std::fmt::Display for DiscoverySkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(e) => f.write_str(e),
+            Self::NoIdJagSupport { issuer } => write!(
+                f,
+                "authorization server {issuer:?} does not advertise ID-JAG redemption \
+                 (the {GRANT_PROFILE_ID_JAG} grant profile or the {GRANT_TYPE_JWT_BEARER} grant)"
+            ),
+        }
+    }
+}
+
+/// What the discovered `audience` has to name for this federation's
+/// credential issuer.
+fn credential_flow(fed: &FederationConfig) -> CredentialFlow {
+    let plugin = fed
+        .upstream
+        .auth
+        .credential
+        .as_deref()
+        .and_then(|uri| uri.strip_prefix("cred://"))
+        .and_then(|rest| rest.split_once('/'))
+        .map(|(plugin, _)| plugin);
+    if plugin == Some(ID_JAG_ISSUER) {
+        CredentialFlow::IdJag
+    } else {
+        CredentialFlow::Direct
+    }
+}
+
 /// Populate `auth.credential_config` from RFC 9728/8414 discovery when
 /// the registry opts in and the federation uses an OAuth credential
 /// mode without an explicit per-call config. Falls back to the previous
@@ -589,7 +645,7 @@ async fn apply_oauth_discovery(
     registry: &McpRegistryConfig,
     fed: &mut FederationConfig,
     prior: &[FederationConfig],
-) -> Result<(), String> {
+) -> Result<(), DiscoverySkip> {
     if !registry.defaults.oauth_discovery.enabled
         || !matches!(
             fed.upstream.auth.mode,
@@ -605,9 +661,46 @@ async fn apply_oauth_discovery(
         // keeps the same posture.
         allow_insecure_http: false,
     };
-    match mcpg_mcp_client::auth::discover_oauth(&fed.upstream.url, policy).await {
+    let outcome = mcpg_mcp_client::auth::discover_oauth(&fed.upstream.url, policy).await;
+    apply_discovered(&registry.name, fed, outcome, prior)
+}
+
+/// Write a discovery outcome onto `fed`. An AS that does not offer ID-JAG
+/// redemption is an answer from a reachable AS, not an outage, so it never
+/// falls back to the prior snapshot.
+fn apply_discovered(
+    registry: &str,
+    fed: &mut FederationConfig,
+    outcome: Result<DiscoveredOauth, String>,
+    prior: &[FederationConfig],
+) -> Result<(), DiscoverySkip> {
+    match outcome {
         Ok(discovered) => {
-            fed.upstream.auth.credential_config = Some(discovered.into_call_config());
+            let flow = credential_flow(fed);
+            if flow == CredentialFlow::IdJag {
+                match discovered.id_jag_support() {
+                    IdJagSupport::Advertised => {}
+                    IdJagSupport::JwtBearerOnly => {
+                        metrics::counter!(
+                            "mcpg_registry_oauth_discovery_warning_total",
+                            "registry" => registry.to_owned(),
+                            "reason" => "id_jag_profile_missing"
+                        )
+                        .increment(1);
+                        tracing::warn!(
+                            registry, federation = %fed.name, issuer = %discovered.issuer,
+                            "authorization server offers the jwt-bearer grant without the \
+                             id-jag grant profile; federating anyway"
+                        );
+                    }
+                    IdJagSupport::Unsupported => {
+                        return Err(DiscoverySkip::NoIdJagSupport {
+                            issuer: discovered.issuer,
+                        });
+                    }
+                }
+            }
+            fed.upstream.auth.credential_config = Some(discovered.into_call_config(flow));
             Ok(())
         }
         Err(e) => {
@@ -623,7 +716,7 @@ async fn apply_oauth_discovery(
                 fed.upstream.auth.credential_config = Some(previous);
                 Ok(())
             } else {
-                Err(e)
+                Err(DiscoverySkip::Failed(e))
             }
         }
     }
@@ -739,15 +832,16 @@ async fn sync_registry(
         }
         match federation_for_entry(registry, entry) {
             Ok(mut fed) => {
-                if let Err(e) = apply_oauth_discovery(registry, &mut fed, prior).await {
+                if let Err(skip) = apply_oauth_discovery(registry, &mut fed, prior).await {
                     metrics::counter!(
                         "mcpg_registry_server_skipped_total",
-                        "registry" => registry.name.clone(), "reason" => "oauth_discovery"
+                        "registry" => registry.name.clone(), "reason" => skip.label()
                     )
                     .increment(1);
                     tracing::warn!(
-                        registry = %registry.name, server = %entry.server.name, error = %e,
-                        "registry server not federated (OAuth discovery failed)"
+                        registry = %registry.name, server = %entry.server.name,
+                        reason = skip.label(), error = %skip,
+                        "registry server not federated (OAuth discovery)"
                     );
                     continue;
                 }
@@ -883,8 +977,123 @@ mod tests {
         let err = apply_oauth_discovery(&registry, &mut fed, &[])
             .await
             .unwrap_err();
-        assert!(!err.is_empty());
+        assert_eq!(err.label(), "oauth_discovery");
+        assert!(!err.to_string().is_empty());
         assert!(fed.upstream.auth.credential_config.is_none());
+    }
+
+    /// Discovery output for an upstream whose resource sits below its AS
+    /// issuer, as an mcpg upstream's does.
+    fn discovered_as(grant_types: &[&str], profiles: &[&str]) -> DiscoveredOauth {
+        DiscoveredOauth {
+            resource: "https://crm.acme.example/mcp".to_owned(),
+            token_endpoint: "https://crm.acme.example/oauth/token".to_owned(),
+            issuer: "https://crm.acme.example".to_owned(),
+            grant_types_supported: grant_types.iter().map(|s| (*s).to_owned()).collect(),
+            authorization_grant_profiles_supported: profiles
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn with_credential(registry: &McpRegistryConfig, credential: &str) -> FederationConfig {
+        let mut fed = crm_fed(registry);
+        fed.upstream.auth.credential = Some(credential.to_owned());
+        fed
+    }
+
+    /// An ID-JAG federation asks the IdP for a grant addressed to the
+    /// upstream AS issuer; the MCP resource rides along as `resource`.
+    #[test]
+    fn id_jag_federation_gets_the_issuer_as_audience() {
+        let registry = oauth_registry(true);
+        let mut fed = crm_fed(&registry);
+        assert_eq!(credential_flow(&fed), CredentialFlow::IdJag);
+        let discovered = discovered_as(&[GRANT_TYPE_JWT_BEARER], &[GRANT_PROFILE_ID_JAG]);
+        apply_discovered("acme", &mut fed, Ok(discovered), &[]).expect("federates");
+        let cfg = fed.upstream.auth.credential_config.expect("config");
+        assert_eq!(cfg["audience"], "https://crm.acme.example");
+        assert_eq!(cfg["issuer"], "https://crm.acme.example");
+        assert_eq!(cfg["resource"], "https://crm.acme.example/mcp");
+        assert_eq!(
+            cfg["redeem_token_url"],
+            "https://crm.acme.example/oauth/token"
+        );
+    }
+
+    /// The id-jag profile is a recommendation: an AS that lists only the
+    /// jwt-bearer grant still federates.
+    #[test]
+    fn id_jag_federation_with_only_the_jwt_bearer_grant_federates() {
+        let registry = oauth_registry(true);
+        let mut fed = crm_fed(&registry);
+        let discovered = discovered_as(&["authorization_code", GRANT_TYPE_JWT_BEARER], &[]);
+        apply_discovered("acme", &mut fed, Ok(discovered), &[]).expect("federates");
+        let cfg = fed.upstream.auth.credential_config.expect("config");
+        assert_eq!(cfg["audience"], "https://crm.acme.example");
+        assert_eq!(cfg["resource"], "https://crm.acme.example/mcp");
+    }
+
+    /// An AS that does not offer the jwt-bearer grant is skipped, and a
+    /// prior snapshot does not paper over the answer.
+    #[test]
+    fn id_jag_federation_without_the_jwt_bearer_grant_is_skipped() {
+        let registry = oauth_registry(true);
+        let mut prior_fed = crm_fed(&registry);
+        prior_fed.upstream.auth.credential_config =
+            Some(serde_json::json!({ "audience": "https://crm.acme.example" }));
+        let prior = [prior_fed];
+        for discovered in [
+            discovered_as(&[], &[]),
+            discovered_as(&["authorization_code"], &[]),
+            discovered_as(&["authorization_code"], &[GRANT_PROFILE_ID_JAG]),
+        ] {
+            let mut fed = crm_fed(&registry);
+            let skip = apply_discovered("acme", &mut fed, Ok(discovered), &prior).unwrap_err();
+            assert_eq!(skip.label(), "no_id_jag_support");
+            assert_eq!(
+                skip,
+                DiscoverySkip::NoIdJagSupport {
+                    issuer: "https://crm.acme.example".to_owned()
+                }
+            );
+            assert!(fed.upstream.auth.credential_config.is_none());
+        }
+    }
+
+    /// Other OAuth issuers present their token to the resource itself:
+    /// the audience stays the resource and the profile is not required.
+    #[test]
+    fn direct_federation_keeps_the_resource_as_audience() {
+        let registry = oauth_registry(true);
+        let mut fed = with_credential(
+            &registry,
+            "cred://dev.mcpg.credential.oauth-token-exchange/com.acme/crm",
+        );
+        assert_eq!(credential_flow(&fed), CredentialFlow::Direct);
+        apply_discovered("acme", &mut fed, Ok(discovered_as(&[], &[])), &[]).expect("federates");
+        let cfg = fed.upstream.auth.credential_config.expect("config");
+        assert_eq!(cfg["audience"], "https://crm.acme.example/mcp");
+        assert_eq!(cfg["resource"], "https://crm.acme.example/mcp");
+    }
+
+    #[test]
+    fn credential_flow_matches_the_plugin_id_exactly() {
+        let registry = oauth_registry(true);
+        for credential in [
+            "cred://dev.mcpg.credential.oauth-id-jag-shadow/x",
+            "cred://dev.mcpg.credential.oauth-client-credentials/x",
+            "dev.mcpg.credential.oauth-id-jag/x",
+        ] {
+            let fed = with_credential(&registry, credential);
+            assert_eq!(
+                credential_flow(&fed),
+                CredentialFlow::Direct,
+                "{credential}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -962,6 +1171,74 @@ mod tests {
             .map(|f| f.name.as_str())
             .collect();
         assert_eq!(names, vec!["crm", "acme--com.acme--crm"]);
+    }
+
+    /// A registry-synced federation that presents the caller's stored IdP
+    /// sign-in keeps its mode in the snapshot followers adopt, and the
+    /// merged config holds it to the rule a written one meets: without a
+    /// login IdP the overlay is not applied.
+    #[test]
+    fn a_stored_sign_in_federation_is_adopted_and_validated_like_a_written_one() {
+        use crate::config::SubjectToken;
+        const WITH_LOGIN: &str = "
+gateway:
+  secrets:
+    dir: /run/mcpg/secrets
+governance:
+  access:
+    resource_metadata:
+      resource: https://mcp.example.com/mcp
+    authorization_server:
+      issuer: https://mcp.example.com
+      signing_secret: registry-signing-secret-0123456789
+      trusted_idps:
+        - issuer: https://acme.okta.com
+          allowed_hosts: [acme.okta.com]
+          login:
+            client_id: 0oa1agent
+            client_secret: login-client-secret-0123
+      clients:
+        - client_id: mcp-client
+";
+        let mut fed = overlay_fed("acme--com.acme--crm", "com.acme.crm.");
+        fed.upstream.auth = serde_yaml::from_str(
+            "mode: oauth_impersonation\ncredential: cred://dev.mcpg.credential.oauth-id-jag/com.acme/crm\nsubject_token: idp_refresh_token\n",
+        )
+        .expect("parse auth");
+        let overlay = RegistryOverlay {
+            federations: vec![fed],
+        };
+        let (adopted, _) = decode_overlay_snapshot(
+            &encode_overlay_snapshot(&overlay, 3).expect("snapshot encodes"),
+        )
+        .expect("snapshot decodes");
+        assert_eq!(
+            adopted.federations[0].upstream.auth.subject_token,
+            SubjectToken::IdpRefreshToken
+        );
+
+        let with_login: AppConfig = serde_yaml::from_str(WITH_LOGIN).expect("parse config");
+        with_login.validate().expect("the base config validates");
+        let merged = merged_with_overlay(&with_login, &adopted).expect("merged");
+        assert_eq!(
+            merged.mcp.federations[0].upstream.auth.subject_token,
+            SubjectToken::IdpRefreshToken
+        );
+
+        let mut without_login = with_login;
+        if let Some(authz) = without_login
+            .governance
+            .access
+            .authorization_server
+            .as_mut()
+        {
+            authz.trusted_idps[0].login = None;
+        }
+        without_login.validate().expect("the base config validates");
+        assert!(
+            merged_with_overlay(&without_login, &adopted).is_none(),
+            "no login IdP: the overlay is not applied"
+        );
     }
 
     #[test]

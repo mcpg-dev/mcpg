@@ -1,8 +1,9 @@
 //! Unauthenticated discovery surfaces.
 //!
 //! OAuth 2.1 Protected Resource Metadata (RFC 9728) and Authorization Server
-//! Metadata (RFC 8414), the token endpoint, and the MCP registry `v0.1` catalog
-//! view of this gateway's own servers.
+//! Metadata (RFC 8414), the token, revocation and client registration
+//! endpoints, and the MCP registry `v0.1` catalog view of this gateway's own
+//! servers.
 
 use super::*;
 
@@ -333,13 +334,48 @@ pub(crate) async fn oauth_protected_resource_handler(
         auth_servers = derive_authorization_servers(&config.governance.access);
     }
     let host = super::request_host(&headers, config.gateway.server.trust_proxy_ip);
-    Json(serde_json::json!({
+    let mut document = serde_json::json!({
         "resource": rm.resource_for_host(host.as_deref()),
         "authorization_servers": auth_servers,
         "scopes_supported": rm.scopes_supported,
         "bearer_methods_supported": rm.bearer_methods_supported,
-    }))
-    .into_response()
+    });
+    // RFC 9728 §2: while the embedded authorization server binds tokens,
+    // this resource takes them with the DPoP scheme.
+    if let Some(dpop) = config
+        .governance
+        .access
+        .authorization_server
+        .as_ref()
+        .map(|authz| &authz.dpop)
+        .filter(|dpop| dpop.enabled)
+    {
+        let runtime = state.runtime.load();
+        let identity_plugins = runtime.plugin_registry().has_identity_plugins();
+        let embedded_only =
+            embedded_server_only(&config.governance.access, &auth_servers, identity_plugins);
+        document["dpop_signing_alg_values_supported"] = serde_json::json!(dpop.allowed_algs);
+        document["dpop_bound_access_tokens_required"] =
+            serde_json::json!(dpop.required && embedded_only);
+    }
+    // RFC 9728 §2: the authorization details types this resource's own
+    // tokens may be limited to.
+    if let Some(details) = config
+        .governance
+        .access
+        .authorization_server
+        .as_ref()
+        .map(|authz| &authz.authorization_details)
+        .filter(|details| details.enabled())
+    {
+        let types: Vec<&str> = details
+            .types
+            .iter()
+            .map(|rule| rule.type_name.as_str())
+            .collect();
+        document["authorization_details_types_supported"] = serde_json::json!(types);
+    }
+    Json(document).into_response()
 }
 
 /// The one server entry the registry surface publishes: this gateway.
@@ -413,14 +449,42 @@ pub(crate) async fn served_registry_version_handler(
     }
 }
 
+/// Whether the embedded authorization server is the one verifier of this
+/// resource's access tokens: the only authorization server listed, with no
+/// `oidc_oauth` provider, `jwks` verifier or identity plugin beside it. Its
+/// `dpop.required` binds its own tokens only, so only then does every
+/// token the resource accepts have to be DPoP-bound.
+fn embedded_server_only(
+    access: &crate::config::AccessConfig,
+    auth_servers: &[String],
+    identity_plugins: bool,
+) -> bool {
+    let Some(ref authz) = access.authorization_server else {
+        return false;
+    };
+    auth_servers.iter().all(|server| *server == authz.issuer)
+        && access
+            .oidc_oauth
+            .as_ref()
+            .is_none_or(|oidc| oidc.providers.is_empty())
+        && access.jwks.is_none()
+        && !identity_plugins
+}
+
 /// Extract authorization server URLs from auth config.
 pub(crate) fn derive_authorization_servers(auth: &crate::config::AccessConfig) -> Vec<String> {
     let mut servers = Vec::new();
     // The embedded EMA authorization server fronts this very gateway —
     // list it first so EMA-capable clients discover the ID-JAG grant
-    // profile without extra configuration.
+    // profile without extra configuration. Verbatim: a client compares the
+    // metadata `issuer` with this string exactly (RFC 8414 §3.3).
     if let Some(ref authz) = auth.authorization_server {
-        servers.push(authz.issuer.trim_end_matches('/').to_owned());
+        servers.push(authz.issuer.clone());
+        // With interactive sign-in it is the only one listed: a client
+        // signs in at the first entry, and a longer list invites guessing.
+        if authz.login_idp().is_some() {
+            return servers;
+        }
     }
     if let Some(ref oidc) = auth.oidc_oauth {
         for provider in &oidc.providers {
@@ -436,8 +500,8 @@ pub(crate) fn derive_authorization_servers(auth: &crate::config::AccessConfig) -
 }
 
 /// RFC 8414 authorization-server metadata for the embedded EMA
-/// authorization server. Mounted only when
-/// `governance.access.authorization_server` is configured.
+/// authorization server. Answers 404 while
+/// `governance.access.authorization_server` is unset.
 pub(crate) async fn oauth_authorization_server_metadata_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Response {
@@ -454,17 +518,51 @@ pub(crate) async fn oauth_authorization_server_metadata_handler(
     }
 }
 
-/// `POST /oauth/token` — ID-JAG redemption (the only supported grant).
+/// `GET /oauth/jwks` — the public keys of the embedded authorization
+/// server's asymmetric signing keys, advertised as `jwks_uri` in its
+/// metadata. 404 while it has none: an HMAC secret is never published.
+pub(crate) async fn oauth_jwks_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Response {
+    let runtime = state.runtime.load();
+    let Some(jwks) = runtime
+        .ema_authorization_server()
+        .and_then(|server| server.jwks())
+    else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no published signing keys" })),
+        )
+            .into_response();
+    };
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "public, max-age=300")],
+        Json(jwks.clone()),
+    )
+        .into_response()
+}
+
+/// `POST /oauth/token` — ID-JAG redemption and, with a login IdP, the
+/// authorization code and the refresh token of an interactive sign-in.
 /// Token responses and errors are never cacheable (RFC 6749 §5.1/§5.2).
+/// Every request within the per-IP rate limit is audited, under the
+/// `x-mcpg-request-id` it answers with, together with what it did to
+/// grants (a replayed code, a reused refresh token, a revoked grant, an
+/// ended IdP sign-in). Only refused requests spend the limit: a successful
+/// redemption gives back what it took. The `DPoP` headers go to the
+/// server, which reads them while DPoP is on.
 pub(crate) async fn oauth_token_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
+    peer: Option<axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     form: Result<
         axum::extract::Form<crate::runtime::authorization_server::TokenRequestForm>,
         axum::extract::rejection::FormRejection,
     >,
 ) -> Response {
-    use crate::runtime::authorization_server::OAuthError;
+    use crate::runtime::authorization_server::TokenRedemption;
+    use crate::runtime::authorization_server::dpop::{self, DpopPresentation};
 
     let runtime = state.runtime.load();
     let Some(server) = runtime.ema_authorization_server() else {
@@ -474,22 +572,318 @@ pub(crate) async fn oauth_token_handler(
         )
             .into_response();
     };
-    let outcome = match form {
+    // Before any redemption work: signature checks and key or metadata
+    // document fetches are what a flood would buy. An unattributable
+    // source is not limited, as on `/mcp`.
+    let per_min = server.rate_limit_per_min();
+    let limited_ip = if per_min > 0 {
+        crate::transports::anon_limit::client_ip(
+            state.config.load().gateway.server.trust_proxy_ip,
+            headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+            peer.map(|ext| ext.0.0.ip()),
+        )
+    } else {
+        None
+    };
+    if let Some(ip) = limited_ip
+        && let Err(wait) = crate::transports::anon_limit::OAUTH_TOKEN.acquire(ip, per_min, per_min)
+    {
+        return token_rate_limited_response(ip, wait);
+    }
+    let request_id = GatewayRequestId::new();
+    let redemption = match form {
         Ok(axum::extract::Form(form)) => {
             let authorization = headers
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok());
-            server.handle_token_request(form, authorization).await
+            let presentation = DpopPresentation::from_values(
+                headers
+                    .get_all(dpop::DPOP_HEADER)
+                    .iter()
+                    .map(axum::http::HeaderValue::as_bytes),
+            );
+            server
+                .redeem_with_dpop(form, authorization, &presentation)
+                .await
         }
-        Err(rejection) => Err(OAuthError {
-            status: 400,
-            error: "invalid_request",
-            description: format!("malformed token request: {rejection}"),
-            basic_challenge: false,
-        }),
+        Err(rejection) => TokenRedemption {
+            dpop_nonce: server.token_endpoint_nonce(),
+            ..TokenRedemption::malformed(format!("malformed token request: {rejection}"))
+        },
     };
-    match outcome {
-        Ok(token) => {
+    // Clients behind one address (a NAT, a proxy, a hosted MCP client)
+    // share the budget, so their successful redemptions, and the nonce
+    // round trip before them, must not spend it.
+    if let Some(ip) = limited_ip
+        && (redemption.result.is_ok() || redemption.nonce_requested())
+    {
+        crate::transports::anon_limit::OAUTH_TOKEN.refund(ip, per_min, per_min);
+    }
+    let upstream_request_id = headers
+        .get(UPSTREAM_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    for event in redemption.audit_events(request_id.as_str()) {
+        let event = event.with_upstream_request_id(upstream_request_id.clone());
+        let _ = runtime.plugin_registry().emit_audit_event(&event).await;
+    }
+    let mut resp = token_endpoint_response(redemption);
+    if let Ok(value) = axum::http::HeaderValue::from_str(request_id.as_str()) {
+        resp.headers_mut().insert(REQUEST_ID_RESPONSE_HEADER, value);
+    }
+    resp
+}
+
+/// `POST /oauth/revoke` — RFC 7009 token revocation, offered with a login
+/// IdP (404 otherwise). The client authenticates as at the token endpoint
+/// and shares its per-IP budget. Answers 200 with no body whether or not
+/// the token was known (RFC 7009 §2.2), an RFC 6749 §5.2 error otherwise;
+/// never cacheable. Audited like a token request; the IdP refresh token of
+/// a sign-in the revocation released is revoked at the IdP after the
+/// answer.
+pub(crate) async fn oauth_revoke_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
+    peer: Option<axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    form: Result<
+        axum::extract::Form<
+            crate::runtime::authorization_server::revocation::RevocationRequestForm,
+        >,
+        axum::extract::rejection::FormRejection,
+    >,
+) -> Response {
+    use crate::runtime::authorization_server::revocation::TokenRevocation;
+
+    let runtime = state.runtime.load();
+    let Some(server) = runtime
+        .ema_authorization_server()
+        .filter(|server| server.login_idp().is_some())
+    else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "token revocation is not offered" })),
+        )
+            .into_response();
+    };
+    let per_min = server.rate_limit_per_min();
+    let limited_ip = if per_min > 0 {
+        crate::transports::anon_limit::client_ip(
+            state.config.load().gateway.server.trust_proxy_ip,
+            headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+            peer.map(|ext| ext.0.0.ip()),
+        )
+    } else {
+        None
+    };
+    if let Some(ip) = limited_ip
+        && let Err(wait) = crate::transports::anon_limit::OAUTH_TOKEN.acquire(ip, per_min, per_min)
+    {
+        return token_rate_limited_response(ip, wait);
+    }
+    let request_id = GatewayRequestId::new();
+    let mut revocation = match form {
+        Ok(axum::extract::Form(form)) => {
+            let authorization = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok());
+            server.revoke_token(form, authorization).await
+        }
+        Err(rejection) => {
+            TokenRevocation::malformed(format!("malformed revocation request: {rejection}"))
+        }
+    };
+    if let Some(ip) = limited_ip
+        && revocation.result.is_ok()
+    {
+        crate::transports::anon_limit::OAUTH_TOKEN.refund(ip, per_min, per_min);
+    }
+    let upstream_request_id = headers
+        .get(UPSTREAM_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    for event in revocation.audit_events(request_id.as_str()) {
+        let event = event.with_upstream_request_id(upstream_request_id.clone());
+        let _ = runtime.plugin_registry().emit_audit_event(&event).await;
+    }
+    if let Some(released) = revocation.released.take() {
+        let runtime = state.runtime.load_full();
+        tokio::spawn(async move {
+            if let Some(server) = runtime.ema_authorization_server() {
+                server.revoke_superseded(released).await;
+            }
+        });
+    }
+    let mut resp = match revocation.result {
+        Ok(()) => {
+            let mut resp = axum::http::StatusCode::OK.into_response();
+            let h = resp.headers_mut();
+            h.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            h.insert(
+                axum::http::header::PRAGMA,
+                axum::http::HeaderValue::from_static("no-cache"),
+            );
+            resp
+        }
+        Err(ref err) => oauth_error_response(err),
+    };
+    if let Ok(value) = axum::http::HeaderValue::from_str(request_id.as_str()) {
+        resp.headers_mut().insert(REQUEST_ID_RESPONSE_HEADER, value);
+    }
+    resp
+}
+
+/// `POST /oauth/register` — RFC 7591 dynamic client registration, offered
+/// with a login IdP while `interactive.dynamic_client_registration` is on
+/// (404 otherwise). It shares the token endpoint's per-IP budget; a
+/// successful registration gives back what it took. Answers 201 with the
+/// registered client, or an RFC 7591 §3.2.2 error (401 with a Bearer
+/// challenge for a missing or unknown initial access token, 429 with
+/// `Retry-After` over the hourly allowance, 503 at `max_clients`); never
+/// cacheable. Audited, except a request over the hourly allowance.
+pub(crate) async fn oauth_register_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
+    peer: Option<axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    body: axum::body::Body,
+) -> Response {
+    use crate::runtime::authorization_server::dcr::{ClientRegistration, MAX_REGISTRATION_BYTES};
+
+    let runtime = state.runtime.load();
+    let Some(server) = runtime
+        .ema_authorization_server()
+        .filter(|server| server.registers_clients())
+    else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "dynamic client registration is not offered" })),
+        )
+            .into_response();
+    };
+    let client_ip = crate::transports::anon_limit::client_ip(
+        state.config.load().gateway.server.trust_proxy_ip,
+        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+        peer.map(|ext| ext.0.0.ip()),
+    );
+    let per_min = server.rate_limit_per_min();
+    let limited_ip = client_ip.filter(|_| per_min > 0);
+    if let Some(ip) = limited_ip
+        && let Err(wait) = crate::transports::anon_limit::OAUTH_TOKEN.acquire(ip, per_min, per_min)
+    {
+        return token_rate_limited_response(ip, wait);
+    }
+    let request_id = GatewayRequestId::new();
+    let is_json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"));
+    let registration = if !is_json {
+        ClientRegistration::malformed(
+            "the registration request must be sent as application/json".to_owned(),
+        )
+    } else {
+        match axum::body::to_bytes(body, MAX_REGISTRATION_BYTES).await {
+            Ok(body) => {
+                let authorization = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok());
+                server
+                    .register_client(&body, authorization, client_ip)
+                    .await
+            }
+            Err(_) => ClientRegistration::malformed(format!(
+                "the registration request exceeds {MAX_REGISTRATION_BYTES} bytes"
+            )),
+        }
+    };
+    if let Some(ip) = limited_ip
+        && registration.result.is_ok()
+    {
+        crate::transports::anon_limit::OAUTH_TOKEN.refund(ip, per_min, per_min);
+    }
+    if let Some(event) = registration.audit_event(request_id.as_str()) {
+        let upstream_request_id = headers
+            .get(UPSTREAM_REQUEST_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let event = event.with_upstream_request_id(upstream_request_id);
+        let _ = runtime.plugin_registry().emit_audit_event(&event).await;
+    }
+    let mut resp = match registration.result {
+        Ok(ref registered) => {
+            (axum::http::StatusCode::CREATED, Json(registered.body())).into_response()
+        }
+        Err(ref error) => {
+            let status = axum::http::StatusCode::from_u16(error.status())
+                .unwrap_or(axum::http::StatusCode::BAD_REQUEST);
+            let mut resp = (status, Json(error.body())).into_response();
+            let h = resp.headers_mut();
+            if let Some(challenge) = error.www_authenticate() {
+                h.insert(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    axum::http::HeaderValue::from_static(challenge),
+                );
+            }
+            if let crate::runtime::authorization_server::dcr::RegistrationError::RateLimited {
+                retry_after_secs,
+            } = *error
+            {
+                h.insert(axum::http::header::RETRY_AFTER, retry_after_secs.into());
+            }
+            resp
+        }
+    };
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    h.insert(
+        axum::http::header::PRAGMA,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(request_id.as_str()) {
+        h.insert(REQUEST_ID_RESPONSE_HEADER, value);
+    }
+    resp
+}
+
+/// `429` for a client address over the token endpoint's rate limit, as an
+/// RFC 6749 §5.2 error body with `Retry-After`. Not audited: a flood would
+/// otherwise fill the audit log.
+fn token_rate_limited_response(ip: std::net::IpAddr, wait: std::time::Duration) -> Response {
+    let retry_after = (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1);
+    metrics::counter!("mcpg_ema_token_rate_limited_total").increment(1);
+    tracing::debug!(%ip, retry_after, "EMA token endpoint rate limit exceeded");
+    let mut resp = (
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": "temporarily_unavailable",
+            "error_description": format!(
+                "too many token requests from this address; retry in {retry_after} s"
+            ),
+        })),
+    )
+        .into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    h.insert(axum::http::header::RETRY_AFTER, retry_after.into());
+    resp
+}
+
+/// The token response or error of `redemption`, with the `DPoP-Nonce` it
+/// carries while DPoP proofs at the token endpoint need one (RFC 9449 §8).
+fn token_endpoint_response(
+    redemption: crate::runtime::authorization_server::TokenRedemption,
+) -> Response {
+    let mut resp = match redemption.result {
+        Ok((token, _)) => {
             let mut resp = Json(token).into_response();
             let h = resp.headers_mut();
             h.insert(
@@ -502,22 +896,36 @@ pub(crate) async fn oauth_token_handler(
             );
             resp
         }
-        Err(err) => {
-            let status = axum::http::StatusCode::from_u16(err.status)
-                .unwrap_or(axum::http::StatusCode::BAD_REQUEST);
-            let mut resp = (status, Json(err.body())).into_response();
-            let h = resp.headers_mut();
-            h.insert(
-                axum::http::header::CACHE_CONTROL,
-                axum::http::HeaderValue::from_static("no-store"),
-            );
-            if err.basic_challenge {
-                h.insert(
-                    axum::http::header::WWW_AUTHENTICATE,
-                    axum::http::HeaderValue::from_static("Basic realm=\"mcpg\""),
-                );
-            }
-            resp
-        }
+        Err(ref err) => oauth_error_response(err),
+    };
+    if let Some(nonce) = redemption.dpop_nonce
+        && let Ok(value) = axum::http::HeaderValue::from_str(nonce.as_str())
+    {
+        resp.headers_mut().insert(
+            crate::runtime::authorization_server::dpop::DPOP_NONCE_HEADER,
+            value,
+        );
     }
+    resp
+}
+
+/// An RFC 6749 §5.2 error of the token or revocation endpoint: never
+/// cacheable, with a Basic challenge after a failed HTTP Basic
+/// authentication.
+fn oauth_error_response(err: &crate::runtime::authorization_server::OAuthError) -> Response {
+    let status =
+        axum::http::StatusCode::from_u16(err.status).unwrap_or(axum::http::StatusCode::BAD_REQUEST);
+    let mut resp = (status, Json(err.body())).into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    if err.basic_challenge {
+        h.insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Basic realm=\"mcpg\""),
+        );
+    }
+    resp
 }

@@ -46,7 +46,7 @@ pub fn verify(bearer: Option<&str>, peer_ip: Option<IpAddr>) -> Option<RequestId
         subject_id: INSPECTOR_SUBJECT.to_owned(),
         issuer: "mcpg-gateway".to_owned(),
         auth_provider: "inspector_supervisor".to_owned(),
-        source: "supervised_inspector_token".to_owned(),
+        source: crate::runtime::INSPECTOR_TOKEN_SOURCE.to_owned(),
         roles: Vec::new(),
         groups: Vec::new(),
         scopes: Vec::new(),
@@ -95,6 +95,7 @@ mod tests {
             crate::runtime::RequestTrustLevel::Verified
         );
         assert_eq!(identity.principal_id(), Some(INSPECTOR_SUBJECT));
+        assert!(identity.is_gateway_minted());
 
         let v6 = verify(
             Some("secret-token"),

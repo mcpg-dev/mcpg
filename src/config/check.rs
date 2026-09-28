@@ -20,6 +20,12 @@
 //! $ mcpg config check base.yaml production.yaml
 //! ✓ base.yaml + production.yaml: valid (8 bindings, audit on)
 //!
+//! $ mcpg config check login.yaml
+//! ✓ login.yaml: valid (3 bindings, 1 plugins)
+//!   interactive sign-in through https://acme.okta.com (client `0oa1agent`); …
+//!   register this sign-in redirect URI at the IdP: https://mcp.acme.example/oauth/callback
+//!   …
+//!
 //! $ mcpg config check broken.yaml
 //! ✗ broken.yaml: invalid
 //!   audit.sinks must not be empty when audit.enabled = true and audit.required = true
@@ -42,8 +48,10 @@ USAGE:
 OPTIONS:
     --deny-warnings   Exit 1 on a warning as well as an error. For a gate:
                       an unreachable trust floor is valid config that serves
-                      nothing, so a run that only checks the exit code would
-                      pass it.
+                      nothing, and an embedded authorization server that
+                      clients cannot discover is valid config that nobody
+                      uses, so a run that only checks the exit code would
+                      pass them.
 
 NOTES:
     Multiple files merge in argument order with later-wins semantics
@@ -108,6 +116,9 @@ pub fn run_code(args: Vec<String>) -> u8 {
         Ok(cfg) => {
             let summary = config_summary(&cfg);
             println!("\u{2713} {label}: valid ({summary})");
+            for line in crate::config::interactive_login_summary(&cfg) {
+                println!("  {line}");
+            }
             // Valid, but these bindings are invisible at runtime — worth
             // saying out loud here rather than leaving the operator to
             // discover an empty tools/list.
@@ -129,6 +140,13 @@ pub fn run_code(args: Vec<String>) -> u8 {
                 if deny_warnings {
                     return 1;
                 }
+            }
+            let access_warnings = crate::config::access_posture_warnings(&cfg);
+            for warning in &access_warnings {
+                eprintln!("  warning: {warning}");
+            }
+            if deny_warnings && !access_warnings.is_empty() {
+                return 1;
             }
             0
         }

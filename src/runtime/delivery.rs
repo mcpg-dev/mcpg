@@ -108,6 +108,26 @@ impl GatewayRuntime {
         let _ = self.delivery_bus.publish(session_id, delivery).await;
     }
 
+    /// Deliver the JSON-RPC `notification` to the client of `session_id`
+    /// on its SSE stream, kept for a stream that connects later, from an
+    /// async context.
+    pub(crate) async fn notify_session(&self, session_id: &str, notification: serde_json::Value) {
+        let mut message = pipeline_store::DeliveryMessage {
+            kind: pipeline_store::DeliveryKind::Notification,
+            jsonrpc_message: notification,
+            delivery_id: String::new(),
+        };
+        if let Ok(delivery_id) = self
+            .pipeline_store
+            .store_pending_delivery(session_id, &message)
+        {
+            message.delivery_id = delivery_id;
+        }
+        if let Err(error) = self.delivery_bus.publish(session_id, message).await {
+            tracing::debug!(error = %error, "a session notification could not be published");
+        }
+    }
+
     /// Deliver a JSON-RPC notification to the client via the session's SSE stream.
     pub(crate) fn deliver_notification(&self, session_id: &str, notification: serde_json::Value) {
         let mut message = pipeline_store::DeliveryMessage {

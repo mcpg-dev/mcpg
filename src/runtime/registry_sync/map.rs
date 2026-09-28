@@ -99,15 +99,22 @@ pub(crate) fn federation_for_entry(
     }
     let headers = resolve_remote_headers(remote, overrides)?;
 
-    // `{server}` in the upstream credential target expands to the registry
-    // server name, so one issuer block (with a target template / allowlist)
-    // serves the whole registry:
+    // `{server}` in the upstream credential target, and in the catalogue
+    // credential's, expands to the registry server name, so one issuer block
+    // (with a target template / allowlist) serves the whole registry:
     //   credential: cred://dev.mcpg.credential.oauth-id-jag/{server}
     let mut auth = overrides
         .auth
         .clone()
         .unwrap_or_else(|| registry.defaults.auth.clone());
-    if let Some(cred) = auth.credential.as_mut() {
+    let import_credential = auth
+        .import
+        .as_deref_mut()
+        .and_then(|import| import.credential.as_mut());
+    for cred in [auth.credential.as_mut(), import_credential]
+        .into_iter()
+        .flatten()
+    {
         *cred = cred.replace("{server}", server_name);
     }
 
@@ -353,6 +360,60 @@ mod tests {
         assert_eq!(
             fed.upstream.auth.credential.as_deref(),
             Some("cred://dev.mcpg.credential.oauth-client-credentials/com.acme/crm")
+        );
+    }
+
+    /// A synthesized federation presents the stored IdP sign-in the
+    /// registry's `auth` names: the defaults, or a server's own `auth`,
+    /// which replaces them whole.
+    #[test]
+    fn the_stored_sign_in_mode_follows_the_auth_that_applies() {
+        use crate::config::SubjectToken;
+        let reg = registry(
+            "name: acme\nurl: \"https://r.example\"\ndefaults:\n  auth:\n    mode: oauth_impersonation\n    credential: \"cred://dev.mcpg.credential.oauth-id-jag/{server}\"\n    subject_token: idp_refresh_token\nservers:\n  \"com.acme/billing\":\n    auth:\n      mode: oauth_impersonation\n      credential: \"cred://dev.mcpg.credential.oauth-id-jag/{server}\"\n      subject_token: idp_id_token\n  \"com.acme/wiki\":\n    auth:\n      mode: oauth_impersonation\n      credential: \"cred://dev.mcpg.credential.oauth-token-exchange/{server}\"\n",
+        );
+        for (server, expected) in [
+            ("com.acme/crm", SubjectToken::IdpRefreshToken),
+            ("com.acme/billing", SubjectToken::IdpIdToken),
+            ("com.acme/wiki", SubjectToken::CallerBearer),
+        ] {
+            let fed = federation_for_entry(
+                &reg,
+                &entry(server, vec![http_remote("https://crm.acme.example/mcp")]),
+            )
+            .expect("federates");
+            assert_eq!(fed.upstream.auth.subject_token, expected, "{server}");
+        }
+    }
+
+    #[test]
+    fn import_credential_target_expands_server_placeholder() {
+        let reg = registry(
+            "name: acme\nurl: \"https://r.example\"\ndefaults:\n  auth:\n    mode: oauth_impersonation\n    credential: \"cred://dev.mcpg.credential.oauth-id-jag/{server}\"\n    import:\n      mode: oauth_client_credentials\n      credential: \"cred://dev.mcpg.credential.oauth-client-credentials/{server}\"\n",
+        );
+        for server in ["com.acme/crm", "com.acme/billing"] {
+            let fed = federation_for_entry(
+                &reg,
+                &entry(server, vec![http_remote("https://crm.acme.example/mcp")]),
+            )
+            .expect("federates");
+            let import = fed.upstream.auth.import.as_deref().expect("import");
+            let catalogue = format!("cred://dev.mcpg.credential.oauth-client-credentials/{server}");
+            let caller = format!("cred://dev.mcpg.credential.oauth-id-jag/{server}");
+            assert_eq!(import.credential.as_deref(), Some(catalogue.as_str()));
+            assert_eq!(
+                fed.upstream.auth.credential.as_deref(),
+                Some(caller.as_str())
+            );
+        }
+        // The registry defaults keep the placeholder for the next server.
+        assert_eq!(
+            reg.defaults
+                .auth
+                .import
+                .as_deref()
+                .and_then(|i| i.credential.as_deref()),
+            Some("cred://dev.mcpg.credential.oauth-client-credentials/{server}")
         );
     }
 

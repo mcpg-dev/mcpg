@@ -1,9 +1,9 @@
 # MCPG deployment templates
 
-Six canonical configurations covering the deployment topologies most operators land on. Each YAML is **valid against the live `AppConfig` schema** — `cargo test -p mcpg --test deployments_validate` enforces it on every CI run, and you can validate any of them locally with:
+Canonical configurations covering the deployment topologies most operators land on. Each YAML is **valid against the live `AppConfig` schema** — the `deployments_validate` suite of the `mcpg-config` crate (`cargo test -p mcpg-config --test deployments_validate`) enforces it on every CI run, and you can validate any of them locally with:
 
 ```bash
-cargo run -p mcpg --bin mcpg-config -- check examples/deployments/<name>.yaml
+cargo run -p mcpg-config -- check examples/deployments/<name>.yaml
 ```
 
 Each YAML carries a `# yaml-language-server: $schema=./config.schema.json` header. Open one in VS Code (with the [YAML extension](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml)) or any IntelliJ IDE and you get autocomplete + hover docs sourced from the gateway's own `///` rustdoc — no separate documentation lookup required.
@@ -18,6 +18,9 @@ Each YAML carries a `# yaml-language-server: $schema=./config.schema.json` heade
 | [`production-nats-cluster.yaml`](production-nats-cluster.yaml) | NATS JetStream variant of the cluster topology. Pick this when your platform already runs NATS. |
 | [`air-gapped.yaml`](air-gapped.yaml) | Zero-outbound deploy. Local plugin tree, static JWKS, file storage, file audit. |
 | [`multi-tenant.yaml`](multi-tenant.yaml) | Single gateway, many tenants. Per-tenant session quota, per-tenant rate limit, group-gated admin tools. |
+| [`enterprise-managed-auth.yaml`](enterprise-managed-auth.yaml) | Embedded authorization server that redeems Okta Cross App Access (Agent SSO) ID-JAGs for MCP clients such as Claude and VS Code. NATS cluster with a shared single-use ledger. No license needed. |
+| [`interactive-login-okta.yaml`](interactive-login-okta.yaml) | Embedded authorization server with Okta: EMA ID-JAGs, interactive sign-in for Claude Code / VS Code / CLIs, and a Cross App Access upstream per user. Enterprise license (`sso.interactive_login`). |
+| [`mcp-apps.yaml`](mcp-apps.yaml) | MCP Apps: front Apps-capable servers (passthrough, capability advertisement, tighten-only CSP) and author UIs from config. |
 
 ## How they're meant to be used
 

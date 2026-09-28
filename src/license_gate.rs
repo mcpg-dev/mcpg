@@ -1,18 +1,23 @@
-//! Plugin license gate for standalone deployments.
+//! License gate at boot and reload.
 //!
-//! The control plane is the authoritative entitlement gate for
-//! CP-attached gateways (plugin-set bind refuses unentitled plugins
-//! before a config is ever pushed), so those skip this entirely. A
-//! standalone gateway instead resolves an offline claims envelope —
-//! the configured `license:` token, or the built-in community tier —
-//! and refuses to boot when `plugins[]` contains entitlement-gated
-//! plugins the envelope does not admit. `license.non_production_use`
-//! loads them anyway under the license's free non-production grant,
-//! loudly.
+//! The gateway resolves an offline claims envelope — the configured
+//! `license:` token, or the built-in community tier — and refuses a config
+//! whose `plugins[]` contain entitlement-gated plugins, or whose blocks turn
+//! on a feature-gated surface (interactive sign-in: `sso.interactive_login`),
+//! that the envelope does not admit. `license.non_production_use` loads them
+//! anyway under the license's free non-production grant, loudly.
+//!
+//! Two halves defer to the control plane, each only where the control plane
+//! checks: plugins on a CP-attached gateway, which the plugin-set bind admits;
+//! config surfaces on a config the managed-cloud platform rendered, which its
+//! publish guard admitted. Every other config — standalone, attached to a
+//! self-hosted control plane, or carrying a `gateway.control_plane` block the
+//! binary ignores — has its surfaces checked here.
 
 use anyhow::{Context, bail};
 use mcpg_control_plane_license::license::{
-    self, LicenseClaims, is_entitlement_gated, plugin_load_violation, verify_license,
+    self, FEATURE_INTERACTIVE_LOGIN, LicenseClaims, is_entitlement_gated, plugin_load_violation,
+    verify_license,
 };
 
 use crate::config::{AppConfig, LicenseConfig};
@@ -21,50 +26,110 @@ use crate::config::{AppConfig, LicenseConfig};
 /// both `mcpg-cp` and `mcpg-gateway`.
 const GATEWAY_AUDIENCE: &str = "mcpg-gateway";
 
-/// Refuses (with a remediation-bearing error) a standalone config whose
-/// `plugins[]` include entitlement-gated plugins the resolved license
-/// envelope does not admit. Runs at boot and on every reload.
-pub fn enforce_plugin_license_gate(config: &AppConfig) -> anyhow::Result<()> {
-    if config.gateway.control_plane.is_some() {
-        return Ok(());
+/// The config surfaces a license feature withholds, as
+/// `(feature, config path of the block)`.
+pub fn licensed_config_surfaces(config: &AppConfig) -> Vec<(&'static str, String)> {
+    const SERVER: &str = "governance.access.authorization_server";
+    let Some(ref server) = config.governance.access.authorization_server else {
+        return Vec::new();
+    };
+    let mut surfaces: Vec<(&'static str, String)> = server
+        .trusted_idps
+        .iter()
+        .filter(|idp| idp.login.is_some())
+        .map(|idp| {
+            (
+                FEATURE_INTERACTIVE_LOGIN,
+                format!("{SERVER}.trusted_idps[`{}`].login", idp.issuer),
+            )
+        })
+        .collect();
+    if server.interactive.is_some() {
+        surfaces.push((FEATURE_INTERACTIVE_LOGIN, format!("{SERVER}.interactive")));
     }
+    surfaces
+}
 
+/// Whether the control plane admits this gateway's plugins: an attached
+/// gateway runs the plugin set its bind checked. A binary built without
+/// `cp-attached` ignores the block and never binds.
+fn control_plane_binds_plugins(config: &AppConfig) -> bool {
+    cfg!(feature = "cp-attached") && config.gateway.control_plane.is_some()
+}
+
+/// Whether the managed-cloud platform rendered this config: its provisioner
+/// stamps `gateway.control_plane` and the placement provenance on every
+/// render, and renders only a config the publish guard admitted.
+fn platform_rendered(config: &AppConfig) -> bool {
+    let provenance = &config.cloud.provenance;
+    control_plane_binds_plugins(config)
+        && provenance.cluster_id.is_some()
+        && provenance.namespace.is_some()
+}
+
+/// Refuses (with a remediation-bearing error) a config whose `plugins[]`
+/// include entitlement-gated plugins, or whose blocks turn on feature-gated
+/// surfaces, that the resolved license envelope does not admit. Runs at boot
+/// and on every reload.
+pub fn enforce_license_gate(config: &AppConfig) -> anyhow::Result<()> {
     // Gate on the artifact's manifest id (`ref`), not the operator
     // alias: the loader separately asserts descriptor.id == ref.
-    let gated: Vec<&str> = config
-        .plugins
-        .iter()
-        .filter(|entry| !entry.disabled)
-        .map(|entry| entry.r#ref.as_deref().unwrap_or(entry.id.as_str()))
-        .filter(|id| is_entitlement_gated(id))
-        .collect();
-    if gated.is_empty() {
+    let gated: Vec<&str> = if control_plane_binds_plugins(config) {
+        Vec::new()
+    } else {
+        config
+            .plugins
+            .iter()
+            .filter(|entry| !entry.disabled)
+            .map(|entry| entry.r#ref.as_deref().unwrap_or(entry.id.as_str()))
+            .filter(|id| is_entitlement_gated(id))
+            .collect()
+    };
+    let surfaces = if platform_rendered(config) {
+        Vec::new()
+    } else {
+        licensed_config_surfaces(config)
+    };
+    if gated.is_empty() && surfaces.is_empty() {
         return Ok(());
     }
 
     if config.license.non_production_use {
+        let features: Vec<String> = surfaces
+            .iter()
+            .map(|(feature, path)| format!("{path} ({feature})"))
+            .collect();
         tracing::warn!(
             plugins = ?gated,
-            "entitlement-gated plugins loaded under their license's non-production \
-             grant (license.non_production_use: true); production use requires an \
-             entitling license token"
+            features = ?features,
+            "entitlement-gated plugins and features loaded under their license's \
+             non-production grant (license.non_production_use: true); production use \
+             requires an entitling license token"
         );
         return Ok(());
     }
 
     let claims = resolve_claims(&config.license)?;
-    let violations: Vec<String> = gated
+    let mut violations: Vec<String> = gated
         .iter()
         .filter_map(|id| plugin_load_violation(&claims, id).map(|v| v.to_string()))
         .collect();
+    violations.extend(
+        surfaces
+            .iter()
+            .filter(|(feature, _)| !claims.has_feature(feature))
+            .map(|(feature, path)| {
+                format!("{path} requires the `{feature}` plan feature, which this license does not grant")
+            }),
+    );
     if violations.is_empty() {
         return Ok(());
     }
     bail!(
-        "license gate: plan `{}` does not license {} configured plugin(s):\n  - {}\n\
+        "license gate: plan `{}` does not license {} configured item(s):\n  - {}\n\
          Install an entitling license (`license.token` / `license.token_file` + \
          `license.pubkey_pem`), declare a non-production deployment \
-         (`license.non_production_use: true`), or remove the plugin(s). \
+         (`license.non_production_use: true`), or remove them. \
          Licensing: https://mcpg.dev/license",
         claims.plan,
         violations.len(),
@@ -147,54 +212,9 @@ mod tests {
         serde_yaml::from_str(&yaml).expect("test config parses")
     }
 
-    #[test]
-    fn free_plugins_pass_unlicensed() {
-        let cfg = config_with_plugins(&["dev.mcpg.backend.http", "dev.mcpg.transform.jsonata"], "");
-        assert!(enforce_plugin_license_gate(&cfg).is_ok());
-    }
-
-    #[test]
-    fn gated_plugin_refuses_without_a_license() {
-        let cfg = config_with_plugins(&["dev.mcpg.payment.ucp"], "");
-        let err = enforce_plugin_license_gate(&cfg).unwrap_err().to_string();
-        assert!(err.contains("payment.ucp"), "{err}");
-        assert!(err.contains("non_production_use"), "{err}");
-    }
-
-    #[test]
-    fn alias_plus_ref_is_gated_on_the_manifest_id() {
-        let yaml = "plugins:\n  - id: my-sso\n    ref: dev.mcpg.identity.saml\n    class: identity_provider\n    source: { path: /tmp/x.so }\n";
-        let cfg: AppConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(enforce_plugin_license_gate(&cfg).is_err());
-    }
-
-    #[test]
-    fn non_production_declaration_loads_gated_plugins() {
-        let cfg = config_with_plugins(
-            &["dev.mcpg.identity.saml"],
-            "license:\n  non_production_use: true\n",
-        );
-        assert!(enforce_plugin_license_gate(&cfg).is_ok());
-    }
-
-    #[test]
-    fn disabled_entries_and_third_party_ids_are_ignored() {
-        let yaml = "plugins:\n  - id: dev.mcpg.cluster.redis\n    class: cluster\n    source: { path: /tmp/x.so }\n    disabled: true\n  - id: acme.payment.custom\n    class: payment\n    source: { path: /tmp/x.so }\n";
-        let cfg: AppConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(enforce_plugin_license_gate(&cfg).is_ok());
-    }
-
-    #[test]
-    fn cp_attached_configs_skip_the_gate() {
-        let cfg = config_with_plugins(
-            &["dev.mcpg.payment.ucp"],
-            "gateway:\n  control_plane:\n    url: http://127.0.0.1:9\n",
-        );
-        assert!(enforce_plugin_license_gate(&cfg).is_ok());
-    }
-
-    #[test]
-    fn entitling_token_admits_and_lesser_token_refuses() {
+    /// A token signed by a fresh issuer key for `plan`, and the `license:`
+    /// block that trusts that key.
+    fn license_yaml_for(plan: &str) -> String {
         use ed25519_dalek::SigningKey;
         use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
         use jsonwebtoken::{EncodingKey, Header};
@@ -208,11 +228,11 @@ mod tests {
 
         let mut claims = LicenseClaims::community(GATEWAY_AUDIENCE);
         claims.exp = chrono::Utc::now().timestamp() + 3600;
-        let (entitlements, quotas) = license::plan_envelope("team");
+        let (entitlements, quotas) = license::plan_envelope(plan);
         claims.plugin_entitlements = entitlements;
         claims.quotas = quotas;
-        claims.features = license::features_for("team");
-        claims.plan = "team".into();
+        claims.features = license::features_for(plan);
+        claims.plan = plan.into();
 
         let token = jsonwebtoken::encode(
             &Header::new(jsonwebtoken::Algorithm::EdDSA),
@@ -221,21 +241,78 @@ mod tests {
         )
         .unwrap();
 
-        let license_yaml = format!(
+        format!(
             "license:\n  token: {token}\n  pubkey_pem: |\n{}",
             pem.lines()
                 .map(|l| format!("    {l}\n"))
                 .collect::<String>()
+        )
+    }
+
+    #[test]
+    fn free_plugins_pass_unlicensed() {
+        let cfg = config_with_plugins(&["dev.mcpg.backend.http", "dev.mcpg.transform.jsonata"], "");
+        assert!(enforce_license_gate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn gated_plugin_refuses_without_a_license() {
+        let cfg = config_with_plugins(&["dev.mcpg.payment.ucp"], "");
+        let err = enforce_license_gate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("payment.ucp"), "{err}");
+        assert!(err.contains("non_production_use"), "{err}");
+    }
+
+    #[test]
+    fn alias_plus_ref_is_gated_on_the_manifest_id() {
+        let yaml = "plugins:\n  - id: my-sso\n    ref: dev.mcpg.identity.saml\n    class: identity_provider\n    source: { path: /tmp/x.so }\n";
+        let cfg: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(enforce_license_gate(&cfg).is_err());
+    }
+
+    #[test]
+    fn non_production_declaration_loads_gated_plugins() {
+        let cfg = config_with_plugins(
+            &["dev.mcpg.identity.saml"],
+            "license:\n  non_production_use: true\n",
         );
+        assert!(enforce_license_gate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn disabled_entries_and_third_party_ids_are_ignored() {
+        let yaml = "plugins:\n  - id: dev.mcpg.cluster.redis\n    class: cluster\n    source: { path: /tmp/x.so }\n    disabled: true\n  - id: acme.payment.custom\n    class: payment\n    source: { path: /tmp/x.so }\n";
+        let cfg: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(enforce_license_gate(&cfg).is_ok());
+    }
+
+    /// The plugin-set bind admits an attached gateway's plugins; a binary
+    /// that ignores the block gates them itself.
+    #[test]
+    fn cp_attached_configs_skip_the_plugin_gate() {
+        let cfg = config_with_plugins(
+            &["dev.mcpg.payment.ucp"],
+            "gateway:\n  control_plane:\n    url: http://127.0.0.1:9\n",
+        );
+        assert!(cfg.gateway.control_plane.is_some());
+        assert_eq!(
+            enforce_license_gate(&cfg).is_ok(),
+            cfg!(feature = "cp-attached")
+        );
+    }
+
+    #[test]
+    fn entitling_token_admits_and_lesser_token_refuses() {
+        let license_yaml = license_yaml_for("team");
         // Team licenses saml + cluster...
         let cfg = config_with_plugins(
             &["dev.mcpg.identity.saml", "dev.mcpg.cluster.redis"],
             &license_yaml,
         );
-        assert!(enforce_plugin_license_gate(&cfg).is_ok());
+        assert!(enforce_license_gate(&cfg).is_ok());
         // ...but not kerberos (enterprise-only feature).
         let cfg = config_with_plugins(&["dev.mcpg.identity.kerberos"], &license_yaml);
-        let err = enforce_plugin_license_gate(&cfg).unwrap_err().to_string();
+        let err = enforce_license_gate(&cfg).unwrap_err().to_string();
         assert!(err.contains("sso.kerberos"), "{err}");
     }
 
@@ -245,7 +322,112 @@ mod tests {
             &["dev.mcpg.payment.ucp"],
             "license:\n  token: not-a-jwt\n  pubkey_pem: also-not-a-key\n",
         );
-        let err = enforce_plugin_license_gate(&cfg).unwrap_err().to_string();
+        let err = enforce_license_gate(&cfg).unwrap_err().to_string();
         assert!(err.contains("pubkey_pem"), "{err}");
+    }
+
+    /// An authorization server with interactive sign-in, parsed without
+    /// validation: the gate reads the blocks, not their contents.
+    fn interactive_login_config(extra: &str) -> AppConfig {
+        let yaml = format!(
+            "governance:\n  access:\n    authorization_server:\n      issuer: https://mcp.example.com\n      \
+             signing_secret: ema-signing-secret-0123456789abcdef\n      trusted_idps:\n        \
+             - issuer: https://acme.okta.com\n          login:\n            client_id: agent\n        \
+             - issuer: https://other.example.com\n      interactive: {{}}\n{extra}"
+        );
+        serde_yaml::from_str(&yaml).expect("test config parses")
+    }
+
+    /// Interactive sign-in is enterprise-only: the community envelope and a
+    /// team license refuse to boot with it and name both blocks and the
+    /// feature; an enterprise license or the non-production grant admit it.
+    #[test]
+    fn interactive_login_needs_its_license_feature() {
+        let surfaces = licensed_config_surfaces(&interactive_login_config(""));
+        assert_eq!(
+            surfaces,
+            vec![
+                (
+                    FEATURE_INTERACTIVE_LOGIN,
+                    "governance.access.authorization_server.trusted_idps[`https://acme.okta.com`].login"
+                        .to_owned()
+                ),
+                (
+                    FEATURE_INTERACTIVE_LOGIN,
+                    "governance.access.authorization_server.interactive".to_owned()
+                ),
+            ]
+        );
+
+        for license_yaml in [String::new(), license_yaml_for("team")] {
+            let err = enforce_license_gate(&interactive_login_config(&license_yaml))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("2 configured item(s)")
+                    && err.contains("trusted_idps[`https://acme.okta.com`].login requires")
+                    && err.contains("authorization_server.interactive requires")
+                    && err.contains("`sso.interactive_login`")
+                    && err.contains("non_production_use"),
+                "{err}"
+            );
+        }
+        enforce_license_gate(&interactive_login_config(&license_yaml_for("enterprise")))
+            .expect("enterprise licenses interactive login");
+        enforce_license_gate(&interactive_login_config(
+            "license:\n  non_production_use: true\n",
+        ))
+        .expect("the non-production grant admits interactive login");
+    }
+
+    /// A `gateway.control_plane` block alone does not lift the surface gate:
+    /// a self-hosted control plane never sees the gateway's local config.
+    /// Only a config the platform rendered (the block plus its placement
+    /// provenance) defers to the publish guard that admitted it.
+    #[test]
+    fn only_a_platform_rendered_config_defers_interactive_login_to_the_control_plane() {
+        const ATTACHED: &str = "gateway:\n  control_plane:\n    url: http://127.0.0.1:9\n    \
+                                enrollment_url: http://127.0.0.1:9\n";
+        const PROVENANCE: &str =
+            "cloud:\n  provenance:\n    cluster_id: cell-1\n    namespace: tenant-acme\n";
+
+        let attached = interactive_login_config(ATTACHED);
+        assert!(attached.gateway.control_plane.is_some());
+        let err = enforce_license_gate(&attached)
+            .expect_err("an attached gateway's local login block needs the feature")
+            .to_string();
+        assert!(
+            err.contains("`sso.interactive_login`") && err.contains("2 configured item(s)"),
+            "{err}"
+        );
+        enforce_license_gate(&interactive_login_config(&format!(
+            "{ATTACHED}{}",
+            license_yaml_for("enterprise")
+        )))
+        .expect("a local enterprise license admits an attached gateway's login block");
+
+        let stamped_only = interactive_login_config(PROVENANCE);
+        assert!(stamped_only.cloud.provenance.cluster_id.is_some());
+        enforce_license_gate(&stamped_only)
+            .expect_err("provenance without a control plane is not a platform render");
+
+        let rendered = interactive_login_config(&format!("{ATTACHED}{PROVENANCE}"));
+        assert_eq!(
+            enforce_license_gate(&rendered).is_ok(),
+            cfg!(feature = "cp-attached"),
+            "a platform render passed the publish guard"
+        );
+    }
+
+    /// An EMA-only server (no login block, no interactive block) needs no
+    /// feature and boots on the community envelope.
+    #[test]
+    fn an_ema_only_authorization_server_needs_no_feature() {
+        let yaml = "governance:\n  access:\n    authorization_server:\n      issuer: https://mcp.example.com\n      \
+                    signing_secret: ema-signing-secret-0123456789abcdef\n      trusted_idps:\n        \
+                    - issuer: https://acme.okta.com\n";
+        let cfg: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(licensed_config_surfaces(&cfg).is_empty());
+        enforce_license_gate(&cfg).expect("EMA alone is not gated");
     }
 }

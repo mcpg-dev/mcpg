@@ -11,9 +11,13 @@ use crate::protocol::v_2026_07_28::wire::lifecycle::{
     ResourcesCapability, ServerCapabilities, ToolsCapability,
 };
 use crate::protocol::v_2026_07_28::wire::tools::CacheScope;
+use crate::runtime::TransportKind;
 use crate::runtime::shared_services::SharedServices;
 
-pub(crate) fn build_discover_result(services: &SharedServices) -> DiscoverResult {
+pub(crate) fn build_discover_result(
+    services: &SharedServices,
+    transport: &TransportKind,
+) -> DiscoverResult {
     use crate::protocol::v_2026_07_28::extensions::tasks::wire::{
         EXTENSION_NAMESPACE as TASKS_EXTENSION_NAMESPACE, METHOD_CANCEL_TASK, METHOD_GET_TASK,
         METHOD_UPDATE_TASK,
@@ -75,6 +79,26 @@ pub(crate) fn build_discover_result(services: &SharedServices) -> DiscoverResult
         extensions.insert(
             crate::protocol::shared::apps::EXTENSION_ID.to_owned(),
             crate::protocol::shared::apps::capability_value(&[]),
+        );
+    }
+
+    // Enterprise-Managed Authorization: declared while the embedded
+    // authorization server is installed. The live runtime is authoritative
+    // because a reload rebuilds the server but not this config snapshot.
+    // An HTTP-transport auth flow; stdio carries no bearer.
+    let ema_installed = match live {
+        Some(rt) => rt.ema_authorization_server().is_some(),
+        None => services
+            .config_snapshot
+            .governance
+            .access
+            .authorization_server
+            .is_some(),
+    };
+    if ema_installed && *transport == TransportKind::Http {
+        extensions.insert(
+            crate::runtime::authorization_server::EXTENSION_ID.to_owned(),
+            serde_json::json!({}),
         );
     }
 

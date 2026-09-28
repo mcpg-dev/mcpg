@@ -148,6 +148,12 @@ pub enum TransportKind {
     Stdio,
 }
 
+/// `source` of a caller authenticated by an access token the embedded
+/// authorization server minted.
+pub const EMA_ACCESS_TOKEN_SOURCE: &str = "authorization:ema_access_token";
+/// `source` of the supervised inspector's loopback credential.
+pub const INSPECTOR_TOKEN_SOURCE: &str = "supervised_inspector_token";
+
 /// Caller identity resolved from transport headers during request intake.
 /// The variant determines the trust level applied by the policy engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +236,20 @@ impl RequestIdentity {
 
     pub fn is_anonymous(&self) -> bool {
         matches!(self, RequestIdentity::Anonymous { .. })
+    }
+
+    /// True when the caller's bearer was minted by this gateway process: an
+    /// EMA access token or the supervised inspector's credential. Only this
+    /// gateway can validate such a bearer. Read from `source`, which a
+    /// `principal_issuer` alias leaves alone while it rewrites `issuer` and
+    /// `auth_provider`.
+    pub fn is_gateway_minted(&self) -> bool {
+        match self {
+            RequestIdentity::Verified { source, .. } => {
+                source == EMA_ACCESS_TOKEN_SOURCE || source == INSPECTOR_TOKEN_SOURCE
+            }
+            _ => false,
+        }
     }
 
     /// True for any identity whose trust tier is below cryptographic
@@ -348,6 +368,11 @@ pub struct RequestContext {
     /// performs zero session-store operations.
     #[serde(default)]
     pub session_ephemeral: bool,
+    /// The link a federated call of this request offers a caller with no
+    /// stored IdP sign-in, while the request may answer with a URL-mode
+    /// elicitation. Shared by the clones of the context; in memory only.
+    #[serde(skip)]
+    pub(crate) connect_link: Arc<federation::idp_sessions::ConnectLinkSlot>,
     // Per-request session-snapshot cache. The first `load_session_cached`
     // call populates the OnceLock; subsequent calls within the same
     // request lifecycle skip the SessionStore Mutex / Redis RTT.
@@ -381,6 +406,7 @@ impl RequestContext {
             modern_request_capabilities: None,
             inbound_bearer: None,
             session_ephemeral: false,
+            connect_link: Arc::default(),
             cached_session: Arc::new(OnceLock::new()),
         }
     }

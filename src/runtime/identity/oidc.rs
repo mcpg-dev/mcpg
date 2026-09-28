@@ -12,7 +12,7 @@ pub use mcpg_plugin_identity_oidc_core::{OidcIdentity, OidcOAuthResolver, OidcVe
 
 /// Id of the OIDC identity-provider plugin. The gateway holds only the id: it
 /// checks the registry for a provider registered under it and refuses to boot
-/// when `access.oauth` is configured without one.
+/// when `governance.access.oidc_oauth` is configured without one.
 pub const PLUGIN_ID: &str = "dev.mcpg.identity.oidc";
 
 use crate::config::OidcOAuthConfig;

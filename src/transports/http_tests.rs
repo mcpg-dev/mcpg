@@ -27,10 +27,21 @@ use crate::{
 const MCP_ACCEPT_HEADER: &str = "application/json, text/event-stream";
 
 async fn initialize_session(app: Router) -> (Router, String) {
+    initialize_session_as(app, None).await
+}
+
+/// [`initialize_session`] presenting `bearer` on both requests, so the
+/// session belongs to the principal that bearer resolves to.
+async fn initialize_session_as(app: Router, bearer: Option<&str>) -> (Router, String) {
+    let authorization = bearer.map(|token| format!("Bearer {token}"));
+    let with_bearer = |builder: axum::http::request::Builder| match authorization.as_deref() {
+        Some(value) => builder.header(header::AUTHORIZATION, value),
+        None => builder,
+    };
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            with_bearer(Request::builder())
                 .method("POST")
                 .uri("/mcp")
                 .header(header::CONTENT_TYPE, "application/json")
@@ -74,7 +85,7 @@ async fn initialize_session(app: Router) -> (Router, String) {
     let response = app
         .clone()
         .oneshot(
-            Request::builder()
+            with_bearer(Request::builder())
                 .method("POST")
                 .uri("/mcp")
                 .header(header::CONTENT_TYPE, "application/json")
@@ -423,10 +434,12 @@ async fn build_request_context_preserves_upstream_request_id_and_header_identity
 
     // With the subject header explicitly trusted, it resolves to a
     // header-asserted identity.
-    let request_context = build_request_context(&headers, None, None, None, None, true, None)
-        .await
-        .expect("no verifier configured → no 401");
+    let (request_context, origin) =
+        build_request_context(&headers, None, None, None, None, true, None, None)
+            .await
+            .expect("no verifier configured → no 401");
 
+    assert_eq!(origin, CredentialOrigin::External);
     assert_eq!(
         request_context.upstream_request_id.as_deref(),
         Some("external-req-1")
@@ -448,9 +461,10 @@ async fn subject_header_is_ignored_when_untrusted() {
         HeaderValue::from_static("victim-principal"),
     );
 
-    let request_context = build_request_context(&headers, None, None, None, None, false, None)
-        .await
-        .expect("no verifier configured → no 401");
+    let (request_context, _) =
+        build_request_context(&headers, None, None, None, None, false, None, None)
+            .await
+            .expect("no verifier configured → no 401");
 
     assert!(
         matches!(
@@ -501,8 +515,17 @@ async fn invalid_bearer_token_rejected_with_401() {
         HeaderValue::from_static("attacker"),
     );
 
-    let result =
-        build_request_context(&headers, Some(&verifier), None, None, None, true, None).await;
+    let result = build_request_context(
+        &headers,
+        Some(&verifier),
+        None,
+        None,
+        None,
+        true,
+        None,
+        None,
+    )
+    .await;
     let response = result.expect_err("invalid token must reject");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
@@ -537,10 +560,18 @@ async fn missing_bearer_token_falls_back_not_401() {
         crate::runtime::identity::JwtVerifier::from_jwks_json(&jwks, &jwks_config).unwrap();
 
     let headers = HeaderMap::new();
-    let request_context =
-        build_request_context(&headers, Some(&verifier), None, None, None, false, None)
-            .await
-            .expect("no credential presented → fall back, not 401");
+    let (request_context, _) = build_request_context(
+        &headers,
+        Some(&verifier),
+        None,
+        None,
+        None,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("no credential presented → fall back, not 401");
     assert!(matches!(
         request_context.identity,
         crate::runtime::RequestIdentity::Anonymous { .. }
@@ -5567,6 +5598,50 @@ fn plugin_identity_to_request_verified() {
     }
 }
 
+/// An identity plugin cannot give its caller an attribute only a
+/// credential of this gateway sets, which a policy trusts: the DPoP key,
+/// the authorization details, the way in.
+#[test]
+fn plugin_identity_to_request_drops_gateway_set_attributes() {
+    use crate::runtime::authorization_server::GATEWAY_SET_ATTRIBUTES;
+    let mut attributes: std::collections::BTreeMap<String, String> = GATEWAY_SET_ATTRIBUTES
+        .iter()
+        .map(|name| ((*name).to_owned(), "plugin-set".to_owned()))
+        .collect();
+    attributes.insert("dept".into(), "eng".into());
+    let pi = mcpg_plugin_protocol::PluginIdentity {
+        kind: "verified".into(),
+        trust_level: "verified".into(),
+        subject_id: Some("user-1".into()),
+        auth_provider: Some("oidc_oauth:sso".into()),
+        issuer: Some("https://sso.example.com".into()),
+        roles: Vec::new(),
+        groups: Vec::new(),
+        scopes: Vec::new(),
+        attributes,
+    };
+    let identity = plugin_identity_to_request(&pi);
+    let attributes = identity.attributes();
+    assert_eq!(
+        attributes.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["dept"],
+        "{attributes:?}"
+    );
+    let context = crate::runtime::policy::ToolPolicyContext::from_request_context(
+        &RequestContext::new(
+            GatewayRequestId::new(),
+            None,
+            None,
+            None,
+            identity,
+            TransportKind::Http,
+        ),
+        "tool",
+    );
+    assert!(!context.attributes.contains_key("authorization_details"));
+    assert!(!context.attributes.contains_key("dpop_jkt"));
+}
+
 #[test]
 fn plugin_identity_to_request_anonymous() {
     let pi = mcpg_plugin_protocol::PluginIdentity {
@@ -5667,7 +5742,7 @@ async fn t6_05_sse_events_have_message_event_type() {
 }
 
 #[tokio::test]
-async fn t6_01_oauth_metadata_not_mounted_without_auth() {
+async fn t6_01_oauth_metadata_is_404_without_auth() {
     let app = router(build_test_state(), "/health", "/mcp");
     let response = app
         .oneshot(
@@ -5679,7 +5754,6 @@ async fn t6_01_oauth_metadata_not_mounted_without_auth() {
         )
         .await
         .expect("response");
-    // Without auth config, endpoint is not mounted → 404
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
@@ -5693,6 +5767,7 @@ async fn t6_01_oauth_metadata_refuses_derivation_without_explicit_resource() {
         governance: crate::config::GovernanceConfig {
             access: crate::config::AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 jwks: None,
                 oidc_oauth: Some(crate::config::OidcOAuthConfig {
                     token_source: crate::config::TokenSourceConfig {
@@ -5756,6 +5831,7 @@ async fn t6_01_oauth_metadata_with_explicit_config() {
         governance: crate::config::GovernanceConfig {
             access: crate::config::AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 jwks: None,
                 oidc_oauth: None,
                 resource_metadata: Some(crate::config::OAuthResourceMetadataConfig {
@@ -5805,6 +5881,7 @@ async fn auth02_path_aware_prm_well_known_served() {
         governance: crate::config::GovernanceConfig {
             access: crate::config::AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 jwks: None,
                 oidc_oauth: None,
                 resource_metadata: Some(crate::config::OAuthResourceMetadataConfig {
@@ -6089,6 +6166,208 @@ async fn no_cors_block_answers_no_preflight() {
     assert!(resp.headers().get("access-control-allow-origin").is_none());
 }
 
+fn access_control_headers(resp: &Response) -> Vec<String> {
+    resp.headers()
+        .keys()
+        .map(|name| name.as_str().to_owned())
+        .filter(|name| name.starts_with("access-control-"))
+        .collect()
+}
+
+/// The interactive sign-in pages answer no CORS request, even from an origin
+/// `server.cors` lists (RFC 9700 §2.6), while `/mcp` and the other routes
+/// keep answering it.
+#[tokio::test]
+async fn cors_is_never_answered_on_the_browser_only_paths() {
+    let mut config = AppConfig::default();
+    config.gateway.server.allowed_origins = vec!["https://app.example.com".to_owned()];
+    config.gateway.server.cors = Some(crate::config::CorsConfig {
+        allowed_origins: vec!["https://app.example.com".to_owned()],
+        allowed_headers: vec!["content-type".to_owned()],
+        expose_headers: vec!["mcp-session-id".to_owned()],
+        max_age_secs: 600,
+        allow_credentials: true,
+    });
+    let app = router(
+        finish_app_state(config, default_test_runtime()),
+        "/health",
+        "/mcp",
+    );
+    let preflight = |path: &str| {
+        Request::builder()
+            .method("OPTIONS")
+            .uri(path)
+            .header("origin", "https://app.example.com")
+            .header("access-control-request-method", "POST")
+            .body(Body::empty())
+            .expect("request")
+    };
+    let navigation = |path: &str| {
+        Request::builder()
+            .method("GET")
+            .uri(format!("{path}?code=c&state=s"))
+            .header("origin", "https://app.example.com")
+            .body(Body::empty())
+            .expect("request")
+    };
+
+    for path in crate::runtime::authorization_server::BROWSER_ONLY_PATHS {
+        for req in [preflight(path), navigation(path)] {
+            let method = req.method().clone();
+            let resp = app.clone().oneshot(req).await.expect("response");
+            assert!(
+                access_control_headers(&resp).is_empty(),
+                "{method} {path} answered CORS: {:?}",
+                access_control_headers(&resp)
+            );
+        }
+    }
+
+    let mcp = app
+        .clone()
+        .oneshot(preflight("/mcp"))
+        .await
+        .expect("response");
+    assert_eq!(mcp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        mcp.headers().get("access-control-allow-origin").unwrap(),
+        "https://app.example.com"
+    );
+    assert_eq!(
+        mcp.headers()
+            .get("access-control-allow-credentials")
+            .unwrap(),
+        "true"
+    );
+    // Unrouted like the sign-in pages, but not on the list: the layer still
+    // answers, so the list is what keeps them silent.
+    for path in ["/health", "/oauth/elsewhere"] {
+        let resp = app
+            .clone()
+            .oneshot(navigation(path))
+            .await
+            .expect("response");
+        assert_eq!(
+            resp.headers().get("access-control-allow-origin").unwrap(),
+            "https://app.example.com",
+            "{path}"
+        );
+    }
+}
+
+/// Every span field recorded while it is installed, as
+/// `(span name, field name, value)`.
+#[derive(Clone, Default)]
+struct SpanFieldCapture(Arc<std::sync::Mutex<Vec<(String, String, String)>>>);
+
+struct SpanFieldVisitor<'a> {
+    span: &'static str,
+    out: &'a mut Vec<(String, String, String)>,
+}
+
+impl tracing::field::Visit for SpanFieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.out.push((
+            self.span.to_owned(),
+            field.name().to_owned(),
+            format!("{value:?}"),
+        ));
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.out.push((
+            self.span.to_owned(),
+            field.name().to_owned(),
+            value.to_owned(),
+        ));
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for SpanFieldCapture
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _id: &tracing::span::Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut out = self.0.lock().expect("capture lock");
+        attrs.record(&mut SpanFieldVisitor {
+            span: attrs.metadata().name(),
+            out: &mut out,
+        });
+    }
+
+    fn on_record(
+        &self,
+        id: &tracing::span::Id,
+        values: &tracing::span::Record<'_>,
+        ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let span = ctx.span(id).map_or("?", |s| s.metadata().name());
+        let mut out = self.0.lock().expect("capture lock");
+        values.record(&mut SpanFieldVisitor {
+            span,
+            out: &mut out,
+        });
+    }
+}
+
+/// An authorization response rides in the query string, so the request
+/// span records the method and path and never the query, on every route.
+#[tokio::test]
+async fn request_spans_never_record_the_query_string() {
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let capture = SpanFieldCapture::default();
+    let _guard =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    let app = router(
+        finish_app_state(AppConfig::default(), default_test_runtime()),
+        "/health",
+        "/mcp",
+    );
+    for (method, uri) in [
+        ("POST", "/oauth/token?code=secret-code&state=secret-state"),
+        ("GET", "/oauth/callback?code=secret-code&state=secret-state"),
+        ("GET", "/health?code=secret-code&state=secret-state"),
+    ] {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+    }
+
+    let fields = capture.0.lock().expect("capture lock").clone();
+    let paths: Vec<&str> = fields
+        .iter()
+        .filter(|(span, field, _)| span == "request" && field == "path")
+        .map(|(_, _, value)| value.as_str())
+        .collect();
+    assert_eq!(paths, ["/oauth/token", "/oauth/callback", "/health"]);
+    assert!(
+        fields
+            .iter()
+            .filter(|(span, _, _)| span == "request")
+            .all(|(_, field, _)| field == "method" || field == "path"),
+        "{fields:?}"
+    );
+    for (span, field, value) in &fields {
+        assert!(
+            !value.contains("secret-code") && !value.contains("secret-state"),
+            "span `{span}` field `{field}` recorded the query: {value}"
+        );
+    }
+}
+
 /// `server.canonical_url` gives the deployment one identity: a request on any
 /// other host is answered 308 to the same path under the canonical origin, so
 /// a client cannot discover — or mint a token for — a second resource. Probes
@@ -6203,7 +6482,9 @@ fn unauthenticated_policy_403_becomes_401_challenge() {
         true,
         TEST_PRM_URL,
         None,
+        None,
         Some(&anon),
+        None,
     );
     assert_eq!(lifted.status(), StatusCode::UNAUTHORIZED);
     let value = lifted
@@ -6233,7 +6514,9 @@ fn unauthenticated_policy_403_becomes_401_challenge() {
         true,
         TEST_PRM_URL,
         None,
+        None,
         Some(&verified),
+        None,
     );
     assert_eq!(kept.status(), StatusCode::FORBIDDEN);
     assert!(kept.headers().get(header::WWW_AUTHENTICATE).is_none());
@@ -6244,6 +6527,8 @@ fn unauthenticated_policy_403_becomes_401_challenge() {
         TEST_PRM_URL,
         None,
         None,
+        None,
+        None,
     );
     assert_eq!(unknown.status(), StatusCode::FORBIDDEN);
 
@@ -6252,7 +6537,8 @@ fn unauthenticated_policy_403_becomes_401_challenge() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("tools:write"),
     );
-    let scoped = with_www_authenticate_challenge(scoped, true, TEST_PRM_URL, None, Some(&anon));
+    let scoped =
+        with_www_authenticate_challenge(scoped, true, TEST_PRM_URL, None, None, Some(&anon), None);
     assert_eq!(scoped.status(), StatusCode::FORBIDDEN);
     assert!(
         scoped
@@ -6269,7 +6555,9 @@ fn unauthenticated_policy_403_becomes_401_challenge() {
         false,
         TEST_PRM_URL,
         None,
+        None,
         Some(&anon),
+        None,
     );
     assert_eq!(no_verifier.status(), StatusCode::FORBIDDEN);
 }
@@ -6322,6 +6610,7 @@ fn resource_metadata_url_follows_the_request_host() {
         governance: crate::config::GovernanceConfig {
             access: crate::config::AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 jwks: None,
                 oidc_oauth: None,
                 resource_metadata: Some(crate::config::OAuthResourceMetadataConfig {
@@ -6355,7 +6644,8 @@ fn resource_metadata_url_follows_the_request_host() {
 #[test]
 fn t6_02_www_authenticate_header_added_on_401() {
     let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
+    let response =
+        with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None, None, None);
     let www_auth = response.headers().get(header::WWW_AUTHENTICATE);
     assert!(www_auth.is_some());
     let value = www_auth.unwrap().to_str().unwrap();
@@ -6364,10 +6654,74 @@ fn t6_02_www_authenticate_header_added_on_401() {
     assert!(value.contains(TEST_PRM_URL));
 }
 
+/// The unauthenticated challenge names the configured scopes; a quote in
+/// one cannot break out of the auth-param.
+#[test]
+fn t6_02_www_authenticate_names_the_given_scope_on_401() {
+    let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
+    let response = with_www_authenticate_challenge(
+        response,
+        true,
+        TEST_PRM_URL,
+        Some("mcp:tools \"x"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+        &format!("Bearer resource_metadata=\"{TEST_PRM_URL}\", scope=\"mcp:tools x\"")
+    );
+
+    let mut config = AppConfig::default();
+    assert_eq!(challenge_scope(&config), None);
+    config.governance.access = ema_access(false);
+    assert_eq!(challenge_scope(&config).as_deref(), Some("mcp:tools"));
+}
+
+/// A scope no header can carry never costs a 401 its challenge: the
+/// challenge names only the scopes that are RFC 6749 scope tokens, and one
+/// handed a scope it cannot encode falls back to the bare form.
+#[test]
+fn a_401_keeps_its_challenge_whatever_the_scopes() {
+    let mut config = AppConfig::default();
+    config.governance.access = ema_access(false);
+    config
+        .governance
+        .access
+        .resource_metadata
+        .as_mut()
+        .expect("resource_metadata")
+        .scopes_supported = vec![
+        "lecture:écrire".to_owned(),
+        "mcp:tools".to_owned(),
+        "bad\\scope".to_owned(),
+    ];
+    assert_eq!(challenge_scope(&config).as_deref(), Some("mcp:tools"));
+
+    let response = with_www_authenticate_challenge(
+        axum::http::StatusCode::UNAUTHORIZED.into_response(),
+        true,
+        TEST_PRM_URL,
+        Some("tools\u{7}"),
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .expect("a 401 always carries a challenge"),
+        &format!("Bearer resource_metadata=\"{TEST_PRM_URL}\"")
+    );
+}
+
 #[test]
 fn t6_02_www_authenticate_header_not_added_when_auth_disabled() {
     let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let response = with_www_authenticate_challenge(response, false, TEST_PRM_URL, None, None);
+    let response =
+        with_www_authenticate_challenge(response, false, TEST_PRM_URL, None, None, None, None);
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 }
 
@@ -6392,8 +6746,15 @@ fn aauth_challenge_rides_401_when_configured() {
         identity,
     };
     let response = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let response =
-        with_www_authenticate_challenge(response, true, TEST_PRM_URL, Some(ch(None)), None);
+    let response = with_www_authenticate_challenge(
+        response,
+        true,
+        TEST_PRM_URL,
+        None,
+        Some(ch(None)),
+        None,
+        None,
+    );
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_some());
     assert_eq!(
         response.headers().get("aauth-requirement").unwrap(),
@@ -6409,7 +6770,8 @@ fn aauth_challenge_rides_401_when_configured() {
     );
 
     let ok = axum::http::StatusCode::OK.into_response();
-    let ok = with_www_authenticate_challenge(ok, true, TEST_PRM_URL, Some(ch(None)), None);
+    let ok =
+        with_www_authenticate_challenge(ok, true, TEST_PRM_URL, None, Some(ch(None)), None, None);
     assert!(ok.headers().get("aauth-requirement").is_none());
 
     // A bare authorization 403 for an AUTHENTICATED caller is not a
@@ -6430,7 +6792,9 @@ fn aauth_challenge_rides_401_when_configured() {
         forbidden,
         true,
         TEST_PRM_URL,
+        None,
         Some(ch(Some(&verified))),
+        None,
         None,
     );
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
@@ -6443,8 +6807,15 @@ fn aauth_challenge_rides_401_when_configured() {
         source: "test".into(),
     };
     let floor = axum::http::StatusCode::FORBIDDEN.into_response();
-    let floor =
-        with_www_authenticate_challenge(floor, true, TEST_PRM_URL, Some(ch(Some(&anon))), None);
+    let floor = with_www_authenticate_challenge(
+        floor,
+        true,
+        TEST_PRM_URL,
+        None,
+        Some(ch(Some(&anon))),
+        None,
+        None,
+    );
     assert_eq!(floor.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
         floor.headers().get("aauth-requirement").unwrap(),
@@ -6465,10 +6836,12 @@ fn aauth_challenge_rides_401_when_configured() {
         response,
         true,
         TEST_PRM_URL,
+        None,
         Some(response::AauthChallenge {
             resource: &person_mode,
             identity: None,
         }),
+        None,
         None,
     );
     assert_eq!(
@@ -6533,10 +6906,12 @@ fn aauth_step_up_mints_resource_token_on_scope_denial() {
         denied,
         true,
         TEST_PRM_URL,
+        None,
         Some(response::AauthChallenge {
             resource: &resource,
             identity: Some(&person),
         }),
+        None,
         None,
     );
     assert_eq!(stepped.status(), StatusCode::UNAUTHORIZED);
@@ -6574,10 +6949,12 @@ fn aauth_step_up_mints_resource_token_on_scope_denial() {
         denied,
         true,
         TEST_PRM_URL,
+        None,
         Some(response::AauthChallenge {
             resource: &resource,
             identity: Some(&anon),
         }),
+        None,
         None,
     );
     assert_eq!(plain.status(), StatusCode::FORBIDDEN);
@@ -6596,7 +6973,8 @@ fn aauth_step_up_mints_resource_token_on_scope_denial() {
 #[test]
 fn t6_02_www_authenticate_not_added_on_200() {
     let response = axum::http::StatusCode::OK.into_response();
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
+    let response =
+        with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None, None, None);
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 }
 
@@ -6610,7 +6988,8 @@ fn t4_07_www_authenticate_includes_insufficient_scope_hint() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("tools.call sampling.read"),
     );
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
+    let response =
+        with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None, None, None);
     let value = response
         .headers()
         .get(header::WWW_AUTHENTICATE)
@@ -6639,7 +7018,8 @@ fn auth09_insufficient_scope_403_carries_step_up_challenge() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("payments.write"),
     );
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
+    let response =
+        with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None, None, None);
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let value = response
         .headers()
@@ -6666,7 +7046,8 @@ fn auth09_insufficient_scope_403_carries_step_up_challenge() {
 #[test]
 fn auth09_bare_403_gets_no_challenge() {
     let response = axum::http::StatusCode::FORBIDDEN.into_response();
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
+    let response =
+        with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None, None, None);
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(response.headers().get(header::WWW_AUTHENTICATE).is_none());
 }
@@ -6681,11 +7062,13 @@ fn auth04_403_not_conflated_into_401() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("admin.read"),
     );
-    let forbidden = with_www_authenticate_challenge(forbidden, true, TEST_PRM_URL, None, None);
+    let forbidden =
+        with_www_authenticate_challenge(forbidden, true, TEST_PRM_URL, None, None, None, None);
     assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
 
     let unauth = axum::http::StatusCode::UNAUTHORIZED.into_response();
-    let unauth = with_www_authenticate_challenge(unauth, true, TEST_PRM_URL, None, None);
+    let unauth =
+        with_www_authenticate_challenge(unauth, true, TEST_PRM_URL, None, None, None, None);
     assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
     // The unauthenticated challenge does not name a specific scope.
     let unauth_value = unauth
@@ -6705,13 +7088,1403 @@ fn t4_07_insufficient_scope_header_stripped_even_on_non_401() {
         HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
         HeaderValue::from_static("tools.call"),
     );
-    let response = with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None);
+    let response =
+        with_www_authenticate_challenge(response, true, TEST_PRM_URL, None, None, None, None);
     assert!(
         response
             .headers()
             .get(HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER))
             .is_none()
     );
+}
+
+// ── enterprise-managed authorization on the transport ─────────
+
+const EMA_ISSUER: &str = "https://gateway.example.com";
+const EMA_IDP: &str = "https://idp.example.com";
+const EMA_EXTENSION: &str = "io.modelcontextprotocol/enterprise-managed-authorization";
+
+/// Access settings of an EMA-only gateway: the embedded authorization
+/// server and its protected resource metadata, no other verifier.
+fn ema_access(require_authentication: bool) -> crate::config::AccessConfig {
+    crate::config::AccessConfig {
+        authorization_server: Some(crate::config::AuthorizationServerConfig {
+            issuer: EMA_ISSUER.to_owned(),
+            resource: None,
+            signing_secret: Some("transport-test-signing-secret-0123456789".to_owned()),
+            signing_keys: Vec::new(),
+            access_token_ttl_secs: 3600,
+            clock_skew_secs: 60,
+            max_assertion_lifetime_secs: 600,
+            enforce_single_use: true,
+            allowed_scopes: None,
+            require_scope: false,
+            trusted_idps: vec![crate::config::TrustedIdpConfig {
+                issuer: EMA_IDP.to_owned(),
+                jwks_uri: None,
+                jwks: None,
+                allowed_hosts: vec![],
+                allow_private_network: false,
+                allowed_algs: vec!["RS256".to_owned()],
+                allowed_clients: vec![],
+                required_tenant: None,
+                claim_mappings: Default::default(),
+                principal_issuer: None,
+                login: None,
+            }],
+            clients: vec![crate::config::AuthorizationServerClientConfig {
+                client_id: "mcp-client".to_owned(),
+                client_secret: None,
+                token_endpoint_auth_method: None,
+                jwks_uri: None,
+                jwks: None,
+                accept_token_endpoint_audience: false,
+                allow_private_network: false,
+                redirect_uris: Vec::new(),
+                grant_types: None,
+                client_name: None,
+                consent: Default::default(),
+                dpop_bound_access_tokens: false,
+            }],
+            client_roles: Default::default(),
+            client_id_metadata_documents: Default::default(),
+            rate_limit_per_min: 120,
+            interactive: None,
+            dpop: Default::default(),
+            authorization_details: Default::default(),
+        }),
+        resource_metadata: Some(crate::config::OAuthResourceMetadataConfig {
+            resource: "https://gateway.example.com/mcp".to_owned(),
+            additional_resources: vec![],
+            authorization_servers: vec![],
+            scopes_supported: vec!["mcp:tools".to_owned()],
+            bearer_methods_supported: vec!["header".to_owned()],
+            allow_loopback_resource: false,
+        }),
+        require_authentication,
+        ..Default::default()
+    }
+}
+
+/// The embedded authorization server `access` describes, built the way
+/// boot builds it.
+fn ema_server(
+    access: &crate::config::AccessConfig,
+) -> Arc<crate::runtime::authorization_server::AuthorizationServer> {
+    let mut config = AppConfig::default();
+    config.governance.access = access.clone();
+    crate::app::build_ema_authorization_server(
+        &config,
+        crate::runtime::authorization_server::ReplayLedger::in_process(),
+    )
+    .expect("valid EMA config")
+    .expect("authorization server configured")
+}
+
+/// An EMA-only gateway with the embedded server installed on its runtime
+/// and one command tool that needs a verified caller holding `mcp:admin`.
+/// Returns the server too, so a test can mint the bearers it accepts.
+fn build_ema_state(
+    require_authentication: bool,
+) -> (
+    AppState,
+    Arc<crate::runtime::authorization_server::AuthorizationServer>,
+) {
+    build_ema_state_with(ema_access(require_authentication))
+}
+
+/// [`build_ema_state`] with the access settings `access`.
+fn build_ema_state_with(
+    access: crate::config::AccessConfig,
+) -> (
+    AppState,
+    Arc<crate::runtime::authorization_server::AuthorizationServer>,
+) {
+    let server = ema_server(&access);
+    let installed = Arc::clone(&server);
+    let state = build_test_state_with_all_runtime_controls_mut(
+        false,
+        RuntimeDebugConfig {
+            enabled: false,
+            command_profiles: std::collections::BTreeMap::from([(
+                DEFAULT_COMMAND_PROFILE.to_owned(),
+                CommandToolRuntimeConfig {
+                    command: "cat".to_owned(),
+                    args: vec![],
+                    timeout_ms: 2_000,
+                    max_output_bytes: 4_096,
+                },
+            )]),
+            network_profiles: std::collections::BTreeMap::from([(
+                DEFAULT_NETWORK_PROFILE.to_owned(),
+                NetworkToolRuntimeConfig::default(),
+            )]),
+            bindings: DebugToolBackends::default(),
+            exposure: DebugToolExposure::default(),
+            default_allow_private_backends: true,
+        },
+        vec![test_command_binding("mcpg.command.json_call")],
+        ToolAccessPolicyConfig {
+            default_minimum_trust: RequestTrustLevel::Unauthenticated,
+            cel_allow_if: None,
+            rules: vec![ToolTrustRule {
+                tool_name: "mcpg.command.json_call".to_owned(),
+                minimum_trust: RequestTrustLevel::Verified,
+                cel_allow_if: None,
+                required_scopes: vec!["mcp:admin".to_owned()],
+            }],
+        },
+        move |runtime| runtime.set_ema_authorization_server(Some(installed)),
+    );
+    let mut config = (**state.config.load()).clone();
+    config.governance.access = access;
+    state.config.store(Arc::new(config));
+    (state, server)
+}
+
+fn tools_call_request(bearer: Option<&str>, session_id: &str) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+        .header(
+            PROTOCOL_VERSION_HEADER,
+            crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+        )
+        .header(SESSION_ID_HEADER, session_id);
+    if let Some(token) = bearer {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+    }
+    builder
+        .body(Body::from(
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 300,
+                "method": "tools/call",
+                "params": {
+                    "name": "mcpg.command.json_call",
+                    "arguments": {"message": "hello"}
+                }
+            })
+            .to_string(),
+        ))
+        .expect("request")
+}
+
+fn initialize_request() -> axum::http::request::Builder {
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+}
+
+fn initialize_body() -> Body {
+    Body::from(
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0.0"}
+            }
+        })
+        .to_string(),
+    )
+}
+
+fn www_authenticate(response: &axum::response::Response) -> String {
+    response
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .expect("WWW-Authenticate challenge")
+        .to_str()
+        .expect("ASCII challenge")
+        .to_owned()
+}
+
+/// The challenge an anonymous caller of the EMA-only gateway gets.
+const EMA_CHALLENGE: &str = "Bearer resource_metadata=\"https://gateway.example.com/.well-known/oauth-protected-resource/mcp\", scope=\"mcp:tools\"";
+
+/// With the embedded authorization server as the only verifier, an
+/// anonymous call below the trust floor is answered with the 401 discovery
+/// challenge, naming `scopes_supported` as the scope to request.
+#[tokio::test]
+async fn ema_only_anonymous_trust_floor_refusal_is_a_401_challenge() {
+    let (state, _) = build_ema_state(false);
+    let (app, session_id) = initialize_session(router(state, "/health", "/mcp")).await;
+
+    let refused = app
+        .oneshot(tools_call_request(None, &session_id))
+        .await
+        .expect("response");
+
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(www_authenticate(&refused), EMA_CHALLENGE);
+    let body = response_json(refused).await;
+    assert_eq!(body["error"]["code"], -32003);
+}
+
+/// An EMA caller short of a required scope keeps its 403 and gets the
+/// `insufficient_scope` step-up naming the missing scope.
+#[tokio::test]
+async fn ema_token_short_of_a_required_scope_gets_the_step_up_challenge() {
+    let (state, server) = build_ema_state(false);
+    let token = server.mint_access_token_for_tests("employee-7", EMA_IDP, Some("mcp:tools"));
+    let (app, session_id) =
+        initialize_session_as(router(state, "/health", "/mcp"), Some(&token)).await;
+
+    let denied = app
+        .oneshot(tools_call_request(Some(&token), &session_id))
+        .await
+        .expect("response");
+
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        www_authenticate(&denied),
+        "Bearer resource_metadata=\"https://gateway.example.com/.well-known/oauth-protected-resource/mcp\", error=\"insufficient_scope\", scope=\"mcp:admin\""
+    );
+}
+
+/// An identity plugin that rejects every bearer it is shown, counting the
+/// requests it sees.
+struct RejectingBearerPlugin {
+    manifest: mcpg_plugin_protocol::PluginManifest,
+    seen: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[mcpg_plugin_protocol::async_trait]
+impl mcpg_plugin_protocol::IdentityProviderPlugin for RejectingBearerPlugin {
+    fn manifest(&self) -> &mcpg_plugin_protocol::PluginManifest {
+        &self.manifest
+    }
+
+    async fn resolve_identity(
+        &self,
+        headers: &[(String, String)],
+        _metadata: &mcpg_plugin_protocol::types::RequestMetadata,
+        _config: &serde_json::Value,
+    ) -> mcpg_plugin_protocol::IdentityResolution {
+        self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+        {
+            mcpg_plugin_protocol::IdentityResolution::Invalid {
+                reason: "bearer from an unknown issuer".to_owned(),
+                response_headers: Vec::new(),
+            }
+        } else {
+            mcpg_plugin_protocol::IdentityResolution::None
+        }
+    }
+}
+
+/// A credential the gateway minted is verified by the cascade alone: an
+/// identity plugin that would reject it as a foreign bearer never sees
+/// it, while every other request still goes through the plugin chain.
+#[tokio::test]
+async fn gateway_minted_credential_skips_the_identity_plugin_chain() {
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = mcpg_plugin_host::PluginRegistry::new();
+    registry
+        .register_identity(
+            Box::new(RejectingBearerPlugin {
+                manifest: mcpg_plugin_protocol::PluginManifest {
+                    id: "dev.mcpg.test.reject-bearer".into(),
+                    version: "0.1.0".into(),
+                    name: "Rejects every bearer".into(),
+                    plugin_class: mcpg_plugin_protocol::PluginClass::IdentityProvider,
+                    protocol_version: "1.0".into(),
+                    license: None,
+                    required_capabilities: vec![],
+                    tags: vec![],
+                    provides: vec![],
+                    provides_schemes: vec![],
+                    module_path_prefix: "mcpg".into(),
+                    backend_profile: None,
+                },
+                seen: Arc::clone(&seen),
+            }),
+            mcpg_plugin_protocol::PluginTier::Native,
+            serde_json::json!({}),
+        )
+        .expect("identity plugin registers");
+    let mut runtime = GatewayRuntime::try_new_with_runtime_controls_and_cache(
+        "mcpg",
+        "0.1.0",
+        "127.0.0.1:8787",
+        "/health",
+        "/mcp",
+        "info",
+        vec![crate::config::SinkConfig {
+            kind: "stdout".to_owned(),
+            config: serde_json::json!({"format": "json"}),
+            level: None,
+        }],
+        true,
+        Arc::new(
+            crate::runtime::session_store::KvBackedSessionStore::new_in_memory(
+                SessionStoreConfig::default(),
+            ),
+        ),
+        ToolAccessPolicyConfig::default(),
+        RuntimeDebugConfig::default(),
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        Arc::new(crate::runtime::pipeline_store::KvBackedPipelineStore::new_in_memory()),
+        Arc::new(crate::runtime::task_store::KvBackedTaskStore::new_in_memory_default()),
+        Arc::new(crate::runtime::delivery_bus::BusBackedDeliveryBus::new_in_memory()),
+        Arc::new(crate::runtime::subscription_store::KvBackedSubscriptionStore::new_in_memory(100)),
+        None,
+        registry,
+        Arc::new(
+            mcpg_plugin_host::credential_cache_clustered::CredentialCacheKind::Local(Arc::new(
+                mcpg_plugin_host::credential_cache::CredentialCache::default(),
+            )),
+        ),
+        Vec::new(),
+    )
+    .expect("runtime builds");
+    let server = ema_server(&ema_access(false));
+    runtime.set_ema_authorization_server(Some(Arc::clone(&server)));
+
+    let resolve = |bearer: Option<String>| {
+        let mut headers = HeaderMap::new();
+        if let Some(token) = bearer {
+            headers.insert(
+                header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("header value"),
+            );
+        }
+        let runtime = &runtime;
+        async move {
+            build_full_request_context(
+                &headers,
+                runtime,
+                None,
+                false,
+                &axum::http::Method::POST,
+                Some("/mcp"),
+                None,
+            )
+            .await
+        }
+    };
+    let seen_count = || seen.load(std::sync::atomic::Ordering::SeqCst);
+
+    let token = server.mint_access_token_for_tests("employee-7", EMA_IDP, Some("mcp:tools"));
+    let ctx = resolve(Some(token.clone()))
+        .await
+        .expect("a minted EMA token is accepted");
+    match &ctx.identity {
+        crate::runtime::RequestIdentity::Verified { auth_provider, .. } => {
+            assert_eq!(auth_provider, "ema");
+        }
+        other => panic!("expected a verified EMA identity, got {other:?}"),
+    }
+    assert_eq!(
+        seen_count(),
+        0,
+        "the plugin chain never sees a minted token"
+    );
+
+    // A forged token naming the embedded issuer fails closed in the cascade.
+    let mut parts: Vec<String> = token.split('.').map(str::to_owned).collect();
+    let first = parts[2].chars().next().expect("signature is non-empty");
+    let swap = if first == 'A' { 'B' } else { 'A' };
+    parts[2] = format!("{swap}{}", &parts[2][1..]);
+    let forged = resolve(Some(parts.join(".")))
+        .await
+        .expect_err("a forged EMA token is refused");
+    assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(seen_count(), 0, "the cascade refuses it before the chain");
+
+    let foreign = resolve(Some("opaque-foreign-token".to_owned()))
+        .await
+        .expect_err("the plugin rejects a foreign bearer");
+    assert_eq!(foreign.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(seen_count(), 1);
+
+    let anonymous = resolve(None).await.expect("no credential is anonymous");
+    assert!(anonymous.identity.is_anonymous());
+    assert_eq!(seen_count(), 2);
+}
+
+/// `require_authentication` refuses every MCP verb and method from a
+/// caller below verified with the 401 discovery challenge, while the
+/// metadata documents and the probes stay open.
+#[tokio::test]
+async fn require_authentication_refuses_callers_below_verified() {
+    let (state, _) = build_ema_state(true);
+    let app = router(state, "/health", "/mcp");
+
+    let assert_challenge = |response: &axum::response::Response, what: &str| {
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{what}");
+        assert_eq!(www_authenticate(response), EMA_CHALLENGE, "{what}");
+    };
+
+    let initialize = app
+        .clone()
+        .oneshot(
+            initialize_request()
+                .body(initialize_body())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_challenge(&initialize, "anonymous initialize");
+    let body = response_json(initialize).await;
+    assert_eq!(body["error"]["code"], -32000);
+    assert_eq!(body["id"], Value::Null);
+
+    let header_asserted = app
+        .clone()
+        .oneshot(
+            initialize_request()
+                .header(SUBJECT_ID_HEADER, "alice")
+                .body(initialize_body())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_challenge(&header_asserted, "header-asserted initialize");
+
+    let list = app
+        .clone()
+        .oneshot(tools_call_request(None, "any-session"))
+        .await
+        .expect("response");
+    assert_challenge(&list, "anonymous tools/call");
+
+    let discover = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "server/discover")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "server/discover",
+                        "params": {}
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_challenge(&discover, "anonymous server/discover");
+
+    for method in ["GET", "DELETE"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/mcp")
+                    .header(header::ACCEPT, SSE_ACCEPT)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_challenge(&response, method);
+    }
+
+    for open in [
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-authorization-server",
+        "/health",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(open)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "{open} stays open");
+    }
+}
+
+/// A foreign `Origin` is refused with 403 before `require_authentication`
+/// asks for credentials: MCP Streamable HTTP requires the 403 for an
+/// invalid `Origin` on every verb.
+#[tokio::test]
+async fn a_foreign_origin_is_a_403_even_where_authentication_is_required() {
+    let (state, _) = build_ema_state(true);
+    let app = router(state, "/health", "/mcp");
+    let post = initialize_request()
+        .header(header::ORIGIN, "https://attacker.example")
+        .body(initialize_body())
+        .expect("request");
+    let mut requests = vec![("POST", post)];
+    for method in ["GET", "DELETE"] {
+        requests.push((
+            method,
+            Request::builder()
+                .method(method)
+                .uri("/mcp")
+                .header(header::ACCEPT, SSE_ACCEPT)
+                .header(header::ORIGIN, "https://attacker.example")
+                .body(Body::empty())
+                .expect("request"),
+        ));
+    }
+    for (method, request) in requests {
+        let response = app.clone().oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
+        assert!(
+            response.headers().get(header::WWW_AUTHENTICATE).is_none(),
+            "{method}"
+        );
+    }
+}
+
+/// With `require_authentication`, a verified EMA caller initializes as
+/// usual, and the handshake declares the EMA extension.
+#[tokio::test]
+async fn require_authentication_admits_an_ema_token() {
+    let (state, server) = build_ema_state(true);
+    let token = server.mint_access_token_for_tests("employee-7", EMA_IDP, Some("mcp:tools"));
+    let response = router(state, "/health", "/mcp")
+        .oneshot(
+            initialize_request()
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(initialize_body())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(
+        body["result"]["capabilities"]["extensions"][EMA_EXTENSION],
+        serde_json::json!({})
+    );
+}
+
+/// `initialize` declares the EMA extension only while the embedded
+/// authorization server is installed.
+#[tokio::test]
+async fn initialize_declares_the_ema_extension_only_with_an_authorization_server() {
+    let without = router(build_test_state(), "/health", "/mcp")
+        .oneshot(
+            initialize_request()
+                .body(initialize_body())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(without.status(), StatusCode::OK);
+    let body = response_json(without).await;
+    assert!(
+        body["result"]["capabilities"]
+            .get("extensions")
+            .and_then(|e| e.get(EMA_EXTENSION))
+            .is_none(),
+        "{body}"
+    );
+
+    let (state, _) = build_ema_state(false);
+    let with = router(state, "/health", "/mcp")
+        .oneshot(
+            initialize_request()
+                .body(initialize_body())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(with.status(), StatusCode::OK);
+    let body = response_json(with).await;
+    assert_eq!(
+        body["result"]["capabilities"]["extensions"][EMA_EXTENSION],
+        serde_json::json!({})
+    );
+}
+
+/// The authorization-server and protected-resource routes exist on every
+/// router and follow the live config and runtime, so a reload that adds
+/// or removes the embedded server takes effect without a restart.
+#[tokio::test]
+async fn authorization_server_routes_follow_a_reload() {
+    let state = finish_app_state(AppConfig::default(), default_test_runtime());
+    let app = router(state.clone(), "/health", "/mcp");
+    let status = |uri: &'static str, method: &'static str| {
+        let app = app.clone();
+        async move {
+            let mut builder = Request::builder().method(method).uri(uri);
+            let body = if method == "POST" {
+                builder = builder.header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+                Body::from("grant_type=authorization_code")
+            } else {
+                Body::empty()
+            };
+            app.oneshot(builder.body(body).expect("request"))
+                .await
+                .expect("response")
+                .status()
+        }
+    };
+
+    assert_eq!(
+        status("/.well-known/oauth-authorization-server", "GET").await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(status("/oauth/token", "POST").await, StatusCode::NOT_FOUND);
+    assert_eq!(status("/oauth/jwks", "GET").await, StatusCode::NOT_FOUND);
+    assert_eq!(
+        status("/.well-known/oauth-protected-resource/mcp", "GET").await,
+        StatusCode::NOT_FOUND
+    );
+
+    let access = ema_access(true);
+    let mut config = AppConfig::default();
+    config.governance.access = access.clone();
+    let mut runtime = default_test_runtime();
+    runtime.set_ema_authorization_server(Some(ema_server(&access)));
+    state.config.store(Arc::new(config));
+    state.runtime.store(Arc::new(runtime));
+
+    assert_eq!(
+        status("/.well-known/oauth-authorization-server", "GET").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        status("/oauth/token", "POST").await,
+        StatusCode::BAD_REQUEST,
+        "the token endpoint answers with an OAuth error, not 404"
+    );
+    assert_eq!(
+        status("/oauth/jwks", "GET").await,
+        StatusCode::NOT_FOUND,
+        "an HMAC signing secret is never published"
+    );
+    assert_eq!(
+        status("/.well-known/oauth-protected-resource/mcp", "GET").await,
+        StatusCode::OK
+    );
+
+    state.config.store(Arc::new(AppConfig::default()));
+    state.runtime.store(Arc::new(default_test_runtime()));
+    assert_eq!(
+        status("/.well-known/oauth-authorization-server", "GET").await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// `GET /oauth/jwks` serves the public halves of the asymmetric signing
+/// keys, and the authorization server metadata points at it.
+#[tokio::test]
+async fn oauth_jwks_serves_the_public_signing_keys() {
+    let mut access = ema_access(false);
+    let authz = access
+        .authorization_server
+        .as_mut()
+        .expect("authorization server configured");
+    authz.signing_secret = None;
+    authz.signing_keys = vec![crate::config::SigningKeyConfig {
+        kid: Some("2026-09".to_owned()),
+        alg: crate::config::SigningAlgorithm::Es256,
+        secret: None,
+        private_key: Some(
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+                .expect("P-256 key generates")
+                .serialize_pem(),
+        ),
+    }];
+    let mut config = AppConfig::default();
+    config.governance.access = access.clone();
+    let mut runtime = default_test_runtime();
+    runtime.set_ema_authorization_server(Some(ema_server(&access)));
+    let app = router(finish_app_state(config, runtime), "/health", "/mcp");
+    let get = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+        }
+    };
+
+    let response = get("/oauth/jwks").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "public, max-age=300"
+    );
+    let jwks = response_json(response).await;
+    assert_eq!(jwks["keys"][0]["kid"], "2026-09");
+    assert_eq!(jwks["keys"][0]["kty"], "EC");
+    assert!(jwks["keys"][0].get("d").is_none(), "{jwks}");
+
+    let metadata = response_json(get("/.well-known/oauth-authorization-server").await).await;
+    assert_eq!(metadata["jwks_uri"], format!("{EMA_ISSUER}/oauth/jwks"));
+}
+
+/// `POST /oauth/token` spends a per-address budget of its own: spending
+/// it leaves the anonymous `/mcp` budget of the same address untouched,
+/// and a source with no attributable address is never limited.
+#[tokio::test]
+async fn token_endpoint_budget_is_its_own() {
+    let mut access = ema_access(false);
+    access
+        .authorization_server
+        .as_mut()
+        .expect("authorization server configured")
+        .rate_limit_per_min = 1;
+    let mut config = AppConfig::default();
+    config.governance.access = access.clone();
+    config.gateway.server.trust_proxy_ip = true;
+    config.gateway.server.anonymous_rate_limit_per_min = 60;
+    config.gateway.server.anonymous_rate_limit_burst = 1;
+    let mut runtime = default_test_runtime();
+    runtime.set_ema_authorization_server(Some(ema_server(&access)));
+    let app = router(finish_app_state(config, runtime), "/health", "/mcp");
+    let token = |xff: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            if let Some(xff) = xff {
+                builder = builder.header("x-forwarded-for", xff);
+            }
+            app.oneshot(
+                builder
+                    .body(Body::from("grant_type=authorization_code"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+        }
+    };
+
+    assert_eq!(
+        token(Some("192.0.2.77")).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let limited = token(Some("192.0.2.77")).await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        limited
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+        Some("60")
+    );
+    assert_eq!(
+        response_json(limited).await["error"],
+        "temporarily_unavailable"
+    );
+
+    let anonymous = app
+        .clone()
+        .oneshot(anon_post("192.0.2.77", None))
+        .await
+        .expect("response");
+    assert_ne!(anonymous.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    for _ in 0..3 {
+        assert_eq!(token(None).await.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+/// The protected resource metadata of an EMA-only gateway derives the
+/// embedded issuer as its authorization server.
+#[tokio::test]
+async fn ema_only_protected_resource_metadata_names_the_embedded_issuer() {
+    let (state, _) = build_ema_state(true);
+    let response = router(state, "/health", "/mcp")
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/.well-known/oauth-protected-resource/mcp")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["resource"], "https://gateway.example.com/mcp");
+    assert_eq!(
+        body["authorization_servers"],
+        serde_json::json!([EMA_ISSUER])
+    );
+    assert_eq!(body["scopes_supported"], serde_json::json!(["mcp:tools"]));
+    assert!(body.get("dpop_signing_alg_values_supported").is_none());
+    assert!(body.get("dpop_bound_access_tokens_required").is_none());
+    assert!(body.get("authorization_details_types_supported").is_none());
+}
+
+/// RFC 9728 §2: while the embedded authorization server limits tokens to
+/// authorization details, the protected resource metadata names the types.
+#[tokio::test]
+async fn protected_resource_metadata_names_the_authorization_details_types() {
+    let mut access = ema_access(true);
+    access
+        .authorization_server
+        .as_mut()
+        .expect("authorization_server")
+        .authorization_details = serde_json::from_value(serde_json::json!({
+        "types": [{ "type": "mcp_tool" }, { "type": "https://example.com/payment" }],
+    }))
+    .expect("details parse");
+    let (state, server) = build_ema_state_with(access);
+    let response = router(state, "/health", "/mcp")
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/.well-known/oauth-protected-resource/mcp")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let body = response_json(response).await;
+    let types = serde_json::json!(["mcp_tool", "https://example.com/payment"]);
+    assert_eq!(body["authorization_details_types_supported"], types);
+    assert_eq!(
+        server.metadata()["authorization_details_types_supported"],
+        types
+    );
+}
+
+// ── DPoP (RFC 9449) at the resource ───────────────────────────
+
+/// The URL a proof names for the MCP endpoint of the EMA test resource.
+const EMA_MCP_HTU: &str = "https://gateway.example.com/mcp";
+const EMA_PRM_URL: &str = "https://gateway.example.com/.well-known/oauth-protected-resource/mcp";
+
+/// A client's P-256 DPoP key, generated for the test.
+struct ClientDpopKey {
+    encoding: jsonwebtoken::EncodingKey,
+    jwk: jsonwebtoken::jwk::Jwk,
+}
+
+impl ClientDpopKey {
+    fn new() -> Self {
+        let pem = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("P-256 key generates")
+            .serialize_pem();
+        let encoding =
+            jsonwebtoken::EncodingKey::from_ec_pem(pem.as_bytes()).expect("P-256 key parses");
+        let jwk =
+            jsonwebtoken::jwk::Jwk::from_encoding_key(&encoding, jsonwebtoken::Algorithm::ES256)
+                .expect("public JWK");
+        Self { encoding, jwk }
+    }
+
+    fn jkt(&self) -> String {
+        self.jwk
+            .thumbprint(jsonwebtoken::jwk::ThumbprintHash::SHA256)
+            .expect("thumbprint")
+    }
+
+    /// A fresh proof of `method` at `htu` for `access_token`.
+    fn proof(&self, method: &str, htu: &str, access_token: &str) -> String {
+        use base64::Engine as _;
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.typ = Some("dpop+jwt".to_owned());
+        header.jwk = Some(self.jwk.clone());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let ath = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            <sha2::Sha256 as sha2::Digest>::digest(access_token.as_bytes()),
+        );
+        let claims = serde_json::json!({
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "htm": method,
+            "htu": htu,
+            "iat": now,
+            "ath": ath,
+        });
+        jsonwebtoken::encode(&header, &claims, &self.encoding).expect("the proof signs")
+    }
+}
+
+/// [`ema_access`] with DPoP on, `required` as given.
+fn dpop_ema_access(require_authentication: bool, required: bool) -> crate::config::AccessConfig {
+    let mut access = ema_access(require_authentication);
+    let authz = access
+        .authorization_server
+        .as_mut()
+        .expect("authorization_server");
+    authz.dpop.enabled = true;
+    authz.dpop.required = required;
+    authz.dpop.allowed_algs = vec!["ES256".to_owned(), "EdDSA".to_owned()];
+    access
+}
+
+/// An `initialize` carrying `authorization` and, if given, `proof`.
+fn initialize_with(authorization: &str, proof: Option<&str>) -> Request<Body> {
+    let mut builder = initialize_request().header(header::AUTHORIZATION, authorization);
+    if let Some(proof) = proof {
+        builder = builder.header("dpop", proof);
+    }
+    builder.body(initialize_body()).expect("request")
+}
+
+/// With DPoP on, a bound token is served with the `DPoP` scheme and a
+/// fresh proof of its key, and refused with the Bearer scheme, a spent
+/// proof, no proof, or a token of another issuer — each with a `DPoP`
+/// challenge carrying `algs` and the `resource_metadata` pointer.
+#[tokio::test]
+async fn a_bound_token_is_served_with_the_dpop_scheme_and_its_proof() {
+    let (state, server) = build_ema_state_with(dpop_ema_access(true, false));
+    let app = router(state, "/health", "/mcp");
+    let key = ClientDpopKey::new();
+    let token = server.mint_bound_access_token_for_tests(
+        "employee-7",
+        EMA_IDP,
+        Some("mcp:tools"),
+        Some(&key.jkt()),
+    );
+    let proof = key.proof("POST", EMA_MCP_HTU, &token);
+
+    let served = app
+        .clone()
+        .oneshot(initialize_with(&format!("DPoP {token}"), Some(&proof)))
+        .await
+        .expect("response");
+    assert_eq!(served.status(), StatusCode::OK);
+    assert!(served.headers().get("dpop-nonce").is_none());
+
+    let refused = |response: &axum::response::Response, error: &str| {
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{error}");
+        let challenge = www_authenticate(response);
+        assert!(
+            challenge.starts_with(&format!("DPoP error=\"{error}\"")),
+            "{challenge}"
+        );
+        assert!(challenge.contains("algs=\"ES256 EdDSA\""), "{challenge}");
+        assert!(
+            challenge.ends_with(&format!(", resource_metadata=\"{EMA_PRM_URL}\"")),
+            "{challenge}"
+        );
+    };
+    let replayed = app
+        .clone()
+        .oneshot(initialize_with(&format!("DPoP {token}"), Some(&proof)))
+        .await
+        .expect("response");
+    refused(&replayed, "invalid_dpop_proof");
+    assert_eq!(response_json(replayed).await["error"]["code"], -32000);
+
+    let as_bearer = app
+        .clone()
+        .oneshot(initialize_with(&format!("Bearer {token}"), None))
+        .await
+        .expect("response");
+    refused(&as_bearer, "invalid_token");
+    assert!(www_authenticate(&as_bearer).contains("present it with the DPoP scheme"));
+
+    let without_proof = app
+        .clone()
+        .oneshot(initialize_with(&format!("dpop {token}"), None))
+        .await
+        .expect("response");
+    refused(&without_proof, "invalid_dpop_proof");
+
+    let foreign = app
+        .clone()
+        .oneshot(initialize_with(
+            "DPoP opaque-foreign-token",
+            Some(&key.proof("POST", EMA_MCP_HTU, "opaque-foreign-token")),
+        ))
+        .await
+        .expect("response");
+    refused(&foreign, "invalid_token");
+
+    // A proof names its own request: the runtime snapshot takes a proof of
+    // `GET /runtime`, not the MCP endpoint's.
+    let runtime = |proof: String| {
+        let app = app.clone();
+        let authorization = format!("DPoP {token}");
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/runtime")
+                    .header(header::AUTHORIZATION, authorization)
+                    .header("dpop", proof)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+        }
+    };
+    let elsewhere = runtime(key.proof("GET", EMA_MCP_HTU, &token)).await;
+    assert_eq!(elsewhere.status(), StatusCode::UNAUTHORIZED);
+    let snapshot = runtime(key.proof("GET", "https://gateway.example.com/runtime", &token)).await;
+    assert_ne!(snapshot.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A caller verified with a proof carries its key's thumbprint as
+/// `dpop_jkt`; a DPoP token is never recorded as the caller's bearer, so
+/// `pass_through` never forwards it.
+#[tokio::test]
+async fn a_dpop_caller_carries_its_key_thumbprint() {
+    let (state, server) = build_ema_state_with(dpop_ema_access(false, false));
+    let runtime = state.runtime.load();
+    let key = ClientDpopKey::new();
+    let token =
+        server.mint_bound_access_token_for_tests("employee-7", EMA_IDP, None, Some(&key.jkt()));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        format!("DPoP {token}").parse().expect("header value"),
+    );
+    headers.insert(
+        "dpop",
+        key.proof("POST", EMA_MCP_HTU, &token)
+            .parse()
+            .expect("header value"),
+    );
+    let ctx = build_full_request_context(
+        &headers,
+        &runtime,
+        None,
+        false,
+        &axum::http::Method::POST,
+        Some("/mcp?trace=1"),
+        None,
+    )
+    .await
+    .expect("the bound token is accepted");
+    assert!(ctx.identity.is_gateway_minted());
+    assert_eq!(ctx.identity.attributes().get("dpop_jkt"), Some(&key.jkt()));
+    assert_eq!(ctx.inbound_bearer, None);
+
+    // Without a request target, no proof is accepted.
+    headers.insert(
+        "dpop",
+        key.proof("POST", EMA_MCP_HTU, &token)
+            .parse()
+            .expect("header value"),
+    );
+    let refused = build_full_request_context(
+        &headers,
+        &runtime,
+        None,
+        false,
+        &axum::http::Method::POST,
+        None,
+        None,
+    )
+    .await
+    .expect_err("no request target");
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert!(www_authenticate(&refused).starts_with("DPoP error=\"invalid_dpop_proof\""));
+}
+
+/// While DPoP is off, the `DPoP` scheme is not recognised: the caller is
+/// anonymous and meets the discovery challenge, byte-identical to the
+/// challenge of a gateway without DPoP.
+#[tokio::test]
+async fn while_dpop_is_off_the_dpop_scheme_meets_the_bearer_challenge() {
+    let (state, server) = build_ema_state(true);
+    let token = server.mint_access_token_for_tests("employee-7", EMA_IDP, Some("mcp:tools"));
+    let response = router(state, "/health", "/mcp")
+        .oneshot(initialize_with(&format!("DPoP {token}"), None))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let challenges: Vec<_> = response
+        .headers()
+        .get_all(header::WWW_AUTHENTICATE)
+        .iter()
+        .collect();
+    assert_eq!(challenges, [EMA_CHALLENGE]);
+}
+
+/// An ID-JAG is refused whatever scheme it comes with.
+#[tokio::test]
+async fn an_id_jag_is_refused_with_the_dpop_scheme_too() {
+    use base64::Engine as _;
+    let (state, _) = build_ema_state_with(dpop_ema_access(false, false));
+    let encode = |value: serde_json::Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_string())
+    };
+    let id_jag = format!(
+        "{}.{}.c2ln",
+        encode(serde_json::json!({ "alg": "RS256", "typ": "oauth-id-jag+jwt" })),
+        encode(serde_json::json!({ "iss": EMA_IDP, "sub": "employee-7" })),
+    );
+    let response = router(state, "/health", "/mcp")
+        .oneshot(initialize_with(&format!("DPoP {id_jag}"), None))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(www_authenticate(&response).starts_with("Bearer error=\"invalid_token\""));
+}
+
+/// `required`: an unbound token is refused with a DPoP challenge, the
+/// discovery 401 carries a second `WWW-Authenticate: DPoP` field, and the
+/// protected resource metadata says only bound tokens are accepted. Merely
+/// enabled, the discovery 401 is the Bearer one alone.
+#[tokio::test]
+async fn required_adds_the_dpop_challenge_and_refuses_unbound_tokens() {
+    let (state, server) = build_ema_state_with(dpop_ema_access(true, true));
+    let app = router(state, "/health", "/mcp");
+    let anonymous = app
+        .clone()
+        .oneshot(
+            initialize_request()
+                .body(initialize_body())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let challenges: Vec<_> = anonymous
+        .headers()
+        .get_all(header::WWW_AUTHENTICATE)
+        .iter()
+        .map(|value| value.to_str().expect("ASCII").to_owned())
+        .collect();
+    assert_eq!(
+        challenges,
+        [
+            EMA_CHALLENGE.to_owned(),
+            format!("DPoP algs=\"ES256 EdDSA\", resource_metadata=\"{EMA_PRM_URL}\""),
+        ]
+    );
+
+    let unbound = server.mint_access_token_for_tests("employee-7", EMA_IDP, Some("mcp:tools"));
+    let refused = app
+        .clone()
+        .oneshot(initialize_with(&format!("Bearer {unbound}"), None))
+        .await
+        .expect("response");
+    assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        www_authenticate(&refused).starts_with(
+            "DPoP error=\"invalid_token\", error_description=\"this resource accepts only \
+             DPoP-bound tokens\""
+        ),
+        "{}",
+        www_authenticate(&refused)
+    );
+
+    let metadata = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/.well-known/oauth-protected-resource/mcp")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let body = response_json(metadata).await;
+    assert_eq!(
+        body["dpop_signing_alg_values_supported"],
+        serde_json::json!(["ES256", "EdDSA"])
+    );
+    assert_eq!(body["dpop_bound_access_tokens_required"], true);
+
+    let (state, _) = build_ema_state_with(dpop_ema_access(true, false));
+    let app = router(state, "/health", "/mcp");
+    let anonymous = app
+        .clone()
+        .oneshot(
+            initialize_request()
+                .body(initialize_body())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let challenges: Vec<_> = anonymous
+        .headers()
+        .get_all(header::WWW_AUTHENTICATE)
+        .iter()
+        .collect();
+    assert_eq!(challenges, [EMA_CHALLENGE]);
+    let metadata = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/.well-known/oauth-protected-resource/mcp")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        response_json(metadata).await["dpop_bound_access_tokens_required"],
+        false
+    );
+}
+
+/// `required` binds the embedded server's tokens only: beside a `jwks`
+/// verifier, whose Bearer tokens the resource still accepts, the
+/// protected resource metadata does not say that every token must be
+/// bound.
+#[tokio::test]
+async fn required_beside_a_jwks_verifier_is_not_published_as_required() {
+    let mut access = dpop_ema_access(true, true);
+    access.jwks = Some(crate::config::JwksConfig {
+        url: "https://sso.example.com/.well-known/jwks.json".to_owned(),
+        keys_json: None,
+        issuer: Some("https://sso.example.com/".to_owned()),
+        audience: Some(EMA_MCP_HTU.to_owned()),
+        audiences: vec![],
+        header_name: "authorization".to_owned(),
+        header_prefix: "Bearer ".to_owned(),
+        allow_missing_audience: false,
+    });
+    let (state, _) = build_ema_state_with(access);
+    let metadata = router(state, "/health", "/mcp")
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/.well-known/oauth-protected-resource/mcp")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let body = response_json(metadata).await;
+    assert_eq!(body["dpop_bound_access_tokens_required"], false, "{body}");
+    assert_eq!(
+        body["dpop_signing_alg_values_supported"],
+        serde_json::json!(["ES256", "EdDSA"])
+    );
+}
+
+fn caller_with(source: &str, attributes: &[(&str, &str)]) -> crate::runtime::RequestIdentity {
+    crate::runtime::RequestIdentity::Verified {
+        subject_id: "employee-7".into(),
+        issuer: EMA_IDP.into(),
+        auth_provider: "ema".into(),
+        source: source.into(),
+        roles: vec![],
+        groups: vec![],
+        scopes: vec![],
+        attributes: attributes
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect(),
+    }
+}
+
+/// RFC 9449 §7.1: a caller of a DPoP-bound token gets its step-up
+/// challenge in the `DPoP` scheme with `algs`; any other caller, one whose
+/// identity came from elsewhere with the same attribute included, keeps
+/// the Bearer one.
+#[test]
+fn a_dpop_caller_is_challenged_in_the_dpop_scheme() {
+    let dpop = crate::runtime::authorization_server::dpop::DpopChallenge {
+        algs: "ES256",
+        required: false,
+    };
+    let under_scoped = || {
+        let mut response = axum::http::StatusCode::FORBIDDEN.into_response();
+        response.headers_mut().insert(
+            HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER),
+            HeaderValue::from_static("mcp:admin"),
+        );
+        response
+    };
+    let bound = caller_with(
+        crate::runtime::EMA_ACCESS_TOKEN_SOURCE,
+        &[("dpop_jkt", "thumbprint")],
+    );
+    let response = with_www_authenticate_challenge(
+        under_scoped(),
+        true,
+        TEST_PRM_URL,
+        None,
+        None,
+        Some(&bound),
+        Some(dpop),
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        www_authenticate(&response),
+        format!(
+            "DPoP resource_metadata=\"{TEST_PRM_URL}\", error=\"insufficient_scope\", \
+             scope=\"mcp:admin\", algs=\"ES256\""
+        )
+    );
+
+    for other in [
+        caller_with(crate::runtime::EMA_ACCESS_TOKEN_SOURCE, &[]),
+        caller_with("authorization:oidc_oauth", &[("dpop_jkt", "thumbprint")]),
+    ] {
+        let response = with_www_authenticate_challenge(
+            under_scoped(),
+            true,
+            TEST_PRM_URL,
+            None,
+            None,
+            Some(&other),
+            Some(dpop),
+        );
+        assert!(
+            www_authenticate(&response).starts_with("Bearer "),
+            "{other:?}"
+        );
+    }
+}
+
+/// The `resource_metadata` pointer completes a `DPoP` challenge as it does
+/// a Bearer one, and no other scheme.
+#[test]
+fn the_resource_metadata_pointer_completes_a_dpop_challenge() {
+    let challenged = |value: &'static str| {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, value)],
+        )
+            .into_response()
+    };
+    let completed = with_resource_metadata_pointer(
+        challenged("DPoP error=\"invalid_token\", algs=\"ES256\""),
+        TEST_PRM_URL,
+    );
+    assert_eq!(
+        www_authenticate(&completed),
+        format!(
+            "DPoP error=\"invalid_token\", algs=\"ES256\", resource_metadata=\"{TEST_PRM_URL}\""
+        )
+    );
+    for untouched in ["DPoPx error=\"x\"", "Basic realm=\"x\""] {
+        let response = with_resource_metadata_pointer(challenged(untouched), TEST_PRM_URL);
+        assert_eq!(www_authenticate(&response), untouched);
+    }
 }
 
 // ── modern wire end-to-end routing ────────────────────────────
@@ -9950,6 +11723,7 @@ async fn mcp_registry_serves_v01_catalog_view() {
         governance: crate::config::GovernanceConfig {
             access: crate::config::AccessConfig {
                 authorization_server: None,
+                require_authentication: false,
                 jwks: None,
                 oidc_oauth: None,
                 resource_metadata: Some(crate::config::OAuthResourceMetadataConfig {

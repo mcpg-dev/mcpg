@@ -127,8 +127,36 @@ verified deterministically at the engine-integration level instead.
   `subject_token` in `attributes`) instead of the machine identity, so the issuer
   exchanges the caller's token for an upstream one (per-caller, host-cached). Backed by
   the `dev.mcpg.credential.oauth-token-exchange` issuer plugin. Import/listen (no caller) list
-  anonymously, like `pass_through`. Tests:
+  anonymously, like `pass_through`, unless `auth.import` is set. Tests:
   `oauth_impersonation_exchanges_caller_bearer_for_upstream` + config validation.
+- **Catalogue credential (`auth.import`)** ✅ — an optional nested `service_token` /
+  `oauth_client_credentials` block used only by the sessions without a caller (import,
+  `list_changed` / TTL re-import, notification listener), so upstreams that require a
+  token for `tools/list` can be federated with a caller-derived mode. Dispatch never
+  reads it. A 401/403 import counts `mcpg_federation_import_failed_total{reason="unauthorized"}`
+  and warns with the fix. Tests:
+  `import_credential_lists_an_auth_gated_upstream_while_calls_impersonate`,
+  `a_call_without_a_caller_bearer_never_borrows_the_import_credential`,
+  `listener_and_its_reimport_use_the_import_credential`,
+  `import_credential_lists_an_auth_gated_upstream_end_to_end` + config validation.
+- **The caller's stored enterprise sign-in (`auth.subject_token`)** ✅ — with interactive
+  sign-in on the embedded authorization server, `idp_refresh_token` / `idp_id_token` make
+  `oauth_impersonation` exchange the user's stored IdP token (read by principal through
+  `FederationEngine::with_idp_sessions`) instead of the caller's bearer. The engine drops
+  every caller `subject_token*` attribute and sets the `idp_vault` contract
+  (`docs/plugin-protocol/abi-changelog.md`); `oauth-id-jag` and `oauth-token-exchange`
+  send the token only to the endpoint and client that issued it. A caller without one is
+  refused before any request (`UpstreamError::NotLinked`), and a client that declares
+  `elicitation.url` is offered a link to `/oauth/connect` bound to the caller's principal:
+  `-32042` on `2025-11-25`, an `InputRequiredResult` on `2026-07-28`. Upstream sessions
+  key on the principal and the token kind, and the credential cache on the stored
+  sign-in, so rotations cost no new exchange.
+  Tests: `runtime::federation::engine::idp_tests`,
+  `a_signed_in_user_reaches_a_cross_app_access_resource_with_their_stored_sign_in`,
+  `a_caller_without_a_stored_sign_in_is_given_a_link_and_the_retry_succeeds`,
+  `on_the_2026_wire_the_link_rides_an_input_required_result`,
+  `a_stored_sign_in_federation_refuses_a_caller_without_one_before_the_upstream`,
+  `a_caller_without_a_principal_is_offered_no_link`.
 - **`list_changed` runtime refresh + notification forwarding** ✅ — a persistent
   per-federation listener opens the upstream's server→client SSE stream (GET) and
   reacts to pushes: on `notifications/{tools,resources,prompts}/list_changed` it

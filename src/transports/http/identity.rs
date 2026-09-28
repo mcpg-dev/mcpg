@@ -1,11 +1,16 @@
 //! Request-identity resolution for the HTTP transport.
 //!
-//! Turns raw headers (bearer token, mTLS peer cert, asserted subject) into a
-//! [`RequestContext`] by running the identity-plugin chain, then falls back to
-//! a header-asserted or anonymous principal. Carries no MCP-specific logic —
-//! `transports::http_route` uses the same entry point for plugin HTTP routes.
+//! Turns raw headers (bearer token, DPoP-bound token and its proof, mTLS
+//! peer cert, asserted subject) into a [`RequestContext`] by running the
+//! identity-plugin chain, then falls back to a header-asserted or anonymous
+//! principal. Carries no MCP-specific logic — `transports::http_route` uses
+//! the same entry point for plugin HTTP routes.
 
 use super::*;
+use crate::runtime::authorization_server::EmaBearerOutcome;
+use crate::runtime::authorization_server::dpop::{
+    DPOP_HEADER, DPOP_NONCE_HEADER, DPOP_SCHEME, DpopPresentation, DpopTarget, EmaRefusal,
+};
 
 /// Build a request context with full identity resolution: transport-level + plugin chain.
 ///
@@ -14,6 +19,14 @@ use super::*;
 /// `None` for plain HTTP requests. The metadata threads through to
 /// `RequestMetadata.tls` so identity plugins like `dev.mcpg.identity.workload`'s
 /// X.509-SVID source can consume the peer cert chain.
+///
+/// A credential the gateway minted itself is never handed to the identity
+/// plugins: a plugin verifying the same bearer against its own issuer would
+/// reject it, and one resolving another credential on the request would
+/// replace it.
+///
+/// `method` and `path` (the request target, query included) are also what a
+/// DPoP proof must name; without a `path` no proof is accepted.
 pub(crate) async fn build_full_request_context(
     headers: &HeaderMap,
     runtime: &crate::runtime::GatewayRuntime,
@@ -23,7 +36,10 @@ pub(crate) async fn build_full_request_context(
     path: Option<&str>,
     peer_ip: Option<std::net::IpAddr>,
 ) -> Result<RequestContext, Response> {
-    let ctx = build_request_context(
+    let target = path.map(|request_target| {
+        DpopTarget::of_request(method.as_str(), request_target, runtime.mcp_path())
+    });
+    let (ctx, origin) = build_request_context(
         headers,
         runtime.jwt_verifier(),
         runtime.oidc_resolver(),
@@ -31,18 +47,35 @@ pub(crate) async fn build_full_request_context(
         Some(runtime.plugin_registry()),
         trust_subject_header,
         peer_ip,
+        target,
     )
     .await?;
-    let ctx = enrich_identity_via_plugins(
-        ctx,
-        headers,
-        runtime.plugin_registry(),
-        tls_info,
-        method,
-        path,
-    )
-    .await?;
+    let ctx = match origin {
+        CredentialOrigin::GatewayMinted => ctx,
+        CredentialOrigin::External => {
+            enrich_identity_via_plugins(
+                ctx,
+                headers,
+                runtime.plugin_registry(),
+                tls_info,
+                method,
+                path,
+            )
+            .await?
+        }
+    };
     enforce_aauth_resource_state(ctx, runtime).await
+}
+
+/// Where the transport cascade's identity came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialOrigin {
+    /// A credential this gateway minted and verified itself: an EMA access
+    /// token from the embedded authorization server, or the supervised
+    /// inspector's loopback credential.
+    GatewayMinted,
+    /// Any other credential, or none at all.
+    External,
 }
 
 /// The gateway's AAuth resource role, applied after the identity chain: a
@@ -80,6 +113,9 @@ async fn enforce_aauth_resource_state(
     Ok(ctx)
 }
 
+/// `target` is the request a DPoP proof must name; `None` where no proof is
+/// accepted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_request_context(
     headers: &HeaderMap,
     jwt_verifier: Option<&crate::runtime::identity::JwtVerifier>,
@@ -88,7 +124,8 @@ pub(crate) async fn build_request_context(
     audit_registry: Option<&mcpg_plugin_host::PluginRegistry>,
     trust_subject_header: bool,
     peer_ip: Option<std::net::IpAddr>,
-) -> Result<RequestContext, Response> {
+    target: Option<DpopTarget<'_>>,
+) -> Result<(RequestContext, CredentialOrigin), Response> {
     let request_id = GatewayRequestId::new();
     let upstream_request_id = headers
         .get(UPSTREAM_REQUEST_ID_HEADER)
@@ -113,45 +150,113 @@ pub(crate) async fn build_request_context(
     // 3. Header-asserted
     // 4. Anonymous
     //
+    // An ID-JAG is a grant for an authorization server's token endpoint.
+    // Its `iss` is the IdP, so a verifier trusting that IdP for SSO would
+    // otherwise accept it as an access token, skipping client
+    // authentication, single use and every other redemption check.
+    let credential = extract_inbound_credential(headers);
+    if let Some((_, ref token)) = credential
+        && crate::runtime::authorization_server::is_id_jag(token)
+    {
+        let reason = "an ID-JAG is a grant to redeem at a token endpoint, not an access token";
+        tracing::warn!(
+            request_id = %request_id.as_str(),
+            "ID-JAG presented as a bearer token, rejecting with 401"
+        );
+        if let Some(reg) = audit_registry {
+            let event = mcpg_plugin_host::audit_events::auth_failed_event(
+                "bearer",
+                reason,
+                request_id.as_str(),
+                "http",
+            )
+            .with_upstream_request_id(upstream_request_id.clone());
+            let _ = reg.emit_audit_event(&event).await;
+        }
+        return Err(invalid_token_response(&request_id));
+    }
     // A bearer whose `iss` names the embedded EMA authorization server
     // MUST verify there — once a token claims to be gateway-minted it
     // never falls through to another verifier, so a forgery cannot
-    // shop for a laxer validation path.
-    let ema_identity = match (ema_authorization_server, extract_inbound_bearer(headers)) {
-        (Some(ema), Some(bearer)) => match ema.verify_bearer(&bearer) {
-            crate::runtime::authorization_server::EmaBearerOutcome::NotOurs => None,
-            crate::runtime::authorization_server::EmaBearerOutcome::Verified(id) => {
-                Some(RequestIdentity::Verified {
-                    subject_id: id.subject_id,
-                    issuer: id.issuer,
-                    auth_provider: "ema".to_owned(),
-                    source: "authorization:ema_access_token".to_owned(),
-                    roles: Vec::new(),
-                    groups: Vec::new(),
-                    scopes: id.scopes,
-                    attributes: id.attributes,
-                })
+    // shop for a laxer validation path. While DPoP is on, a token
+    // presented with the `DPoP` scheme is verified there too, with its
+    // proof, whatever its `iss`: no other verifier reads that scheme.
+    let ema_outcome = match (ema_authorization_server, credential) {
+        (Some(ema), Some((AuthScheme::Bearer, bearer))) => Some(ema.verify_bearer(&bearer)),
+        (Some(ema), Some((AuthScheme::Dpop, token))) if ema.dpop_enabled() => {
+            let presentation = DpopPresentation::from_values(
+                headers
+                    .get_all(DPOP_HEADER)
+                    .iter()
+                    .map(HeaderValue::as_bytes),
+            );
+            Some(
+                ema.verify_dpop(&token, &presentation, target.as_ref())
+                    .await,
+            )
+        }
+        _ => None,
+    };
+    let ema_identity = match ema_outcome {
+        None | Some(EmaBearerOutcome::NotOurs) => None,
+        Some(EmaBearerOutcome::Verified(id)) => Some(RequestIdentity::Verified {
+            subject_id: id.subject_id,
+            issuer: id.issuer,
+            auth_provider: id.auth_provider,
+            source: crate::runtime::EMA_ACCESS_TOKEN_SOURCE.to_owned(),
+            roles: id.roles,
+            groups: id.groups,
+            scopes: id.scopes,
+            attributes: id.attributes,
+        }),
+        Some(EmaBearerOutcome::Invalid(reason)) => {
+            tracing::warn!(
+                request_id = %request_id.as_str(),
+                reason = %reason,
+                "EMA access token verification failed, rejecting with 401"
+            );
+            if let Some(reg) = audit_registry {
+                let event = mcpg_plugin_host::audit_events::auth_failed_event(
+                    "ema",
+                    &reason,
+                    request_id.as_str(),
+                    "http",
+                )
+                .with_upstream_request_id(upstream_request_id.clone());
+                let _ = reg.emit_audit_event(&event).await;
             }
-            crate::runtime::authorization_server::EmaBearerOutcome::Invalid(reason) => {
+            return Err(invalid_token_response(&request_id));
+        }
+        Some(EmaBearerOutcome::Refused(refusal)) => {
+            if refusal.audited() {
                 tracing::warn!(
                     request_id = %request_id.as_str(),
-                    reason = %reason,
-                    "EMA access token verification failed, rejecting with 401"
+                    error = refusal.error.as_str(),
+                    reason = %refusal.reason,
+                    "EMA access token refused with a DPoP challenge, rejecting with 401"
                 );
                 if let Some(reg) = audit_registry {
-                    let event = mcpg_plugin_host::audit_events::auth_failed_event(
-                        "ema",
-                        &reason,
+                    let mut event = mcpg_plugin_host::audit_events::auth_failed_event(
+                        "ema_dpop",
+                        &refusal.reason,
                         request_id.as_str(),
                         "http",
                     )
                     .with_upstream_request_id(upstream_request_id.clone());
+                    event.details["error"] = serde_json::json!(refusal.error.as_str());
                     let _ = reg.emit_audit_event(&event).await;
                 }
-                return Err(invalid_token_response(&request_id));
+            } else {
+                tracing::debug!(
+                    request_id = %request_id.as_str(),
+                    "DPoP proof without a current nonce, answering with one"
+                );
             }
-        },
-        _ => None,
+            return Err(dpop_refusal_response(&request_id, &refusal));
+        }
+        Some(EmaBearerOutcome::Unavailable) => {
+            return Err(replay_unavailable_response(&request_id));
+        }
     };
     // Priority -1: the supervised inspector's process-minted loopback
     // credential (see `runtime::inspector_identity`). Checked before
@@ -163,6 +268,11 @@ pub(crate) async fn build_request_context(
         peer_ip,
     );
 
+    let origin = if inspector_identity.is_some() || ema_identity.is_some() {
+        CredentialOrigin::GatewayMinted
+    } else {
+        CredentialOrigin::External
+    };
     let identity = if let Some(identity) = inspector_identity {
         identity
     } else if let Some(identity) = ema_identity {
@@ -173,7 +283,9 @@ pub(crate) async fn build_request_context(
                 RequestIdentity::Verified {
                     subject_id: oidc_id.subject_id,
                     issuer: oidc_id.issuer,
-                    auth_provider: format!("oidc_oauth:{}", oidc_id.provider_label),
+                    auth_provider: mcpg_plugin_identity_oidc_core::oidc_auth_provider(
+                        &oidc_id.provider_label,
+                    ),
                     source: format!("{}:oidc_oauth", resolver.header_name()),
                     roles: oidc_id.roles,
                     groups: oidc_id.groups,
@@ -252,7 +364,7 @@ pub(crate) async fn build_request_context(
         build_header_or_anonymous_identity(headers, trust_subject_header)
     };
 
-    Ok(RequestContext::new(
+    let ctx = RequestContext::new(
         request_id,
         upstream_request_id,
         session_id,
@@ -261,7 +373,8 @@ pub(crate) async fn build_request_context(
         TransportKind::Http,
     )
     .with_trace_context(extract_trace_context(headers))
-    .with_inbound_bearer(extract_inbound_bearer(headers)))
+    .with_inbound_bearer(extract_inbound_bearer(headers));
+    Ok((ctx, origin))
 }
 
 /// Run identity plugin chain and upgrade identity if a plugin resolves.
@@ -359,10 +472,15 @@ async fn enrich_identity_via_plugins(
     Ok(ctx)
 }
 
-/// Convert a `PluginIdentity` resolved by the plugin chain back to a `RequestIdentity`.
+/// Convert a `PluginIdentity` resolved by the plugin chain back to a
+/// `RequestIdentity`, without the attributes only a credential of this
+/// gateway sets ([`GATEWAY_SET_ATTRIBUTES`]).
+///
+/// [`GATEWAY_SET_ATTRIBUTES`]: crate::runtime::authorization_server::GATEWAY_SET_ATTRIBUTES
 pub(crate) fn plugin_identity_to_request(
     pi: &mcpg_plugin_protocol::PluginIdentity,
 ) -> RequestIdentity {
+    use crate::runtime::authorization_server::GATEWAY_SET_ATTRIBUTES;
     match pi.trust_level.as_str() {
         "verified" => RequestIdentity::Verified {
             subject_id: pi.subject_id.clone().unwrap_or_default(),
@@ -372,7 +490,12 @@ pub(crate) fn plugin_identity_to_request(
             roles: pi.roles.clone(),
             groups: pi.groups.clone(),
             scopes: pi.scopes.clone(),
-            attributes: pi.attributes.clone(),
+            attributes: pi
+                .attributes
+                .iter()
+                .filter(|(name, _)| !GATEWAY_SET_ATTRIBUTES.contains(&name.as_str()))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
         },
         "header_asserted" => RequestIdentity::HttpHeader {
             subject_id: pi.subject_id.clone().unwrap_or_default(),
@@ -382,6 +505,31 @@ pub(crate) fn plugin_identity_to_request(
             source: "identity_plugin:no_resolution".into(),
         },
     }
+}
+
+/// The `Authorization` scheme a credential was presented with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthScheme {
+    Bearer,
+    /// RFC 9449 §7.1: a token bound to a key, sent with a proof of it.
+    Dpop,
+}
+
+/// The credential of the `Authorization` header and its scheme: `Bearer`
+/// exactly as [`extract_inbound_bearer`] reads it, or `DPoP`, whose scheme
+/// name matches in any case (RFC 9110 §11.1).
+fn extract_inbound_credential(headers: &HeaderMap) -> Option<(AuthScheme, String)> {
+    if let Some(bearer) = extract_inbound_bearer(headers) {
+        return Some((AuthScheme::Bearer, bearer));
+    }
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case(DPOP_SCHEME)
+        .then(|| (AuthScheme::Dpop, token.trim_start_matches(' ').to_owned()))
 }
 
 /// Extract the inbound bearer token (strips the `Bearer ` scheme) for
@@ -453,12 +601,61 @@ fn invalid_token_response_with_headers(
     request_id: &GatewayRequestId,
     extra_headers: &[(String, String)],
 ) -> Response {
+    refused_credential(
+        request_id,
+        HeaderValue::from_static("Bearer error=\"invalid_token\""),
+        extra_headers,
+    )
+}
+
+/// HTTP 401 for a credential refused with the `WWW-Authenticate: DPoP`
+/// challenge of `refusal` (RFC 9449 §7.1), carrying the nonce a
+/// `use_dpop_nonce` refusal hands out as `DPoP-Nonce` (§9).
+fn dpop_refusal_response(request_id: &GatewayRequestId, refusal: &EmaRefusal) -> Response {
+    let extra: Vec<(String, String)> = refusal
+        .nonce
+        .iter()
+        .map(|nonce| (DPOP_NONCE_HEADER.to_owned(), nonce.as_str().to_owned()))
+        .collect();
+    match HeaderValue::from_str(&refusal.challenge()) {
+        Ok(challenge) => refused_credential(request_id, challenge, &extra),
+        Err(_) => refused_credential(
+            request_id,
+            HeaderValue::from_static("DPoP error=\"invalid_token\""),
+            &extra,
+        ),
+    }
+}
+
+/// HTTP 503 for a request whose DPoP proof the replay ledger cannot
+/// record: accepting it unrecorded would let it be replayed.
+fn replay_unavailable_response(request_id: &GatewayRequestId) -> Response {
+    let response = (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        axum::Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {
+                "code": -32000,
+                "message": "replay protection is unavailable; retry shortly",
+            },
+        })),
+    )
+        .into_response();
+    with_request_id_header(response, request_id)
+}
+
+/// HTTP 401 with `challenge` for a refused credential, plus
+/// `extra_headers`; see [`invalid_token_response_with_headers`].
+fn refused_credential(
+    request_id: &GatewayRequestId,
+    challenge: HeaderValue,
+    extra_headers: &[(String, String)],
+) -> Response {
     let mut resp = (
         axum::http::StatusCode::UNAUTHORIZED,
-        [(
-            axum::http::header::WWW_AUTHENTICATE,
-            "Bearer error=\"invalid_token\"",
-        )],
+        [(axum::http::header::WWW_AUTHENTICATE, challenge)],
         axum::Json(serde_json::json!({
             "jsonrpc": "2.0",
             "id": null,

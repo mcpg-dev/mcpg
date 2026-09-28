@@ -58,9 +58,10 @@ pub async fn build_from_sources(
     let jwt_verifier = build_jwt_verifier(&config).await?;
     let oidc_resolver = build_oidc_resolver(&config)?.map(std::sync::Arc::new);
 
-    // Standalone deployments prove their plugin entitlements before
-    // anything is loaded; CP-attached ones are gated at the CP bind.
-    crate::license_gate::enforce_plugin_license_gate(&config)?;
+    // Plugin and feature entitlements are proven before anything is loaded;
+    // the gate defers only what the control plane checks (the plugin-set bind,
+    // the managed-cloud publish guard).
+    crate::license_gate::enforce_license_gate(&config)?;
 
     // Build the plugin registry FIRST, before any capability touches
     // its KV / PubSub primitives. This guarantees the cluster
@@ -89,12 +90,14 @@ pub async fn build_from_sources(
         quota_gate,
         resolved_secret_refs,
         secrets_digest,
+        authorization_server,
     } = build_plugin_registry(&mut config, jwt_verifier.as_ref(), oidc_resolver.clone()).await?;
 
     // Runs here rather than at validation time so it sees the final binding
     // set — including the capabilities plugins expanded during the registry
     // build.
     crate::config::warn_unreachable_binding_trust(&config);
+    crate::config::warn_access_posture(&config);
 
     // Capability boot draws KV / PubSub primitives from the cluster
     // coordinator. `Some` for any cluster kind that exposes the
@@ -393,7 +396,13 @@ pub async fn build_from_sources(
     runtime.set_secrets_digest(secrets_digest);
 
     // Embedded EMA authorization server (governance.access.authorization_server).
-    runtime.set_ema_authorization_server(build_ema_authorization_server(&config)?);
+    runtime.set_ema_authorization_server(wire_ema_authorization_server(
+        &with_resolved_authorization_server(&config, authorization_server),
+        cluster_backend.as_ref(),
+        &state_cipher,
+        &tenant_seg,
+        None,
+    )?);
     runtime.set_aauth_resource(crate::app::auth_wiring::build_aauth_resource(&config)?);
 
     // Install the runtime quota gate so the
@@ -970,21 +979,11 @@ pub async fn build_from_sources(
         }
     }
 
-    let shared_services = Arc::new(crate::runtime::shared_services::SharedServices::new(
-        Arc::clone(&config_arc),
+    install_protocol_handlers(
         &runtime_arc,
+        Arc::clone(&config_arc),
         Arc::clone(&request_state_codec),
-    ));
-    let mut protocol_registry = crate::protocol::registry::ProtocolRegistry::new();
-    protocol_registry.register(Arc::new(crate::protocol::v_2025_11_25::Handler::new()));
-    protocol_registry.register(Arc::new(crate::protocol::v_2026_07_28::Handler::new()));
-    let protocol_registry = Arc::new(protocol_registry);
-    runtime_arc
-        .load()
-        .set_protocol_registry(Arc::clone(&protocol_registry));
-    runtime_arc
-        .load()
-        .set_shared_services(Arc::clone(&shared_services));
+    );
 
     let base_config_arc = Arc::clone(&config_arc);
     let state = AppState {
@@ -1016,4 +1015,40 @@ pub async fn build_from_sources(
     let _ = cp_attach;
 
     Ok(state)
+}
+
+/// Register the handler of every MCP revision the gateway speaks on
+/// `runtime`, sharing `config` and the `requestState` codec `codec`.
+fn install_protocol_handlers(
+    runtime: &Arc<ArcSwap<GatewayRuntime>>,
+    config: Arc<AppConfig>,
+    codec: Arc<crate::protocol::v_2026_07_28::dispatch::request_state::RequestStateCodec>,
+) {
+    let shared_services = Arc::new(crate::runtime::shared_services::SharedServices::new(
+        config, runtime, codec,
+    ));
+    let mut protocol_registry = crate::protocol::registry::ProtocolRegistry::new();
+    protocol_registry.register(Arc::new(crate::protocol::v_2025_11_25::Handler::new()));
+    protocol_registry.register(Arc::new(crate::protocol::v_2026_07_28::Handler::new()));
+    runtime
+        .load()
+        .set_protocol_registry(Arc::new(protocol_registry));
+    runtime.load().set_shared_services(shared_services);
+}
+
+/// Serve every MCP revision from a hand-built `state` as boot does, with a
+/// `requestState` key of this process and an in-memory store behind it.
+/// Public for the integration-test harness.
+pub fn install_protocol_handlers_in_process(state: &AppState) {
+    use crate::protocol::v_2026_07_28::dispatch::request_state::{
+        InMemoryRequestStateStore, RequestStateCodec,
+    };
+    install_protocol_handlers(
+        &state.runtime,
+        state.config.load_full(),
+        Arc::new(RequestStateCodec::new(
+            RequestStateCodec::ephemeral_key(),
+            Arc::new(InMemoryRequestStateStore::new()),
+        )),
+    );
 }
