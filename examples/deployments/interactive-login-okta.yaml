@@ -26,6 +26,8 @@
 #   OKTA_AGENT_KEY         — RSA PKCS#8 PEM of the Okta agent app
 #   CLAUDE_EMA_SECRET      — client secret of the Claude EMA client
 #   VENDOR_CLIENT_KEY      — PEM the gateway authenticates with at the vendor
+#   HOSTNAME               — `cluster.node.id`, unique per replica; exported
+#                            by a container runtime, not by a shell
 #
 # Boot:  MCPG_CONFIG=interactive-login-okta.yaml mcpg
 
@@ -149,6 +151,14 @@ governance:
           enabled: false
 
 plugins:
+  # The coordinator `cluster.kind: nats` selects: without this entry the
+  # gateway refuses to boot. It takes its settings from `cluster:`.
+  - id: dev.mcpg.cluster.nats
+    class: cluster
+    source:
+      # Your mirror of the plugin channel; keep it in step with the gateway.
+      oci: "registry.acme.example/mcpg/plugins/cluster-nats:0.1.0"
+    granted_capabilities: [network_outbound]
   - id: dev.mcpg.credential.oauth-id-jag
     class: credential_issuer
     source:
@@ -167,9 +177,8 @@ plugins:
           client_auth: private_key_jwt
           private_key: "${env.OKTA_AGENT_KEY}"
           key_id: "mcpg-2026-09"
-          # The login block takes its algorithm from the key; this provider
-          # signs RS256 unless told otherwise. ES256 for a P-256 key.
-          signing_alg: RS256
+          # No signing_alg: like the login block, the provider takes the
+          # algorithm from the key (RS256 for RSA, ES256 for P-256).
           subject_token_type: refresh_token
           audience: "https://auth.vendor.example"
           resource: "https://mcp.vendor.example/mcp"

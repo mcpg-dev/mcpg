@@ -10,10 +10,13 @@ This is *application-layer* multi-tenancy. Subdomain-based routing (different ho
 
 ## What's in it
 
-- Redis cluster (same as the production-redis-cluster topology).
-- OIDC inbound auth — tenant identity comes from the `sub` claim.
+- Redis cluster (same as the production-redis-cluster topology), served by the `dev.mcpg.cluster.redis` plugin.
+- OIDC inbound auth — tenant identity comes from the `sub` claim. The `dev.mcpg.identity.oidc` plugin carries the same providers as `governance.access.oidc_oauth`.
 - `gateway.server.max_sessions_per_tenant: 100` — each tenant capped at 100 concurrent sessions.
-- One rate-limit plugin entry; its default `per_principal` scope buckets by tenant id.
+- One `dev.mcpg.rate-limit` plugin entry; its default `per_principal` scope buckets by tenant id.
+- Metrics through the `dev.mcpg.observability.prometheus` plugin at `/metrics` on the gateway listener.
+- The gateway image carries no plugins: the gateway pulls each signed artifact in `plugins` at boot. Without the Redis or the OIDC entry the gateway refuses to boot; without the Prometheus entry it boots and exports no metrics.
+- A `license` block. The Redis coordinator is a licensed plugin: the gateway refuses to load it without a license that entitles `cluster.*` plugins (Team, Enterprise). Outside production, `license.non_production_use: true` in place of the token loads it under the non-production grant.
 - Two bindings illustrating governance:
   - `api.tenant.lookup` — any authenticated tenant.
   - `api.admin.tenant.delete` — only `tenant_admins` group members.
@@ -23,15 +26,19 @@ This is *application-layer* multi-tenancy. Subdomain-based routing (different ho
 | Field | Why |
 |---|---|
 | `gateway.server.max_sessions_per_tenant` | Per-SLA-tier cap. 100 is a starting point; 0 = unlimited. |
-| `plugins[0].config.default_limit` / `default_window_ms` / `default_burst` | Rate-limit budget — pick by tenant tier. For per-tool overrides add a `rules:` entry; for multi-tier limits register multiple plugin entries with different `id`s. |
-| `plugins[0].source.oci` | The rate-limit plugin's OCI reference if your registry differs. |
+| `governance.access.oidc_oauth.providers`, `config.providers` of the `dev.mcpg.identity.oidc` entry | Your IdP's issuer and the audience it issues for this gateway, the same in both places. |
+| `config.default_limit` / `default_window_ms` / `default_burst` of the `dev.mcpg.rate-limit` entry | Rate-limit budget — pick by tenant tier. For per-tool overrides add a `rules:` entry; for multi-tier limits register multiple plugin entries with different `id`s. |
+| `plugins[*].source.oci` | The plugin releases that match the gateway you run, or your mirror of them. |
 | `mcp.capabilities.tools[1].governance.allow_if` | The CEL expression resolving "is this caller an admin?". Adapt to your IdP's group claim shape. |
 
 ## Required env vars
 
 - `MCPG_REDIS_URL` — Redis cluster.
+- `MCPG_REDIS_PASSWORD` — Redis password, passed out of the URL.
 - `MCPG_CLUSTER_STATE_KEY` — URL-safe-base64 32-byte state-encryption key, identical on every replica (`openssl rand -base64 32 | tr '+/' '-_'`). Required whenever `cluster.kind` is not `single_node`.
-- IdP credentials (issuer / audience are inline in the YAML; verification keys come from the IdP's JWKS).
+- `MCPG_LICENSE_PUBKEY` — the public key (SPKI PEM) that verifies the license token.
+
+The IdP needs no credentials here: issuer and audience are inline in the YAML, and the verification keys come from the IdP's JWKS.
 
 ## CEL primer for tenant-aware bindings
 

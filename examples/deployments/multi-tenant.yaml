@@ -12,7 +12,12 @@
 # routing (different host -> different gateway) is handled by your
 # reverse proxy / ingress, not in this YAML.
 #
-# Required env vars: same as production-single-redis.yaml.
+# Required env vars:
+#   MCPG_REDIS_URL          — rediss:// preferred
+#   MCPG_REDIS_PASSWORD     — Redis password, kept out of the URL
+#   MCPG_CLUSTER_STATE_KEY  — URL-safe-base64 32-byte state key, same on
+#                             every replica
+#   MCPG_LICENSE_PUBKEY     — public key (SPKI PEM) that verifies the license
 
 gateway:
   server:
@@ -36,7 +41,6 @@ cluster:
   url: "${env.MCPG_REDIS_URL}"
   password: "${env.MCPG_REDIS_PASSWORD}"
   key_prefix: "mcpg:multi-tenant"
-  pool_size: 16
   # Required for any non-single_node cluster: seals all Redis-held tenant
   # state (sessions incl. SSE replay, pipelines, tasks, delivery, …) with
   # XChaCha20-Poly1305 and derives the cross-replica modern-session resume
@@ -44,6 +48,14 @@ cluster:
   # URL-safe-base64 32-byte key, IDENTICAL on every replica:
   #   openssl rand -base64 32 | tr '+/' '-_'
   state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
+
+# The Redis coordinator is a licensed plugin: the gateway refuses to load
+# it without a license that entitles `cluster.*` plugins (Team,
+# Enterprise). Outside production, `non_production_use: true` in place of
+# the token loads it under the non-production grant.
+license:
+  token_file: "/etc/mcpg/license/license.jwt"
+  pubkey_pem: "${env.MCPG_LICENSE_PUBKEY}"
 
 governance:
   access:
@@ -62,26 +74,43 @@ governance:
       - kind: dev.mcpg.builtin.audit.local-file
         config: { path: "/var/log/mcpg/audit.log" }
 
-# Tool-gate plugins enforced before every dispatch. The rate-limit
-# plugin's default `per_principal` scope keys its bucket on the
-# principal id so each tenant gets their own budget. Adjust
-# `default_limit` per your SLA tier. Layout D'' P4 flattened the plugin
-# list — entries live directly under `plugins:` (no `entries:` wrapper,
-# no `enabled:` toggle).
-#
-# This is the one example that pulls from a registry, deliberately: the
-# gateway images carry the backends and a handful of others, not this
-# one, and nothing else we ship exercises the `oci:` path. Per-tenant
-# limits need it — `server.anonymous_rate_limit_*` and
-# `server.completion_rate_limit_per_sec` are server-wide ceilings on
-# anonymous traffic and completions, not per-invocation gating. Pin the
-# version you run; a pinned example is the kind that goes stale, so
-# check it against the release you are on.
+# The gateway image carries no plugins: each entry below is a signed
+# artifact the gateway pulls and verifies at boot. Without the Redis or
+# the OIDC entry the gateway refuses to boot; without the Prometheus entry
+# it boots but exports no metrics. Pin the releases that match the
+# gateway you run, or point `oci:` at your mirror of them.
 plugins:
+  # The coordinator `cluster.kind: redis` selects. It takes its settings
+  # from the `cluster:` block, so the entry carries no `config:`.
+  - id: dev.mcpg.cluster.redis
+    class: cluster
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/cluster-redis:0.1.0-alpha.41"
+    granted_capabilities: [network_outbound]
+  # Its `providers` must match `governance.access.oidc_oauth.providers`.
+  - id: dev.mcpg.identity.oidc
+    class: identity_provider
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/identity-oidc:0.1.0-alpha.41"
+    # OIDC discovery and JWKS fetches from the IdP.
+    granted_capabilities: [network_outbound]
+    config:
+      providers:
+        - issuer: "https://example.okta.com"
+          audiences: ["mcpg-gateway"]
+          verification:
+            kind: oidc_jwks
+            allowed_algs: ["RS256"]
+  # Tool gate enforced before every dispatch. Its default `per_principal`
+  # scope keys the bucket on the principal id, so each tenant gets its own
+  # budget; adjust `default_limit` per SLA tier. Per-tenant limits need
+  # this plugin: `server.anonymous_rate_limit_*` and
+  # `server.completion_rate_limit_per_sec` are server-wide ceilings on
+  # anonymous traffic and completions, not per-invocation gating.
   - id: dev.mcpg.rate-limit
     class: tool_gate
     source:
-      oci: "ghcr.io/mcpg-dev/plugins/rate-limit:0.1.0-alpha.16"
+      oci: "ghcr.io/mcpg-dev/plugins/rate-limit:0.1.0-alpha.42"
     config:
       # per_principal scope (the default) keys the bucket on the
       # authenticated principal; unauthenticated requests fall back
@@ -89,6 +118,10 @@ plugins:
       default_limit: 600
       default_window_ms: 60000
       default_burst: 50
+  - id: dev.mcpg.observability.prometheus
+    class: metrics_sink
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/observability-prometheus:0.1.0-alpha.41"
 
 mcp:
   capabilities:
@@ -121,7 +154,8 @@ observability:
     sinks:
       - kind: stderr
         config: { format: json }
+  # Served on the gateway listener (`bind_address`), not a port of its own.
   metrics:
     sinks:
       - kind: dev.mcpg.observability.prometheus
-        config: { path: "/metrics", bind: "0.0.0.0:9090" }
+        config: { path: "/metrics" }

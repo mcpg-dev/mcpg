@@ -6,7 +6,7 @@ A gateway whose embedded authorization server accepts enterprise-managed authori
 - The gateway checks the ID-JAG (signature against Okta's keys, `typ`, `aud`, `client_id`, lifetime, single use) and issues an access token for `https://mcp.acme.example/mcp` only. It issues no refresh token: the client asks Okta for a new ID-JAG when the token expires.
 - Every MCP request carries that token. Policy sees the Okta user as a verified caller, with the client's `client_roles` and the granted scopes.
 
-This is a core feature: no license is needed. For interactive sign-in (clients that cannot get an ID-JAG) and for calling Cross App Access upstreams per user, start from `interactive-login-okta.yaml` instead.
+Enterprise-managed authorization is a core feature and needs no license. The NATS coordinator (`dev.mcpg.cluster.nats`) that shares the single-use ledger across replicas is a licensed plugin: it needs a license that entitles `cluster.*` plugins (Team, Enterprise), or `license.non_production_use: true` outside production. One replica on `cluster.kind: single_node` needs neither. For interactive sign-in (clients that cannot get an ID-JAG) and for calling Cross App Access upstreams per user, start from `interactive-login-okta.yaml` instead.
 
 ## Set up Okta
 
@@ -28,7 +28,7 @@ Okta limits ID-JAGs on SSO plans to 250 per user, per resource app, per month. O
 - **Hosts.** `mcp.acme.example`, `acme.okta.com` and `crm.internal.example` are placeholders. The issuer, `canonical_url` and the resource share one origin.
 - **The client.** Create the secret of `claude-ema` yourself and give the client ID and secret to the MCP client where its vendor's documentation says. For a client that authenticates with `private_key_jwt`, replace `client_secret` with `jwks_uri` (or inline `jwks`). A client that identifies with a Client ID Metadata Document needs no `clients[]` entry: list its host under `client_id_metadata_documents.allowed_hosts`.
 - **Groups.** Okta ID-JAGs carry no group claim. Key policy on `identity.roles` from `client_roles`, on `identity.attributes["client_id"]`, or on claims you copy with `claim_mappings.attribute_claim_mappings`.
-- **Single node.** With `cluster.kind: single_node`, remove `servers`, `node`, `jetstream` and `state_encryption_key_env`. The single-use ledger then lives in the process: it survives a reload but not a restart.
+- **Single node.** With `cluster.kind: single_node`, remove `servers`, `node`, `jetstream` and `state_encryption_key_env`, the `dev.mcpg.cluster.nats` entry in `plugins` and the `license` block. The single-use ledger then lives in the process: it survives a reload but not a restart.
 - **Signing key.** Generate a P-256 key (`openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256`). Its public half is served at `/oauth/jwks`. To rotate, list the new key first and keep the old one until the tokens it signed have expired.
 
 ## Required env vars

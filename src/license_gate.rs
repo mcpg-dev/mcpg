@@ -3,9 +3,11 @@
 //! The gateway resolves an offline claims envelope — the configured
 //! `license:` token, or the built-in community tier — and refuses a config
 //! whose `plugins[]` contain entitlement-gated plugins, or whose blocks turn
-//! on a feature-gated surface (interactive sign-in: `sso.interactive_login`),
-//! that the envelope does not admit. `license.non_production_use` loads them
-//! anyway under the license's free non-production grant, loudly.
+//! on a feature-gated surface of the embedded authorization server
+//! (interactive sign-in: `sso.interactive_login`; DPoP: `oauth.dpop`; rich
+//! authorization requests: `oauth.rich_authorization`), that the envelope
+//! does not admit. `license.non_production_use` loads them anyway under the
+//! license's free non-production grant, loudly.
 //!
 //! Two halves defer to the control plane, each only where the control plane
 //! checks: plugins on a CP-attached gateway, which the plugin-set bind admits;
@@ -16,8 +18,8 @@
 
 use anyhow::{Context, bail};
 use mcpg_control_plane_license::license::{
-    self, FEATURE_INTERACTIVE_LOGIN, LicenseClaims, is_entitlement_gated, plugin_load_violation,
-    verify_license,
+    self, FEATURE_DPOP, FEATURE_INTERACTIVE_LOGIN, FEATURE_RICH_AUTHORIZATION, LicenseClaims,
+    is_entitlement_gated, plugin_load_violation, verify_license,
 };
 
 use crate::config::{AppConfig, LicenseConfig};
@@ -27,7 +29,9 @@ use crate::config::{AppConfig, LicenseConfig};
 const GATEWAY_AUDIENCE: &str = "mcpg-gateway";
 
 /// The config surfaces a license feature withholds, as
-/// `(feature, config path of the block)`.
+/// `(feature, config path of the block)`. A block counts only when it turns
+/// its surface on: `dpop` with `enabled: true`, `authorization_details` with
+/// at least one type. A present block that leaves it off needs no feature.
 pub fn licensed_config_surfaces(config: &AppConfig) -> Vec<(&'static str, String)> {
     const SERVER: &str = "governance.access.authorization_server";
     let Some(ref server) = config.governance.access.authorization_server else {
@@ -47,6 +51,15 @@ pub fn licensed_config_surfaces(config: &AppConfig) -> Vec<(&'static str, String
     if server.interactive.is_some() {
         surfaces.push((FEATURE_INTERACTIVE_LOGIN, format!("{SERVER}.interactive")));
     }
+    if server.dpop.enabled {
+        surfaces.push((FEATURE_DPOP, format!("{SERVER}.dpop")));
+    }
+    if server.authorization_details.enabled() {
+        surfaces.push((
+            FEATURE_RICH_AUTHORIZATION,
+            format!("{SERVER}.authorization_details"),
+        ));
+    }
     surfaces
 }
 
@@ -57,9 +70,10 @@ fn control_plane_binds_plugins(config: &AppConfig) -> bool {
     cfg!(feature = "cp-attached") && config.gateway.control_plane.is_some()
 }
 
-/// Whether the managed-cloud platform rendered this config: its provisioner
-/// stamps `gateway.control_plane` and the placement provenance on every
-/// render, and renders only a config the publish guard admitted.
+/// Whether this config carries the stamp the managed-cloud provisioner puts on
+/// every render (`gateway.control_plane` and the placement provenance); the
+/// platform renders only a config its publish guard admitted. The stamp is
+/// taken on trust, not verified.
 fn platform_rendered(config: &AppConfig) -> bool {
     let provenance = &config.cloud.provenance;
     control_plane_binds_plugins(config)
@@ -412,6 +426,166 @@ mod tests {
             .expect_err("provenance without a control plane is not a platform render");
 
         let rendered = interactive_login_config(&format!("{ATTACHED}{PROVENANCE}"));
+        assert_eq!(
+            enforce_license_gate(&rendered).is_ok(),
+            cfg!(feature = "cp-attached"),
+            "a platform render passed the publish guard"
+        );
+    }
+
+    /// An EMA-only authorization server with `extra` under it, parsed without
+    /// validation: the gate reads the blocks, not their contents.
+    fn authorization_server_config(server_extra: &str, extra: &str) -> AppConfig {
+        let yaml = format!(
+            "governance:\n  access:\n    authorization_server:\n      issuer: https://mcp.example.com\n      \
+             signing_secret: ema-signing-secret-0123456789abcdef\n      trusted_idps:\n        \
+             - issuer: https://acme.okta.com\n{server_extra}{extra}"
+        );
+        serde_yaml::from_str(&yaml).expect("test config parses")
+    }
+
+    const DPOP_ON: &str = "      dpop:\n        enabled: true\n        required: true\n";
+    const DETAILS_ON: &str = "      authorization_details:\n        types:\n          \
+                              - type: mcp_tool\n            actions: [\"tools/call\"]\n";
+
+    fn constrained_tokens_config(extra: &str) -> AppConfig {
+        authorization_server_config(&format!("{DPOP_ON}{DETAILS_ON}"), extra)
+    }
+
+    /// DPoP and rich authorization requests are enterprise-only: the
+    /// community envelope and a team license refuse to boot with either
+    /// turned on and name the block, the feature and the plan; an enterprise
+    /// license or the non-production grant admit both.
+    #[test]
+    fn dpop_and_rich_authorization_need_their_license_features() {
+        assert_eq!(
+            licensed_config_surfaces(&constrained_tokens_config("")),
+            vec![
+                (
+                    FEATURE_DPOP,
+                    "governance.access.authorization_server.dpop".to_owned()
+                ),
+                (
+                    FEATURE_RICH_AUTHORIZATION,
+                    "governance.access.authorization_server.authorization_details".to_owned()
+                ),
+            ]
+        );
+
+        for (plan, license_yaml) in [
+            ("community", String::new()),
+            ("team", license_yaml_for("team")),
+        ] {
+            let err = enforce_license_gate(&constrained_tokens_config(&license_yaml))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(&format!("plan `{plan}`"))
+                    && err.contains("2 configured item(s)")
+                    && err.contains(
+                        "governance.access.authorization_server.dpop requires the `oauth.dpop` \
+                         plan feature"
+                    )
+                    && err.contains(
+                        "governance.access.authorization_server.authorization_details requires \
+                         the `oauth.rich_authorization` plan feature"
+                    )
+                    && err.contains("non_production_use"),
+                "{err}"
+            );
+
+            let dpop_only = authorization_server_config(DPOP_ON, &license_yaml);
+            let err = enforce_license_gate(&dpop_only).unwrap_err().to_string();
+            assert!(
+                err.contains("1 configured item(s)")
+                    && err.contains("`oauth.dpop`")
+                    && !err.contains("oauth.rich_authorization"),
+                "{err}"
+            );
+            let details_only = authorization_server_config(DETAILS_ON, &license_yaml);
+            let err = enforce_license_gate(&details_only).unwrap_err().to_string();
+            assert!(
+                err.contains("1 configured item(s)")
+                    && err.contains("`oauth.rich_authorization`")
+                    && !err.contains("oauth.dpop"),
+                "{err}"
+            );
+        }
+        enforce_license_gate(&constrained_tokens_config(&license_yaml_for("enterprise")))
+            .expect("enterprise licenses DPoP and rich authorization requests");
+        enforce_license_gate(&constrained_tokens_config(
+            "license:\n  non_production_use: true\n",
+        ))
+        .expect("the non-production grant admits DPoP and rich authorization requests");
+    }
+
+    /// Every gated block of one server is named in one refusal, whichever
+    /// feature it needs.
+    #[test]
+    fn one_refusal_names_every_authorization_server_feature() {
+        let every = format!("{DPOP_ON}{DETAILS_ON}      interactive: {{}}\n");
+        let err = enforce_license_gate(&authorization_server_config(&every, ""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("3 configured item(s)")
+                && err.contains("`sso.interactive_login`")
+                && err.contains("`oauth.dpop`")
+                && err.contains("`oauth.rich_authorization`"),
+            "{err}"
+        );
+    }
+
+    /// A present block that leaves its surface off needs no feature: `dpop`
+    /// with `enabled: false` whatever its other keys, and
+    /// `authorization_details` without a type.
+    #[test]
+    fn disabled_dpop_and_authorization_details_blocks_need_no_feature() {
+        for server_extra in [
+            "      dpop:\n        enabled: false\n        nonce: always\n        \
+             proof_max_age_secs: 30\n        allowed_algs: [ES256]\n",
+            "      dpop: {}\n",
+            "      authorization_details:\n        max_entries: 8\n",
+            "      authorization_details:\n        types: []\n        max_entries: 4\n",
+            "      dpop:\n        enabled: false\n      authorization_details:\n        types: []\n",
+        ] {
+            let cfg = authorization_server_config(server_extra, "");
+            assert!(licensed_config_surfaces(&cfg).is_empty(), "{server_extra}");
+            enforce_license_gate(&cfg).expect(server_extra);
+        }
+    }
+
+    /// As for interactive sign-in, a `gateway.control_plane` block alone does
+    /// not lift the gate; only a config the platform rendered defers to the
+    /// publish guard that admitted it.
+    #[test]
+    fn only_a_platform_rendered_config_defers_dpop_and_rich_authorization_to_the_control_plane() {
+        const ATTACHED: &str = "gateway:\n  control_plane:\n    url: http://127.0.0.1:9\n    \
+                                enrollment_url: http://127.0.0.1:9\n";
+        const PROVENANCE: &str =
+            "cloud:\n  provenance:\n    cluster_id: cell-1\n    namespace: tenant-acme\n";
+
+        let attached = constrained_tokens_config(ATTACHED);
+        assert!(attached.gateway.control_plane.is_some());
+        let err = enforce_license_gate(&attached)
+            .expect_err("an attached gateway's local blocks need the features")
+            .to_string();
+        assert!(
+            err.contains("`oauth.dpop`")
+                && err.contains("`oauth.rich_authorization`")
+                && err.contains("2 configured item(s)"),
+            "{err}"
+        );
+        enforce_license_gate(&constrained_tokens_config(&format!(
+            "{ATTACHED}{}",
+            license_yaml_for("enterprise")
+        )))
+        .expect("a local enterprise license admits an attached gateway's blocks");
+
+        enforce_license_gate(&constrained_tokens_config(PROVENANCE))
+            .expect_err("provenance without a control plane is not a platform render");
+
+        let rendered = constrained_tokens_config(&format!("{ATTACHED}{PROVENANCE}"));
         assert_eq!(
             enforce_license_gate(&rendered).is_ok(),
             cfg!(feature = "cp-attached"),

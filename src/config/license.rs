@@ -34,11 +34,12 @@ pub struct LicenseConfig {
     pub pubkey_pem: Option<String>,
 
     /// Declares this deployment non-production. Entitlement-gated
-    /// plugins and feature-gated config blocks (interactive sign-in at the
-    /// embedded authorization server) then load without a token under
-    /// their license's free non-production grant (development, testing,
-    /// evaluation, staging), with a boot warning naming them. Production
-    /// use still requires an entitling token.
+    /// plugins and feature-gated config blocks (interactive sign-in, DPoP
+    /// and rich authorization requests at the embedded authorization
+    /// server) then load without a token under their license's free
+    /// non-production grant (development, testing, evaluation, staging),
+    /// with a boot warning naming them. Production use still requires an
+    /// entitling token.
     #[serde(default)]
     pub non_production_use: bool,
 }

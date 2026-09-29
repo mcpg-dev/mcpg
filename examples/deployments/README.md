@@ -1,10 +1,12 @@
 # MCPG deployment templates
 
-Canonical configurations covering the deployment topologies most operators land on. Each YAML is **valid against the live `AppConfig` schema** — the `deployments_validate` suite of the `mcpg-config` crate (`cargo test -p mcpg-config --test deployments_validate`) enforces it on every CI run, and you can validate any of them locally with:
+Canonical configurations covering the deployment topologies most operators land on. Each YAML is **valid against the live `AppConfig` schema** — CI runs `mcpg-config check` on every one of them, and you can validate any of them yourself with:
 
 ```bash
-cargo run -p mcpg-config -- check examples/deployments/<name>.yaml
+mcpg config check examples/deployments/<name>.yaml
 ```
+
+The `mcpg` binary answers `config check` itself, against the schema of the gateway it would boot; the standalone `mcpg-config check` runs the same validation.
 
 Each YAML carries a `# yaml-language-server: $schema=./config.schema.json` header. Open one in VS Code (with the [YAML extension](https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml)) or any IntelliJ IDE and you get autocomplete + hover docs sourced from the gateway's own `///` rustdoc — no separate documentation lookup required.
 
@@ -18,7 +20,7 @@ Each YAML carries a `# yaml-language-server: $schema=./config.schema.json` heade
 | [`production-nats-cluster.yaml`](production-nats-cluster.yaml) | NATS JetStream variant of the cluster topology. Pick this when your platform already runs NATS. |
 | [`air-gapped.yaml`](air-gapped.yaml) | Zero-outbound deploy. Local plugin tree, static JWKS, file storage, file audit. |
 | [`multi-tenant.yaml`](multi-tenant.yaml) | Single gateway, many tenants. Per-tenant session quota, per-tenant rate limit, group-gated admin tools. |
-| [`enterprise-managed-auth.yaml`](enterprise-managed-auth.yaml) | Embedded authorization server that redeems Okta Cross App Access (Agent SSO) ID-JAGs for MCP clients such as Claude and VS Code. NATS cluster with a shared single-use ledger. No license needed. |
+| [`enterprise-managed-auth.yaml`](enterprise-managed-auth.yaml) | Embedded authorization server that redeems Okta Cross App Access (Agent SSO) ID-JAGs for MCP clients such as Claude and VS Code. NATS cluster with a shared single-use ledger. EMA needs no license; the NATS coordinator needs a Team or Enterprise license. |
 | [`interactive-login-okta.yaml`](interactive-login-okta.yaml) | Embedded authorization server with Okta: EMA ID-JAGs, interactive sign-in for Claude Code / VS Code / CLIs, and a Cross App Access upstream per user. Enterprise license (`sso.interactive_login`). |
 | [`mcp-apps.yaml`](mcp-apps.yaml) | MCP Apps: front Apps-capable servers (passthrough, capability advertisement, tighten-only CSP) and author UIs from config. |
 
@@ -27,23 +29,24 @@ Each YAML carries a `# yaml-language-server: $schema=./config.schema.json` heade
 These are **starting points**, not turnkey configs. Treat each YAML as a layer-zero base, then either:
 
 1. **Copy and edit in place** for a one-off deployment.
-2. **Layer overrides via [multi-file config support](https://github.com/mcpg-dev/mcpg/blob/main/docs/configuration.md#multi-file-config)** — combine a base template with environment-specific overrides:
+2. **Layer overrides via [multi-file config support](https://mcpg.dev/docs/gateway/config-sources)** — combine a base template with environment-specific overrides:
 
    ```bash
    MCPG_CONFIG=examples/deployments/production-redis-cluster.yaml:./local-overrides.yaml mcpg
    ```
 
-   `local-overrides.yaml` only needs to declare the fields you're changing — figment deep-merges the rest from the base.
+   `local-overrides.yaml` only needs to declare the fields you're changing — objects deep-merge with the base. Lists replace wholesale, so an override that changes `plugins` or an OIDC `providers` list restates the whole list.
 
 ## What's not in here
 
 - **`MCPG_*` env vars** — every template has a comment block listing the env vars it expects. The gateway resolves `${env.X}` at config-load time, and `MCPG_*` overrides apply last (after every file).
-- **Plugin sourcing** — production templates assume `oci:` references resolve against your registry. Point `gateway.plugin_registry.default_registry` at your internal mirror, or pre-stage `source.path` references for fully sealed deploys (see `air-gapped.yaml`).
+- **Plugin sourcing** — templates that pull plugins name either the published coordinates (`ghcr.io/mcpg-dev/plugins/<name>:<version>`) or a placeholder mirror (`registry.acme.example`), each pinned to a release; use the plugin releases that match the gateway you run. To pull through your own registry, list it under `gateway.plugin_registry.mirrors` (a mirror replaces the registry host and keeps the repository path) or point each `oci:` at it — `gateway.plugin_registry.default_registry` applies only to references that name no registry. For fully sealed deploys, pre-stage the artifacts and use `source.path` (see `air-gapped.yaml`).
 - **TLS materials** — production templates assume cert/key paths exist on disk. Wire your secret manager / cert-manager into the listed paths.
+- **A license token** — the `redis` and `nats` cluster coordinators are licensed plugins. The templates that use one read a license from `/etc/mcpg/license/license.jwt` and refuse to boot without a license that entitles `cluster.*` plugins (Team, Enterprise). To evaluate one outside production, replace the `license` block with `non_production_use: true`.
 
 ## Schema drift
 
-`config.schema.json` in this directory is a snapshot of `AppConfig`'s JSON Schema, generated by `mcpg-config schema`. CI re-generates it and fails on drift, so the IDE autocomplete you see always matches the running gateway. Operators who fork these templates can either:
+`config.schema.json` in this directory is a snapshot of `AppConfig`'s JSON Schema, generated by `mcpg-config schema`. CI re-generates it and fails on drift, so the IDE autocomplete you see matches the gateway built from the same source. Operators who fork these templates can either:
 
 - Pin to the committed schema (stable, breaks when MCPG bumps a major version with config changes), or
-- Run `cargo run -p mcpg --bin mcpg-config -- schema > config.schema.json` locally to keep current.
+- Regenerate it from the release you run: `mcpg-config schema > config.schema.json`.

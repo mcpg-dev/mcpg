@@ -49,11 +49,17 @@ mcp:
         tools: true
       naming:
         tool_prefix: "notion."
+      governance:
+        minimum_trust: unauthenticated
 ```
 
 Boot MCPG; `tools/list` now includes `notion.search`, `notion.create_page`, …
 and `tools/call` for them is proxied to the upstream. That's it — no auth (the
-upstream is public), default governance (inherits the gateway default trust).
+upstream is public). The `governance` line is there because this config has no
+identity source, so every caller is `unauthenticated`. The default floor is
+`header_asserted`, and a caller below the floor does not see the tools in
+`tools/list`. When you add an identity source, remove the line or raise the
+floor.
 
 ---
 
@@ -68,12 +74,12 @@ mcp:
                                      #   Must be unique; must not shadow a native binding.
 
       governance:                   # Inherited by EVERY synthetic capability (like a native binding).
-        minimum_trust: verified     #   unauthenticated | header_asserted | verified  (default: gateway default)
-        allow_if: "identity.has_group('notion-users')"   # optional CEL; same engine as native per-tool rules
+        minimum_trust: verified     #   unauthenticated | header_asserted | verified  (default: header_asserted)
+        allow_if: '"notion-users" in identity.groups'   # optional CEL; same engine as native per-tool rules
 
       retry:                        # optional; upstream call retry
         max_attempts: 2
-        backoff_ms: 500
+        initial_backoff_ms: 500
 
       upstream:
         url: https://notion-mcp.example.com/mcp   # required for streamable_http; omit for stdio
@@ -131,7 +137,6 @@ mcp:
         poll_interval_ms: 30000     # poll cadence; subscriber-gated (no subscribers → no polling)
 
       session:
-        mode: per_client            # per_client (default). `shared` not yet supported.
         idle_timeout_secs: 600      # idle satellite teardown; default 600
 
       response:
@@ -216,6 +221,10 @@ mcp:
 
 plugins:
   - id: dev.mcpg.credential.oauth-id-jag
+    class: credential_issuer
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/credential-oauth-id-jag:protocol-1"
+    granted_capabilities: [network_outbound]
     config:
       target_template:
         allowed_targets: ["com.acme/*"]   # fail-closed: only these expand
@@ -410,12 +419,18 @@ URI — no separate route type.
 ## 5. Filtering tools
 
 `filter` is a minimal glob (`*` = all, `prefix*` = prefix glob, exact otherwise)
-applied to **upstream tool names** before prefixing:
+applied to **upstream tool names** before prefixing. There is no suffix glob: a
+leading `*` is literal, so `*_admin` matches only a tool named `*_admin`.
 
 ```yaml
-filter:
-  include_tools: ["search*", "read_*"]   # only these import
-  exclude_tools: ["*_admin", "delete_*"] # …minus these (exclude wins)
+mcp:
+  federations:
+    - name: notion
+      upstream:
+        url: https://notion-mcp.example.com/mcp
+      filter:
+        include_tools: ["search*", "read_*"]    # only these import
+        exclude_tools: ["admin_*", "delete_*"]  # …minus these (exclude wins)
 ```
 
 Use it to expose a safe subset of a powerful upstream.
@@ -429,15 +444,26 @@ exactly as if you'd written it on a native binding:
 
 - **`minimum_trust`** — `unauthenticated` < `header_asserted` < `verified`. A
   caller below the bar can't call the federated tool — and the tool is **hidden
-  from `tools/list`** for that caller (visibility honours trust).
+  from `tools/list`** for that caller (visibility honours trust). Unset, it is
+  `header_asserted`: `governance.policy.tool_access.default_minimum_trust` does
+  not reach federated capabilities, so set the floor on each federation.
 - **`allow_if`** — a CEL expression evaluated per call against the caller's
-  identity (groups, roles, claims). Same engine and semantics as native
-  per-tool `allow_if`.
+  identity (`identity.groups`, `identity.roles`, `identity.scopes`,
+  `identity.attributes`) and `tool_name`, the prefixed name the client called.
+  Same engine and semantics as native per-tool `allow_if`; an expression that
+  fails to evaluate denies the call.
 
 ```yaml
-governance:
-  minimum_trust: verified
-  allow_if: "identity.has_group('notion-users') && !request.tool.endsWith('.delete_page')"
+mcp:
+  federations:
+    - name: notion
+      upstream:
+        url: https://notion-mcp.example.com/mcp
+      naming:
+        tool_prefix: "notion."
+      governance:
+        minimum_trust: verified
+        allow_if: '"notion-users" in identity.groups && !tool_name.endsWith(".delete_page")'
 ```
 
 This is enforced at dispatch by the same `PreDispatchPolicyGate` that guards
@@ -493,6 +519,9 @@ cached + auto-refreshed; no client secret lives in the federation config.
 ```yaml
 plugins:
   - id: dev.mcpg.credential.oauth-client-credentials
+    class: credential_issuer
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/credential-oauth-client-credentials:protocol-1"
     config:
       providers:
         notion:
@@ -524,6 +553,9 @@ import/listen (no caller) the upstream is listed anonymously, like
 ```yaml
 plugins:
   - id: dev.mcpg.credential.oauth-token-exchange
+    class: credential_issuer
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/credential-oauth-token-exchange:protocol-1"
     config:
       providers:
         notion:
@@ -581,6 +613,10 @@ own scope policy.
 ```yaml
 plugins:
   - id: dev.mcpg.credential.oauth-id-jag
+    class: credential_issuer
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/credential-oauth-id-jag:protocol-1"
+    granted_capabilities: [network_outbound]
     config:
       providers:
         partner:
@@ -635,6 +671,10 @@ caller's bearer:
 ```yaml
 plugins:
   - id: dev.mcpg.credential.oauth-id-jag
+    class: credential_issuer
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/credential-oauth-id-jag:protocol-1"
+    granted_capabilities: [network_outbound]
     config:
       providers:
         partner:
@@ -854,8 +894,8 @@ mcp:
     - name: acme-internal
       upstream:
         url: tunnel://acme-internal/mcp      # <name> = the private tunnel's name
-      auth:
-        mode: pass_through                   # forward the caller identity downstream
+        auth:
+          mode: pass_through                 # forward the caller identity downstream
 ```
 
 `tunnel://<name>/<path>` resolves at connect time to
@@ -996,7 +1036,7 @@ the link was for; never the link id.
   highest level your callers legitimately have, and add an `allow_if` group/role
   gate. Federation inherits — but only what you configure.
 - Use `filter.exclude_tools` to drop destructive/admin tools you don't want
-  exposed (`exclude_tools: ["*_delete", "admin_*"]`).
+  exposed (`exclude_tools: ["delete_*", "admin_*"]`).
 
 **Auth**
 - Never inline secrets — use `${env.VAR}` or `${cred://…}`; the literal then
@@ -1033,6 +1073,9 @@ the link was for; never the link id.
 ```yaml
 plugins:
   - id: dev.mcpg.credential.oauth-client-credentials
+    class: credential_issuer
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/credential-oauth-client-credentials:protocol-1"
     config:
       providers:
         notion: { token_url: https://auth.notion.example.com/oauth/token,
@@ -1041,14 +1084,14 @@ plugins:
 mcp:
   federations:
     - name: notion
-      governance: { minimum_trust: verified, allow_if: "identity.has_group('notion')" }
+      governance: { minimum_trust: verified, allow_if: '"notion" in identity.groups' }
       upstream:
         url: https://notion-mcp.example.com/mcp
         auth: { mode: oauth_client_credentials,
                 credential: cred://dev.mcpg.credential.oauth-client-credentials/notion }
       import: { tools: true, resources: true, prompts: true }
       naming: { tool_prefix: "notion.", resource_uri_prefix: "mcp://notion/", prompt_prefix: "notion." }
-      filter: { exclude_tools: ["*_delete"] }
+      filter: { exclude_tools: ["delete_*"] }
 ```
 
 ### B. Local tool server over stdio
@@ -1069,6 +1112,9 @@ mcp:
 ```yaml
 plugins:
   - id: dev.mcpg.credential.oauth-token-exchange
+    class: credential_issuer
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/credential-oauth-token-exchange:protocol-1"
     config:
       providers:
         drive: { token_url: https://sts.example.com/token, client_id: mcpg,

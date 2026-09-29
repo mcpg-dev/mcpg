@@ -10,18 +10,17 @@
 # What's different from production-single-redis:
 #   - delivery + cancellation buses are pinned to the cluster's pub/sub
 #     primitive so server-initiated messages reach the right replica.
-#   - cluster.pool_size raised — more concurrent connections survive a
-#     thundering-herd reconnect.
 #   - each replica writes its audit trail to a host-mounted path; ship
 #     that path to a central SIEM with a filebeat/vector/fluentbit
 #     sidecar so the trail is greppable across all N pods.
 #
 # Required env vars:
-#   MCPG_OIDC_CLIENT_ID, MCPG_OIDC_CLIENT_SECRET   — IdP credentials
-#   MCPG_REDIS_URL                                  — rediss:// preferred
-#   MCPG_CLUSTER_STATE_KEY                          — URL-safe-base64 32-byte
-#                                                     state key, same on every
-#                                                     replica
+#   MCPG_REDIS_URL          — rediss:// preferred
+#   MCPG_REDIS_PASSWORD     — Redis password, kept out of the URL
+#   MCPG_CLUSTER_STATE_KEY  — URL-safe-base64 32-byte state key, same on
+#                             every replica
+#   MCPG_LICENSE_PUBKEY     — public key (SPKI PEM) that verifies the license
+#   ACCOUNTS_API_TOKEN      — upstream token of the example binding
 
 gateway:
   server:
@@ -42,7 +41,6 @@ cluster:
   url: "${env.MCPG_REDIS_URL}"
   password: "${env.MCPG_REDIS_PASSWORD}"
   key_prefix: "mcpg:prod"
-  pool_size: 32
   # Required for any non-single_node cluster: seals all coordinator-backed
   # capability state (sessions incl. SSE replay, pipelines, tasks, delivery,
   # cancellation, …) with XChaCha20-Poly1305 and derives the key that makes
@@ -51,6 +49,14 @@ cluster:
   # a URL-safe-base64 32-byte key, IDENTICAL on every replica:
   #   openssl rand -base64 32 | tr '+/' '-_'
   state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
+
+# The Redis coordinator is a licensed plugin: the gateway refuses to load
+# it without a license that entitles `cluster.*` plugins (Team,
+# Enterprise). Outside production, `non_production_use: true` in place of
+# the token loads it under the non-production grant.
+license:
+  token_file: "/etc/mcpg/license/license.jwt"
+  pubkey_pem: "${env.MCPG_LICENSE_PUBKEY}"
 
 # `delivery` and `cancellation` are intentionally omitted — when their
 # `bus` is unset they inherit the cluster's pub/sub primitive (Redis
@@ -83,6 +89,48 @@ governance:
         config:
           path: "/var/log/mcpg/audit.log"
 
+# The gateway image carries no plugins: each entry below is a signed
+# artifact the gateway pulls and verifies at boot. Without the Redis or
+# the OIDC entry the gateway refuses to boot; without a sink's entry it
+# boots but does not export that signal. Pin the releases that match the
+# gateway you run, or point `oci:` at your mirror of them.
+plugins:
+  # The coordinator `cluster.kind: redis` selects. It takes its settings
+  # from the `cluster:` block, so the entry carries no `config:`.
+  - id: dev.mcpg.cluster.redis
+    class: cluster
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/cluster-redis:0.1.0-alpha.41"
+    granted_capabilities: [network_outbound]
+  # Its `providers` must match `governance.access.oidc_oauth.providers`.
+  - id: dev.mcpg.identity.oidc
+    class: identity_provider
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/identity-oidc:0.1.0-alpha.41"
+    # OIDC discovery and JWKS fetches from the IdP.
+    granted_capabilities: [network_outbound]
+    config:
+      providers:
+        - issuer: "https://example.okta.com"
+          audiences: ["mcpg-gateway"]
+          verification:
+            kind: oidc_jwks
+            allowed_algs: ["RS256"]
+  - id: dev.mcpg.observability.prometheus
+    class: metrics_sink
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/observability-prometheus:0.1.0-alpha.41"
+  # Exports spans over OTLP/gRPC, so `url` names the collector's gRPC
+  # port (4317), not its OTLP/HTTP one (4318).
+  - id: dev.mcpg.observability.otlp
+    class: telemetry_sink
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/observability-otlp:0.1.0-alpha.41"
+    granted_capabilities: [network_outbound]
+    config:
+      url: "http://otel-collector.observability.svc.cluster.local:4317"
+      service_name: "mcpg-gateway"
+
 mcp:
   capabilities:
     tools:
@@ -108,13 +156,14 @@ observability:
     sinks:
       - kind: stderr
         config: { format: json }
+  # Served on the gateway listener (`bind_address`), not a port of its own.
   metrics:
     sinks:
       - kind: dev.mcpg.observability.prometheus
-        config: { path: "/metrics", bind: "0.0.0.0:9090" }
+        config: { path: "/metrics" }
+  # The collector endpoint is the `config.url` of the plugin entry above.
   traces:
     enabled: true
     service_name: "mcpg-gateway"
     sinks:
       - kind: dev.mcpg.observability.otlp
-        config: { url: "http://otel-collector.observability.svc.cluster.local:4318" }

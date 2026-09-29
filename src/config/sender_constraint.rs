@@ -38,7 +38,9 @@ const MAX_DETAIL_ENTRIES: u32 = 64;
 /// parameter, and an ID-JAG bound to a key (`cnf`) is refused. Turn it on
 /// only after every replica runs a build that knows this block: a replica
 /// without it drops the key binding of a sign-in's grant when it rotates
-/// the grant's refresh token.
+/// the grant's refresh token. Turning it on (`enabled: true`) requires a
+/// license with the `oauth.dpop` feature; a block that leaves it off needs
+/// none.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct DpopConfig {
@@ -59,6 +61,7 @@ pub struct DpopConfig {
     /// server metadata and the protected resource metadata publish
     /// `dpop_signing_alg_values_supported`. A token bound to a key is never
     /// accepted with the `Bearer` scheme, even after DPoP is turned off.
+    /// Requires a license with the `oauth.dpop` feature.
     pub enabled: bool,
     /// Issue and accept only DPoP-bound tokens of this authorization
     /// server: a token request without a proof is refused, with
@@ -202,7 +205,9 @@ impl DpopConfig {
 /// `authorization_details` request parameter is ignored. Turn it on only
 /// after every replica runs a build that knows this block: a replica
 /// without it drops the details of a sign-in's grant when it rotates the
-/// grant's refresh token, and the grant's next tokens carry none.
+/// grant's refresh token, and the grant's next tokens carry none. Turning
+/// it on (a non-empty `types`) requires a license with the
+/// `oauth.rich_authorization` feature; a block without a type needs none.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuthorizationDetailsConfig {
@@ -227,7 +232,8 @@ pub struct AuthorizationDetailsConfig {
     /// metadata and the protected resource metadata. A parameter that fails
     /// a rule is refused with `invalid_authorization_details`. An
     /// authorization request with details and no `scope` is granted no
-    /// scope.
+    /// scope. Non-empty requires a license with the
+    /// `oauth.rich_authorization` feature.
     pub types: Vec<AuthorizationDetailsTypeConfig>,
     /// Most objects one `authorization_details` array may hold (1–64).
     /// The array is also limited to 8 KiB of JSON.

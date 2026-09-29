@@ -8,11 +8,15 @@
 # other services; pick redis-cluster when it doesn't.
 #
 # Required env vars:
-#   MCPG_OIDC_CLIENT_ID, MCPG_OIDC_CLIENT_SECRET   — IdP credentials
-#   MCPG_NATS_URL                                   — nats://… or tls://…
-#   MCPG_CLUSTER_STATE_KEY                          — URL-safe-base64 32-byte
-#                                                     state key, same on every
-#                                                     replica
+#   MCPG_NATS_URL           — tls://… (a plaintext nats://… needs the
+#                             opt-outs under `cluster`)
+#   MCPG_CLUSTER_STATE_KEY  — URL-safe-base64 32-byte state key, same on
+#                             every replica
+#   MCPG_LICENSE_PUBKEY     — public key (SPKI PEM) that verifies the license
+#   HOSTNAME               — `cluster.node.id`, unique per replica. A
+#                             container runtime exports it; a shell sets
+#                             it without exporting it, so export it when
+#                             running outside a container.
 
 gateway:
   server:
@@ -50,6 +54,14 @@ cluster:
   #   openssl rand -base64 32 | tr '+/' '-_'
   state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
 
+# The NATS coordinator is a licensed plugin: the gateway refuses to load
+# it without a license that entitles `cluster.*` plugins (Team,
+# Enterprise). Outside production, `non_production_use: true` in place of
+# the token loads it under the non-production grant.
+license:
+  token_file: "/etc/mcpg/license/license.jwt"
+  pubkey_pem: "${env.MCPG_LICENSE_PUBKEY}"
+
 # `delivery` and `cancellation` inherit the cluster's pub/sub by default
 # (NATS subject-based fan-out here) — no override needed.
 
@@ -74,6 +86,48 @@ governance:
         config:
           path: "/var/log/mcpg/audit.log"
 
+# The gateway image carries no plugins: each entry below is a signed
+# artifact the gateway pulls and verifies at boot. Without the NATS or
+# the OIDC entry the gateway refuses to boot; without a sink's entry it
+# boots but does not export that signal. Pin the releases that match the
+# gateway you run, or point `oci:` at your mirror of them.
+plugins:
+  # The coordinator `cluster.kind: nats` selects. It takes its settings
+  # from the `cluster:` block, so the entry carries no `config:`.
+  - id: dev.mcpg.cluster.nats
+    class: cluster
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/cluster-nats:0.1.0-alpha.41"
+    granted_capabilities: [network_outbound]
+  # Its `providers` must match `governance.access.oidc_oauth.providers`.
+  - id: dev.mcpg.identity.oidc
+    class: identity_provider
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/identity-oidc:0.1.0-alpha.41"
+    # OIDC discovery and JWKS fetches from the IdP.
+    granted_capabilities: [network_outbound]
+    config:
+      providers:
+        - issuer: "https://example.okta.com"
+          audiences: ["mcpg-gateway"]
+          verification:
+            kind: oidc_jwks
+            allowed_algs: ["RS256"]
+  - id: dev.mcpg.observability.prometheus
+    class: metrics_sink
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/observability-prometheus:0.1.0-alpha.41"
+  # Exports spans over OTLP/gRPC, so `url` names the collector's gRPC
+  # port (4317), not its OTLP/HTTP one (4318).
+  - id: dev.mcpg.observability.otlp
+    class: telemetry_sink
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/observability-otlp:0.1.0-alpha.41"
+    granted_capabilities: [network_outbound]
+    config:
+      url: "http://otel-collector.observability.svc.cluster.local:4317"
+      service_name: "mcpg-gateway"
+
 mcp:
   capabilities:
     tools:
@@ -94,13 +148,14 @@ observability:
     sinks:
       - kind: stderr
         config: { format: json }
+  # Served on the gateway listener (`bind_address`), not a port of its own.
   metrics:
     sinks:
       - kind: dev.mcpg.observability.prometheus
-        config: { path: "/metrics", bind: "0.0.0.0:9090" }
+        config: { path: "/metrics" }
+  # The collector endpoint is the `config.url` of the plugin entry above.
   traces:
     enabled: true
     service_name: "mcpg-gateway"
     sinks:
       - kind: dev.mcpg.observability.otlp
-        config: { url: "http://otel-collector.observability.svc.cluster.local:4318" }

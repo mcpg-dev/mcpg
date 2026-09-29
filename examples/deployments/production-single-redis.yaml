@@ -9,9 +9,11 @@
 # retry + governance — replace with your tools.
 #
 # Required env vars:
-#   MCPG_OIDC_CLIENT_SECRET   — OIDC client secret for token verification
 #   MCPG_REDIS_URL            — e.g. rediss://gateway-cache.internal:6380
+#   MCPG_REDIS_PASSWORD       — Redis password, kept out of the URL
 #   MCPG_CLUSTER_STATE_KEY    — URL-safe-base64 32-byte state key
+#   MCPG_LICENSE_PUBKEY       — public key (SPKI PEM) that verifies the license
+#   ACCOUNTS_API_TOKEN        — upstream token of the example binding
 #
 # Boot:  MCPG_CONFIG=production-single-redis.yaml mcpg
 
@@ -50,14 +52,21 @@ cluster:
   # never sits in the config); the var must hold a URL-safe-base64 32-byte
   # key: openssl rand -base64 32 | tr '+/' '-_'
   state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
-  pool_size: 8
 
-# Governance umbrella (Layout D''): identity + authorization + audit
+# The Redis coordinator is a licensed plugin: the gateway refuses to load
+# it without a license that entitles `cluster.*` plugins (Team,
+# Enterprise). Outside production, `non_production_use: true` in place of
+# the token loads it under the non-production grant.
+license:
+  token_file: "/etc/mcpg/license/license.jwt"
+  pubkey_pem: "${env.MCPG_LICENSE_PUBKEY}"
+
+# Governance umbrella: identity + authorization + audit
 # co-located so the tool-call lifecycle reads as one block.
 governance:
   # Inbound OIDC: the gateway validates Bearer tokens against the IdP's
   # JWKS. `providers` is a list — add another entry to accept tokens
-  # from multiple issuers.
+  # from multiple issuers, and to the plugin entry below as well.
   access:
     oidc_oauth:
       providers:
@@ -77,6 +86,38 @@ governance:
     sinks:
       - kind: dev.mcpg.builtin.audit.local-file
         config: { path: "/var/log/mcpg/audit.log" }
+
+# The gateway image carries no plugins: each entry below is a signed
+# artifact the gateway pulls and verifies at boot. Without the Redis or
+# the OIDC entry the gateway refuses to boot; without the Prometheus entry
+# it boots but exports no metrics. Pin the releases that match the
+# gateway you run, or point `oci:` at your mirror of them.
+plugins:
+  # The coordinator `cluster.kind: redis` selects. It takes its settings
+  # from the `cluster:` block, so the entry carries no `config:`.
+  - id: dev.mcpg.cluster.redis
+    class: cluster
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/cluster-redis:0.1.0-alpha.41"
+    granted_capabilities: [network_outbound]
+  # Its `providers` must match `governance.access.oidc_oauth.providers`.
+  - id: dev.mcpg.identity.oidc
+    class: identity_provider
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/identity-oidc:0.1.0-alpha.41"
+    # OIDC discovery and JWKS fetches from the IdP.
+    granted_capabilities: [network_outbound]
+    config:
+      providers:
+        - issuer: "https://example.okta.com"
+          audiences: ["mcpg-gateway"]
+          verification:
+            kind: oidc_jwks
+            allowed_algs: ["RS256"]
+  - id: dev.mcpg.observability.prometheus
+    class: metrics_sink
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/observability-prometheus:0.1.0-alpha.41"
 
 # Demonstrative binding — replace with your own.
 mcp:
@@ -106,7 +147,8 @@ observability:
     sinks:
       - kind: stderr
         config: { format: json }
+  # Served on the gateway listener (`bind_address`), not a port of its own.
   metrics:
     sinks:
       - kind: dev.mcpg.observability.prometheus
-        config: { path: "/metrics", bind: "0.0.0.0:9090" }
+        config: { path: "/metrics" }

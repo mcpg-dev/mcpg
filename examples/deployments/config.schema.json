@@ -813,7 +813,7 @@
     },
     "AuthorizationDetailsConfig": {
       "additionalProperties": false,
-      "description": "Rich Authorization Requests (RFC 9396) at the embedded authorization server (`governance.access.authorization_server.authorization_details`). Off while `types` is empty: an ID-JAG that carries `authorization_details` is then refused (`invalid_grant`), and the `authorization_details` request parameter is ignored. Turn it on only after every replica runs a build that knows this block: a replica without it drops the details of a sign-in's grant when it rotates the grant's refresh token, and the grant's next tokens carry none.",
+      "description": "Rich Authorization Requests (RFC 9396) at the embedded authorization server (`governance.access.authorization_server.authorization_details`). Off while `types` is empty: an ID-JAG that carries `authorization_details` is then refused (`invalid_grant`), and the `authorization_details` request parameter is ignored. Turn it on only after every replica runs a build that knows this block: a replica without it drops the details of a sign-in's grant when it rotates the grant's refresh token, and the grant's next tokens carry none. Turning it on (a non-empty `types`) requires a license with the `oauth.rich_authorization` feature; a block without a type needs none.",
       "properties": {
         "max_entries": {
           "default": 16,
@@ -824,7 +824,7 @@
         },
         "types": {
           "default": [],
-          "description": "The authorization details types this server accepts. Non-empty turns RFC 9396 on: the `authorization_details` parameter of the authorization endpoint (shown on the consent page, which is then always shown unless the client's `consent` is `skip`, and never remembered) and of the token endpoint (which may only narrow what was granted); the `authorization_details` claim of an ID-JAG (every object must be valid, or the assertion is refused with `invalid_grant`); the granted details in the token response and in the access token's `authorization_details` claim; the identity attributes `authorization_details` (compact JSON, which audit records carry only as `keyed-blake3:` and its digest under a key derived from the first signing key, so the value cannot be guessed back from it) and `authorization_details_types` (the distinct types, space-separated), and the policy binding `identity.authorization_details`, a list of maps (for example `identity.authorization_details.exists(d, d.type == \"mcp_tool\" && \"tools/call\" in d.actions)`); and `authorization_details_types_supported` in the authorization server metadata and the protected resource metadata. A parameter that fails a rule is refused with `invalid_authorization_details`. An authorization request with details and no `scope` is granted no scope.",
+          "description": "The authorization details types this server accepts. Non-empty turns RFC 9396 on: the `authorization_details` parameter of the authorization endpoint (shown on the consent page, which is then always shown unless the client's `consent` is `skip`, and never remembered) and of the token endpoint (which may only narrow what was granted); the `authorization_details` claim of an ID-JAG (every object must be valid, or the assertion is refused with `invalid_grant`); the granted details in the token response and in the access token's `authorization_details` claim; the identity attributes `authorization_details` (compact JSON, which audit records carry only as `keyed-blake3:` and its digest under a key derived from the first signing key, so the value cannot be guessed back from it) and `authorization_details_types` (the distinct types, space-separated), and the policy binding `identity.authorization_details`, a list of maps (for example `identity.authorization_details.exists(d, d.type == \"mcp_tool\" && \"tools/call\" in d.actions)`); and `authorization_details_types_supported` in the authorization server metadata and the protected resource metadata. A parameter that fails a rule is refused with `invalid_authorization_details`. An authorization request with details and no `scope` is granted no scope. Non-empty requires a license with the `oauth.rich_authorization` feature.",
           "items": {
             "$ref": "#/definitions/AuthorizationDetailsTypeConfig"
           },
@@ -1030,7 +1030,7 @@
             "max_entries": 16,
             "types": []
           },
-          "description": "Rich Authorization Requests (RFC 9396): grants and access tokens limited to fine-grained `authorization_details` of the types listed here. Off while `types` is empty."
+          "description": "Rich Authorization Requests (RFC 9396): grants and access tokens limited to fine-grained `authorization_details` of the types listed here. Off while `types` is empty. A non-empty `types` requires a license with the `oauth.rich_authorization` feature; a block without a type needs none."
         },
         "client_id_metadata_documents": {
           "allOf": [
@@ -1096,7 +1096,7 @@
             "proof_max_age_secs": 60,
             "required": false
           },
-          "description": "DPoP (RFC 9449): access tokens bound to a key the client proves it holds. Off by default."
+          "description": "DPoP (RFC 9449): access tokens bound to a key the client proves it holds. Off by default. `enabled: true` requires a license with the `oauth.dpop` feature; a block that leaves it off needs none."
         },
         "enforce_single_use": {
           "default": true,
@@ -2630,7 +2630,7 @@
     },
     "DpopConfig": {
       "additionalProperties": false,
-      "description": "DPoP (RFC 9449) at the embedded authorization server (`governance.access.authorization_server.dpop`). Off by default: the token endpoint then ignores `DPoP` headers and the `dpop_jkt` parameter, and an ID-JAG bound to a key (`cnf`) is refused. Turn it on only after every replica runs a build that knows this block: a replica without it drops the key binding of a sign-in's grant when it rotates the grant's refresh token.",
+      "description": "DPoP (RFC 9449) at the embedded authorization server (`governance.access.authorization_server.dpop`). Off by default: the token endpoint then ignores `DPoP` headers and the `dpop_jkt` parameter, and an ID-JAG bound to a key (`cnf`) is refused. Turn it on only after every replica runs a build that knows this block: a replica without it drops the key binding of a sign-in's grant when it rotates the grant's refresh token. Turning it on (`enabled: true`) requires a license with the `oauth.dpop` feature; a block that leaves it off needs none.",
       "properties": {
         "allowed_algs": {
           "default": [
@@ -2652,7 +2652,7 @@
         },
         "enabled": {
           "default": false,
-          "description": "Bind tokens to the client's key. The token endpoint reads one `DPoP` proof header per request: a token issued with a valid proof carries `cnf.jkt` and `token_type: DPoP`, and one issued without a proof stays a Bearer token. An ID-JAG with `cnf.jkt` is redeemed only with a proof of that key (`invalid_grant` otherwise). The authorization endpoint reads `dpop_jkt` (RFC 9449 §10), and the code is then redeemed only with a proof of that key. A public client's refresh token is bound to its proof key; a confidential client's is not. The resource (`/mcp` and every endpoint that takes this server's tokens) accepts a bound token with `Authorization: DPoP` and a `DPoP` proof of its key for that request (method, URL, `ath`, single use); a Bearer token keeps working with the `Bearer` scheme. The caller then carries the key's thumbprint as the `dpop_jkt` identity attribute, which a policy can require. The authorization server metadata and the protected resource metadata publish `dpop_signing_alg_values_supported`. A token bound to a key is never accepted with the `Bearer` scheme, even after DPoP is turned off.",
+          "description": "Bind tokens to the client's key. The token endpoint reads one `DPoP` proof header per request: a token issued with a valid proof carries `cnf.jkt` and `token_type: DPoP`, and one issued without a proof stays a Bearer token. An ID-JAG with `cnf.jkt` is redeemed only with a proof of that key (`invalid_grant` otherwise). The authorization endpoint reads `dpop_jkt` (RFC 9449 §10), and the code is then redeemed only with a proof of that key. A public client's refresh token is bound to its proof key; a confidential client's is not. The resource (`/mcp` and every endpoint that takes this server's tokens) accepts a bound token with `Authorization: DPoP` and a `DPoP` proof of its key for that request (method, URL, `ath`, single use); a Bearer token keeps working with the `Bearer` scheme. The caller then carries the key's thumbprint as the `dpop_jkt` identity attribute, which a policy can require. The authorization server metadata and the protected resource metadata publish `dpop_signing_alg_values_supported`. A token bound to a key is never accepted with the `Bearer` scheme, even after DPoP is turned off. Requires a license with the `oauth.dpop` feature.",
           "type": "boolean"
         },
         "nonce": {
@@ -3931,7 +3931,7 @@
       "properties": {
         "non_production_use": {
           "default": false,
-          "description": "Declares this deployment non-production. Entitlement-gated plugins and feature-gated config blocks (interactive sign-in at the embedded authorization server) then load without a token under their license's free non-production grant (development, testing, evaluation, staging), with a boot warning naming them. Production use still requires an entitling token.",
+          "description": "Declares this deployment non-production. Entitlement-gated plugins and feature-gated config blocks (interactive sign-in, DPoP and rich authorization requests at the embedded authorization server) then load without a token under their license's free non-production grant (development, testing, evaluation, staging), with a boot warning naming them. Production use still requires an entitling token.",
           "type": "boolean"
         },
         "pubkey_pem": {

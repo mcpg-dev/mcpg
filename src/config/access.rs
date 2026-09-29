@@ -243,12 +243,15 @@ pub struct AuthorizationServerConfig {
     #[serde(default)]
     pub interactive: Option<InteractiveLoginConfig>,
     /// DPoP (RFC 9449): access tokens bound to a key the client proves it
-    /// holds. Off by default.
+    /// holds. Off by default. `enabled: true` requires a license with the
+    /// `oauth.dpop` feature; a block that leaves it off needs none.
     #[serde(default)]
     pub dpop: DpopConfig,
     /// Rich Authorization Requests (RFC 9396): grants and access tokens
     /// limited to fine-grained `authorization_details` of the types listed
-    /// here. Off while `types` is empty.
+    /// here. Off while `types` is empty. A non-empty `types` requires a
+    /// license with the `oauth.rich_authorization` feature; a block without
+    /// a type needs none.
     #[serde(default)]
     pub authorization_details: AuthorizationDetailsConfig,
 }

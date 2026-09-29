@@ -62,9 +62,9 @@ storage:
         root: "/var/lib/mcpg/storage"
         max_bytes: 268435456  # 256 MiB
 
-# Plugin tree pre-staged on disk. Layout D'' P4 flattened
-# `plugins.entries` to a top-level array — operators write entries
-# directly here with `source.path: "/opt/mcpg/plugins/<plugin>.zip"`.
+# Plugin tree pre-staged on disk. `plugins` is a top-level array —
+# operators write entries directly here with
+# `source.path: "/opt/mcpg/plugins/<plugin>.zip"`.
 # An empty array is the smallest air-gapped wedge; populate as plugins
 # get pre-staged.
 #

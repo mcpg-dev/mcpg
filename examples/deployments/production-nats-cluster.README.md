@@ -14,14 +14,16 @@ Same as `production-redis-cluster` for the server / auth / audit / bindings / ob
 
 | Field | Why |
 |---|---|
-| `cluster.url` (`MCPG_NATS_URL`) | `tls://` or `nats://` connection. Use `tls://` outside localhost. |
-| `cluster.bucket` | JetStream KV bucket name. Operators usually segment per-deployment. |
+| `cluster.servers` (`MCPG_NATS_URL`) | NATS server URLs. TLS is required by default, so use `tls://`; a plaintext `nats://` link needs `tls: { require_tls: false }` and `allow_insecure_transport: true`. |
+| `cluster.jetstream.state_bucket` | JetStream KV bucket for capability state. Operators usually segment per-deployment. |
+| The `dev.mcpg.cluster.nats` entry in `plugins` | The coordinator `cluster.kind: nats` selects, in place of `dev.mcpg.cluster.redis`. Without it the gateway refuses to boot. Pin the release that matches the gateway you run. Like the Redis coordinator it is a licensed plugin, so the `license` block is the same. |
 
 ## Required env vars
 
 - `MCPG_NATS_URL` — NATS connection.
 - `MCPG_CLUSTER_STATE_KEY` — URL-safe-base64 32-byte state-encryption key, identical on every replica (`openssl rand -base64 32 | tr '+/' '-_'`). Required whenever `cluster.kind` is not `single_node`.
-- `MCPG_OIDC_CLIENT_ID`, `MCPG_OIDC_CLIENT_SECRET` — IdP credentials.
+- `MCPG_LICENSE_PUBKEY` — the public key (SPKI PEM) that verifies the license token.
+- `HOSTNAME` — the replica's `cluster.node.id`, which must be unique per replica. A container runtime exports it. A shell such as bash sets it but does not export it, so export it (`export HOSTNAME`) when you run the gateway outside a container.
 
 ## Audit
 
@@ -30,5 +32,5 @@ Same as `production-redis-cluster`: the bundled sink is `dev.mcpg.builtin.audit.
 ## NATS-specific operational notes
 
 - **Subject hierarchy.** Cluster pub/sub uses `mcpg.{deployment}.delivery.>` etc. — confirm your NATS account permissions allow publish + subscribe on `mcpg.>`.
-- **JetStream replication.** Match `bucket`'s replication factor to your durability needs; default 1 is fine for dev, ≥3 for prod.
+- **JetStream replication.** Match `cluster.jetstream.replicas` to your durability needs; the default 1 suits a single-node dev NATS, 3 (as here) a production cluster.
 - **Connection limits.** NATS clusters often cap clients per node — confirm your gateway replica count fits before scale-up.
