@@ -1,0 +1,73 @@
+# Managed by the release pipeline — changes made here are overwritten.
+#
+# Publishes the model-context-protocol-gateway crate to crates.io: a small
+# launcher for the mcpg CLI suite, whose binaries download the release
+# binaries for their platform on first use. It attaches one suite archive
+# per platform to this repository's release and pins their SHA-256 sums in
+# the crate. Fires when this repository's Release run completes green, when
+# a release is published by hand, and by hand for re-runs (a re-run keeps
+# the archives already attached and skips a version crates.io has).
+#
+# The Release workflow publishes its record with the workflow's own token,
+# and GitHub raises no `release` event for anything that token does — so
+# the pipeline's own releases arrive here through `workflow_run`, and the
+# `release` trigger serves releases published by hand.
+#
+# Publishing needs the repository variable OSS_CARGO_PUBLISH set 'true' and
+# the CARGO_REGISTRY_TOKEN secret; without them the run builds and packages
+# only.
+name: Publish crates.io suite
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "suite version (default: latest release)"
+        type: string
+        default: ""
+      dry_run:
+        description: "build and package only, no upload"
+        type: boolean
+        default: false
+permissions:
+  # Attaching the suite archives to the release.
+  contents: write
+concurrency:
+  group: publish-crates-suite
+  cancel-in-progress: false
+jobs:
+  publish:
+    # A red Release run still publishes its record with whatever attached;
+    # the suite needs every binary, so such a release waits for a hand-run.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Build, attach and publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_REF: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          # A tag-triggered Release run names its tag; the suite then ships
+          # that version rather than whichever release is newest by now.
+          if [ -z "${VERSION:-}" ] && [ "${RELEASE_REF:-}" != "${RELEASE_REF#v}" ]; then
+            VERSION="${RELEASE_REF#v}"
+          fi
+          export VERSION
+          DRY=true
+          if [ "${{ vars.OSS_CARGO_PUBLISH }}" = "true" ] \
+            && [ -n "${CARGO_REGISTRY_TOKEN:-}" ] \
+            && [ "${{ inputs.dry_run }}" != "true" ]; then
+            DRY=false
+          else
+            echo "::notice::dry run (gates unset or dry_run requested)"
+          fi
+          DRY_RUN="$DRY" python3 .github/scripts/publish-crates-suite.py

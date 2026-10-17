@@ -46,9 +46,13 @@ const key =
     : `${process.platform}-${process.arch}`;
 
 const pkg = PLATFORMS[key];
-const invoked = path
+// The command named like the public npm package runs `mcpg`, so
+// `npx model-context-protocol-gateway` has a command to pick on every npm.
+const ALIASES = { "model-context-protocol-gateway": "mcpg" };
+const called = path
   .basename(process.argv[1] ?? "mcpg")
   .replace(/\.(mjs|js|cmd|ps1)$/i, "");
+const invoked = ALIASES[called] ?? called;
 const exe = process.platform === "win32" ? `${invoked}.exe` : invoked;
 
 if (!pkg) {

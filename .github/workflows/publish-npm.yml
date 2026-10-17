@@ -1,6 +1,6 @@
 # Managed by the release pipeline — changes made here are overwritten.
 #
-# Publishes the @mcpg-dev/cli npm suite from published release artifacts:
+# Publishes the model-context-protocol-gateway npm suite from published release artifacts:
 # every binary is downloaded from a GitHub Release of its own repository,
 # so npm serves exactly what the releases attested. Fires when this
 # repository's Release run completes green, when a release is published

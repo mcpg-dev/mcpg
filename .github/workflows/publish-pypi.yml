@@ -1,0 +1,91 @@
+# Managed by the release pipeline — changes made here are overwritten.
+#
+# Publishes the model-context-protocol-gateway wheels to PyPI from published
+# release artifacts: every binary is downloaded from a GitHub Release of its
+# own repository, so PyPI serves exactly what the releases attested. Fires
+# when this repository's Release run completes green, when a release is
+# published by hand, and by hand for re-runs or backfills.
+#
+# The Release workflow publishes its record with the workflow's own token,
+# and GitHub raises no `release` event for anything that token does — so
+# the pipeline's own releases arrive here through `workflow_run`, and the
+# `release` trigger serves releases published by hand.
+#
+# Publishing needs the repository variable OSS_PYPI_PUBLISH set 'true' and
+# the PYPI_TOKEN secret; without them the run builds and checks only.
+name: Publish PyPI suite
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "suite version (default: latest release)"
+        type: string
+        default: ""
+      dry_run:
+        description: "build + check only, no upload"
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: publish-pypi-suite
+  cancel-in-progress: false
+jobs:
+  publish:
+    # A red Release run still publishes its record with whatever attached;
+    # the suite needs every binary, so such a release waits for a hand-run.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Install twine
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/twine-venv"
+          "$RUNNER_TEMP/twine-venv/bin/pip" install --quiet --upgrade twine
+          echo "$RUNNER_TEMP/twine-venv/bin" >> "$GITHUB_PATH"
+      # binutils strip reads native ELF only; llvm-strip also strips the
+      # aarch64 and Windows binaries, which keeps every wheel under PyPI's
+      # per-file limit.
+      - name: Locate llvm-strip
+        run: |
+          set -euo pipefail
+          rustup component add llvm-tools
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "LLVM_STRIP=$(rustc --print sysroot)/lib/rustlib/${host}/bin/llvm-strip" >> "$GITHUB_ENV"
+      - name: Build + publish
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_REF: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          # A tag-triggered Release run names its tag; the suite then ships
+          # that version rather than whichever release is newest by now.
+          if [ -z "${VERSION:-}" ] && [ "${RELEASE_REF:-}" != "${RELEASE_REF#v}" ]; then
+            VERSION="${RELEASE_REF#v}"
+          fi
+          export VERSION
+          DRY=true
+          if [ "${{ vars.OSS_PYPI_PUBLISH }}" = "true" ] \
+            && [ -n "${PYPI_TOKEN:-}" ] \
+            && [ "${{ inputs.dry_run }}" != "true" ]; then
+            DRY=false
+          else
+            echo "::notice::dry run (gates unset or dry_run requested)"
+          fi
+          DRY_RUN="$DRY" bash .github/scripts/publish-pypi-suite.sh
+      - name: Upload wheels (inspection)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pypi-suite-wheels
+          path: dist-pypi/wheels/*.whl
+          if-no-files-found: ignore
+          retention-days: 3

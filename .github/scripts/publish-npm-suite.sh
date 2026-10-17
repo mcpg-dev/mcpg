@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Publish the @mcpg-dev/cli npm suite from published release artifacts.
+# Publish the model-context-protocol-gateway npm suite from published release
+# artifacts.
 #
 # Runs in the public mcpg repository. Every binary comes from a GitHub
 # Release of its own repository — nothing is built here, so what npm serves
 # is byte-identical to what the releases attested. Emits one platform
-# package per target plus the @mcpg-dev/cli launcher package.
+# package per target (@mcpg-dev/cli-<platform>) plus the
+# model-context-protocol-gateway launcher package.
 #
 #   VERSION       suite version; default: this repository's latest release
 #   NPM_DIST_TAG  dist-tag for publish (default: beta)
@@ -18,6 +20,7 @@
 set -euo pipefail
 
 ORG="mcpg-dev"
+LAUNCHER="model-context-protocol-gateway"
 DRY_RUN="${DRY_RUN:-true}"
 NPM_DIST_TAG="${NPM_DIST_TAG:-beta}"
 OUT_DIR="${OUT_DIR:-$PWD/dist-npm}"
@@ -103,8 +106,19 @@ publish_one() { # <pkg-dir> <name>
   ( cd "$dir" && npm pack --pack-destination "$OUT_DIR" >/dev/null )
   if [ "$DRY_RUN" = "false" ]; then
     if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
-      echo "[suite] ${name}@${VERSION} already published — skipping"
-      return 0
+      # A version number is never reusable on npm, so an existing one is
+      # either this release (a re-run) or a foreign publish that would
+      # silently stand in for it.
+      local repo
+      repo="$(npm view "${name}@${VERSION}" repository.url 2>/dev/null || true)"
+      case "$repo" in
+        *github.com/${ORG}/mcpg*)
+          echo "[suite] ${name}@${VERSION} already published — skipping"
+          return 0 ;;
+        *)
+          echo "::error::${name}@${VERSION} exists on npm but was not published from ${ORG}/mcpg (repository: ${repo:-none}); npm never reuses a version, so release a later one"
+          return 1 ;;
+      esac
     fi
     ( cd "$dir" && npm publish --tag "$NPM_DIST_TAG" --access public --provenance )
     # Until a stable lane exists, `latest` deliberately tracks the newest
@@ -153,27 +167,28 @@ mkdir -p "$meta/bin"
 cp .github/npm/launcher.mjs "$meta/bin/launcher.mjs"
 cp "$LICENSE_SRC" "$meta/LICENSE.md"
 cat > "$meta/README.md" <<EOF
-# @mcpg-dev/cli
+# Model Context Protocol Gateway
 
 The [mcpg](https://mcpg.dev) MCP gateway CLI suite — \`mcpg\`,
 \`mcpg-config\`, \`mcpg-cloud\` and \`mcpg-plugin\` — as prebuilt binaries.
 
 \`\`\`sh
-npx @mcpg-dev/cli --help
-npm install -g @mcpg-dev/cli && mcpg --version
+npx ${LAUNCHER} --help
+npm install -g ${LAUNCHER} && mcpg --version
 \`\`\`
 
-Installing puts every command above on \`PATH\`; the package name is scoped
-but the commands are not.
+Installing puts every command above on \`PATH\`, plus \`${LAUNCHER}\`, which
+runs \`mcpg\`.
 
 The matching platform binary package installs via optionalDependencies; the
 \`--omit=optional\` install flag therefore breaks this package by design.
 EOF
 {
   printf '{\n'
-  printf '  "name": "@mcpg-dev/cli",\n'
+  printf '  "name": "%s",\n' "$LAUNCHER"
   printf '  "version": "%s",\n' "$VERSION"
-  printf '  "description": "mcpg — MCP gateway CLI suite (prebuilt binaries)",\n'
+  printf '  "description": "Model Context Protocol Gateway — the mcpg CLI suite (prebuilt binaries)",\n'
+  printf '  "keywords": ["mcp", "model-context-protocol", "mcp-gateway", "gateway", "mcpg"],\n'
   printf '  "license": "Apache-2.0",\n'
   printf '  "homepage": "https://mcpg.dev",\n'
   printf '  "repository": { "type": "git", "url": "https://github.com/mcpg-dev/mcpg" },\n'
@@ -183,7 +198,8 @@ EOF
   printf '    "mcpg": "bin/launcher.mjs",\n'
   printf '    "mcpg-config": "bin/launcher.mjs",\n'
   printf '    "mcpg-cloud": "bin/launcher.mjs",\n'
-  printf '    "mcpg-plugin": "bin/launcher.mjs"\n'
+  printf '    "mcpg-plugin": "bin/launcher.mjs",\n'
+  printf '    "%s": "bin/launcher.mjs"\n' "$LAUNCHER"
   printf '  },\n'
   printf '  "optionalDependencies": {\n'
   for i in "${!built[@]}"; do
@@ -194,4 +210,4 @@ EOF
   printf '  "files": ["bin/", "README.md", "LICENSE.md"]\n'
   printf '}\n'
 } > "$meta/package.json"
-publish_one "$meta" "@mcpg-dev/cli"
+publish_one "$meta" "$LAUNCHER"
