@@ -60,7 +60,24 @@ per capability via a nested `backend.kind:` discriminator. Common kinds:
 
 Full reference: [docs/backends.md](docs/backends.md).
 
-## Quick Start
+## Install
+
+The `model-context-protocol-gateway` package installs `mcpg` together with
+`mcpg-config`, `mcpg-cloud` and `mcpg-plugin`:
+
+```bash
+npx model-context-protocol-gateway --help       # npm, one-shot
+npm install -g model-context-protocol-gateway   # npm
+pipx install model-context-protocol-gateway     # PyPI (or: uvx model-context-protocol-gateway)
+cargo install model-context-protocol-gateway    # crates.io: a launcher that runs the release binaries
+cargo binstall model-context-protocol-gateway   # the release binaries directly
+curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh
+```
+
+The container image is `ghcr.io/mcpg-dev/mcpg:<version>`. Every install path:
+[mcpg.dev/docs/install](https://mcpg.dev/docs/install).
+
+## Build from source
 
 ```bash
 # Build

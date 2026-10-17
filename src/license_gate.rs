@@ -1074,6 +1074,7 @@ fn verify_delivered(token: &str, org_slug: &str, origin: Origin) -> Result<Vendo
 /// What a delivery's proof binds besides the org and the licence: the nonce
 /// the Channel it came down opened with, and the instance uid that Channel is
 /// authenticated as.
+#[cfg(any(feature = "cp-attached", test))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ChannelBinding<'a> {
     pub nonce: &'a str,
@@ -1082,6 +1083,7 @@ pub(crate) struct ChannelBinding<'a> {
 
 /// The delivery `proof` must vouch for; `None` when the licence does not
 /// verify, which the gate reports on its own.
+#[cfg(any(feature = "cp-attached", test))]
 fn expected_delivery<'a>(
     license_jwt: &'a str,
     org_slug: &'a str,
@@ -1107,6 +1109,7 @@ fn expected_delivery<'a>(
 
 /// Why a delivery's cloud licence counts for nothing, as the gateway reports
 /// it to the control plane that sent it. Never the licence.
+#[cfg(any(feature = "cp-attached", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeliveryRefusal {
     /// `no_proof` or `proof_refused`.
@@ -1117,6 +1120,7 @@ pub(crate) struct DeliveryRefusal {
 }
 
 /// A delivery that came down a Channel of this process, judged.
+#[cfg(any(feature = "cp-attached", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JudgedDelivery {
     pub origin: Origin,
@@ -1131,6 +1135,7 @@ pub(crate) struct JudgedDelivery {
 /// counts for nothing, is counted in
 /// `mcpg_license_unproven_deliveries_total` by why (`no_proof` or
 /// `proof_refused`), and comes back as the refusal the gateway reports.
+#[cfg(any(feature = "cp-attached", test))]
 pub(crate) fn judge_delivery(
     license_jwt: &str,
     org_slug: &str,
@@ -1179,6 +1184,7 @@ pub(crate) fn judge_delivery(
 /// without a proof that verifies: one a customer's control plane relays, or
 /// one mcpg.cloud's sent without a proof the gateway accepts. The refusal to
 /// report for it; `None` for a delivery that carries no such licence.
+#[cfg(any(feature = "cp-attached", test))]
 fn unproven_cloud_licence(
     license_jwt: &str,
     org_slug: &str,
@@ -1204,6 +1210,7 @@ fn unproven_cloud_licence(
 /// the proof kept with it: [`Origin::CachedProven`] while that proof verifies
 /// again for the Channel it was kept with and was signed less than a day ago,
 /// else [`Origin::Cached`].
+#[cfg(any(feature = "cp-attached", test))]
 pub(crate) fn cached_origin_of(
     license_jwt: &str,
     org_slug: &str,
@@ -1358,10 +1365,12 @@ pub(crate) mod platform {
 
     /// Whether the delivery or the bound set changed after `seen` was read
     /// from [`generation`].
+    #[cfg(any(feature = "cp-attached", test))]
     pub fn changed_since(seen: u64) -> bool {
         generation() != seen
     }
 
+    #[cfg(any(feature = "cp-attached", test))]
     fn record_change() {
         GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         CHANGED.notify_waiters();
@@ -1394,6 +1403,7 @@ pub(crate) mod platform {
     }
 
     /// Record a delivery; returns whether it differs from the last one.
+    #[cfg(any(feature = "cp-attached", test))]
     pub fn set_delivery(delivery: Delivery) -> bool {
         let changed = *DELIVERY.load_full() != delivery;
         if changed {
@@ -1417,6 +1427,7 @@ pub(crate) mod platform {
     /// proven delivery of a licence that does not verify says nothing about
     /// the plan, so, as on a running gateway, the cached licence stays until
     /// its day ends.
+    #[cfg(any(feature = "cp-attached", test))]
     pub fn receive_delivery(delivery: Delivery) -> bool {
         let current = DELIVERY.load_full();
         if matches!(current.origin(), Some(Origin::CachedProven { .. })) {
@@ -1452,6 +1463,7 @@ pub(crate) mod platform {
     /// mcpg.cloud already proved it delivered on a Channel of this process: a
     /// licence the process holds proven gains nothing from being sent again
     /// without a proof but the word on its refresh.
+    #[cfg(any(feature = "cp-attached", test))]
     fn still_proven(current: &Delivery, delivery: Delivery) -> Delivery {
         match (current, delivery) {
             (
@@ -1481,6 +1493,7 @@ pub(crate) mod platform {
 
     /// Whether the licence in `delivery` verifies. No licence (the org holds
     /// none) is the platform's word that the org runs on community.
+    #[cfg(any(feature = "cp-attached", test))]
     fn verifies(delivery: &Delivery) -> Result<(), String> {
         match delivery {
             Delivery::Delivered {
@@ -1500,6 +1513,7 @@ pub(crate) mod platform {
 
     /// Record the bound plugin set the control plane sent this process;
     /// returns whether it changed.
+    #[cfg(any(feature = "cp-attached", test))]
     pub fn set_bound_plugins(bound: Option<BTreeSet<String>>) -> bool {
         let changed = BOUND.load_full().as_deref() != bound.as_ref();
         if changed {
@@ -1518,6 +1532,7 @@ pub(crate) mod platform {
     /// before this one: the licence it last sent ([`Origin::Cached`], or
     /// [`Origin::CachedProven`] while the proof kept with it holds) and the
     /// plugin set of the last bundle it pushed, when either was kept.
+    #[cfg(any(feature = "cp-attached", test))]
     pub fn seed_from_cache(delivery: Option<Delivery>, bound: Option<Option<BTreeSet<String>>>) {
         if let Some(delivery) = delivery {
             set_delivery(delivery);
@@ -1561,6 +1576,7 @@ pub(crate) mod platform {
     /// another Channel of its instance holds the slot, and that the agent
     /// opens it again in `retry_in`. A booting gate then waits for the
     /// delivery that Channel brings instead of giving up first.
+    #[cfg(any(feature = "cp-attached", test))]
     pub fn slot_held(retry_in: Duration) {
         *SLOT_FREES_AT.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(tokio::time::Instant::now() + retry_in);
@@ -1776,6 +1792,7 @@ impl LicenseRuntimeState {
 
     /// Whether a licence delivery or bound plugin set arrived after this
     /// runtime was gated, so the gateway has to be gated again to run on it.
+    #[cfg(any(feature = "cp-attached", test))]
     pub(crate) fn is_behind_platform(&self) -> bool {
         platform::changed_since(self.platform_generation)
     }
@@ -1784,6 +1801,7 @@ impl LicenseRuntimeState {
     /// of this runtime would. `Ok(true)` when the answer withholds or holds
     /// other items than this runtime does, which only a reload applies and
     /// publishes; otherwise the licence status is published here.
+    #[cfg(any(feature = "cp-attached", test))]
     pub(crate) fn regate(&self, config: &AppConfig) -> anyhow::Result<bool> {
         let outcome = gate_at_reload(config, self)?;
         let changed =
@@ -1829,6 +1847,7 @@ static REGATE_FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 
 /// Record whether a regate of the running gateway reached it: failures in a
 /// row count until one does.
+#[cfg(any(feature = "cp-attached", test))]
 pub(crate) fn record_regate(reached: bool) {
     use std::sync::atomic::Ordering;
     if reached {

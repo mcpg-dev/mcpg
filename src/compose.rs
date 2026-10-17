@@ -517,8 +517,9 @@ pub async fn boot_sidecar_cp(cp_args: &[String]) -> anyhow::Result<SidecarCp> {
         anyhow::bail!(
             "`--control-plane` supervises the sibling `mcpg-control-plane` binary, \
              which is not installed (not on PATH, not next to this executable). It \
-             ships in the mcpg toolchain suite — install it with:\n\n  \
-             curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh\n\n\
+             is not in the public CLI suite: it ships from a licensed repository, \
+             and with access to it the installer fetches it:\n\n  \
+             curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh -s -- --bin mcpg-control-plane\n\n\
              or run a control plane yourself and attach with `--enroll <URL>`."
         );
     };

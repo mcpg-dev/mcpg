@@ -301,12 +301,13 @@ fn print_plugins_not_installed() {
     eprintln!(
         "error: '{PLUGIN_CLI_BINARY}' is not installed or not on PATH.\n\n\
          The mcpg plugin CLI extension is a separate tool for packing,\n\
-         signing, pushing, and managing MCPG plugin artifacts.\n\n\
-         Install it from the workspace source (the crate is publish=false,\n\
-         so it is not on crates.io):\n\
-         \n  cargo install --path apps/plugin\n\n\
-         Or build it without installing:\n\
-         \n  cargo build -p mcpg-plugin \n",
+         signing, pushing, and managing MCPG plugin artifacts. It ships\n\
+         with mcpg in the model-context-protocol-gateway package:\n\
+         \n  npm install -g model-context-protocol-gateway\
+         \n  pipx install model-context-protocol-gateway\
+         \n  cargo install model-context-protocol-gateway\n\n\
+         Or install it alone:\n\
+         \n  curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh -s -- --bin mcpg-plugin\n",
     );
 }
 
@@ -404,13 +405,11 @@ fn exec_sibling(binary: &str, args: &[String], label: &str) -> anyhow::Result<()
             eprintln!(
                 "error: '{binary}' is not installed or not on PATH.\n\n\
                  `mcpg {label}` delegates to the sibling `{binary}` binary, which\n\
-                 ships in the mcpg toolchain alongside `mcpg`. Install it with the\n\
-                 installer (each binary is its own release artifact):\n\
-                 \n  curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh -s -- --bin {binary}\n\
-                 \nor build from the workspace source:\n\
-                 \n  cargo build -p mcpg -p mcpg-config          # mcpg + mcpg-config\n\
-                 \n  cargo build -p mcpg-control-plane-server    # mcpg-control-plane\n\
-                 \n  cargo build -p mcpg-cloud -p mcpg-admin     # cloud CLIs\n",
+                 runs beside `mcpg`. The model-context-protocol-gateway package\n\
+                 installs mcpg-config, mcpg-cloud and mcpg-plugin with mcpg:\n\
+                 \n  npm install -g model-context-protocol-gateway   # or: pipx install / cargo install\n\
+                 \nAny released binary, one at a time:\n\
+                 \n  curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh -s -- --bin {binary}\n",
             );
             std::process::exit(1);
         }
