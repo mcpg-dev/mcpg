@@ -52,9 +52,13 @@ COPY --from=build /src/target/release/mcpg /usr/local/bin/mcpg
 USER 10001:10001
 WORKDIR /home/mcpg
 
+# A bare `oci:` plugin ref resolves against the public plugin registry. The
+# binary's compiled-in default is the internal one, which strangers cannot
+# pull; an explicit `plugin_registry.default_registry` still wins.
 ENV MCPG_CONFIG=/etc/mcpg/config.yaml \
     MCPG_GATEWAY__SERVER__BIND_ADDRESS=0.0.0.0:8787 \
     MCPG_OBSERVABILITY__LOGS__LEVEL=info \
+    MCPG_DEFAULT_PLUGIN_REGISTRY=ghcr.io/mcpg-dev/plugins \
     RUST_LOG=info
 
 EXPOSE 8787
