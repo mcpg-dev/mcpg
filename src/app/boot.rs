@@ -24,8 +24,30 @@ pub async fn build_from_config(config: AppConfig, config_paths: Vec<PathBuf>) ->
 }
 
 pub async fn build_from_sources(
+    config: AppConfig,
+    config_sources: Vec<crate::config::ConfigSource>,
+) -> Result<AppState> {
+    build_with(config, config_sources, None).await
+}
+
+/// A runtime change made before the runtime is shared, where an attached
+/// control plane wires its hooks.
+type RuntimeAdjustment = Box<dyn FnOnce(&mut crate::runtime::GatewayRuntime) + Send>;
+
+/// [`build_from_config`] with `adjust` applied to the runtime where an
+/// attached control plane wires its hooks: how a test stands in for one.
+#[cfg(test)]
+pub(crate) async fn build_from_config_adjusted(
+    config: AppConfig,
+    adjust: impl FnOnce(&mut crate::runtime::GatewayRuntime) + Send + 'static,
+) -> Result<AppState> {
+    build_with(config, Vec::new(), Some(Box::new(adjust))).await
+}
+
+async fn build_with(
     mut config: AppConfig,
     config_sources: Vec<crate::config::ConfigSource>,
+    adjust: Option<RuntimeAdjustment>,
 ) -> Result<AppState> {
     let mut observability = observability::init(&config.observability)?;
     // The `allow_plaintext_state` warning fires here rather than only in
@@ -58,10 +80,20 @@ pub async fn build_from_sources(
     let jwt_verifier = build_jwt_verifier(&config).await?;
     let oidc_resolver = build_oidc_resolver(&config)?.map(std::sync::Arc::new);
 
-    // Plugin and feature entitlements are proven before anything is loaded;
-    // the gate defers only what the control plane checks (the plugin-set bind,
-    // the managed-cloud publish guard).
-    crate::license_gate::enforce_license_gate(&config)?;
+    // The control-plane agent starts first: an attached gateway gates its
+    // plugins and features on the licence the control plane delivers.
+    let cp_attach =
+        crate::runtime::cp::attach::start_if_configured(&config, &config_sources, &observability)
+            .await?;
+
+    // Plugin and feature entitlements are proven before anything is loaded.
+    // Withheld plugins stay in the base config, so the reload that follows a
+    // licence covering them loads them.
+    let license = crate::license_gate::gate_at_boot(&config).await?;
+    let base_config = (!license.withheld.is_empty()).then(|| config.clone());
+    crate::license_gate::withhold(&mut config, &license);
+    let withheld_backend_kinds = crate::license_gate::withheld_backend_kinds(&license);
+    crate::license_gate::spawn_reminder();
 
     // Build the plugin registry FIRST, before any capability touches
     // its KV / PubSub primitives. This guarantees the cluster
@@ -91,7 +123,13 @@ pub async fn build_from_sources(
         resolved_secret_refs,
         secrets_digest,
         authorization_server,
-    } = build_plugin_registry(&mut config, jwt_verifier.as_ref(), oidc_resolver.clone()).await?;
+    } = build_plugin_registry(
+        &mut config,
+        jwt_verifier.as_ref(),
+        oidc_resolver.clone(),
+        &withheld_backend_kinds,
+    )
+    .await?;
 
     // Runs here rather than at validation time so it sees the final binding
     // set — including the capabilities plugins expanded during the registry
@@ -291,6 +329,8 @@ pub async fn build_from_sources(
         None
     };
 
+    let (watched_resources, watched_templates) =
+        resolved_resource_watches(&config, &plugin_registry).await?;
     let mut runtime = GatewayRuntime::try_new_with_runtime_controls_and_cache(
         "mcpg",
         env!("CARGO_PKG_VERSION"),
@@ -366,8 +406,8 @@ pub async fn build_from_sources(
         },
         &config.mcp.capabilities.tools,
         &config.mcp.capabilities.prompts,
-        &config.mcp.capabilities.resources,
-        &config.mcp.capabilities.resource_templates,
+        &watched_resources,
+        &watched_templates,
         jwt_verifier,
         oidc_resolver,
         pipeline_store,
@@ -420,6 +460,7 @@ pub async fn build_from_sources(
     // stable signature.
     runtime.set_idempotency_store(idempotency_store.clone());
     runtime.set_idempotency_capability(idempotency_capability.clone());
+    runtime.set_events_config(config.mcp.configurations.events.clone());
     runtime.set_idempotency_replay_revalidation(
         idempotency_cfg.enabled && idempotency_cfg.replay_revalidation,
     );
@@ -444,6 +485,7 @@ pub async fn build_from_sources(
         &apps_cfg.registry,
     );
     runtime.set_tunnel_federation(config.gateway.server.tunnel_federation.as_ref());
+    runtime.set_license_state((&license).into());
 
     // Install the concrete `GatewayBackendHost` on the late-bound host
     // that the LLM plugin received at `register_profile` time. This
@@ -732,20 +774,15 @@ pub async fn build_from_sources(
     // (attach needs mutable access). Idempotent — no-op if already
     // attached (e.g. on a hot-reload path that re-enters this
     // function).
-    // Optional Control Plane attachment. When the
-    // `cp-attached` feature is built in AND `config.gateway.control_plane`
-    // is set, this registers an `AgentRunner`, wires its
-    // `MetricsBuffer` as the gateway's `ToolCallRecorder`, and
-    // spawns the agent on its own task. No-op otherwise. Must
-    // happen BEFORE `Arc::new(ArcSwap::from_pointee(runtime))`
-    // so we still have `&mut runtime` to set the recorder slot.
-    // The returned handle is intentionally leaked into the
-    // background task — graceful shutdown follows the gateway's
-    // own shutdown signal (the agent's reconnect loop exits
-    // cleanly when the tokio runtime drops).
-    let cp_attach =
-        crate::runtime::cp::attach::wire_if_configured(&mut runtime, &config, &observability)
-            .await?;
+    // The Control Plane agent started before the license gate; its
+    // `MetricsBuffer` and quota status reach the runtime here, while
+    // `&mut runtime` still exists.
+    if let Some(handle) = &cp_attach {
+        handle.wire_runtime(&mut runtime);
+    }
+    if let Some(adjust) = adjust {
+        adjust(&mut runtime);
+    }
 
     let runtime_arc = Arc::new(ArcSwap::from_pointee(runtime));
 
@@ -985,7 +1022,18 @@ pub async fn build_from_sources(
         Arc::clone(&request_state_codec),
     );
 
-    let base_config_arc = Arc::clone(&config_arc);
+    // The MCP Events core lives in the shared services, which every reload
+    // carries to the next runtime. A declaration that does not compile, or
+    // a store that cannot be resolved, refuses the boot.
+    if let Some(services) = runtime_arc.load().shared_services.load_full() {
+        let core = crate::runtime::events::install_core(&services);
+        core.apply(&config_arc, &runtime_arc)
+            .await
+            .context("mcp.configurations.events")?;
+        crate::runtime::events::builtin::observe_tasks(&core, &runtime_arc.load());
+    }
+
+    let base_config_arc = base_config.map_or_else(|| Arc::clone(&config_arc), Arc::new);
     let state = AppState {
         config: Arc::new(ArcSwap::new(config_arc)),
         base_config: Arc::new(ArcSwap::new(base_config_arc)),
@@ -1007,14 +1055,45 @@ pub async fn build_from_sources(
 
     // Bind the live state to the CP-attach hook so a pushed ConfigUpdate can
     // hot-reload this gateway in place, and so log capture ships to the agent.
-    // The handle then drops at scope end (the agent task is detached and
-    // retains its own clones of the shared cells).
+    // Binding also gates the gateway again when a licence arrived after the
+    // gate above ran. The handle then drops at scope end (the agent task is
+    // detached and retains its own clones of the shared cells).
     if let Some(handle) = &cp_attach {
-        handle.bind_state(state.clone());
+        handle.bind_state(state.clone()).await;
     }
     let _ = cp_attach;
 
     Ok(state)
+}
+
+/// The resource and resource-template bindings of `config` with each
+/// `watch:` strategy resolved, for the runtime's watch engine: a watch
+/// plugin gets values in place of `${env.…}`, `${secret.…}` and provider
+/// URIs, as a backend spec does.
+pub(crate) async fn resolved_resource_watches(
+    config: &AppConfig,
+    registry: &mcpg_plugin_host::PluginRegistry,
+) -> Result<(
+    Vec<crate::config::BackendConfig>,
+    Vec<crate::config::BackendConfig>,
+)> {
+    use crate::config::resolver::resolve_binding_watches;
+    let secrets = crate::config::SecretsSource::from_config(&config.gateway.secrets);
+    let resources = resolve_binding_watches(
+        &config.mcp.capabilities.resources,
+        registry,
+        &secrets,
+        "mcp.capabilities.resources",
+    )
+    .await?;
+    let templates = resolve_binding_watches(
+        &config.mcp.capabilities.resource_templates,
+        registry,
+        &secrets,
+        "mcp.capabilities.resource_templates",
+    )
+    .await?;
+    Ok((resources, templates))
 }
 
 /// Register the handler of every MCP revision the gateway speaks on

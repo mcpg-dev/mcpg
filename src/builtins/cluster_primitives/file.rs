@@ -22,6 +22,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -38,6 +39,9 @@ use tokio::sync::mpsc;
 // ---------------------------------------------------------------------------
 // FileKv
 // ---------------------------------------------------------------------------
+
+/// Numbers the temporary files of this process's writes.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Stored on-disk shape — keep stable; operators may script around it.
 #[derive(Debug, Serialize, Deserialize)]
@@ -73,7 +77,14 @@ pub struct FileKv {
     /// what makes the counter genuinely atomic; the tmp+rename write
     /// keeps it crash-consistent like every other write.
     incr_lock: tokio::sync::Mutex<()>,
+    /// Serialize `put_if_absent`'s check-then-write per key stripe, so a
+    /// claim and its value appear together: a caller that loses a claim
+    /// reads the winner's value.
+    claim_locks: [tokio::sync::Mutex<()>; CLAIM_STRIPES],
 }
+
+/// Lock stripes of `put_if_absent`.
+const CLAIM_STRIPES: usize = 32;
 
 impl FileKv {
     /// Create a `FileKv` rooted at `<data_dir>/kv/`. The directory
@@ -88,7 +99,16 @@ impl FileKv {
         Ok(Arc::new(Self {
             kv_dir,
             incr_lock: tokio::sync::Mutex::new(()),
+            claim_locks: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         }))
+    }
+
+    /// The claim lock of `key`'s stripe.
+    fn claim_lock(&self, key: &str) -> &tokio::sync::Mutex<()> {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        &self.claim_locks[(hasher.finish() % CLAIM_STRIPES as u64) as usize]
     }
 
     /// Spawn a background sweeper that drops expired entries every
@@ -131,6 +151,8 @@ impl FileKv {
     async fn read_entry(&self, key: &str) -> Result<Option<StoredKv>, ClusterError> {
         let path = self.path_for(key);
         match fs::read(&path).await {
+            // An empty claim file an older build left behind holds no value.
+            Ok(bytes) if bytes.is_empty() => Ok(None),
             Ok(bytes) => {
                 let stored: StoredKv =
                     serde_json::from_slice(&bytes).map_err(|e| ClusterError::Internal {
@@ -151,20 +173,28 @@ impl FileKv {
 
     async fn write_entry(&self, stored: &StoredKv) -> Result<(), ClusterError> {
         let path = self.path_for(&stored.key);
-        let tmp = path.with_extension("json.tmp");
+        // A temporary file per write: two writes of one key must not share
+        // one, or one rename finds it gone and the other renames mixed bytes.
+        let tmp = path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         let bytes = serde_json::to_vec(stored).map_err(|e| ClusterError::Internal {
             reason: format!("encode entry: {e}"),
         })?;
-        fs::write(&tmp, &bytes)
-            .await
-            .map_err(|e| ClusterError::BackendUnavailable {
+        if let Err(e) = fs::write(&tmp, &bytes).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(ClusterError::BackendUnavailable {
                 reason: format!("write {}: {}", tmp.display(), e),
-            })?;
-        fs::rename(&tmp, &path)
-            .await
-            .map_err(|e| ClusterError::BackendUnavailable {
+            });
+        }
+        if let Err(e) = fs::rename(&tmp, &path).await {
+            let _ = fs::remove_file(&tmp).await;
+            return Err(ClusterError::BackendUnavailable {
                 reason: format!("rename {} -> {}: {}", tmp.display(), path.display(), e),
-            })?;
+            });
+        }
         Ok(())
     }
 
@@ -251,39 +281,19 @@ impl KeyValueStore for FileKv {
             payload: value.to_vec(),
             expires_at_secs: ttl.map(|d| current_unix_secs() + d.as_secs().max(1)),
         };
-        let path = self.path_for(key);
-        // Atomic reserve via O_EXCL: only one creator wins the key, even
-        // across concurrent in-process tasks. (FileKv is a single-node,
-        // single-process backend — there is no cross-replica race here.)
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await
+        // FileKv is a single-node, single-process backend, so the stripe
+        // lock makes the claim atomic; the tmp+rename write makes the value
+        // appear whole, never as an empty claim.
+        let _guard = self.claim_lock(key).lock().await;
+        if let Some(existing) = self.read_entry(key).await?
+            && existing
+                .expires_at_secs
+                .is_none_or(|d| d > current_unix_secs())
         {
-            Ok(_reserved) => {
-                // We hold the key exclusively; populate it (tmp+rename
-                // clobbers the empty reservation file we just created).
-                self.write_entry(&stored).await?;
-                Ok(true)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // A file exists. Treat a lapsed incumbent as absent and
-                // reclaim it; a live one means we lost the claim.
-                if let Some(existing) = self.read_entry(key).await?
-                    && existing
-                        .expires_at_secs
-                        .is_some_and(|d| d <= current_unix_secs())
-                {
-                    self.write_entry(&stored).await?;
-                    return Ok(true);
-                }
-                Ok(false)
-            }
-            Err(e) => Err(ClusterError::BackendUnavailable {
-                reason: format!("put_if_absent create_new {}: {}", path.display(), e),
-            }),
+            return Ok(false);
         }
+        self.write_entry(&stored).await?;
+        Ok(true)
     }
 
     async fn delete(&self, key: &str) -> Result<bool, ClusterError> {
@@ -734,6 +744,121 @@ mod tests {
         }
         assert_eq!(kv.incr("c", 0, None).await.unwrap(), 100);
         assert_eq!(&kv.get("c").await.unwrap().unwrap().bytes[..], b"100");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_and_claims_of_one_key_never_fail_a_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = FileKv::new(dir.path()).await.unwrap();
+        let mut handles = Vec::new();
+        for task in 0..4u8 {
+            let kv = Arc::clone(&kv);
+            handles.push(tokio::spawn(async move {
+                for round in 0..25u8 {
+                    let claim = format!("claim-{round}");
+                    kv.put_if_absent(&claim, Bytes::from(vec![task]), None)
+                        .await
+                        .unwrap();
+                    assert!(
+                        kv.get(&claim).await.unwrap().is_some(),
+                        "a claim is read with its value once put_if_absent returns"
+                    );
+                    kv.put("shared", Bytes::from(vec![task, round]), None)
+                        .await
+                        .unwrap();
+                    let got = kv.get("shared").await.unwrap().unwrap();
+                    assert_eq!(got.bytes.len(), 2);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("kv"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "every temporary file is renamed or removed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn one_claimant_wins_and_every_loser_reads_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = FileKv::new(dir.path()).await.unwrap();
+        for round in 0..50u32 {
+            let key = format!("epoch-{round}");
+            let barrier = Arc::new(tokio::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8u8)
+                .map(|task| {
+                    let kv = Arc::clone(&kv);
+                    let key = key.clone();
+                    let barrier = Arc::clone(&barrier);
+                    tokio::spawn(async move {
+                        barrier.wait().await;
+                        let won = kv
+                            .put_if_absent(&key, Bytes::from(vec![task]), None)
+                            .await
+                            .unwrap();
+                        let seen = kv.get(&key).await.unwrap().expect("the winner's value");
+                        (won, task, seen.bytes)
+                    })
+                })
+                .collect();
+            let mut winners = Vec::new();
+            let mut seen = Vec::new();
+            for handle in handles {
+                let (won, task, bytes) = handle.await.unwrap();
+                if won {
+                    winners.push(task);
+                }
+                seen.push(bytes);
+            }
+            assert_eq!(winners.len(), 1, "round {round}: {winners:?}");
+            assert!(
+                seen.iter().all(|b| b[..] == [winners[0]]),
+                "round {round}: every claimant reads the winner's value"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_claim_is_taken_over_and_a_live_one_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = FileKv::new(dir.path()).await.unwrap();
+        let lapsed = StoredKv {
+            key: "lease".to_owned(),
+            payload: b"old".to_vec(),
+            expires_at_secs: Some(current_unix_secs() - 1),
+        };
+        kv.write_entry(&lapsed).await.unwrap();
+        assert!(
+            kv.put_if_absent(
+                "lease",
+                Bytes::from_static(b"new"),
+                Some(Duration::from_secs(60))
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !kv.put_if_absent("lease", Bytes::from_static(b"other"), None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(&kv.get("lease").await.unwrap().unwrap().bytes[..], b"new");
+
+        std::fs::write(kv.path_for("left"), b"").unwrap();
+        assert!(
+            kv.put_if_absent("left", Bytes::from_static(b"v"), None)
+                .await
+                .unwrap(),
+            "an empty claim file an older build left holds nothing"
+        );
+        assert_eq!(&kv.get("left").await.unwrap().unwrap().bytes[..], b"v");
     }
 
     #[tokio::test]

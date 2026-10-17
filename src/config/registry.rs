@@ -397,6 +397,7 @@ pub struct RegistryOauthDiscoveryConfig {
 
 impl RegistryDefaultsConfig {
     fn validate(&self, path: &str) -> Result<()> {
+        self.governance.validate(&format!("{path}.defaults"))?;
         self.import.validate(path)?;
         self.auth.validate(path)?;
         Ok(())
@@ -470,6 +471,7 @@ fn default_registry_import() -> ImportConfig {
         resources: true,
         resource_templates: true,
         prompts: true,
+        events: false,
     }
 }
 
@@ -493,6 +495,25 @@ url: "https://registry.acme.example"
         assert!(matches!(c.on_deprecated, OnDeprecated::ServeAndWarn));
         assert!(c.defaults.import.tools && c.defaults.import.resources);
         assert!(!c.registry_safety.allow_private_registry);
+    }
+
+    /// The governance every synthesized federation inherits is held to the
+    /// rules a written federation's is, at the registry's own path.
+    #[test]
+    fn defaults_governance_allow_if_is_compiled_at_validation() {
+        let err = cfg(r#"
+name: acme
+url: "https://r.example"
+defaults:
+  governance:
+    allow_if: "tool_name == "
+"#)
+        .validate()
+        .expect_err("a syntax error must not validate");
+        assert!(
+            format!("{err:#}").contains("mcp.registries[acme].defaults.governance.allow_if"),
+            "{err:#}"
+        );
     }
 
     #[test]

@@ -1262,8 +1262,7 @@
             }
           ],
           "default": {
-            "allow_if": null,
-            "minimum_trust": "header_asserted"
+            "allow_if": null
           }
         },
         "icons": {
@@ -1413,6 +1412,7 @@
       "type": "object"
     },
     "BackendGovernanceConfig": {
+      "additionalProperties": false,
       "properties": {
         "allow_if": {
           "default": null,
@@ -1422,12 +1422,15 @@
           ]
         },
         "minimum_trust": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/TrustLevelConfig"
+            },
+            {
+              "type": "null"
             }
           ],
-          "default": "header_asserted"
+          "description": "The lowest caller trust level the capability accepts. When unset, a binding takes `governance.policy.tool_access.default_minimum_trust`, and a federation, a registry's `defaults` or an openapi source's auto-exposed capabilities take `header_asserted`."
         },
         "required_scopes": {
           "description": "Scopes the caller's credential MUST carry to invoke this binding (OAuth `scope`, or an AAuth auth token's `scope`). A caller short of them is answered with the step-up challenge naming the missing scopes (`WWW-Authenticate … error=\"insufficient_scope\"`; for an AAuth person or auth-token caller, `AAuth-Requirement: requirement=auth-token` carrying a resource token). Empty (the default) means no scope requirement.",
@@ -1624,6 +1627,26 @@
         "window"
       ],
       "type": "object"
+    },
+    "BuiltinEventSource": {
+      "description": "An event the gateway raises itself.",
+      "oneOf": [
+        {
+          "const": "mcp.task.updated",
+          "description": "A task of the subscriber changed status. Delivered only to the principal whose session owns the task.",
+          "type": "string"
+        },
+        {
+          "const": "approval.requested",
+          "description": "A tool gate asked a person to approve a call.",
+          "type": "string"
+        },
+        {
+          "const": "approval.resolved",
+          "description": "An approval was granted, denied or ran out of time.",
+          "type": "string"
+        }
+      ]
     },
     "BusOverrideConfig": {
       "additionalProperties": true,
@@ -2142,7 +2165,7 @@
       "oneOf": [
         {
           "const": "reject",
-          "description": "Same key + different body hash → JSON-RPC error `-32010 IdempotencyConflict` (HTTP 422).",
+          "description": "Same key + different body hash → JSON-RPC error `-33010 IdempotencyConflict` (HTTP 422).",
           "type": "string"
         }
       ]
@@ -2177,6 +2200,21 @@
       },
       "type": "object"
     },
+    "ControlEnvelopeKind": {
+      "description": "A webhook control envelope the gateway may send.",
+      "oneOf": [
+        {
+          "const": "gap",
+          "description": "Events were skipped; carries the cursor to persist.",
+          "type": "string"
+        },
+        {
+          "const": "terminated",
+          "description": "The subscription ended on the gateway's side.",
+          "type": "string"
+        }
+      ]
+    },
     "ControlPlaneAttachConfig": {
       "additionalProperties": false,
       "description": "Control Plane attachment config. See `apps/gateway/src/runtime/cp/attach.rs` for the wiring logic.",
@@ -2204,7 +2242,7 @@
         },
         "heartbeat_interval_ms": {
           "default": null,
-          "description": "Seconds between heartbeats. Default 30s.",
+          "description": "Milliseconds between heartbeats. Default 30000 (30 s); held to 5000–60000, since each heartbeat reply carries the CP's quota status. A platform-provisioned gateway always runs the default.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -2603,6 +2641,21 @@
       },
       "type": "object"
     },
+    "DeliveryAuditMode": {
+      "description": "Granularity of delivery audit records.",
+      "oneOf": [
+        {
+          "const": "summary",
+          "description": "Counts per subscription per window.",
+          "type": "string"
+        },
+        {
+          "const": "every",
+          "description": "One record per delivery request.",
+          "type": "string"
+        }
+      ]
+    },
     "DeliveryConfig": {
       "additionalProperties": false,
       "description": "`delivery:` config — delivery bus (the internal pub/sub that fans server-initiated messages out to the SSE stream owning each session) + per-capability `bus:` override. When `bus` is unset, the gateway inherits the cluster's `pub_sub()` primitive.",
@@ -2790,6 +2843,813 @@
       ],
       "type": "object"
     },
+    "EventAudience": {
+      "description": "Whose credential reads an event source.",
+      "oneOf": [
+        {
+          "const": "shared",
+          "description": "The gateway's own identity; one source serves every subscriber.",
+          "type": "string"
+        },
+        {
+          "const": "per_principal",
+          "description": "Each subscriber's own credential. No source kind of this build reads with a subscriber's credential, so this is refused.",
+          "type": "string"
+        }
+      ]
+    },
+    "EventDeliveryMode": {
+      "description": "A delivery mode of an event type.",
+      "oneOf": [
+        {
+          "const": "poll",
+          "description": "`events/poll`.",
+          "type": "string"
+        },
+        {
+          "const": "push",
+          "description": "`events/stream`.",
+          "type": "string"
+        },
+        {
+          "const": "webhook",
+          "description": "`events/subscribe` with a callback URL.",
+          "type": "string"
+        }
+      ]
+    },
+    "EventErrorCodes": {
+      "description": "The numbering of the MCP Events error codes on the wire.",
+      "oneOf": [
+        {
+          "const": "draft",
+          "description": "`-32011` to `-32015`.",
+          "type": "string"
+        },
+        {
+          "const": "sep_3415",
+          "description": "`-32023` to `-32027`.",
+          "type": "string"
+        }
+      ]
+    },
+    "EventLogConfig": {
+      "additionalProperties": false,
+      "description": "`events.log:` — the inbox that `inbound` routes write before an event reaches the log.",
+      "properties": {
+        "inbox_max_rows": {
+          "default": 10000,
+          "description": "Most rows one source's inbox holds; past it an inbound route answers `503` with `Retry-After`. Default 10 000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inbox_ttl_ms": {
+          "default": 86400000,
+          "description": "How long an inbox row waits for the log writer, in milliseconds. An inbound route answers `503` with `Retry-After` once the inbox has not been drained for this long, so the sender keeps the event and retries. Default 86 400 000 (24 hours).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "EventReplay": {
+      "description": "Whether a type's log serves replay.",
+      "oneOf": [
+        {
+          "const": "log",
+          "description": "Cursors resume from the log within retention.",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "No cursor is issued; every subscription starts from now.",
+          "type": "string"
+        }
+      ]
+    },
+    "EventRetentionConfig": {
+      "additionalProperties": false,
+      "description": "`retention:` — the bounds of one type's log. The oldest occurrences are evicted first; an append is never refused. On a gateway a control plane manages, the plan's retention caps are the most each bound can be.",
+      "properties": {
+        "max_age_ms": {
+          "default": 86400000,
+          "description": "Oldest occurrence kept, in milliseconds. Default 86 400 000 (24 hours).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_bytes": {
+          "description": "Most bytes kept. Default 8 388 608 (8 MiB). The sum over every type, imported types included, must fit the event-log store: half of the NATS coordinator's events bucket (`jetstream.named_bucket_max_bytes`, 256 MiB by default), or 64 MiB for an in-process memory store. Redis, a `file` store and a store plugin set no limit on the sum.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_events": {
+          "default": 10000,
+          "description": "Most occurrences kept. Default 10 000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "EventSourceConfig": {
+      "additionalProperties": false,
+      "description": "The source of an event type: exactly one of `watch`, `inbound`, `resource` or `builtin`.",
+      "properties": {
+        "builtin": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/BuiltinEventSource"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "An event the gateway itself raises."
+        },
+        "inbound": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InboundSourceConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Signed webhooks that third parties POST to `/webhooks/events/{source_id}`."
+        },
+        "resource": {
+          "description": "The `uri` of the `resources[]` binding whose `watch:` block feeds the type. Every change is one occurrence with `data: {uri, observedAt}`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "watch": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EventWatchSourceConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A plugin watch strategy. Every change it reports is one occurrence: with the plugin's payload when `event_type` names one of the event types the plugin declares, else `data: {observedAt}`."
+        }
+      },
+      "type": "object"
+    },
+    "EventSourcesConfig": {
+      "additionalProperties": false,
+      "description": "`events.sources:` — when event sources run.",
+      "properties": {
+        "linger_ms": {
+          "default": 300000,
+          "description": "How long a source keeps running after its last subscription ends, in milliseconds. Default 300 000 (5 minutes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "EventTransformConfig": {
+      "additionalProperties": false,
+      "description": "An operator transform of occurrence data.",
+      "properties": {
+        "expression": {
+          "description": "The expression handed to the plugin.",
+          "type": "string"
+        },
+        "plugin": {
+          "description": "Id of a loaded transform plugin, for example `dev.mcpg.transform.jsonata`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin",
+        "expression"
+      ],
+      "type": "object"
+    },
+    "EventTypeConfig": {
+      "additionalProperties": false,
+      "description": "One event type the gateway offers (`mcp.capabilities.events[]`).\n\nA type binds exactly one `source`. Subscription `arguments` are a filter applied by `match`, never a parameter of the source.",
+      "properties": {
+        "always_on": {
+          "default": false,
+          "description": "Keep the source running with no subscriber, so the log covers periods without one. Default `false`: a source starts with the first subscription and stops `sources.linger_ms` after the last.",
+          "type": "boolean"
+        },
+        "audience": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventAudience"
+            }
+          ],
+          "default": "shared",
+          "description": "Whose credential reads the source. `shared` (default) reads with the gateway's own identity; per-subscriber visibility is then expressed in `match`."
+        },
+        "delivery": {
+          "default": [
+            "poll",
+            "push",
+            "webhook"
+          ],
+          "description": "Delivery modes offered, intersected with the modes `mcp.configurations.events` enables. Default every mode. The intersection must not be empty.",
+          "items": {
+            "$ref": "#/definitions/EventDeliveryMode"
+          },
+          "type": "array"
+        },
+        "description": {
+          "description": "What an occurrence means, for the client.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input_schema": {
+          "description": "JSON Schema of the subscription `arguments`. Omitted, a subscription carries no arguments."
+        },
+        "match": {
+          "description": "CEL expression over `arguments`, `event` (`event.data`, `event.name`, `event.eventId`, `event.timestamp`) and `subscriber` that selects the occurrences a subscription receives. An error or a non-boolean result delivers nothing.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The type's name, unique, at most 128 characters of `[A-Za-z0-9._-]`. Publish a new name instead of changing a schema in a way that is not additive.",
+          "type": "string"
+        },
+        "payload_schema": {
+          "description": "JSON Schema of each occurrence's `data`. An occurrence that does not match it is dropped and counted. Omitted, any object is accepted. A `watch` or `resource` source sends `{observedAt}` (and `uri` for `resource`), which the schema must accept."
+        },
+        "replay": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventReplay"
+            }
+          ],
+          "default": "log",
+          "description": "`log` (default) lets a client resume from a cursor within retention; `none` always answers `cursor: null`."
+        },
+        "retention": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventRetentionConfig"
+            }
+          ],
+          "default": {
+            "max_age_ms": 86400000,
+            "max_events": 10000
+          },
+          "description": "How long and how much of this type's log is kept."
+        },
+        "source": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventSourceConfig"
+            }
+          ],
+          "description": "Where occurrences come from: exactly one of `watch`, `inbound`, `resource` or `builtin`."
+        },
+        "transform": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/EventTransformConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Operator transform applied to each occurrence's `data` before the payload schema check."
+        }
+      },
+      "required": [
+        "name",
+        "source"
+      ],
+      "type": "object"
+    },
+    "EventWatchSourceConfig": {
+      "additionalProperties": false,
+      "description": "`source.watch:` — a plugin watch strategy.",
+      "properties": {
+        "event_type": {
+          "description": "One of the event types the strategy declares in its plugin's `plugin.yaml` (`watch_strategies[].event_types`). The type then carries the plugin's payload, its schemas unless this type declares its own, and resumes where it stopped when the strategy can. A strategy that declares no types is refused at boot. Omitted, every change is a payload-free `{observedAt}` occurrence. Either way the source runs where the strategy places it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "strategy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WatchStrategyConfig"
+            }
+          ],
+          "description": "A plugin-backed strategy: `nats_topic`, `kafka_topic` (it reads with its own `mcpg-events-{name}` group unless `group_id` names one), `sql_polling`, `postgres_listen_notify` or `plugin`. `poll` and `webhook` are refused: `poll` reads a resource the event type does not have, and the `webhook` token route is not an event source (use `inbound`)."
+        }
+      },
+      "required": [
+        "strategy"
+      ],
+      "type": "object"
+    },
+    "EventsAdvertiseLocation": {
+      "description": "A place in the `server/discover` capabilities where MCP Events is advertised.",
+      "oneOf": [
+        {
+          "const": "capability",
+          "description": "The top-level `capabilities.events` object.",
+          "type": "string"
+        },
+        {
+          "const": "extension",
+          "description": "The `capabilities.extensions[\"io.modelcontextprotocol/events\"]` entry.",
+          "type": "string"
+        }
+      ]
+    },
+    "EventsAuditConfig": {
+      "additionalProperties": false,
+      "description": "`events.audit:` — how delivery is audited.",
+      "properties": {
+        "deliveries": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/DeliveryAuditMode"
+            }
+          ],
+          "default": "summary",
+          "description": "`summary` (default) writes one record per subscription per window with delivery counts; `every` writes one record per delivery request."
+        }
+      },
+      "type": "object"
+    },
+    "EventsConfig": {
+      "additionalProperties": false,
+      "description": "`events:` config — the experimental MCP Events extension.\n\nOff by default. With `enabled: false` the `events/*` methods answer `-32601` and `server/discover` does not mention events. The extension is served on the `2026-07-28` wire over HTTP only; the `2025-11-25` wire and stdio never carry it. Event types are declared under `mcp.capabilities.events`.",
+      "properties": {
+        "advertise": {
+          "default": [
+            "capability",
+            "extension"
+          ],
+          "description": "Where `server/discover` advertises the extension. The drafts disagree on the location, so both are on by default: `capability` is the top-level `capabilities.events` object (read by ChatGPT), `extension` is the `capabilities.extensions[\"io.modelcontextprotocol/events\"]` entry. Must name at least one location when `enabled` is `true`.",
+          "items": {
+            "$ref": "#/definitions/EventsAdvertiseLocation"
+          },
+          "type": "array"
+        },
+        "allow_ephemeral_subscriptions": {
+          "default": false,
+          "description": "Accept webhook subscriptions on a store that loses them on a restart. Every grant is then capped at `webhook.ttl.min_ms`, so a client refreshes before a restart can matter for long. Default `false`.",
+          "type": "boolean"
+        },
+        "audit": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventsAuditConfig"
+            }
+          ],
+          "default": {
+            "deliveries": "summary"
+          },
+          "description": "Audit of event delivery."
+        },
+        "delivery_paused": {
+          "default": false,
+          "description": "Hold every delivery, in every mode, while keeping every subscription and every event within retention: webhook deliveries wait, a poll answers no events and the cursor it was given, and a stream sends heartbeats only. Subscribe and refresh still answer, with `deliveryStatus.active: false` and `lastError: \"paused\"`. Delivery resumes from each position when this is cleared. Default `false`.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "default": false,
+          "description": "Serve the `events/*` methods of every delivery mode enabled below, and advertise the extension. Default `false`.",
+          "type": "boolean"
+        },
+        "error_codes": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventErrorCodes"
+            }
+          ],
+          "default": "draft",
+          "description": "How the extension's error codes are numbered. `draft` (default) answers `-32011` to `-32015`, the numbers the ChatGPT profile documents; `sep_3415` answers `-32023` to `-32027`, the numbers the upstream sketch assigns. The documentation names the `draft` numbers."
+        },
+        "inbound_profiles": {
+          "description": "Signing profiles of inbound senders beyond the built-in ones (`standard_webhooks`, `github`, `stripe`, `slack`). A route names one in `source.inbound.verify.profile`.",
+          "items": {
+            "$ref": "#/definitions/InboundProfileConfig"
+          },
+          "type": "array"
+        },
+        "log": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventLogConfig"
+            }
+          ],
+          "default": {
+            "inbox_max_rows": 10000,
+            "inbox_ttl_ms": 86400000
+          },
+          "description": "Event log limits."
+        },
+        "log_store": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StoreOverrideConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Store of the event log (store role `event-log`). Omitted, the cluster coordinator's store is used. The retention byte budgets of every event type must fit this store (see `mcp.capabilities.events[].retention.max_bytes`)."
+        },
+        "poll": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventsPollConfig"
+            }
+          ],
+          "default": {
+            "enabled": false,
+            "lease_multiplier": 3,
+            "max_events": 100,
+            "max_events_cap": 1000,
+            "max_leases_per_principal": 100,
+            "min_next_poll_ms": 1000,
+            "next_poll_ms": 5000,
+            "require_trust": "verified"
+          },
+          "description": "Poll delivery (`events/poll`)."
+        },
+        "push": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventsPushConfig"
+            }
+          ],
+          "default": {
+            "enabled": false,
+            "heartbeat_interval_ms": 20000,
+            "max_streams_per_principal": 16,
+            "require_trust": "verified"
+          },
+          "description": "Push delivery (`events/stream`)."
+        },
+        "reauthorize_interval_ms": {
+          "default": 300000,
+          "description": "How often the authorization of a long-lived grant is checked again from its stored identity: each webhook subscription and each open stream. In milliseconds; default 300 000 (5 minutes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sources": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventSourcesConfig"
+            }
+          ],
+          "default": {
+            "linger_ms": 300000
+          },
+          "description": "Lifecycle of event sources."
+        },
+        "store": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/StoreOverrideConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Store of the webhook subscription records (store role `event-subscription`). Omitted, the cluster coordinator's store is used, which is in memory on a single node. Webhook delivery refuses a store that does not survive a restart unless `allow_ephemeral_subscriptions` is set; a single node keeps subscriptions with `{kind: file, dir: …}`."
+        },
+        "unsubscribe_unknown": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/UnsubscribeUnknown"
+            }
+          ],
+          "default": "ok",
+          "description": "The answer to `events/unsubscribe` for a subscription that does not exist. `ok` (default) answers `{}`, as an idempotent unsubscribe; `not_found` answers `-32011` with `data.kind: \"subscription\"`."
+        },
+        "webhook": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventsWebhookConfig"
+            }
+          ],
+          "default": {
+            "control_envelopes": [
+              "gap",
+              "terminated"
+            ],
+            "egress": {
+              "allow_private_backends": false,
+              "allowed_ports": [],
+              "attempt_timeout_ms": 10000,
+              "connect_timeout_ms": 3000,
+              "deny_hosts": []
+            },
+            "enabled": true,
+            "limits": {
+              "per_host_concurrency": 8,
+              "per_principal": 100,
+              "per_principal_callback_hosts": 5,
+              "per_subscription_in_flight": 4,
+              "per_type": 5000,
+              "total": 10000
+            },
+            "max_payload_bytes": 245760,
+            "require_trust": "verified",
+            "retry": {
+              "honor_retry_after": true,
+              "max_attempts": 5,
+              "window_ms": 900000
+            },
+            "secret_rotation_grace_ms": 600000,
+            "suspension": {
+              "drop_no_expiry_after_ms": 604800000,
+              "failure_rate": 0.95,
+              "min_attempts": 100,
+              "window_ms": 3600000
+            },
+            "ttl": {
+              "allow_no_expiry": false,
+              "clamp_to_token_expiry": true,
+              "default_ms": 3600000,
+              "max_ms": 86400000,
+              "min_ms": 300000
+            },
+            "verification": {
+              "allowlist": [],
+              "cache_ttl_ms": 86400000,
+              "modes": [
+                "challenge"
+              ],
+              "per_host_in_flight": 3,
+              "per_host_per_min": 6,
+              "timeout_ms": 10000
+            }
+          },
+          "description": "Webhook delivery (`events/subscribe`)."
+        }
+      },
+      "type": "object"
+    },
+    "EventsPollConfig": {
+      "additionalProperties": false,
+      "description": "`events.poll:` — `events/poll`: a client reads a type's log itself, on any replica, with the cursor of its previous poll. Off by default.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Serve `events/poll`, and offer `poll` on every type whose `delivery` lists it. Default `false`.",
+          "type": "boolean"
+        },
+        "lease_multiplier": {
+          "default": 3,
+          "description": "A poll lease lasts this many `next_poll_ms` after the last poll. While a type has a lease, its source runs. Default 3.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_events": {
+          "default": 100,
+          "description": "Events per poll when the client sets no `maxEvents`. Default 100.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_events_cap": {
+          "default": 1000,
+          "description": "Most events per poll. Default 1 000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_leases_per_principal": {
+          "default": 100,
+          "description": "Poll leases one principal may hold: one per event type and arguments it polls. Default 100.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_next_poll_ms": {
+          "default": 1000,
+          "description": "Shortest wait the gateway asks for, in milliseconds. Default 1 000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "next_poll_ms": {
+          "default": 5000,
+          "description": "Suggested wait before the next poll, in milliseconds. Default 5 000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "require_trust": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SubscriberTrust"
+            }
+          ],
+          "default": "verified",
+          "description": "The lowest caller trust that may poll. `verified` (default) requires a cryptographically verified principal; `header_asserted` also admits a principal named by a request header."
+        }
+      },
+      "type": "object"
+    },
+    "EventsPushConfig": {
+      "additionalProperties": false,
+      "description": "`events.push:` — `events/stream`: one long-lived response per subscription, on the replica the client reaches. Off by default.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Serve `events/stream`, and offer `push` on every type whose `delivery` lists it. Default `false`.",
+          "type": "boolean"
+        },
+        "heartbeat_interval_ms": {
+          "default": 20000,
+          "description": "Interval of heartbeat frames, in milliseconds, from 1 000 to 30 000. Default 20 000. A client that hears nothing for twice this treats the stream as dead and reconnects with its cursor.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_streams_per_principal": {
+          "default": 16,
+          "description": "Streams one principal may hold open across the cluster. Default 16. These do not count against the server-push stream cap of a session.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "require_trust": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SubscriberTrust"
+            }
+          ],
+          "default": "verified",
+          "description": "The lowest caller trust that may open a stream. `verified` (default) requires a cryptographically verified principal; `header_asserted` also admits a principal named by a request header."
+        }
+      },
+      "type": "object"
+    },
+    "EventsWebhookConfig": {
+      "additionalProperties": false,
+      "description": "`events.webhook:` — the webhook delivery profile.",
+      "properties": {
+        "control_envelopes": {
+          "default": [
+            "gap",
+            "terminated"
+          ],
+          "description": "The control envelopes sent besides events. Default both `gap` and `terminated`; a `verification` envelope is always sent.",
+          "items": {
+            "$ref": "#/definitions/ControlEnvelopeKind"
+          },
+          "type": "array"
+        },
+        "egress": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WebhookEgressConfig"
+            }
+          ],
+          "default": {
+            "allow_private_backends": false,
+            "allowed_ports": [],
+            "attempt_timeout_ms": 10000,
+            "connect_timeout_ms": 3000,
+            "deny_hosts": []
+          },
+          "description": "The outbound client that reaches callback URLs."
+        },
+        "enabled": {
+          "default": true,
+          "description": "Accept `events/subscribe` and deliver to callback URLs. Default `true`. Requires a store that survives a restart (or `allow_ephemeral_subscriptions`) and a key that every replica shares: `cluster.state_encryption_key_env` or `mcp.configurations.sessions.synthetic_session_key`.",
+          "type": "boolean"
+        },
+        "limits": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WebhookLimitsConfig"
+            }
+          ],
+          "default": {
+            "per_host_concurrency": 8,
+            "per_principal": 100,
+            "per_principal_callback_hosts": 5,
+            "per_subscription_in_flight": 4,
+            "per_type": 5000,
+            "total": 10000
+          },
+          "description": "Subscription and delivery limits."
+        },
+        "max_payload_bytes": {
+          "default": 245760,
+          "description": "Largest serialized occurrence, in bytes; a larger occurrence is not delivered. At most 245 760 (the default), so the whole request body stays within 262 144 bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "require_trust": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SubscriberTrust"
+            }
+          ],
+          "default": "verified",
+          "description": "The lowest caller trust that may subscribe. `verified` (default) requires a cryptographically verified principal; `header_asserted` also admits a principal named by a request header and is for self-hosted deployments that trust their front proxy."
+        },
+        "retry": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WebhookRetryConfig"
+            }
+          ],
+          "default": {
+            "honor_retry_after": true,
+            "max_attempts": 5,
+            "window_ms": 900000
+          },
+          "description": "Retries of one delivery."
+        },
+        "secret_rotation_grace_ms": {
+          "default": 600000,
+          "description": "How long the previous secret keeps signing after a subscribe replaces it, in milliseconds. Default 600 000 (10 minutes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "suspension": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WebhookSuspensionConfig"
+            }
+          ],
+          "default": {
+            "drop_no_expiry_after_ms": 604800000,
+            "failure_rate": 0.95,
+            "min_attempts": 100,
+            "window_ms": 3600000
+          },
+          "description": "When failing deliveries suspend a subscription."
+        },
+        "ttl": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WebhookTtlConfig"
+            }
+          ],
+          "default": {
+            "allow_no_expiry": false,
+            "clamp_to_token_expiry": true,
+            "default_ms": 3600000,
+            "max_ms": 86400000,
+            "min_ms": 300000
+          },
+          "description": "Lifetime of a subscription grant."
+        },
+        "verification": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/WebhookVerificationConfig"
+            }
+          ],
+          "default": {
+            "allowlist": [],
+            "cache_ttl_ms": 86400000,
+            "modes": [
+              "challenge"
+            ],
+            "per_host_in_flight": 3,
+            "per_host_per_min": 6,
+            "timeout_ms": 10000
+          },
+          "description": "Proof that a callback endpoint wants the deliveries."
+        }
+      },
+      "type": "object"
+    },
+    "FailureRate": {
+      "description": "A share between 0 and 1.",
+      "format": "double",
+      "type": "number"
+    },
     "FeatureFlagsConfig": {
       "additionalProperties": false,
       "description": "Operator-controlled strictness / compat flags.\n\nEvery field defaults to the safe / standards-compliant value; flipping a flag is an explicit acknowledgement that the operator is taking on the risk the default protects against.",
@@ -2841,6 +3701,22 @@
           },
           "description": "Capability-cache behaviour (TTL refresh)."
         },
+        "events": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FederationEventsConfig"
+            }
+          ],
+          "default": {
+            "delivery": "auto",
+            "retention": {
+              "max_age_ms": 86400000,
+              "max_events": 10000
+            },
+            "sharing": "fan_in"
+          },
+          "description": "How imported event types are read from the upstream."
+        },
         "filter": {
           "allOf": [
             {
@@ -2848,12 +3724,16 @@
             }
           ],
           "default": {
+            "exclude_events": [],
             "exclude_tools": [],
+            "include_events": [
+              "*"
+            ],
             "include_tools": [
               "*"
             ]
           },
-          "description": "Allow/deny filtering of imported tool names."
+          "description": "Allow/deny filtering of imported tool and event type names."
         },
         "governance": {
           "allOf": [
@@ -2862,8 +3742,7 @@
             }
           ],
           "default": {
-            "allow_if": null,
-            "minimum_trust": "header_asserted"
+            "allow_if": null
           },
           "description": "Governance inherited by every capability imported from this upstream — identical block to a native binding's, so the gate chain treats a federated call exactly like a native one."
         },
@@ -2874,6 +3753,7 @@
             }
           ],
           "default": {
+            "events": false,
             "prompts": false,
             "resource_templates": false,
             "resources": false,
@@ -2955,12 +3835,65 @@
       ],
       "type": "object"
     },
+    "FederationEventsConfig": {
+      "additionalProperties": false,
+      "description": "How imported MCP Events types are read from the upstream.",
+      "properties": {
+        "delivery": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/UpstreamEventDelivery"
+            }
+          ],
+          "default": "auto",
+          "description": "The upstream delivery mode each upstream subscription uses."
+        },
+        "retention": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventRetentionConfig"
+            }
+          ],
+          "default": {
+            "max_age_ms": 86400000,
+            "max_events": 10000
+          },
+          "description": "What the gateway keeps of each imported type's events, as `retention` does for a configured type. Imported types count against the event-log store's byte budget after the configured ones; a type that does not fit is not served."
+        },
+        "sharing": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/UpstreamEventSharing"
+            }
+          ],
+          "default": "fan_in",
+          "description": "Whose upstream subscriptions serve the subscribers."
+        }
+      },
+      "type": "object"
+    },
     "FilterConfig": {
       "additionalProperties": false,
-      "description": "Allow/deny filtering of imported tool names (glob `*` suffix).",
+      "description": "Allow/deny filtering of imported tool and event type names (glob `*` suffix).",
       "properties": {
+        "exclude_events": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "exclude_tools": {
           "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "include_events": {
+          "default": [
+            "*"
+          ],
           "items": {
             "type": "string"
           },
@@ -3536,6 +4469,26 @@
       },
       "type": "object"
     },
+    "HmacAlgorithm": {
+      "description": "The hash of an HMAC signature.",
+      "oneOf": [
+        {
+          "const": "sha1",
+          "description": "HMAC-SHA1, 20-byte digests.",
+          "type": "string"
+        },
+        {
+          "const": "sha256",
+          "description": "HMAC-SHA256, 32-byte digests.",
+          "type": "string"
+        },
+        {
+          "const": "sha512",
+          "description": "HMAC-SHA512, 64-byte digests.",
+          "type": "string"
+        }
+      ]
+    },
     "IdempotencyConfig": {
       "additionalProperties": false,
       "description": "`idempotency:` config — opt-in dedupe for `tools/call` and `tasks/create`. When `enabled: false` (the default), the gateway omits the `dev.mcpg/idempotency` extension from its `initialize` capability advertisement and silently ignores any `_meta[\"dev.mcpg/idempotency-key\"]` the caller sets.",
@@ -3658,6 +4611,11 @@
       "additionalProperties": false,
       "description": "Which capability surfaces to import.",
       "properties": {
+        "events": {
+          "default": false,
+          "description": "Import the upstream's MCP Events types. Each serves downstream from the gateway's own log, in every delivery mode the gateway enables, and is fed by one upstream subscription per distinct set of arguments in demand, held with this federation's catalogue credential. Needs an upstream on the `2026-07-28` wire over `streamable_http` that advertises events; any other imports none.",
+          "type": "boolean"
+        },
         "prompts": {
           "default": false,
           "type": "boolean"
@@ -3673,6 +4631,276 @@
         "tools": {
           "default": true,
           "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "InboundHandshakeConfig": {
+      "additionalProperties": false,
+      "description": "An entry of `handshakes:` — a request the route answers itself.",
+      "properties": {
+        "reply": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The JSON object of a `200` reply: each key takes the string at a JSON pointer into the body, as a URL challenge is echoed. Omitted, the route acknowledges with `202`.",
+          "type": "object"
+        },
+        "when": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InboundWhenConfig"
+            }
+          ],
+          "description": "The requests it answers. Every listed header and body field must match."
+        }
+      },
+      "required": [
+        "when"
+      ],
+      "type": "object"
+    },
+    "InboundProfileConfig": {
+      "additionalProperties": false,
+      "description": "An entry of `inbound_profiles:` — how one kind of sender signs its webhooks: an HMAC of a message built from the raw body, a signed timestamp and headers. Routes name it in `verify.profile`.",
+      "properties": {
+        "algorithm": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/HmacAlgorithm"
+            }
+          ],
+          "default": "sha256",
+          "description": "The HMAC hash. Default `sha256`."
+        },
+        "event_id": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InboundValueConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the sender puts its event id. A route's own `event_id` takes its place."
+        },
+        "event_time": {
+          "description": "JSON pointer to the event time in the body, RFC 3339 or Unix seconds. A route's own `timestamp` takes its place.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "handshakes": {
+          "description": "Requests the route answers itself, never as events: a sender's ping or URL challenge. The first match applies.",
+          "items": {
+            "$ref": "#/definitions/InboundHandshakeConfig"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "The name routes give in `verify.profile`. At most 64 characters of `[a-z0-9_-]`; a built-in name cannot be declared again.",
+          "type": "string"
+        },
+        "secret": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SecretFormatConfig"
+            }
+          ],
+          "default": {
+            "encoding": "utf8"
+          },
+          "description": "How a configured secret becomes the HMAC key."
+        },
+        "signature": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SignatureFormatConfig"
+            }
+          ],
+          "description": "Where the request carries its signatures."
+        },
+        "signed_payload": {
+          "default": "{body}",
+          "description": "The signed message. `{body}` is the raw body and must appear once; `{timestamp}` is the signed timestamp; `{header:NAME}` is the value of request header `NAME`. Default `{body}`.",
+          "type": "string"
+        },
+        "signed_timestamp": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SignedTimestampConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The signed Unix-seconds timestamp, for a sender that signs one. A request outside the tolerance is refused as stale."
+        }
+      },
+      "required": [
+        "name",
+        "signature"
+      ],
+      "type": "object"
+    },
+    "InboundRateLimitConfig": {
+      "additionalProperties": false,
+      "description": "Request rate of one inbound source on each replica.",
+      "properties": {
+        "burst": {
+          "default": 100,
+          "description": "Requests accepted in a burst. Default 100.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "per_sec": {
+          "default": 50,
+          "description": "Sustained requests per second. Default 50.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "InboundSourceConfig": {
+      "additionalProperties": false,
+      "description": "`source.inbound:` — a signed inbound webhook route.",
+      "properties": {
+        "allow_unsigned": {
+          "default": false,
+          "description": "Accept requests nobody signed. Anyone who can reach the route can then inject events. Default `false`.",
+          "type": "boolean"
+        },
+        "event_id": {
+          "description": "JSON pointer to the sender's event id in the body (for example `/id`). Omitted, the scheme's id is used: the `webhook-id` header of Standard Webhooks, `X-GitHub-Delivery` of GitHub, `/id` of Stripe, `/event_id` of Slack; with none, the gateway mints an id. A repeated id is accepted once.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rate_limit": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InboundRateLimitConfig"
+            }
+          ],
+          "default": {
+            "burst": 100,
+            "per_sec": 50
+          },
+          "description": "Requests accepted per second on each replica; past it the route answers `429` with `Retry-After`."
+        },
+        "source_id": {
+          "description": "The route segment: senders POST to `/webhooks/events/{source_id}`. At most 64 characters of `[A-Za-z0-9_-]`. Types that share a route each take the requests their `when` keeps, and declare the same `verify`, `allow_unsigned` and `rate_limit`.",
+          "type": "string"
+        },
+        "timestamp": {
+          "description": "JSON pointer to the event time in the body, RFC 3339 or Unix seconds. Omitted, the scheme's time (`/created` of Stripe, `/event_time` of Slack), else the time the request arrived.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verify": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InboundVerifyConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How a request proves its sender. Required unless `allow_unsigned` is set."
+        },
+        "when": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/InboundWhenConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Requests to keep; any other request is acknowledged and dropped."
+        }
+      },
+      "required": [
+        "source_id"
+      ],
+      "type": "object"
+    },
+    "InboundValueConfig": {
+      "additionalProperties": false,
+      "description": "A value of the request. Name exactly one of `header` and `pointer`.",
+      "properties": {
+        "header": {
+          "description": "A request header.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pointer": {
+          "description": "A JSON pointer into the body.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "InboundVerifyConfig": {
+      "additionalProperties": false,
+      "description": "`verify:` — how an inbound request proves its sender: a signing profile and this route's secrets.",
+      "properties": {
+        "profile": {
+          "description": "The signing profile: a built-in one (`standard_webhooks`, `github`, `stripe`, `slack`) or the `name` of an entry of `mcp.configurations.events.inbound_profiles`.",
+          "type": "string"
+        },
+        "secrets": {
+          "description": "Shared secrets, usually `${secret.NAME}`. Several are accepted at once during a rotation.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tolerance_secs": {
+          "description": "Largest age or skew of the signed timestamp, in seconds, in place of the profile's. Only for a profile that signs a timestamp.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "profile",
+        "secrets"
+      ],
+      "type": "object"
+    },
+    "InboundWhenConfig": {
+      "additionalProperties": false,
+      "description": "`when:` — the requests an inbound source keeps. Every listed header and every listed body field must match.",
+      "properties": {
+        "body": {
+          "additionalProperties": true,
+          "default": {},
+          "description": "JSON pointer into the body to the exact JSON value it must hold.",
+          "type": "object"
+        },
+        "header": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Header name to the exact value it must carry.",
+          "type": "object"
         }
       },
       "type": "object"
@@ -3928,28 +5156,29 @@
     },
     "LicenseConfig": {
       "additionalProperties": false,
+      "description": "The licence of a gateway that mcpg.cloud does not license. A gateway mcpg.cloud delivers a licence to — the delivery carries a proof, signed with an MCPG key, that mcpg.cloud made it on that very connection — ignores the whole block (token, `token_file` and `non_production_use`) and runs on that licence, so a config never chooses its own licence there. Under a customer's own control plane, and until a delivery arrives, the block counts, and takes precedence over a self-host licence that control plane relays.",
       "properties": {
         "non_production_use": {
           "default": false,
-          "description": "Declares this deployment non-production. Entitlement-gated plugins and feature-gated config blocks (interactive sign-in, DPoP and rich authorization requests at the embedded authorization server) then load without a token under their license's free non-production grant (development, testing, evaluation, staging), with a boot warning naming them. Production use still requires an entitling token.",
+          "description": "Declares this deployment non-production. Entitlement-gated plugins and feature-gated config blocks (interactive sign-in, DPoP and rich authorization requests at the embedded authorization server) then load without a token under their license's free non-production grant (development, testing, evaluation, staging). The declaration is visible: a boot warning repeated daily, the admin health endpoint's `license.non_production`, and the `non_production` label of the `mcpg_license_info` metric. Production use still requires an entitling token. A gateway mcpg.cloud delivers a licence to ignores it.",
           "type": "boolean"
         },
         "pubkey_pem": {
-          "description": "Trusted license-signing public key (SPKI PEM, Ed25519) — the verification anchor for the configured token (`mcpg-license keygen --public-out`). Required when a token is configured; an unverifiable token refuses boot rather than silently degrading to community.",
+          "description": "Deprecated and ignored. A license verifies only against the MCPG issuer keys compiled into the binary, never a key from configuration; setting this logs a warning.",
           "type": [
             "string",
             "null"
           ]
         },
         "token": {
-          "description": "The signed license JWT, inline (commonly `${env.MCPG_LICENSE}`). Exactly one of `token` / `token_file` may be set.",
+          "description": "The MCPG-issued self-host license JWT, inline. Supply via `${env.X}` (commonly `${env.MCPG_LICENSE}`) or `${secret.NAME}`. A secret-provider reference (`cred://`, or a `vault://` path) is not resolved here: the licence is read before any plugin loads, because it decides which plugins may load, and the Vault provider is itself a licensed plugin. Exactly one of `token` / `token_file` may be set. It verifies against the MCPG issuer keys compiled into the binary. A token that does not verify refuses boot when the config has an entitlement-gated plugin or a licensed authorization-server block, rather than silently degrading them to community; with neither, the gateway logs a warning and runs the community tier. An expired token keeps its plan for a 14-day grace period, with warnings from 30 days before expiry.",
           "type": [
             "string",
             "null"
           ]
         },
         "token_file": {
-          "description": "Path to a file holding the signed license JWT (e.g. a mounted secret). Exactly one of `token` / `token_file` may be set.",
+          "description": "Path to a file holding the MCPG-issued self-host license JWT (e.g. a mounted secret), read verbatim. Exactly one of `token` / `token_file` may be set.",
           "type": [
             "string",
             "null"
@@ -4115,6 +5344,13 @@
           },
           "description": "MCP elicitation — server-initiated prompt requests the gateway emits during pipeline execution."
         },
+        "events": {
+          "description": "MCP Events (experimental) event types — what `events/list` offers and the delivery modes deliver. Each type binds one source: a plugin watch strategy, a signed inbound webhook route, a resource binding's watch, or an event the gateway raises itself. Served only while `mcp.configurations.events.enabled` is `true`.",
+          "items": {
+            "$ref": "#/definitions/EventTypeConfig"
+          },
+          "type": "array"
+        },
         "prompts": {
           "default": [],
           "description": "Operator-declared prompts — the bindings that surface via `prompts/list` and `prompts/get`. Carry `prompt_arguments`.",
@@ -4257,6 +5493,97 @@
               "partition_by_principal": false
             },
             "delivery": {},
+            "events": {
+              "advertise": [
+                "capability",
+                "extension"
+              ],
+              "allow_ephemeral_subscriptions": false,
+              "audit": {
+                "deliveries": "summary"
+              },
+              "delivery_paused": false,
+              "enabled": false,
+              "error_codes": "draft",
+              "log": {
+                "inbox_max_rows": 10000,
+                "inbox_ttl_ms": 86400000
+              },
+              "poll": {
+                "enabled": false,
+                "lease_multiplier": 3,
+                "max_events": 100,
+                "max_events_cap": 1000,
+                "max_leases_per_principal": 100,
+                "min_next_poll_ms": 1000,
+                "next_poll_ms": 5000,
+                "require_trust": "verified"
+              },
+              "push": {
+                "enabled": false,
+                "heartbeat_interval_ms": 20000,
+                "max_streams_per_principal": 16,
+                "require_trust": "verified"
+              },
+              "reauthorize_interval_ms": 300000,
+              "sources": {
+                "linger_ms": 300000
+              },
+              "unsubscribe_unknown": "ok",
+              "webhook": {
+                "control_envelopes": [
+                  "gap",
+                  "terminated"
+                ],
+                "egress": {
+                  "allow_private_backends": false,
+                  "allowed_ports": [],
+                  "attempt_timeout_ms": 10000,
+                  "connect_timeout_ms": 3000,
+                  "deny_hosts": []
+                },
+                "enabled": true,
+                "limits": {
+                  "per_host_concurrency": 8,
+                  "per_principal": 100,
+                  "per_principal_callback_hosts": 5,
+                  "per_subscription_in_flight": 4,
+                  "per_type": 5000,
+                  "total": 10000
+                },
+                "max_payload_bytes": 245760,
+                "require_trust": "verified",
+                "retry": {
+                  "honor_retry_after": true,
+                  "max_attempts": 5,
+                  "window_ms": 900000
+                },
+                "secret_rotation_grace_ms": 600000,
+                "suspension": {
+                  "drop_no_expiry_after_ms": 604800000,
+                  "failure_rate": 0.95,
+                  "min_attempts": 100,
+                  "window_ms": 3600000
+                },
+                "ttl": {
+                  "allow_no_expiry": false,
+                  "clamp_to_token_expiry": true,
+                  "default_ms": 3600000,
+                  "max_ms": 86400000,
+                  "min_ms": 300000
+                },
+                "verification": {
+                  "allowlist": [],
+                  "cache_ttl_ms": 86400000,
+                  "modes": [
+                    "challenge"
+                  ],
+                  "per_host_in_flight": 3,
+                  "per_host_per_min": 6,
+                  "timeout_ms": 10000
+                }
+              }
+            },
             "idempotency": {
               "conflict_policy": "reject",
               "default_ttl_ms": 86400000,
@@ -4371,6 +5698,105 @@
           ],
           "default": {}
         },
+        "events": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventsConfig"
+            }
+          ],
+          "default": {
+            "advertise": [
+              "capability",
+              "extension"
+            ],
+            "allow_ephemeral_subscriptions": false,
+            "audit": {
+              "deliveries": "summary"
+            },
+            "delivery_paused": false,
+            "enabled": false,
+            "error_codes": "draft",
+            "log": {
+              "inbox_max_rows": 10000,
+              "inbox_ttl_ms": 86400000
+            },
+            "poll": {
+              "enabled": false,
+              "lease_multiplier": 3,
+              "max_events": 100,
+              "max_events_cap": 1000,
+              "max_leases_per_principal": 100,
+              "min_next_poll_ms": 1000,
+              "next_poll_ms": 5000,
+              "require_trust": "verified"
+            },
+            "push": {
+              "enabled": false,
+              "heartbeat_interval_ms": 20000,
+              "max_streams_per_principal": 16,
+              "require_trust": "verified"
+            },
+            "reauthorize_interval_ms": 300000,
+            "sources": {
+              "linger_ms": 300000
+            },
+            "unsubscribe_unknown": "ok",
+            "webhook": {
+              "control_envelopes": [
+                "gap",
+                "terminated"
+              ],
+              "egress": {
+                "allow_private_backends": false,
+                "allowed_ports": [],
+                "attempt_timeout_ms": 10000,
+                "connect_timeout_ms": 3000,
+                "deny_hosts": []
+              },
+              "enabled": true,
+              "limits": {
+                "per_host_concurrency": 8,
+                "per_principal": 100,
+                "per_principal_callback_hosts": 5,
+                "per_subscription_in_flight": 4,
+                "per_type": 5000,
+                "total": 10000
+              },
+              "max_payload_bytes": 245760,
+              "require_trust": "verified",
+              "retry": {
+                "honor_retry_after": true,
+                "max_attempts": 5,
+                "window_ms": 900000
+              },
+              "secret_rotation_grace_ms": 600000,
+              "suspension": {
+                "drop_no_expiry_after_ms": 604800000,
+                "failure_rate": 0.95,
+                "min_attempts": 100,
+                "window_ms": 3600000
+              },
+              "ttl": {
+                "allow_no_expiry": false,
+                "clamp_to_token_expiry": true,
+                "default_ms": 3600000,
+                "max_ms": 86400000,
+                "min_ms": 300000
+              },
+              "verification": {
+                "allowlist": [],
+                "cache_ttl_ms": 86400000,
+                "modes": [
+                  "challenge"
+                ],
+                "per_host_in_flight": 3,
+                "per_host_per_min": 6,
+                "timeout_ms": 10000
+              }
+            }
+          },
+          "description": "`io.modelcontextprotocol/events` (MCP Events, experimental) extension config. Off by default; `enabled: true` serves the `events/*` methods on the `2026-07-28` wire and advertises them in `server/discover`."
+        },
         "idempotency": {
           "allOf": [
             {
@@ -4477,10 +5903,10 @@
               "capability_ttl_secs": 300
             },
             "governance": {
-              "allow_if": null,
-              "minimum_trust": "header_asserted"
+              "allow_if": null
             },
             "import": {
+              "events": false,
               "prompts": true,
               "resource_templates": true,
               "resources": true,
@@ -4629,6 +6055,13 @@
       "additionalProperties": false,
       "description": "Prefixes applied to imported capability names / URIs.",
       "properties": {
+        "event_prefix": {
+          "description": "Prepended to every imported event type name (e.g. `\"github.\"`). The result must still be a valid event name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "prompt_prefix": {
           "description": "Prepended to every imported prompt name.",
           "type": [
@@ -5825,8 +7258,7 @@
             }
           ],
           "default": {
-            "allow_if": null,
-            "minimum_trust": "header_asserted"
+            "allow_if": null
           },
           "description": "Governance inherited by every synthesized federation (trust floor + CEL), exactly like a hand-written federation's block."
         },
@@ -5837,6 +7269,7 @@
             }
           ],
           "default": {
+            "events": false,
             "prompts": true,
             "resource_templates": true,
             "resources": true,
@@ -6189,6 +7622,47 @@
         },
         "url": {
           "description": "URL to fetch the JSON Schema from at startup.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SecretFormatConfig": {
+      "additionalProperties": false,
+      "description": "`secret:` — how a configured secret becomes the HMAC key.",
+      "properties": {
+        "encoding": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TextEncoding"
+            }
+          ],
+          "default": "utf8",
+          "description": "How the rest of the secret encodes the key. Default `utf8`."
+        },
+        "max_bytes": {
+          "description": "Longest key, in decoded bytes; a longer secret is refused at boot. Unset, no limit.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_bytes": {
+          "description": "Shortest key, in decoded bytes; a shorter secret is refused at boot. At least 1. Unset, any non-empty key.",
+          "format": "uint32",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "prefix": {
+          "description": "Text every secret starts with, removed before decoding; a secret without it is refused at boot.",
           "type": [
             "string",
             "null"
@@ -6608,6 +8082,48 @@
       },
       "type": "object"
     },
+    "SignatureFormatConfig": {
+      "additionalProperties": false,
+      "description": "`signature:` — where a request carries its signatures.",
+      "properties": {
+        "encoding": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/TextEncoding"
+            }
+          ],
+          "default": "hex",
+          "description": "How a digest is written: `hex` (default) or `base64`."
+        },
+        "header": {
+          "description": "The header with the signatures. It must appear once.",
+          "type": "string"
+        },
+        "key": {
+          "description": "Items are `key=value` pairs, and the signatures are the values of this key. Needs `separator`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "prefix": {
+          "default": "",
+          "description": "Text before each digest, removed before decoding. An item without it is skipped.",
+          "type": "string"
+        },
+        "separator": {
+          "description": "The header holds several items split by this text. Omitted, the whole value is one item.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "header"
+      ],
+      "type": "object"
+    },
     "SignaturePolicy": {
       "description": "Signature verification policy for native plugin artefacts. The Ed25519 signature attached to the artefact (`<artifact>.sig` or the packaged `plugin.sig`) is the primary check; this policy governs behaviour when the signature is missing or invalid. Set per-plugin via `plugins[*].signature.policy:`, or as a gateway-wide default via `gateway.plugin_registry.default_signature_policy:`.",
       "oneOf": [
@@ -6627,6 +8143,34 @@
           "type": "string"
         }
       ]
+    },
+    "SignedTimestampConfig": {
+      "additionalProperties": false,
+      "description": "`signed_timestamp:` — where the signed timestamp is. Name exactly one of `header` and `key`.",
+      "properties": {
+        "header": {
+          "description": "The header that carries it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "description": "The `key=value` item of the signature header that carries it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tolerance_secs": {
+          "default": 300,
+          "description": "Largest age or skew, in seconds. Default 300.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "SigningAlgorithm": {
       "description": "JWS algorithm of an access-token signing key.",
@@ -6834,6 +8378,21 @@
         }
       ]
     },
+    "SubscriberTrust": {
+      "description": "Lowest trust tier allowed to hold a webhook subscription.",
+      "oneOf": [
+        {
+          "const": "verified",
+          "description": "A cryptographically verified principal.",
+          "type": "string"
+        },
+        {
+          "const": "header_asserted",
+          "description": "Also a principal named by a trusted request header.",
+          "type": "string"
+        }
+      ]
+    },
     "SubscriptionsConfig": {
       "additionalProperties": false,
       "description": "`subscriptions:` config (resource subscriptions) — subscription store + per-capability `store:` override + per-session quota. When `store` is unset, the subscription KV inherits from the cluster's `key_value_store()` primitive.",
@@ -6992,6 +8551,26 @@
       },
       "type": "object"
     },
+    "TextEncoding": {
+      "description": "How bytes are written as text.",
+      "oneOf": [
+        {
+          "const": "utf8",
+          "description": "The text's own UTF-8 bytes.",
+          "type": "string"
+        },
+        {
+          "const": "hex",
+          "description": "Hexadecimal.",
+          "type": "string"
+        },
+        {
+          "const": "base64",
+          "description": "Standard base64, with or without padding.",
+          "type": "string"
+        }
+      ]
+    },
     "TlsConfig": {
       "additionalProperties": false,
       "description": "TLS configuration for the HTTP transport.",
@@ -7104,6 +8683,13 @@
             "null"
           ]
         },
+        "event_name": {
+          "description": "The MCP Events type the rule governs: who may see it in `events/list` and subscribe to it. A rule here never governs a tool of the same name. Set this or `tool_name`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "minimum_trust": {
           "$ref": "#/definitions/TrustLevelConfig"
         },
@@ -7115,11 +8701,11 @@
           "type": "array"
         },
         "tool_name": {
+          "description": "The tool, prompt or resource the rule governs. Set this or `event_name`.",
           "type": "string"
         }
       },
       "required": [
-        "tool_name",
         "minimum_trust"
       ],
       "type": "object"
@@ -7163,6 +8749,7 @@
       "type": "string"
     },
     "TrustLevelConfig": {
+      "description": "A caller trust level, lowest first.",
       "enum": [
         "unauthenticated",
         "header_asserted",
@@ -7504,7 +9091,7 @@
           "description": "`relay_terminated` (the relay sees plaintext) or `e2ee` (relay splices ciphertext — requires `private` exposure, mcpg-to-mcpg only)."
         },
         "name": {
-          "description": "Optional stable tunnel name; the relay allocates one when unset.",
+          "description": "Optional stable tunnel name, held by one gateway at a time within the org. When unset, the tunnel is named after this gateway's instance uid, which changes on every restart. A `public` tunnel's name is its host label (`<name>.tunnels.mcpg.cloud`), so it must be one DNS label: 1 to 63 letters, digits and `-`, neither starting nor ending with `-`, compared lowercase. The relay refuses any other public name with `tunnel_name_invalid`.",
           "type": [
             "string",
             "null"
@@ -7665,6 +9252,21 @@
       ],
       "type": "object"
     },
+    "UnsubscribeUnknown": {
+      "description": "The answer to an `events/unsubscribe` naming no live subscription.",
+      "oneOf": [
+        {
+          "const": "ok",
+          "description": "`{}`, the same answer as for a subscription that existed.",
+          "type": "string"
+        },
+        {
+          "const": "not_found",
+          "description": "`-32011` with `data.kind: \"subscription\"`.",
+          "type": "string"
+        }
+      ]
+    },
     "UpstreamConfig": {
       "additionalProperties": false,
       "description": "Upstream connection details.",
@@ -7749,6 +9351,46 @@
         }
       },
       "type": "object"
+    },
+    "UpstreamEventDelivery": {
+      "description": "The upstream delivery mode of an imported event type.",
+      "oneOf": [
+        {
+          "const": "auto",
+          "description": "`webhook` when the type offers it and the gateway has a public address (`gateway.server.canonical_url`, or a public tunnel), else `push` when offered, else `poll`.",
+          "type": "string"
+        },
+        {
+          "const": "webhook",
+          "description": "An upstream webhook subscription per upstream subscription, delivering to `/webhooks/mcp-events/{federation}/{id}` on this gateway.",
+          "type": "string"
+        },
+        {
+          "const": "push",
+          "description": "One `events/stream` per upstream subscription.",
+          "type": "string"
+        },
+        {
+          "const": "poll",
+          "description": "An `events/poll` loop per upstream subscription.",
+          "type": "string"
+        }
+      ]
+    },
+    "UpstreamEventSharing": {
+      "description": "Whose upstream subscriptions serve the subscribers of an imported type.",
+      "oneOf": [
+        {
+          "const": "fan_in",
+          "description": "One upstream subscription per set of arguments, held with the federation's catalogue credential, shared by every subscriber of those arguments.",
+          "type": "string"
+        },
+        {
+          "const": "per_principal",
+          "description": "One upstream subscription per subscriber and set of arguments, held with that subscriber's own upstream credential, minted from their stored sign-in. Needs `auth.mode: oauth_impersonation` with `subject_token: idp_refresh_token` or `idp_id_token`.",
+          "type": "string"
+        }
+      ]
     },
     "UpstreamProtocolVersion": {
       "description": "MCP wire revision the federation client speaks to an upstream.",
@@ -7987,6 +9629,26 @@
         }
       ]
     },
+    "VerificationMode": {
+      "description": "A proof of intent a callback endpoint may give.",
+      "oneOf": [
+        {
+          "const": "challenge",
+          "description": "A signed challenge the endpoint echoes in a 2xx response.",
+          "type": "string"
+        },
+        {
+          "const": "allowlist",
+          "description": "The callback host is on `verification.allowlist`.",
+          "type": "string"
+        },
+        {
+          "const": "well_known",
+          "description": "The callback's origin publishes `/.well-known/mcp-webhook-receiver.json` naming it: `{\"callbacks\": [...]}`, each entry a URL or a prefix ending in `/`. Provisional: the upstream sketch has not fixed the document's shape.",
+          "type": "string"
+        }
+      ]
+    },
     "WatchStrategyConfig": {
       "oneOf": [
         {
@@ -8029,8 +9691,11 @@
           "description": "Subscribe to a Kafka topic — any message means the resource changed.",
           "properties": {
             "group_id": {
-              "default": "mcpg-resource-watcher",
-              "type": "string"
+              "description": "Consumer group. A resource watch defaults to the shared `mcpg-resource-watcher`; an event source to its own `mcpg-events-{name}`.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "topic": {
               "type": "string"
@@ -8097,7 +9762,7 @@
               "type": "string"
             },
             "url": {
-              "description": "Postgres connection URL. Credential interpolation via the gateway's `${env.VAR}` happens before the spec reaches the plugin.",
+              "description": "Postgres connection URL. `${env.X}`, `${secret.X}` and secret provider URIs are resolved before the spec reaches the plugin.",
               "type": "string"
             }
           },
@@ -8110,7 +9775,7 @@
         },
         {
           "additionalProperties": true,
-          "description": "Generic escape hatch — delegate to ANY loaded `watch_strategy` plugin by its `kind()` discriminator. Use this for custom watch plugins that have no dedicated typed variant above (e.g. the Twilio plugin's `twilio_inbound` strategy). The remaining fields flatten into the spec passed verbatim to the plugin's `watch()`, so the plugin owns and validates its own spec schema.\n\n`{ type: plugin, kind: twilio_inbound, kinds: [sms, voice] }`",
+          "description": "Generic escape hatch — delegate to ANY loaded `watch_strategy` plugin by its `kind()` discriminator. Use this for custom watch plugins that have no dedicated typed variant above (e.g. the Twilio plugin's `twilio_inbound` strategy). The remaining fields flatten into the spec passed to the plugin's `watch()`, so the plugin owns and validates its own spec schema. As in every strategy, `${env.X}`, `${secret.X}` and secret provider URIs in its strings are resolved first.\n\n`{ type: plugin, kind: twilio_inbound, kinds: [sms, voice] }`",
           "properties": {
             "kind": {
               "description": "The target plugin's `WatchStrategyPlugin::kind()` string.",
@@ -8128,6 +9793,261 @@
           "type": "object"
         }
       ]
+    },
+    "WebhookEgressConfig": {
+      "additionalProperties": false,
+      "description": "`events.webhook.egress:` — the client that reaches callback URLs. It resolves the host on every attempt, refuses a host when any address is not globally routable, connects to the checked address, and never follows a redirect.",
+      "properties": {
+        "allow_private_backends": {
+          "default": false,
+          "description": "Admit callback hosts outside the public internet. For self-hosted deployments that deliver inside their own network. Default `false`.",
+          "type": "boolean"
+        },
+        "allowed_ports": {
+          "default": [],
+          "description": "Ports a callback URL may name. Empty (default) allows any port.",
+          "items": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "attempt_timeout_ms": {
+          "default": 10000,
+          "description": "Time allowed for one whole request, in milliseconds. Default 10 000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "connect_timeout_ms": {
+          "default": 3000,
+          "description": "Time allowed to open a connection, in milliseconds. Default 3 000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deny_hosts": {
+          "default": [],
+          "description": "Hosts never contacted: a domain (with every name under it) or an IP address. Applies to existing subscriptions from their next delivery.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "probe_url": {
+          "description": "A URL fetched with `GET`, through this egress policy, when webhook delivery starts and whenever the egress settings change. Any HTTP answer shows callbacks are reachable and sets `mcpg_events_egress_probe_ok` to `1`; no answer sets it to `0` and logs a warning. Must pass the policy above. Omitted, no probe.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "WebhookLimitsConfig": {
+      "additionalProperties": false,
+      "description": "`events.webhook.limits:` — subscription and delivery limits. A subscribe past a subscription limit answers `-32013` naming the limit.",
+      "properties": {
+        "per_host_concurrency": {
+          "default": 8,
+          "description": "Concurrent delivery requests to one callback host. Default 8.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "per_principal": {
+          "default": 100,
+          "description": "Subscriptions one principal may hold. Default 100.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "per_principal_callback_hosts": {
+          "default": 5,
+          "description": "Distinct callback hosts one principal may name. Default 5.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "per_subscription_in_flight": {
+          "default": 4,
+          "description": "Deliveries of one subscription in flight at once. Default 4.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "per_type": {
+          "default": 5000,
+          "description": "Subscriptions on one event type. Default 5 000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total": {
+          "default": 10000,
+          "description": "Subscriptions on this gateway. Default 10 000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "WebhookRetryConfig": {
+      "additionalProperties": false,
+      "description": "`events.webhook.retry:` — retries of one delivery. A `410` or `413` answer is never retried.",
+      "properties": {
+        "honor_retry_after": {
+          "default": true,
+          "description": "Wait as long as a `Retry-After` answer asks, inside the window. Default `true`.",
+          "type": "boolean"
+        },
+        "max_attempts": {
+          "default": 5,
+          "description": "Attempts per delivery, the first included. Default 5.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window_ms": {
+          "default": 900000,
+          "description": "Time after the first attempt within which retries happen, in milliseconds. Default 900 000 (15 minutes). On a gateway a control plane manages, the plan's retry window is the most it can be.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "WebhookSuspensionConfig": {
+      "additionalProperties": false,
+      "description": "`events.webhook.suspension:` — when failing deliveries suspend a subscription. A refresh reactivates it.",
+      "properties": {
+        "drop_no_expiry_after_ms": {
+          "default": 604800000,
+          "description": "How long a suspended subscription with no expiry is kept before it is dropped, in milliseconds. Default 604 800 000 (7 days).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failure_rate": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/FailureRate"
+            }
+          ],
+          "default": 0.95,
+          "description": "Share of failed attempts within `window_ms` that suspends delivery, greater than 0 and at most 1. Default 0.95."
+        },
+        "min_attempts": {
+          "default": 100,
+          "description": "Fewest attempts within the window before the rate counts. Default 100.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window_ms": {
+          "default": 3600000,
+          "description": "The window the failure rate is measured over, in milliseconds. Default 3 600 000 (1 hour).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "WebhookTtlConfig": {
+      "additionalProperties": false,
+      "description": "`events.webhook.ttl:` — subscription grant lifetimes.",
+      "properties": {
+        "allow_no_expiry": {
+          "default": false,
+          "description": "Grant a subscription with no expiry when the client sends `ttlMs: null`. Off by default, when such a request receives a `max_ms` grant instead.",
+          "type": "boolean"
+        },
+        "clamp_to_token_expiry": {
+          "default": true,
+          "description": "Never grant past the expiry of the subscriber's access token, when it is known (never below `min_ms`). Default `true`.",
+          "type": "boolean"
+        },
+        "default_ms": {
+          "default": 3600000,
+          "description": "Grant for a subscribe that sends no `ttlMs`, in milliseconds. Default 3 600 000 (1 hour).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_ms": {
+          "default": 86400000,
+          "description": "Longest grant; a longer `ttlMs` is lowered to it. Default 86 400 000 (24 hours).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_ms": {
+          "default": 300000,
+          "description": "Shortest grant; a shorter `ttlMs` is raised to it. Default 300 000 (5 minutes).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "WebhookVerificationConfig": {
+      "additionalProperties": false,
+      "description": "`events.webhook.verification:` — how a callback endpoint proves it wants the deliveries before the first one.",
+      "properties": {
+        "allowlist": {
+          "default": [],
+          "description": "Callback hosts admitted without a challenge when `modes` lists `allowlist`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cache_ttl_ms": {
+          "default": 86400000,
+          "description": "How long a passed verification is reused for the same principal and callback URL, in milliseconds. Default 86 400 000 (24 hours).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "modes": {
+          "default": [
+            "challenge"
+          ],
+          "description": "Accepted proofs. `challenge` (default, and always required) POSTs a signed challenge that the endpoint echoes; `allowlist` also admits the hosts in `allowlist` without one; `well_known` admits a callback its origin's receiver document names.",
+          "items": {
+            "$ref": "#/definitions/VerificationMode"
+          },
+          "type": "array"
+        },
+        "per_host_in_flight": {
+          "default": 3,
+          "description": "Challenge requests in flight to one callback host. Default 3.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "per_host_per_min": {
+          "default": 6,
+          "description": "Challenge requests per callback host per minute, across the cluster. Default 6.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeout_ms": {
+          "default": 10000,
+          "description": "Time allowed for a challenge request, in milliseconds. Default 10 000.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "WidgetKind": {
       "description": "The closed widget vocabulary.",
@@ -8416,7 +10336,7 @@
       "default": {
         "non_production_use": false
       },
-      "description": "`license:` — offline license token (or the non-production declaration). The license gate refuses entitlement-gated plugins and feature-gated config blocks (interactive sign-in) the resolved envelope does not admit. With `gateway.control_plane` attached the control plane admits the plugins, while the config blocks are still checked here unless the managed-cloud platform rendered the config."
+      "description": "`license:` — offline license token (or the non-production declaration). The license gate refuses entitlement-gated plugins and feature-gated config blocks (interactive sign-in, DPoP, rich authorization requests) the resolved envelope does not admit. On a gateway mcpg.cloud delivers a license to (a delivery its proof shows mcpg.cloud made) this block is ignored, and the envelope is the org license it delivers; under a customer's own control plane the block counts. Every license verifies against the MCPG issuer keys compiled into the binary."
     },
     "mcp": {
       "allOf": [
@@ -8478,6 +10398,97 @@
             "partition_by_principal": false
           },
           "delivery": {},
+          "events": {
+            "advertise": [
+              "capability",
+              "extension"
+            ],
+            "allow_ephemeral_subscriptions": false,
+            "audit": {
+              "deliveries": "summary"
+            },
+            "delivery_paused": false,
+            "enabled": false,
+            "error_codes": "draft",
+            "log": {
+              "inbox_max_rows": 10000,
+              "inbox_ttl_ms": 86400000
+            },
+            "poll": {
+              "enabled": false,
+              "lease_multiplier": 3,
+              "max_events": 100,
+              "max_events_cap": 1000,
+              "max_leases_per_principal": 100,
+              "min_next_poll_ms": 1000,
+              "next_poll_ms": 5000,
+              "require_trust": "verified"
+            },
+            "push": {
+              "enabled": false,
+              "heartbeat_interval_ms": 20000,
+              "max_streams_per_principal": 16,
+              "require_trust": "verified"
+            },
+            "reauthorize_interval_ms": 300000,
+            "sources": {
+              "linger_ms": 300000
+            },
+            "unsubscribe_unknown": "ok",
+            "webhook": {
+              "control_envelopes": [
+                "gap",
+                "terminated"
+              ],
+              "egress": {
+                "allow_private_backends": false,
+                "allowed_ports": [],
+                "attempt_timeout_ms": 10000,
+                "connect_timeout_ms": 3000,
+                "deny_hosts": []
+              },
+              "enabled": true,
+              "limits": {
+                "per_host_concurrency": 8,
+                "per_principal": 100,
+                "per_principal_callback_hosts": 5,
+                "per_subscription_in_flight": 4,
+                "per_type": 5000,
+                "total": 10000
+              },
+              "max_payload_bytes": 245760,
+              "require_trust": "verified",
+              "retry": {
+                "honor_retry_after": true,
+                "max_attempts": 5,
+                "window_ms": 900000
+              },
+              "secret_rotation_grace_ms": 600000,
+              "suspension": {
+                "drop_no_expiry_after_ms": 604800000,
+                "failure_rate": 0.95,
+                "min_attempts": 100,
+                "window_ms": 3600000
+              },
+              "ttl": {
+                "allow_no_expiry": false,
+                "clamp_to_token_expiry": true,
+                "default_ms": 3600000,
+                "max_ms": 86400000,
+                "min_ms": 300000
+              },
+              "verification": {
+                "allowlist": [],
+                "cache_ttl_ms": 86400000,
+                "modes": [
+                  "challenge"
+                ],
+                "per_host_in_flight": 3,
+                "per_host_per_min": 6,
+                "timeout_ms": 10000
+              }
+            }
+          },
           "idempotency": {
             "conflict_policy": "reject",
             "default_ttl_ms": 86400000,

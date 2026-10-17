@@ -29,9 +29,88 @@ pub struct QuotaStatusInfo {
     /// against runaway usage, not a meter: load above it is shed so a loop
     /// cannot burn a month's allowance in minutes. `None` when uncapped.
     pub rps_limit: Option<u32>,
+    /// What the plan allows MCP Events on this gateway.
+    pub events: EventsPlan,
 }
 
-/// Sliding one-second counter enforcing the licence's per-gateway RPS ceiling.
+/// What the org's plan allows MCP Events on this gateway. A `None` cap and a
+/// `false` hold are no limit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventsPlan {
+    /// Cap on live readers: webhook subscriptions, poll leases and open
+    /// streams, plus the upstream subscriptions held for imported types.
+    pub readers_limit: Option<u64>,
+    /// The month's deliveries are used: they wait until `held_until`.
+    pub deliveries_held: bool,
+    /// The month's ingests are used: sources wait until `held_until`.
+    pub ingest_held: bool,
+    /// When a used allowance comes back: the start of the next period.
+    pub held_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Cap on the event types served, declared and imported.
+    pub types_limit: Option<u64>,
+    /// Caps on what one event log keeps.
+    pub retention_ms_limit: Option<u64>,
+    pub retention_events_limit: Option<u64>,
+    pub retention_bytes_limit: Option<u64>,
+    /// Cap on the webhook retry window, in milliseconds.
+    pub retry_window_ms_limit: Option<u64>,
+}
+
+impl EventsPlan {
+    /// `retention` within the plan's caps: each bound the smaller of the
+    /// configured one and the plan's. The byte bound never drops below the
+    /// largest occurrence a log holds.
+    pub fn retention(
+        &self,
+        retention: &crate::config::events::EventRetentionConfig,
+    ) -> crate::config::events::EventRetentionConfig {
+        let within = |configured: u64, cap: Option<u64>| {
+            cap.map_or(configured, |cap| configured.min(cap.max(1)))
+        };
+        let max_bytes = match self.retention_bytes_limit {
+            Some(cap) => Some(
+                retention
+                    .max_bytes_or_default()
+                    .min(cap.max(crate::config::events::MAX_WEBHOOK_BODY_BYTES)),
+            ),
+            None => retention.max_bytes,
+        };
+        crate::config::events::EventRetentionConfig {
+            max_age_ms: within(retention.max_age_ms, self.retention_ms_limit),
+            max_events: within(retention.max_events, self.retention_events_limit),
+            max_bytes,
+        }
+    }
+
+    /// The webhook retry window in force: the configured one, or the plan's
+    /// cap when that is shorter.
+    pub fn retry_window_ms(&self, configured: u64) -> u64 {
+        self.retry_window_ms_limit
+            .map_or(configured, |cap| configured.min(cap.max(1)))
+    }
+
+    /// The seconds a held source or webhook sender waits: until the period
+    /// ends.
+    pub fn retry_after_secs(&self) -> u64 {
+        secs_until(self.held_until)
+    }
+}
+
+/// Whole seconds from now to `until`, at least 1; a minute when `until` is
+/// unknown.
+pub fn secs_until(until: Option<chrono::DateTime<chrono::Utc>>) -> u64 {
+    match until {
+        Some(until) => {
+            let secs = (until - chrono::Utc::now()).num_seconds();
+            u64::try_from(secs).unwrap_or(0).max(1)
+        }
+        None => 60,
+    }
+}
+
+/// Fixed one-second window enforcing the licence's per-gateway RPS ceiling.
+/// The count starts over at each epoch second, so a burst across a second
+/// boundary can see up to twice the ceiling.
 ///
 /// Deliberately per-PROCESS, not cluster-wide. It is a blast-radius cap on one
 /// gateway, and a coordinated limiter would need a round-trip on the hot path
@@ -122,6 +201,38 @@ impl QuotaStatusProvider for NoopQuotaStatusProvider {
     }
 }
 
+/// A provider whose status a test sets and changes, in place of an attached
+/// control plane.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestQuota(Arc<parking_lot::Mutex<Option<QuotaStatusInfo>>>);
+
+#[cfg(test)]
+impl TestQuota {
+    /// Tell the gateway about the events part of a plan.
+    pub(crate) fn set_events(&self, events: EventsPlan) {
+        self.set(QuotaStatusInfo {
+            exhausted: false,
+            until: None,
+            remaining: None,
+            limit: None,
+            rps_limit: None,
+            events,
+        });
+    }
+
+    pub(crate) fn set(&self, status: QuotaStatusInfo) {
+        *self.0.lock() = Some(status);
+    }
+}
+
+#[cfg(test)]
+impl QuotaStatusProvider for TestQuota {
+    fn current(&self) -> Option<QuotaStatusInfo> {
+        self.0.lock().clone()
+    }
+}
+
 /// Cheap-to-clone wrapper with a default no-op backing.
 #[derive(Clone)]
 pub struct QuotaStatusHandle(Arc<dyn QuotaStatusProvider>);
@@ -180,12 +291,70 @@ mod tests {
             remaining: Some(0),
             limit: Some(1000),
             rps_limit: None,
+            events: EventsPlan::default(),
         };
         let h = QuotaStatusHandle::new(Arc::new(FixedProvider(Mutex::new(Some(info.clone())))));
         let got = h.current().unwrap();
         assert!(got.exhausted);
         assert_eq!(got.remaining, Some(0));
         assert_eq!(got.limit, Some(1000));
+    }
+
+    #[test]
+    fn the_plan_lowers_retention_and_the_retry_window_never_raises_them() {
+        use crate::config::events::{EventRetentionConfig, MAX_WEBHOOK_BODY_BYTES};
+        let configured = EventRetentionConfig::default();
+        let unlimited = EventsPlan::default();
+        assert_eq!(unlimited.retention(&configured), configured);
+        assert_eq!(unlimited.retry_window_ms(900_000), 900_000);
+
+        let free = EventsPlan {
+            retention_ms_limit: Some(3_600_000),
+            retention_events_limit: Some(1_000),
+            retention_bytes_limit: Some(1 << 20),
+            retry_window_ms_limit: Some(300_000),
+            ..EventsPlan::default()
+        };
+        let held = free.retention(&configured);
+        assert_eq!(held.max_age_ms, 3_600_000);
+        assert_eq!(held.max_events, 1_000);
+        assert_eq!(held.max_bytes, Some(1 << 20));
+        assert_eq!(free.retry_window_ms(900_000), 300_000);
+        assert_eq!(free.retry_window_ms(60_000), 60_000, "a shorter one stays");
+
+        let small = EventRetentionConfig {
+            max_age_ms: 60_000,
+            max_events: 10,
+            max_bytes: Some(MAX_WEBHOOK_BODY_BYTES),
+        };
+        assert_eq!(free.retention(&small), small, "never raised");
+
+        let tiny = EventsPlan {
+            retention_bytes_limit: Some(1),
+            ..EventsPlan::default()
+        };
+        assert_eq!(
+            tiny.retention(&configured).max_bytes,
+            Some(MAX_WEBHOOK_BODY_BYTES),
+            "a log still holds its largest occurrence"
+        );
+    }
+
+    #[test]
+    fn a_hold_names_the_seconds_to_the_period_end() {
+        let plan = EventsPlan {
+            ingest_held: true,
+            held_until: Some(chrono::Utc::now() + chrono::Duration::seconds(90)),
+            ..EventsPlan::default()
+        };
+        let secs = plan.retry_after_secs();
+        assert!((88..=90).contains(&secs), "{secs}");
+        assert_eq!(secs_until(None), 60);
+        assert_eq!(
+            secs_until(Some(chrono::Utc::now() - chrono::Duration::seconds(5))),
+            1,
+            "a passed end waits a second, not none"
+        );
     }
 }
 

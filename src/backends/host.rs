@@ -410,8 +410,14 @@ impl GatewayBackendHost {
             &plugin_ctx.identity,
             tool_name,
         );
-        if let crate::runtime::policy::PreDispatchPolicyOutcome::Deny(_) =
-            pre_dispatch_policy.evaluate_tool_call(&policy_context)
+        // A child tool is always a native binding: the host routes no
+        // federated tools.
+        if let crate::runtime::policy::PreDispatchPolicyOutcome::Deny(_) = pre_dispatch_policy
+            .evaluate(
+                &policy_context,
+                crate::runtime::policy::PolicyRoute::gateway()
+                    .on(crate::runtime::PolicySurface::Tool),
+            )
         {
             return Some(deny("policy"));
         }
@@ -1277,6 +1283,7 @@ mod tests {
                 minimum_trust: crate::runtime::RequestTrustLevel::Verified,
                 cel_allow_if: None,
                 required_scopes: Vec::new(),
+                surface: None,
             }],
         };
         Arc::new(

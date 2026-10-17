@@ -23,6 +23,7 @@ pub mod cli;
 pub mod compose;
 pub mod config;
 pub mod dev_cluster;
+pub mod health_probe;
 pub mod license_gate;
 pub mod observability;
 pub mod protocol;

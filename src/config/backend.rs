@@ -380,32 +380,13 @@ pub enum HttpBackendMethod {
     Get,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
-pub struct BackendGovernanceConfig {
-    #[serde(default = "default_binding_minimum_trust")]
-    pub minimum_trust: TrustLevelConfig,
-    #[serde(default)]
-    pub allow_if: Option<String>,
-    /// Scopes the caller's credential MUST carry to invoke this binding
-    /// (OAuth `scope`, or an AAuth auth token's `scope`). A caller short of
-    /// them is answered with the step-up challenge naming the missing scopes
-    /// (`WWW-Authenticate … error="insufficient_scope"`; for an AAuth person
-    /// or auth-token caller, `AAuth-Requirement: requirement=auth-token`
-    /// carrying a resource token). Empty (the default) means no scope
-    /// requirement.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_scopes: Vec<String>,
-}
+pub use mcpg_expr::governance::BackendGovernanceConfig;
 
-impl Default for BackendGovernanceConfig {
-    fn default() -> Self {
-        Self {
-            minimum_trust: default_binding_minimum_trust(),
-            allow_if: None,
-            required_scopes: Vec::new(),
-        }
-    }
-}
+/// The floor of a federation, a registry-synthesized one, or a capability an
+/// openapi source auto-exposes, whose governance names none. It does not
+/// follow the gateway's `default_minimum_trust`, so lowering that default
+/// never opens an upstream's capabilities.
+pub const FEDERATED_DEFAULT_MINIMUM_TRUST: TrustLevelConfig = TrustLevelConfig::HeaderAsserted;
 
 /// Per-binding retry configuration. Only applies to HTTP, gRPC, GraphQL, NATS, and Kafka bindings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -448,37 +429,6 @@ fn default_retry_initial_backoff_ms() -> u64 {
 
 fn default_retry_on_status_codes() -> Vec<u16> {
     vec![429, 502, 503, 504]
-}
-
-impl BackendGovernanceConfig {
-    pub(crate) fn validate(&self, path: &str) -> Result<()> {
-        if self
-            .allow_if
-            .as_ref()
-            .is_some_and(|expr| expr.trim().is_empty())
-        {
-            return Err(anyhow::anyhow!(
-                "{}.governance.allow_if must not be empty when provided",
-                path
-            ));
-        }
-        if self
-            .required_scopes
-            .iter()
-            .any(|s| s.trim().is_empty() || s.contains(char::is_whitespace))
-        {
-            return Err(anyhow::anyhow!(
-                "{}.governance.required_scopes entries must be non-empty scope values without \
-                 whitespace",
-                path
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn default_binding_minimum_trust() -> TrustLevelConfig {
-    TrustLevelConfig::HeaderAsserted
 }
 
 fn default_http_binding_method() -> HttpBackendMethod {

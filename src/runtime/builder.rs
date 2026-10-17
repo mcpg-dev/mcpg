@@ -1143,7 +1143,9 @@ impl GatewayRuntime {
             idempotency_store: idempotency::noop_idempotency_store(),
             apps_capability: None,
             apps_federate_upstream: false,
+            events_config: crate::config::EventsConfig::default(),
             tunnel_federation: None,
+            federated_events: Arc::new(tokio::sync::watch::channel(Arc::default()).0),
             apps_policy: None,
             gateway_apps: std::collections::BTreeMap::new(),
             credential_cache,
@@ -1177,6 +1179,7 @@ impl GatewayRuntime {
             tool_call_recorder: cp_metrics::ToolCallRecorderHandle::default(),
             cp_quota_status: cp_quota::QuotaStatusHandle::default(),
             cp_rps_limiter: std::sync::Arc::new(cp_quota::RpsLimiter::new()),
+            license_state: std::sync::Arc::default(),
             protocol_registry: ArcSwapOption::const_empty(),
             shared_services: ArcSwapOption::const_empty(),
             modern_session_aliases: dashmap::DashMap::new(),
@@ -1207,6 +1210,16 @@ impl GatewayRuntime {
         self.cp_quota_status = cp_quota::QuotaStatusHandle::new(provider);
     }
 
+    /// Record what the license gate admitted and withheld for this runtime.
+    pub fn set_license_state(&mut self, state: crate::license_gate::LicenseRuntimeState) {
+        self.license_state = std::sync::Arc::new(state);
+    }
+
+    /// What the license gate admitted and withheld for this runtime.
+    pub fn license_state(&self) -> &crate::license_gate::LicenseRuntimeState {
+        &self.license_state
+    }
+
     /// Carry the CP-attached observability hooks from a prior runtime.
     ///
     /// `set_tool_call_recorder` / `set_cp_quota_status_provider` are wired
@@ -1216,11 +1229,14 @@ impl GatewayRuntime {
     /// quota status go silent until the process restarts — undetectably, since
     /// the agent keeps heartbeating either way.
     ///
-    /// Both handles are cheap clones and carry no config, so this is
+    /// The handles are cheap clones and carry no config, so this is
     /// unconditional: nothing here needs to know what the reload changed.
+    /// The RPS limiter comes along too, so a reload neither resets the
+    /// second's count nor splits it between the old runtime and the new.
     pub fn adopt_cp_hooks(&mut self, prior: &GatewayRuntime) {
         self.tool_call_recorder = prior.tool_call_recorder.clone();
         self.cp_quota_status = prior.cp_quota_status.clone();
+        self.cp_rps_limiter = std::sync::Arc::clone(&prior.cp_rps_limiter);
     }
 
     /// configure the per-tenant session quota at bootstrap.
@@ -1300,6 +1316,12 @@ impl GatewayRuntime {
     /// [`crate::config::IdempotencyConfig`] at boot.
     pub fn set_idempotency_capability(&mut self, capability: Option<serde_json::Value>) {
         self.idempotency_capability = capability;
+    }
+
+    /// Install `mcp.configurations.events`. Wired at boot and on every
+    /// reload; the default is events off.
+    pub fn set_events_config(&mut self, config: crate::config::EventsConfig) {
+        self.events_config = config;
     }
 
     /// Enable re-validation of tool arguments after a tool_gate /

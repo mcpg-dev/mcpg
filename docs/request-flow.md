@@ -384,7 +384,7 @@ are the primary extension seams.
                             ▼
  ┌──────────────────────────────────────────────────────────────┐
  │  ⑤ Pre-Dispatch Policy Gate                          BUILTIN │
- │  pre_dispatch_policy.evaluate_tool_call()                     │
+ │  pre_dispatch_policy.evaluate(ctx, route)                     │
  │  • Trust level check (Unauthenticated < HeaderAsserted        │
  │    < Verified) vs the tool's minimum_trust                    │
  │  • Global CEL allow_if expression evaluation                  │
@@ -1130,7 +1130,7 @@ subscription.
 | Identity resolution | `IdentityPlugin` | `plugins[]` | During transport |
 | Backend transport | `BackendPlugin` | `backend: { ... }` per entry | Stage ⑧ |
 | Watch-change source | `WatchStrategyPlugin` | `watch.strategy: ...` per entry | Resource change fan-out |
-| Policy rules | CEL expressions | `policy.cel_allow_if` or per-backend `policy.allow_if` | Stage ③ |
+| Policy rules | CEL expressions | `governance.policy.tool_access.cel_allow_if`, `tool_access.rules[].cel_allow_if`, or per-binding `governance.allow_if` | Stage ③ |
 | Payment gating | Config-driven | `payment:` section | Stage ④ |
 | Guardrail webhooks | Config-driven | `guardrails:` section | Stages ⑤ ⑨ |
 

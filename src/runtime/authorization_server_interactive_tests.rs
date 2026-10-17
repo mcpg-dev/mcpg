@@ -759,7 +759,10 @@ async fn the_consent_page_seals_the_request_and_binds_the_browser() {
     assert!(response.audit.is_none());
 
     let (csrf, max_age) = cookie_set(&response, BrowserCookie::Csrf).expect("CSRF cookie");
-    assert_eq!(max_age, 600, "as long as a sign-in may take");
+    assert!(
+        max_age <= 600,
+        "no longer than a sign-in may take: {max_age}"
+    );
     assert_eq!(csrf.len(), 43);
     assert_eq!(
         page.csrf_token,
@@ -779,6 +782,10 @@ async fn the_consent_page_seals_the_request_and_binds_the_browser() {
         (now + 590..=now + 600).contains(&sealed.exp),
         "{}",
         sealed.exp
+    );
+    assert!(
+        now + max_age >= sealed.exp,
+        "the cookie lives as long as the form: {max_age}"
     );
     let request = sealed.authorization.expect("the authorization request");
     assert_eq!(

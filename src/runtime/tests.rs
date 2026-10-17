@@ -1777,6 +1777,7 @@ async fn runtime_allows_anonymous_tool_call_when_policy_lowers_required_trust() 
                 minimum_trust: RequestTrustLevel::Unauthenticated,
                 cel_allow_if: None,
                 required_scopes: Vec::new(),
+                surface: None,
             }],
         },
     );
@@ -2683,6 +2684,7 @@ async fn tools_list_filters_tools_by_caller_identity() {
                 minimum_trust: RequestTrustLevel::Verified,
                 cel_allow_if: None,
                 required_scopes: Vec::new(),
+                surface: None,
             }],
         },
         execution::RuntimeDebugConfig {
@@ -3073,7 +3075,7 @@ fn build_watch_configs_maps_each_strategy_variant() {
     kafka.watch = Some(ResourceWatchConfig {
         strategy: WatchStrategyConfig::KafkaTopic {
             topic: "events".into(),
-            group_id: "grp".into(),
+            group_id: Some("grp".into()),
         },
         notification_filter: None,
     });
@@ -3827,4 +3829,108 @@ async fn gateway_apps_listed_and_read_end_to_end() {
         }
         other => panic!("unexpected payload: {other:?}"),
     }
+}
+
+/// A pre gate that asks for an approval on every request.
+struct ApprovalGate(mcpg_plugin_protocol::PluginManifest);
+
+#[mcpg_plugin_protocol::async_trait]
+impl mcpg_plugin_protocol::ToolGatePlugin for ApprovalGate {
+    fn manifest(&self) -> &mcpg_plugin_protocol::PluginManifest {
+        &self.0
+    }
+
+    async fn evaluate_pre_dispatch(
+        &self,
+        _ctx: &mcpg_plugin_protocol::PluginContext,
+        _arguments: &serde_json::Value,
+        _meta: Option<&serde_json::Value>,
+        _config: &serde_json::Value,
+    ) -> mcpg_plugin_protocol::GateDecision {
+        mcpg_plugin_protocol::GateDecision::PendingApproval {
+            approval_id: "appr_test".to_owned(),
+            deadline_at: "2099-01-01T00:00:00Z".to_owned(),
+            summary: "needs a human".to_owned(),
+            target_notifiers: Vec::new(),
+            metadata: None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_surface_gate_that_cannot_wait_refuses_a_pending_approval() {
+    let mut runtime = GatewayRuntime::new(
+        "mcpg",
+        "0.1.0",
+        "127.0.0.1:8787",
+        "/health",
+        "/mcp",
+        "info",
+        Vec::new(),
+        true,
+    );
+    let mut registry = mcpg_plugin_host::PluginRegistry::new();
+    registry
+        .register_tool_gate(
+            Box::new(ApprovalGate(mcpg_plugin_protocol::PluginManifest {
+                id: "test.gate.approval".to_owned(),
+                version: "0.1.0".to_owned(),
+                name: "Approval gate".to_owned(),
+                plugin_class: mcpg_plugin_protocol::PluginClass::ToolGate,
+                protocol_version: mcpg_plugin_protocol::PROTOCOL_VERSION.to_owned(),
+                license: None,
+                required_capabilities: Vec::new(),
+                tags: Vec::new(),
+                provides: Vec::new(),
+                provides_schemes: Vec::new(),
+                module_path_prefix: module_path!().split("::").next().unwrap_or("").to_owned(),
+                backend_profile: None,
+            })),
+            mcpg_plugin_protocol::PluginTier::Native,
+            serde_json::json!({}),
+        )
+        .unwrap();
+    runtime.plugin_registry = Arc::new(registry);
+    let ctx = RequestContext::new(
+        GatewayRequestId::new(),
+        None,
+        None,
+        None,
+        RequestIdentity::Verified {
+            subject_id: "alice".to_owned(),
+            issuer: "https://idp.example".to_owned(),
+            auth_provider: "oidc".to_owned(),
+            source: "test".to_owned(),
+            roles: Vec::new(),
+            groups: Vec::new(),
+            scopes: Vec::new(),
+            attributes: Default::default(),
+        },
+        TransportKind::Http,
+    );
+    let arguments = serde_json::json!({});
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        runtime.evaluate_surface_gate_without_waiting(
+            "event",
+            "event.poll.pre",
+            "event:orders.created",
+            crate::runtime::policy::PolicyRoute::event(Some(&arguments)),
+            &arguments,
+            &ctx,
+            &serde_json::Value::Null,
+        ),
+    )
+    .await
+    .expect("it answers at once")
+    .unwrap_err();
+    assert_eq!(refused.http_status, 403);
+    let crate::protocol::ProtocolResponse::JsonRpcError(error) = refused.response else {
+        panic!("a JSON-RPC error");
+    };
+    assert_eq!(error.error.code, super::policy_eval::APPROVAL_REQUIRED_CODE);
+    assert_eq!(
+        error.error.data.unwrap()["reason"],
+        serde_json::json!("approval_required")
+    );
 }

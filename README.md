@@ -82,11 +82,12 @@ docker build -t mcpg:latest -f apps/gateway/Dockerfile .
 # Run single instance
 docker run -p 8787:8787 -v $(pwd)/config.yaml:/etc/mcpg/config.yaml:ro mcpg:latest
 
-# Deploy to Kubernetes via Helm (single instance)
-helm install mcpg ./helm/charts/mcpg
+# Deploy to Kubernetes via Helm (single instance). The charts are
+# 0.1.0-beta.N prereleases: always pass --version.
+helm install mcpg oci://ghcr.io/mcpg-dev/charts/mcpg --version <chart-version>
 
 # Deploy HA with NATS backend (multi-instance)
-helm install mcpg ./helm/charts/mcpg \
+helm install mcpg oci://ghcr.io/mcpg-dev/charts/mcpg --version <chart-version> \
   --set replicaCount=3 \
   --set nats.enabled=true \
   --set autoscaling.enabled=true \

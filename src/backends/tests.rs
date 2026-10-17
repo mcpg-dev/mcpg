@@ -189,6 +189,78 @@ fn federated_entry_cannot_shadow_a_native_name_in_listings() {
     );
 }
 
+/// A URI that two federations both list is read from the first one that
+/// lists it, whichever spelling of the URI the client sends, and a URI no
+/// federation lists does not route.
+#[test]
+fn a_federated_resource_routes_to_the_first_federation_that_lists_it() {
+    let registry = CapabilityRegistry::new(
+        false,
+        DebugToolBackends::default(),
+        DebugToolExposure::default(),
+        &[],
+        &[],
+        &[],
+        &[],
+        None,
+    );
+    let listed = |source: &str, uri: &str| crate::backends::federation::FederatedResource {
+        descriptor: ResourceDescriptor {
+            uri: uri.to_owned(),
+            name: format!("{source} readme"),
+            title: None,
+            description: None,
+            mime_type: None,
+            size: None,
+            annotations: None,
+            icons: None,
+            meta: None,
+        },
+        route: ResourceRoute::Federated {
+            source: source.to_owned(),
+            upstream_uri: uri.to_owned(),
+            listed_as: uri.to_owned(),
+        },
+    };
+    registry
+        .federated_overlay()
+        .store(std::sync::Arc::new(FederatedCatalog::from_parts(
+            vec![],
+            vec![
+                listed("docs", "https://docs.example/a"),
+                listed("first", "https://shared.example/readme"),
+                listed("second", "HTTPS://Shared.Example:443/readme"),
+            ],
+            vec![],
+            vec![],
+        )));
+
+    for uri in [
+        "https://shared.example/readme",
+        "HTTPS://Shared.Example:443/readme",
+        "https://SHARED.example/readme",
+    ] {
+        let route = registry.resource_route(uri).expect("a routed URI");
+        assert_eq!(route.federation(), Some("first"), "{uri}");
+        assert_eq!(
+            registry
+                .resource_descriptor(uri)
+                .expect("a listed URI")
+                .name,
+            "first readme",
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        registry
+            .resource_route("https://docs.example/a")
+            .and_then(|route| route.federation().map(str::to_owned))
+            .as_deref(),
+        Some("docs")
+    );
+    assert!(registry.resource_route("https://docs.example/b").is_none());
+}
+
 #[test]
 fn registry_hides_debug_capabilities_when_debug_disabled() {
     let registry = CapabilityRegistry::new(

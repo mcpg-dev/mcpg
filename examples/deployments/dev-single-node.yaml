@@ -57,10 +57,12 @@ mcp:
       - name: dev.mock.echo
         description: Echo a JSON value back as the tool result. Useful for
           verifying the gateway is reachable end-to-end.
-        # Bindings default to a `header_asserted` trust floor. This file
-        # configures no identity source, so anonymous callers would be
-        # below that floor and the tool would be filtered out of
-        # `tools/list` — spell the floor out to match the posture.
+        # A binding without its own floor takes
+        # `governance.policy.tool_access.default_minimum_trust`, which is
+        # `header_asserted` when unset. This file configures no identity
+        # source, so anonymous callers would be below that floor and the
+        # tool would be filtered out of `tools/list` — spell the floor out
+        # to match the posture.
         governance:
           minimum_trust: unauthenticated
         backend:

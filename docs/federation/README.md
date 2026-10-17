@@ -70,17 +70,26 @@ end-to-end tests):
 - **Live wiring** — `GatewayRuntime::wire_federations` builds + attaches the
   engine at boot and on config reload, with a background idle-satellite sweeper.
 - **Governance inheritance** — federated tools enforce their federation's
-  `governance.minimum_trust` / `allow_if` via the policy gate's federated
-  overlay (`PreDispatchPolicyGate` is now overlay-aware), so a federated call is
-  gated exactly like a native one. CEL is compiled once at import time.
+  `governance.minimum_trust` / `required_scopes` / `allow_if` via the policy
+  gate's federated overlay (`PreDispatchPolicyGate` is overlay-aware), so a
+  federated call is gated exactly like a native one. The gate applies a
+  federation's rule to what the router sends to that federation, together with
+  every central rule that names the request and every native rule that names
+  it for the same kind of surface (a native prompt `search` never governs a
+  federated tool `search`), so those rules can tighten a federation's rule
+  but never loosen it. `allow_if` is compiled at
+  config validation (`config check`, boot, reload) and once per federation at
+  publish; a federation whose rule does not compile has all its capabilities
+  refused, never handed to the gateway-wide policy.
 - **Auth modes** — `none`, `service_token`, and `pass_through` (the inbound
   caller bearer is captured at the transport into a serde-skipped
   `RequestContext` field and forwarded to the satellite).
-- **Carry-across-reload preservation** — on config reload the capability +
-  governance overlays are seeded from the prior runtime (no flicker / no
-  governance gap), live upstream sessions for unchanged federations are carried
-  to the new engine (`adopt_satellites`; changed/removed ones re-establish), and
-  the upstream re-import is skipped when the federation config is unchanged.
+- **Carry-across-reload preservation** — on config reload the new engine
+  adopts the prior engine's import cache and republishes it under the reloaded
+  config's governance (`adopt_imported`; no flicker, no stale rule), live
+  upstream sessions for unchanged federations are carried to the new engine
+  (`adopt_satellites`; changed/removed ones re-establish), and the upstream
+  re-import is skipped when the federation config is unchanged.
 - **End-to-end tests** — `tests/federation_e2e.rs`: list + dispatch + source
   tagging against a mock upstream; governance denial (a `verified`-only
   federation, anonymous caller); and **one MCPG federating another real MCPG

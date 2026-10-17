@@ -6,7 +6,7 @@ A gateway whose embedded authorization server accepts enterprise-managed authori
 - The gateway checks the ID-JAG (signature against Okta's keys, `typ`, `aud`, `client_id`, lifetime, single use) and issues an access token for `https://mcp.acme.example/mcp` only. It issues no refresh token: the client asks Okta for a new ID-JAG when the token expires.
 - Every MCP request carries that token. Policy sees the Okta user as a verified caller, with the client's `client_roles` and the granted scopes.
 
-Enterprise-managed authorization is a core feature and needs no license. The NATS coordinator (`dev.mcpg.cluster.nats`) that shares the single-use ledger across replicas is a licensed plugin: it needs a license that entitles `cluster.*` plugins (Team, Enterprise), or `license.non_production_use: true` outside production. One replica on `cluster.kind: single_node` needs neither. For interactive sign-in (clients that cannot get an ID-JAG) and for calling Cross App Access upstreams per user, start from `interactive-login-okta.yaml` instead.
+Enterprise-managed authorization is a core feature and needs no license. The NATS coordinator (`dev.mcpg.cluster.nats`) that shares the single-use ledger across replicas is a licensed plugin: it needs a license that entitles `cluster.*` plugins (Enterprise), or `license.non_production_use: true` outside production. One replica on `cluster.kind: single_node` needs neither. For interactive sign-in (clients that cannot get an ID-JAG) and for calling Cross App Access upstreams per user, start from `interactive-login-okta.yaml` instead.
 
 ## Set up Okta
 

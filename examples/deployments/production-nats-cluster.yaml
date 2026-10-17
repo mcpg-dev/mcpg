@@ -12,7 +12,6 @@
 #                             opt-outs under `cluster`)
 #   MCPG_CLUSTER_STATE_KEY  — URL-safe-base64 32-byte state key, same on
 #                             every replica
-#   MCPG_LICENSE_PUBKEY     — public key (SPKI PEM) that verifies the license
 #   HOSTNAME               — `cluster.node.id`, unique per replica. A
 #                             container runtime exports it; a shell sets
 #                             it without exporting it, so export it when
@@ -55,12 +54,11 @@ cluster:
   state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
 
 # The NATS coordinator is a licensed plugin: the gateway refuses to load
-# it without a license that entitles `cluster.*` plugins (Team,
-# Enterprise). Outside production, `non_production_use: true` in place of
-# the token loads it under the non-production grant.
+# it without a license that entitles `cluster.*` plugins (Enterprise).
+# Outside production, `non_production_use: true` in place of the token
+# loads it under the non-production grant.
 license:
   token_file: "/etc/mcpg/license/license.jwt"
-  pubkey_pem: "${env.MCPG_LICENSE_PUBKEY}"
 
 # `delivery` and `cancellation` inherit the cluster's pub/sub by default
 # (NATS subject-based fan-out here) — no override needed.

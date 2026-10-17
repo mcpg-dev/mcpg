@@ -687,7 +687,7 @@ fn refused_credential(
 /// downstream dispatcher can dedupe over a stdio-/HTTP-uniform
 /// code path. Header value is validated with the same constraints
 /// as the `_meta` field (ASCII / ≤255 / non-empty) — malformed
-/// values short-circuit with HTTP 400 + `-32013
+/// values short-circuit with HTTP 400 + `-33013
 /// IdempotencyKeyMalformed` before any further processing.
 ///
 /// Per design doc §1.4 the explicit `_meta` field always wins on
@@ -720,7 +720,7 @@ pub(crate) fn lift_idempotency_key_header(
         crate::runtime::idempotency::KeyValidation::Invalid(reason) => {
             // Synthesise a JSON-RPC error response directly —
             // `ProtocolError` constructors don't expose the
-            // `-32013` code we need. The body's `id` is unknown
+            // `-33013` code we need. The body's `id` is unknown
             // at this stage (we haven't parsed it yet), so the
             // error envelope's `id` is `null` per JSON-RPC §5.1.
             let body = serde_json::json!({

@@ -312,6 +312,16 @@ pub enum BackendInvocationRoute {
 }
 
 impl BackendInvocationRoute {
+    /// The federation this route dispatches to; `None` for every tool the
+    /// gateway serves itself.
+    #[must_use]
+    pub fn federation(&self) -> Option<&str> {
+        match self {
+            Self::Federated { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+
     /// Whether this route's executor reads the (allocation-heavy)
     /// `RuntimeSnapshot` from its execution context. Only the two
     /// internal diagnostics tools do — the runtime-snapshot tool
@@ -338,6 +348,18 @@ pub enum PromptRoute {
     },
 }
 
+impl PromptRoute {
+    /// The federation this route fetches from; `None` for every prompt the
+    /// gateway serves itself.
+    #[must_use]
+    pub fn federation(&self) -> Option<&str> {
+        match self {
+            Self::Federated { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ResourceRoute {
     RuntimeOverview,
@@ -359,9 +381,23 @@ pub enum ResourceRoute {
     },
     /// A federated resource — read back from its owning upstream MCP
     /// server by the `FederationEngine`. `upstream_uri` is the bare
-    /// (unprefixed) URI on the upstream.
+    /// (unprefixed) URI on the upstream; `listed_as` is the URI, or the URI
+    /// template, the federation lists it under.
     Federated {
         source: String,
         upstream_uri: String,
+        listed_as: String,
     },
+}
+
+impl ResourceRoute {
+    /// The federation this route reads from; `None` for every route the
+    /// gateway serves itself.
+    #[must_use]
+    pub fn federation(&self) -> Option<&str> {
+        match self {
+            Self::Federated { source, .. } => Some(source),
+            _ => None,
+        }
+    }
 }

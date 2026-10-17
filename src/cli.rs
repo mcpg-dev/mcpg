@@ -465,6 +465,9 @@ pub fn print_top_help() {
          \n                             relay; pass a URL for a self-hosted relay)\n\
          \n  mcpg <command> [args...]   Run a toolchain subcommand (below)\n\
          \n  mcpg status                In-process box report (gateway, agent, CP)\n\
+         \n  mcpg --health-check        Probe the health endpoint of the gateway on\n\
+         \n                             this host over plain HTTP (the image\n\
+         \n                             HEALTHCHECK); exit 0 on a 2xx, else 1\n\
          \n  mcpg capabilities          Print this build's capability manifest as\n\
          \n                             JSON (config schema, ABI/protocol\n\
          \n                             versions, baked plugins)\n\

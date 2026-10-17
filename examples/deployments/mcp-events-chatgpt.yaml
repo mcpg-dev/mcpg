@@ -1,0 +1,157 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: mcp-events-chatgpt
+# ------------------------------
+# A short-lived single-node gateway for checking MCP Events with ChatGPT in
+# developer mode. ChatGPT adds it as a connector, signs its user in through the
+# gateway's embedded authorization server (dynamic client registration, then
+# Keycloak), lists two event types and subscribes to them by webhook:
+#   - test.heartbeat: a cron fire every five minutes, with no outside input;
+#   - test.note:      a note the operator posts on demand, signed with the
+#                     Standard Webhooks secret below.
+#
+# Interactive sign-in is an Enterprise feature; this test declares
+# `license.non_production_use: true`. Remove the gateway after the test.
+#
+# At Keycloak: a confidential OpenID Connect client `mcpg-events-test` with
+# the standard flow and the redirect URI
+# https://events.acme.example/oauth/callback (`mcpg config check` prints it).
+#
+# Required env vars:
+#   MCPG_CLUSTER_STATE_KEY   — URL-safe-base64 32-byte key: seals the event
+#                              stores, subscription secrets and sign-in state
+#   AS_SIGNING_SECRET        — at least 32 bytes; signs the gateway's tokens
+#   KEYCLOAK_CLIENT_SECRET   — client secret of `mcpg-events-test`
+#   TEST_NOTE_WEBHOOK_SECRET — whsec_ secret that signs each test.note POST:
+#                              whsec_ and the base64 of a 24 to 64 byte key
+#                              (whsec_$(openssl rand -base64 32)); another
+#                              length fails the boot
+#
+# Boot:  MCPG_CONFIG=mcp-events-chatgpt.yaml mcpg
+
+gateway:
+  server:
+    bind_address: "0.0.0.0:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    allowed_origins:
+      - "https://events.acme.example"
+    # TLS ends at the proxy in front. It must replace any client-sent
+    # X-Forwarded-For and X-Forwarded-Host, and be the only way to port 8787.
+    trust_proxy_ip: true
+    # Other hosts are redirected here, so the gateway advertises one
+    # resource identity.
+    canonical_url: "https://events.acme.example"
+
+cluster:
+  kind: single_node
+  state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
+
+license:
+  non_production_use: true
+
+governance:
+  access:
+    # An anonymous request gets 401 with the resource metadata, where
+    # ChatGPT starts its sign-in.
+    require_authentication: true
+    resource_metadata:
+      resource: "https://events.acme.example/mcp"
+      scopes_supported: ["mcp:events"]
+    authorization_server:
+      issuer: "https://events.acme.example"
+      signing_secret: "${env.AS_SIGNING_SECRET}"
+      allowed_scopes: ["mcp:events"]
+      trusted_idps:
+        - issuer: "https://sso.acme.example/realms/acme"
+          allowed_hosts: ["sso.acme.example"]
+          allowed_algs: ["RS256"]
+          login:
+            client_id: "mcpg-events-test"
+            client_secret: "${env.KEYCLOAK_CLIENT_SECRET}"
+            display_name: "Acme SSO"
+      interactive:
+        consent:
+          service_name: "MCPG Events test"
+          scope_descriptions:
+            "mcp:events": "List and subscribe to this gateway's test events"
+        # ChatGPT registers itself and holds no initial access token, so
+        # registration is open; an https redirect URI off chatgpt.com is
+        # dropped from a registration. The per-IP budget keeps one caller
+        # from filling the client table (default 1000).
+        dynamic_client_registration:
+          enabled: true
+          allow_open: true
+          allowed_redirect_hosts: ["chatgpt.com"]
+          client_ttl_secs: 86400
+          registrations_per_hour_per_ip: 5
+  policy:
+    tool_access:
+      default_minimum_trust: verified
+      rules:
+        - event_name: test.heartbeat
+          minimum_trust: verified
+        - event_name: test.note
+          minimum_trust: verified
+  audit:
+    enabled: true
+    sinks:
+      - kind: dev.mcpg.builtin.audit.local-file
+        config: { path: "/var/log/mcpg/audit.log" }
+
+# The cron watch carries the test.heartbeat source. Its descriptor must
+# declare `schedule.fired`, or the gateway refuses it at boot, so take the
+# cron build from the same release as the gateway you run.
+plugins:
+  - id: dev.mcpg.watch.cron
+    class: watch_strategy
+    kind: native
+    source:
+      oci: "ghcr.io/mcpg-dev/plugins/watch-cron:protocol-1"
+
+mcp:
+  configurations:
+    events:
+      enabled: true
+      store: { kind: file, dir: "/var/lib/mcpg/events/subscriptions" }
+      log_store: { kind: file, dir: "/var/lib/mcpg/events/log" }
+      # One audit record per delivery request, for the test capture.
+      audit: { deliveries: every }
+  capabilities:
+    events:
+      - name: test.heartbeat
+        description: Fires every five minutes on the gateway's clock.
+        source:
+          watch:
+            strategy:
+              type: plugin
+              kind: cron
+              cron: "0 */5 * * * *"
+            event_type: schedule.fired
+      - name: test.note
+        description: A note the operator sends on demand. `data.text` is the note.
+        payload_schema:
+          type: object
+          required: [text]
+          properties:
+            text: { type: string, maxLength: 500 }
+          additionalProperties: false
+        source:
+          inbound:
+            source_id: operator
+            verify:
+              profile: standard_webhooks
+              secrets: ["${env.TEST_NOTE_WEBHOOK_SECRET}"]
+            rate_limit: { per_sec: 1, burst: 5 }
+
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }
+  # `/metrics` is served on the main listener and needs the
+  # dev.mcpg.observability.prometheus plugin. Turn it on only when the proxy
+  # keeps that path private.
+  metrics:
+    enabled: false

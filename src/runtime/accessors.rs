@@ -1,9 +1,8 @@
 use super::*;
 
 impl GatewayRuntime {
-    /// Test-only view of the session store for session-row accounting
-    /// assertions.
-    #[cfg(test)]
+    /// The session store: who owns each session and the protocol version it
+    /// speaks.
     pub(crate) fn session_store(&self) -> &Arc<dyn SessionStore> {
         &self.session_store
     }
@@ -44,18 +43,12 @@ impl GatewayRuntime {
         self.execution_dispatcher.federation_engine()
     }
 
-    /// Snapshot of the currently-imported federated capabilities (for
-    /// carry-across-reload seeding).
-    pub(crate) fn federated_capabilities(&self) -> Arc<crate::backends::FederatedCatalog> {
-        self.capability_registry.federated_overlay().load_full()
-    }
-
-    /// Snapshot of the current federated-tool governance rules (for
-    /// carry-across-reload seeding).
-    pub(crate) fn federated_policies(&self) -> Arc<policy::FederatedToolPolicies> {
-        self.pre_dispatch_policy
-            .federated_policy_handle()
-            .load_full()
+    /// The MCP Events types this runtime's federations imported, as they
+    /// change.
+    pub(crate) fn federated_events(
+        &self,
+    ) -> tokio::sync::watch::Receiver<events::catalog::FederatedEvents> {
+        self.federated_events.subscribe()
     }
 
     /// Snapshot of the idempotency advertisement currently
@@ -63,6 +56,11 @@ impl GatewayRuntime {
     /// want to assert on the negotiated capability shape.
     pub fn idempotency_capability(&self) -> Option<&serde_json::Value> {
         self.idempotency_capability.as_ref()
+    }
+
+    /// `mcp.configurations.events` of the config this runtime serves.
+    pub fn events_config(&self) -> &crate::config::EventsConfig {
+        &self.events_config
     }
 
     /// Install the idempotency record store. The boot path threads
@@ -94,6 +92,36 @@ impl GatewayRuntime {
     /// The path of the MCP endpoint (`server.mcp_path`).
     pub fn mcp_path(&self) -> &str {
         &self.mcp_path
+    }
+
+    /// The MCP Events core, once the gateway installed one.
+    pub fn events_core(&self) -> Option<std::sync::Arc<crate::runtime::events::EventsCore>> {
+        self.shared_services
+            .load_full()
+            .and_then(|services| services.events_core.get().cloned())
+    }
+
+    /// Count one request on `surface` against the licence's per-gateway
+    /// request ceiling, which `tools/call`, the `events/*` methods and the
+    /// event webhooks share. `Err` carries the ceiling when this request is
+    /// past it and must be refused.
+    pub(crate) fn admit_plan_rps(&self, surface: &'static str) -> Result<(), u32> {
+        let Some(rps) = self
+            .cp_quota_status
+            .current()
+            .and_then(|status| status.rps_limit)
+        else {
+            return Ok(());
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if self.cp_rps_limiter.allow(rps, now_secs) {
+            return Ok(());
+        }
+        metrics::counter!("mcpg_cp_rps_refusals_total", "surface" => surface).increment(1);
+        Err(rps)
     }
 
     pub fn ema_authorization_server(

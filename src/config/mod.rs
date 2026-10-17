@@ -29,6 +29,7 @@ pub mod credentials;
 pub mod debug;
 pub mod diagnostics;
 pub mod encrypted;
+pub mod events;
 pub mod feature_flags;
 pub mod federation;
 pub mod gateway;
@@ -70,9 +71,9 @@ pub use audit::{AuditConfig, AuditOnFailure};
 pub(crate) use backend::default_cel_gate_error_message;
 pub use backend::{
     BackendAnnotationsConfig, BackendConfig, BackendGovernanceConfig, BackendIconConfig,
-    BackendImpl, BackendKind, BackendResourceAnnotations, GatherInputConfig, HttpBackendConfig,
-    HttpBackendMethod, KafkaBackendConfig, MockBackendConfig, NatsBackendConfig,
-    PipelineBackendConfig, PipelineBackendStepConfig, PipelineCelGateStepConfig,
+    BackendImpl, BackendKind, BackendResourceAnnotations, FEDERATED_DEFAULT_MINIMUM_TRUST,
+    GatherInputConfig, HttpBackendConfig, HttpBackendMethod, KafkaBackendConfig, MockBackendConfig,
+    NatsBackendConfig, PipelineBackendConfig, PipelineBackendStepConfig, PipelineCelGateStepConfig,
     PipelineElicitationMode, PipelineElicitationStepConfig, PipelineGatherStepConfig,
     PipelineLogStepConfig, PipelineProgressStepConfig, PipelineRootsListStepConfig,
     PipelineSamplingStepConfig, PipelineSqlAwaitStepConfig, PipelineSqlTxNestedStep,
@@ -95,6 +96,7 @@ pub use diagnostics::{
     access_posture_warnings, reachable_trust_ceiling, trust_ceiling_remedy,
     unreachable_trust_bindings, warn_access_posture, warn_unreachable_binding_trust,
 };
+pub use events::{EventsAdvertiseLocation, EventsConfig};
 pub use feature_flags::FeatureFlagsConfig;
 pub use federation::{
     AuthMode, FederationConfig, SubjectToken, SynthesizeMode, UpstreamProtocolVersion,
@@ -282,10 +284,13 @@ pub struct AppConfig {
 
     /// `license:` — offline license token (or the non-production
     /// declaration). The license gate refuses entitlement-gated plugins
-    /// and feature-gated config blocks (interactive sign-in) the resolved
-    /// envelope does not admit. With `gateway.control_plane` attached the
-    /// control plane admits the plugins, while the config blocks are still
-    /// checked here unless the managed-cloud platform rendered the config.
+    /// and feature-gated config blocks (interactive sign-in, DPoP, rich
+    /// authorization requests) the resolved envelope does not admit. On a
+    /// gateway mcpg.cloud delivers a license to (a delivery its proof shows
+    /// mcpg.cloud made) this block is ignored, and the envelope is the org
+    /// license it delivers; under a customer's own control plane the block
+    /// counts. Every license verifies against the MCPG issuer keys compiled
+    /// into the binary.
     #[serde(default)]
     pub license: LicenseConfig,
 
@@ -342,6 +347,16 @@ impl AppConfig {
     /// `output_schema` in place after the initial parse.
     pub fn all_bindings_mut(&mut self) -> impl Iterator<Item = (BackendKind, &mut BackendConfig)> {
         self.mcp.all_bindings_mut()
+    }
+
+    /// The trust floor `binding` is gated at: its own
+    /// `governance.minimum_trust`, or `default_minimum_trust` when it names
+    /// none.
+    pub fn binding_minimum_trust(&self, binding: &BackendConfig) -> TrustLevelConfig {
+        binding
+            .governance
+            .minimum_trust
+            .unwrap_or(self.governance.policy.tool_access.default_minimum_trust)
     }
 
     /// Total count of operator-declared bindings across all four
@@ -830,6 +845,7 @@ impl AppConfig {
             .validate(self.feature_flags.debug_tools_enabled)?;
         self.validate_bindings()?;
         self.mcp.validate()?;
+        events::validate_app(self)?;
         self.observability.validate()?;
         self.governance.validate()?;
         if self.governance.access.require_authentication
@@ -1059,6 +1075,9 @@ impl AppConfig {
             }
             if binding.description.trim().is_empty() {
                 return Err(anyhow::anyhow!("{}.description must not be empty", path));
+            }
+            if let Some(watch) = &binding.watch {
+                watch.strategy.validate(&format!("{path}.watch.strategy"))?;
             }
             if let Some(ref title) = binding.title
                 && title.trim().is_empty()

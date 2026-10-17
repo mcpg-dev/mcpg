@@ -189,6 +189,40 @@ The `PreDispatchPolicyGate` (`runtime/policy.rs`) evaluates tool access before e
 4. Allow → Proceed to execution
 ```
 
+### Which Rules Apply
+
+The gate decides each request under the route the router gives it, and every
+rule that applies must pass (the highest `minimum_trust`, every
+`required_scopes` entry, every `allow_if`):
+
+- every rule filed under the name the caller used: a tool or prompt name, or
+  the resource URI or URI template it asked for. A binding's rule governs only
+  its own kind of surface (a prompt binding's rule never applies to a tool
+  call of the same name, native or federated); a `policy.tool_access.rules[]`
+  entry governs every surface of its name. A binding's rule is filed
+  under its name and, for a resource or template, also under its `uri` or
+  `uri_template`; a `policy.tool_access.rules[]` entry that names that URI or
+  template applies together with the binding's rule. A `completion/complete` is
+  decided under the prompt its `ref/prompt` names, or the URI template its
+  `ref/resource` names, whatever other field the reference carries;
+- for a resource read or subscription, the rule of the binding the URI routes
+  to, which is filed under the binding's name. A concrete URI that a
+  `resource_templates[]` binding matches, another spelling of a resource's
+  URI (scheme or host case, a default port) and the `mcpg://resources/<name>`
+  URI of a resource declared without `uri` all get their binding's
+  `governance`;
+- for a request routed to a federation, that federation's `governance`
+  (see the federation guide). Other rules can tighten it, never loosen it.
+
+A binding that sets no `governance.minimum_trust` is filed with
+`default_minimum_trust` as its floor, so raising or lowering that default
+moves every such binding with it. A federation, a registry's `defaults` or
+an openapi source whose relayed `governance` sets none is `header_asserted`,
+whatever `default_minimum_trust` is: their capabilities come from an
+upstream's catalog, so lowering the default never opens them.
+With no rule at all, `default_minimum_trust` is the floor. The global
+`cel_allow_if` applies to every request.
+
 ### CEL Context Variables
 
 | Variable | Type | Description |
@@ -198,10 +232,36 @@ The `PreDispatchPolicyGate` (`runtime/policy.rs`) evaluates tool access before e
 | `principal_id` | string | Subject ID from identity (empty if anonymous) |
 | `auth_provider` | string | Auth provider label (empty if not verified) |
 | `identity_kind` | string | Identity variant name ("anonymous", "http_header", "verified") |
+| `identity` | map | `kind`, `trust_level`, `subject_id`, `roles`, `groups`, `scopes`, `attributes` |
+| `surface` | string | The kind of surface the request names: "tool", "prompt", "resource", "event"; empty where the route names none |
+| `arguments` | map | An MCP Events subscription's `arguments` on the event surface; an empty map elsewhere |
+
+### The Event Surface (MCP Events)
+
+An MCP Events type is a surface of its own, filed under `event:<name>`, so it
+never inherits a rule of a tool, prompt or resource with the same name. A rule
+names it with `event_name:` instead of `tool_name:` in
+`governance.policy.tool_access.rules[]`; such a rule governs only the event
+surface. A rule that names an event type nobody declared is a `config check`
+warning, because it governs nothing.
+
+| Decision point | Layers | On deny |
+|---|---|---|
+| `events/list` | built-in gate (visibility) | the type is not listed |
+| `event.subscribe.pre` (subscribe and every refresh) | policy engine chain, built-in gate, tool_gate chain (an approval is awaited) | `-32012 {reason}`; a quota or rate limit answers `-32013` |
+| `events/unsubscribe` | built-in gate (visibility) | `{}`, so no existence leaks |
+| `event.recheck` (every `mcp.configurations.events.reauthorize_interval_ms`, and after each reload) | policy engine chain and built-in gate, from the identity stored at subscribe; never the tool_gate chain, whose gates have side effects | delivery stops, the receiver gets `terminated`, the next refresh is refused |
+| `event.deliver.post` (each payload, per subscriber) | tool_gate post-dispatch chain | the payload is not sent; the receiver gets a `gap` |
+
+Webhook subscriptions also need a verified principal unless
+`mcp.configurations.events.webhook.require_trust` is `header_asserted`. A
+grant never outlives the subscriber's token when its expiry is known, and a
+token or grant the embedded authorization server revokes stops delivery at
+the next pass.
 
 ### Tool Visibility
 
-The policy gate also controls tool visibility. `is_tool_visible()` determines whether a tool appears in `tools/list` responses. Denied tools are hidden from discovery.
+The policy gate also controls visibility. `is_visible()` decides whether a tool, prompt, resource or resource template appears in its list, under the same route and rules a call or read of it would get. Denied capabilities are hidden from discovery.
 
 ### Policy Denial Response
 

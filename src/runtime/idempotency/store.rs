@@ -51,7 +51,7 @@ pub enum ReservationOutcome {
     Reserved { reservation_id: Uuid },
     /// Another caller is mid-flight on this `(scope, key)` pair.
     /// Per design doc §2.2 the caller MUST return
-    /// `-32011 IdempotencyInFlight` (HTTP 409 + `Retry-After: 1`).
+    /// `-33011 IdempotencyInFlight` (HTTP 409 + `Retry-After: 1`).
     InFlight { started_at: SystemTime },
     /// A previous call completed; the cached envelope is returned
     /// for replay. Per design doc §2.4 the caller MUST stamp the
@@ -63,7 +63,7 @@ pub enum ReservationOutcome {
     },
     /// Same `(scope, key)` but the request body hash differs from
     /// the cached one. Per design doc §1.6 the caller MUST return
-    /// `-32010 IdempotencyConflict` (HTTP 422).
+    /// `-33010 IdempotencyConflict` (HTTP 422).
     Conflict { stored_request_hash: [u8; 32] },
 }
 

@@ -58,6 +58,8 @@ impl TlsInfoExtUnwrap for TlsInfoExt {
 
 mod cors;
 mod discovery;
+mod events_stream;
+mod events_webhooks;
 mod identity;
 mod oauth_browser;
 mod probes;
@@ -79,11 +81,11 @@ pub(crate) use oauth_browser::{
 };
 pub(crate) use probes::{health_handler, metrics_handler, readiness_handler, runtime_handler};
 pub(crate) use response::{
-    INSUFFICIENT_SCOPE_DATA_KEY, challenge_scope, map_gateway_response,
+    INSUFFICIENT_SCOPE_DATA_KEY, RETRY_AFTER_DATA_KEY, challenge_scope, map_gateway_response,
     map_protocol_error_response, map_protocol_error_with_status, map_sse_events,
     map_transport_rejection, reject_method_on_modern_wire, request_host, resource_metadata_url,
-    with_request_id_header, with_resource_metadata_pointer, with_session_id_header,
-    with_www_authenticate_challenge,
+    retry_after_data, strip_internal_markers, with_request_id_header,
+    with_resource_metadata_pointer, with_session_id_header, with_www_authenticate_challenge,
 };
 pub(crate) use sse::{
     ResourceSubscriptionGuard, SlottedEventStream, SseStreamSlot, acquire_sse_slot,
@@ -241,6 +243,24 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         post(webhook_approval_resolution_handler),
     );
 
+    // Inbound MCP Events sources: third parties POST signed events here.
+    // Answers 404 for every id while events are off.
+    router = router.route(
+        "/webhooks/events/{source_id}",
+        post(events_webhooks::webhook_events_handler).layer(axum::extract::DefaultBodyLimit::max(
+            crate::config::events::MAX_INBOUND_BODY_BYTES,
+        )),
+    );
+
+    // Upstream webhook subscriptions of imported event types deliver here.
+    // Answers 503 for every id while events are off.
+    router = router.route(
+        "/webhooks/mcp-events/{federation}/{id}",
+        post(events_webhooks::upstream_events_handler).layer(axum::extract::DefaultBodyLimit::max(
+            crate::protocol::v_2026_07_28::extensions::events::wire::MAX_WEBHOOK_BODY_BYTES,
+        )),
+    );
+
     // http_route plugin mount — namespaced under `/plugins/*` so it
     // can never collide with gateway routes. Two routes: one for the
     // bare `/plugins/{id}/{entity}` case and one for any subpath.
@@ -285,7 +305,8 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         .route(
             "/.well-known/oauth-protected-resource/{*resource_path}",
             get(oauth_protected_resource_handler),
-        )
+        );
+    let authorization_server = Router::new()
         .route(
             "/.well-known/oauth-authorization-server",
             get(oauth_authorization_server_metadata_handler),
@@ -328,7 +349,12 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
                 .post(oauth_connect_decision_handler)
                 .head(oauth_browser_method_not_allowed)
                 .fallback(oauth_browser_method_not_allowed),
-        );
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            discovery::refuse_while_authorization_server_held,
+        ));
+    router = router.merge(authorization_server);
 
     // AAuth resource metadata (draft-hardt-oauth-aauth-protocol). Mounted
     // only when `server.aauth_resource_metadata` is configured; the same
@@ -798,6 +824,7 @@ async fn mcp_handler(
             body,
             &request_context,
             wire,
+            client_accepts_sse,
         )
         .await
     } else {
@@ -926,6 +953,7 @@ async fn dispatch_modern(
     body: Value,
     request_context: &RequestContext,
     wire: WireVersion,
+    client_accepts_sse: bool,
 ) -> Dispatch {
     let mut modern_tools_call_session: Option<String> = None;
     // SEP-2243 transport-level header validation (handler decides).
@@ -1026,20 +1054,36 @@ async fn dispatch_modern(
         None
     };
 
-    // `subscriptions/listen` is a long-lived POST-SSE response
-    // that cannot fit in the finite `handler.parse` +
-    // `handler.dispatch` shape. Intercept BEFORE parse and route
-    // to the dedicated streaming handler. The stream outlives the
-    // request, so an ephemeral session materializes its row first
-    // (session lifecycle then belongs to the TTL reaper, exactly
-    // as for a stored synthetic session).
-    if body.get("method").and_then(serde_json::Value::as_str) == Some("subscriptions/listen") {
-        if let Some(sid) = modern_ephemeral_session.as_deref() {
-            runtime.materialize_ephemeral_session(sid);
-        }
-        return Dispatch::Complete(
-            modern_subscriptions_listen_handler(state.clone(), stamped_context, body).await,
-        );
+    // A long-lived POST-SSE response cannot fit in the finite
+    // `handler.parse` + `handler.dispatch` shape: the handler names the
+    // plan before parse and the dedicated streaming handler runs it.
+    if let Some(plan) = handler.long_lived_stream_plan(&body) {
+        use crate::protocol::shared::traits::StreamPlan;
+        runtime.record_request_received(&stamped_context, plan.method());
+        metrics::counter!("mcpg_requests_total", "operation" => plan.method(), "transport" => "http")
+            .increment(1);
+        let response = match plan {
+            StreamPlan::SubscriptionsListen => {
+                // The stream outlives the request, so an ephemeral session
+                // materializes its row first (session lifecycle then belongs
+                // to the TTL reaper, exactly as for a stored synthetic
+                // session).
+                if let Some(sid) = modern_ephemeral_session.as_deref() {
+                    runtime.materialize_ephemeral_session(sid);
+                }
+                modern_subscriptions_listen_handler(state.clone(), stamped_context, body).await
+            }
+            StreamPlan::EventsStream => {
+                events_stream::modern_events_stream_handler(
+                    state.clone(),
+                    stamped_context,
+                    body,
+                    client_accepts_sse,
+                )
+                .await
+            }
+        };
+        return Dispatch::Complete(response);
     }
 
     // RPN-4: remember the synthetic session id this `tools/call`
@@ -1564,15 +1608,9 @@ async fn modern_subscriptions_listen_handler(
         }
     }
 
-    // SEP-2567/2575/RES-07: the client-facing subscription id is the
-    // listen request's JSON-RPC id, NOT a fresh UUID — this is the
-    // stdio correlation contract. String ids pass through verbatim;
-    // numeric/other ids use their canonical JSON rendering.
-    let subscription_id = match &request_id_value {
-        Value::String(s) => s.clone(),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    };
+    // The subscription id is the listen request's JSON-RPC id as sent:
+    // a number stays a number.
+    let subscription_id = request_id_value.clone();
     metrics::counter!("mcpg_subscriptions_listen_opened_total").increment(1);
 
     let runtime = state.runtime.load();
@@ -1610,34 +1648,20 @@ async fn modern_subscriptions_listen_handler(
         );
     }
 
-    // SEP-2575 ack contract: the FIRST frame on a
-    // `subscriptions/listen` stream is the
-    // `notifications/subscriptions/acknowledged` notification
-    // carrying the subscription id (= the listen request's JSON-RPC
-    // id) and the honored-subset `notifications` object. Subsequent
-    // frames are the live notifications matched against the
-    // subscriber's target list, each tagged with the same id under
-    // `_meta.io.modelcontextprotocol/subscriptionId`. The JSON-RPC
-    // response envelope for the `subscriptions/listen` request itself
-    // rides immediately after the ack so the client's
-    // request-correlator can still resolve the call.
+    // The first frame is `notifications/subscriptions/acknowledged` with
+    // the honored filter; then the live notifications, each with the
+    // subscription id in `_meta`. The request's result comes only when the
+    // server ends the stream itself. No SSE event ids are assigned: a
+    // dropped stream is not resumed, the client listens again.
     let established = resource_subscriptions
         .as_ref()
         .map(ResourceSubscriptionGuard::established)
         .unwrap_or_default();
     let honored = params.honored_notifications(&established);
     let ack_payload = subscriptions::acknowledged_notification(&subscription_id, &honored);
-    let response_payload =
-        subscriptions::listen_response_envelope(&request_id_value, &subscription_id, &honored);
-    // SEP-2575 removes SSE resumability on the modern wire — no event
-    // IDs are assigned, so a dropped stream cannot be resumed via
-    // `Last-Event-ID` (the client re-issues `subscriptions/listen`).
     let ack_event: Result<Event, Infallible> = Ok(Event::default()
         .event("message")
         .data(ack_payload.to_string()));
-    let response_event: Result<Event, Infallible> = Ok(Event::default()
-        .event("message")
-        .data(response_payload.to_string()));
 
     // Live event stream: subscribe to the server-internal (synthetic)
     // session delivery bus, filter by subscription targets, stamp the
@@ -1674,17 +1698,15 @@ async fn modern_subscriptions_listen_handler(
         Box::pin(tokio_stream::empty())
     };
 
-    // RES-09: graceful terminal frame. When the delivery bus closes
-    // (server shutdown / session teardown) the live stream ends; emit
-    // a final `resultType:"complete"` frame correlated to the listen
-    // request so the client sees an orderly close rather than a bare
-    // socket drop.
-    let close_payload = subscriptions::complete_notification(&subscription_id);
+    // When the delivery bus closes (shutdown, session teardown) the
+    // server ends the subscription: the listen request's result tells the
+    // client the close is orderly, not a dropped connection.
+    let close_payload = subscriptions::closed_stream_result(&request_id_value);
     let close_event: Result<Event, Infallible> = Ok(Event::default()
         .event("message")
         .data(close_payload.to_string()));
 
-    let priming = iter(vec![ack_event, response_event]);
+    let priming = iter(vec![ack_event]);
     let merged = priming.chain(live).chain(iter(vec![close_event]));
     let guarded = SlottedEventStream {
         inner: Box::pin(merged),

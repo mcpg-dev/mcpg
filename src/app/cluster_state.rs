@@ -495,6 +495,40 @@ pub(crate) async fn resolve_capability_kv(
     }
 }
 
+/// [`resolve_capability_kv`] for a capability that keeps its state apart
+/// from the coordinator's shared store: an absent override and
+/// `kind: cluster` take the coordinator's store named `bucket`.
+pub(crate) async fn resolve_capability_kv_named(
+    over: Option<&crate::config::StoreOverrideConfig>,
+    capability: &str,
+    coordinator: Option<&std::sync::Arc<dyn mcpg_cluster_api::ClusterBackend>>,
+    plugin_registry: &mcpg_plugin_host::PluginRegistry,
+    role: mcpg_plugin_protocol::store::StoreRole,
+    bucket: &str,
+) -> anyhow::Result<std::sync::Arc<dyn mcpg_cluster_api::KeyValueStore>> {
+    if let Some(o) = over
+        && !o.is_cluster_meta()
+    {
+        return build_kv_from_override(o, plugin_registry, role).await;
+    }
+    if let Some(o) = over {
+        o.validate()?;
+    }
+    if let Some(c) = coordinator
+        && c.key_value_store().is_some()
+        && let Some(kv) = c.key_value_store_named(bucket)
+    {
+        info!(
+            capability,
+            bucket,
+            cluster_plugin_id = %c.manifest().id,
+            "store: the cluster coordinator's store of its own"
+        );
+        return Ok(kv);
+    }
+    Ok(default_capability_kv(capability, coordinator))
+}
+
 /// Resolve a per-capability `bus:` override into an
 /// `Arc<dyn PubSub>`. Treats both an absent override and
 /// `kind: cluster` as "use the cluster coordinator's primitive."

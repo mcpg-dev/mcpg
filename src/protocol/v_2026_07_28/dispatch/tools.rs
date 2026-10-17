@@ -89,7 +89,7 @@ pub(crate) async fn dispatch_tools_list(
         tools: modern_tools,
         next_cursor,
         ttl_ms: DEFAULT_TOOLS_LIST_TTL_MS,
-        // Per-principal visibility filtering (`is_tool_visible`) makes this
+        // Per-principal visibility filtering (`is_visible`) makes this
         // list caller-specific — private-cacheable only, never shared, or a
         // shared cache would serve one principal's filtered catalog to another.
         cache_scope: CacheScope::Private,

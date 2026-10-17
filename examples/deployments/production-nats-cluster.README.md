@@ -22,7 +22,6 @@ Same as `production-redis-cluster` for the server / auth / audit / bindings / ob
 
 - `MCPG_NATS_URL` — NATS connection.
 - `MCPG_CLUSTER_STATE_KEY` — URL-safe-base64 32-byte state-encryption key, identical on every replica (`openssl rand -base64 32 | tr '+/' '-_'`). Required whenever `cluster.kind` is not `single_node`.
-- `MCPG_LICENSE_PUBKEY` — the public key (SPKI PEM) that verifies the license token.
 - `HOSTNAME` — the replica's `cluster.node.id`, which must be unique per replica. A container runtime exports it. A shell such as bash sets it but does not export it, so export it (`export HOSTNAME`) when you run the gateway outside a container.
 
 ## Audit

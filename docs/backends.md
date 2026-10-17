@@ -20,8 +20,11 @@ Every backend shares these fields:
 - name: "tool_name"                  # string — Unique MCP capability name (required)
   description: "What it does"        # string — MCP tool description (required)
   title: null                        # Option<string> — Display title
-  minimum_trust: unauthenticated     # enum — unauthenticated | header_asserted | verified
-  cel_allow_if: null                 # Option<string> — CEL expression for access control
+  governance:                        # optional — this binding's pre-dispatch policy
+    minimum_trust: verified          # Option<enum> — unauthenticated | header_asserted | verified;
+                                     #   unset: governance.policy.tool_access.default_minimum_trust
+    allow_if: null                   # Option<string> — CEL expression; the call runs only when true
+    required_scopes: []              # Vec<string> — OAuth scopes the caller's credential must carry
   input_schema: null                 # Option<JSON> — JSON Schema for argument validation
   mcp_app_url: null                  # Option<string> — MCP App URL for _meta.mcpAppUrl (resource/resource_template only)
   backend:                           # required — implementation backend, discriminated by `kind:`
@@ -33,7 +36,7 @@ Every backend shares these fields:
 
 **`mcp_app_url`**: When set on entries under `mcp.capabilities.resources[]` or `mcp.capabilities.resource_templates[]`, the resolved value appears in `_meta.mcpAppUrl` on both `resources/list` descriptors and `resources/read` results. Supports CEL interpolation (e.g., `"https://app.example.com/docs/${arguments.id}"`). Static values are merged at build time with zero runtime cost.
 
-**Governance**: `minimum_trust` and `cel_allow_if` are evaluated by the pre-dispatch policy gate before execution. See [identity-and-authorization.md](identity-and-authorization.md).
+**Governance**: `governance.minimum_trust`, `governance.allow_if` and `governance.required_scopes` are evaluated by the pre-dispatch policy gate before execution. The block refuses unknown keys, so the central rules' `cel_allow_if` spelling is an error here. See [identity-and-authorization.md](identity-and-authorization.md).
 
 **Input validation**: When `input_schema` is a valid JSON Schema, tool arguments are validated against it before execution. Invalid arguments produce a JSON-RPC error without invoking the backend.
 
@@ -725,7 +728,10 @@ resolve — fails fast at boot.
 - **Bulk auto-expose (Tier 2)**: set `expose.tools: true` on the source to
   fan out every (filtered) operation as a tool; read-by-id `GET`s become
   resource templates by default. `filter` (allow/deny) and `tool_prefix`
-  scope and namespace the generated tools.
+  scope and namespace the generated tools. The source's `governance` block
+  is relayed onto each of them; one that names no `minimum_trust` gates them
+  at `header_asserted`, as a federation's does, whatever
+  `default_minimum_trust` is.
 
 **Execution**:
 - Path / query / header / body parameters are bound from the tool arguments

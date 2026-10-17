@@ -216,6 +216,177 @@ pub async fn policy_preview(
     Json(svc.policy_preview(&body.candidate_yaml, body.test_cases))
 }
 
+fn events_error(
+    error: crate::runtime::events::admin::AdminError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use crate::runtime::events::admin::AdminError;
+    let status = match error {
+        AdminError::Disabled | AdminError::NotFound => StatusCode::NOT_FOUND,
+        AdminError::Store => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+}
+
+fn events_core(
+    svc: &AdminService,
+) -> Result<Arc<crate::runtime::events::EventsCore>, (StatusCode, Json<serde_json::Value>)> {
+    svc.events_core()
+        .ok_or_else(|| events_error(crate::runtime::events::admin::AdminError::Disabled))
+}
+
+/// `GET /admin/v1/events` — the state of the event surface.
+pub async fn events_status(State(svc): State<SharedAdmin>) -> impl IntoResponse {
+    match events_core(&svc) {
+        Ok(core) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(core.admin_status().await).unwrap_or_default()),
+        ),
+        Err(error) => error,
+    }
+}
+
+/// `GET /admin/v1/events/types` — every event type with its subscriptions
+/// and log bounds.
+pub async fn events_types(State(svc): State<SharedAdmin>) -> impl IntoResponse {
+    let core = match events_core(&svc) {
+        Ok(core) => core,
+        Err(error) => return error,
+    };
+    match core.admin_types().await {
+        Ok(types) => (StatusCode::OK, Json(serde_json::json!({ "types": types }))),
+        Err(error) => events_error(error),
+    }
+}
+
+/// Query params for `GET /admin/v1/events/subscriptions`.
+#[derive(Debug, serde::Deserialize)]
+pub struct EventsSubscriptionsQuery {
+    pub event: Option<String>,
+    pub principal: Option<String>,
+    #[serde(default = "default_listing_limit")]
+    pub limit: usize,
+}
+
+fn default_listing_limit() -> usize {
+    100
+}
+
+/// `GET /admin/v1/events/subscriptions` — subscriptions, by type or by
+/// principal.
+pub async fn events_subscriptions(
+    State(svc): State<SharedAdmin>,
+    axum::extract::Query(q): axum::extract::Query<EventsSubscriptionsQuery>,
+) -> impl IntoResponse {
+    let core = match events_core(&svc) {
+        Ok(core) => core,
+        Err(error) => return error,
+    };
+    match core
+        .admin_subscriptions(q.event.as_deref(), q.principal.as_deref(), q.limit)
+        .await
+    {
+        Ok(subscriptions) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "subscriptions": subscriptions })),
+        ),
+        Err(error) => events_error(error),
+    }
+}
+
+/// `POST /admin/v1/events/subscriptions/{id}/suspend` — stop delivery to one
+/// subscription until its client refreshes it.
+pub async fn events_suspend(
+    State(svc): State<SharedAdmin>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let core = match events_core(&svc) {
+        Ok(core) => core,
+        Err(error) => return error,
+    };
+    match core.admin_suspend(&id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "suspended": true })),
+        ),
+        Err(error) => events_error(error),
+    }
+}
+
+/// `POST /admin/v1/events/subscriptions/{id}/terminate` — end one
+/// subscription for good.
+pub async fn events_terminate(
+    State(svc): State<SharedAdmin>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let core = match events_core(&svc) {
+        Ok(core) => core,
+        Err(error) => return error,
+    };
+    match core.admin_terminate(&id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "terminated": true })),
+        ),
+        Err(error) => events_error(error),
+    }
+}
+
+async fn set_events_paused(
+    svc: SharedAdmin,
+    paused: bool,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let core = match events_core(&svc) {
+        Ok(core) => core,
+        Err(error) => return error,
+    };
+    match core.admin_set_paused(paused).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "paused": paused })),
+        ),
+        Err(error) => events_error(error),
+    }
+}
+
+/// `POST /admin/v1/events:pause` — stop every delivery on every replica.
+pub async fn events_pause(State(svc): State<SharedAdmin>) -> impl IntoResponse {
+    set_events_paused(svc, true).await
+}
+
+/// `POST /admin/v1/events:resume` — restart delivery after a pause.
+pub async fn events_resume(State(svc): State<SharedAdmin>) -> impl IntoResponse {
+    set_events_paused(svc, false).await
+}
+
+/// Body of `POST /admin/v1/events:purge`.
+#[derive(Debug, serde::Deserialize)]
+pub struct EventsPurgeRequest {
+    /// The trust-qualified principal key, as subscription listings show it.
+    pub principal: String,
+}
+
+/// `POST /admin/v1/events:purge` — delete every subscription of one
+/// principal.
+pub async fn events_purge(
+    State(svc): State<SharedAdmin>,
+    Json(body): Json<EventsPurgeRequest>,
+) -> impl IntoResponse {
+    let core = match events_core(&svc) {
+        Ok(core) => core,
+        Err(error) => return error,
+    };
+    match core.admin_purge(&body.principal).await {
+        Ok(purged) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "purged": purged })),
+        ),
+        Err(error) => events_error(error),
+    }
+}
+
 /// `POST /admin/v1/config:reload` — admin-API hot-reload trigger.
 ///
 /// Parameterless. Returns `200 OK` on a successful reload, `500` on

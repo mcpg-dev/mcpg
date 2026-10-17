@@ -193,7 +193,7 @@ is unchanged from the pre-migration shape.
 
 Every backend carries:
 - MCP descriptor (name, description, input_schema)
-- Governance controls (minimum_trust, cel_allow_if)
+- Governance controls (`governance.minimum_trust`, `governance.allow_if`, `governance.required_scopes`)
 - Optional input schema validation (JSON Schema)
 
 ## Pipeline Execution

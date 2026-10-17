@@ -43,6 +43,20 @@ pub fn admin_router(service: AdminService) -> Router {
         .route("/config:validate", post(handlers::validate_config))
         .route("/config:reload", post(handlers::reload_config_handler))
         .route("/policy:preview", post(handlers::policy_preview))
+        .route("/events", get(handlers::events_status))
+        .route("/events/types", get(handlers::events_types))
+        .route("/events/subscriptions", get(handlers::events_subscriptions))
+        .route(
+            "/events/subscriptions/{id}/suspend",
+            post(handlers::events_suspend),
+        )
+        .route(
+            "/events/subscriptions/{id}/terminate",
+            post(handlers::events_terminate),
+        )
+        .route("/events:pause", post(handlers::events_pause))
+        .route("/events:resume", post(handlers::events_resume))
+        .route("/events:purge", post(handlers::events_purge))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::admin_auth_middleware,

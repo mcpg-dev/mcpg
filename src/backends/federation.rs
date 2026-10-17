@@ -54,6 +54,8 @@ pub(crate) struct CompiledFederatedTemplate {
     pub(crate) matcher: CompiledResourceTemplate,
     pub(crate) source: String,
     pub(crate) prefix: String,
+    /// The (prefixed) URI template the federation lists.
+    pub(crate) uri_template: String,
 }
 
 /// Runtime-mutable overlay of federated capabilities.
@@ -64,8 +66,14 @@ pub(crate) struct CompiledFederatedTemplate {
 pub struct FederatedCatalog {
     pub(crate) tools: Vec<RegisteredTool>,
     pub(crate) resources: Vec<RegisteredResource>,
-    /// Template descriptors for `resources/templates/list`.
-    pub(crate) resource_templates: Vec<crate::protocol::ResourceTemplate>,
+    /// Position in `resources` of the first resource each normalized URI
+    /// names. `resources/list` routes every URI it lists, and an overlay
+    /// holds up to thousands of resources per federation, so routing a URI
+    /// is one lookup rather than a scan.
+    resource_index: std::collections::HashMap<String, usize>,
+    /// Template descriptors for `resources/templates/list`, each with the
+    /// federation that serves it.
+    pub(crate) resource_templates: Vec<(crate::protocol::ResourceTemplate, String)>,
     /// Compiled template matchers for `resources/read` URI routing.
     pub(crate) resource_template_routes: Vec<CompiledFederatedTemplate>,
     pub(crate) prompts: Vec<RegisteredPrompt>,
@@ -92,6 +100,7 @@ impl FederatedCatalog {
                     matcher,
                     source: t.source.clone(),
                     prefix: t.prefix.clone(),
+                    uri_template: t.descriptor.uri_template.clone(),
                 });
             } else {
                 tracing::warn!(
@@ -100,7 +109,17 @@ impl FederatedCatalog {
                     "federated resource template did not compile to a matcher; it lists but reads won't route"
                 );
             }
-            template_descriptors.push(t.descriptor);
+            template_descriptors.push((t.descriptor, t.source));
+        }
+        let resources: Vec<RegisteredResource> = resources
+            .into_iter()
+            .map(|r| RegisteredResource::new(r.descriptor, r.route, None))
+            .collect();
+        let mut resource_index = std::collections::HashMap::with_capacity(resources.len());
+        for (position, resource) in resources.iter().enumerate() {
+            resource_index
+                .entry(resource.normalized_uri().to_owned())
+                .or_insert(position);
         }
         Self {
             tools: tools
@@ -110,14 +129,8 @@ impl FederatedCatalog {
                     route: t.route,
                 })
                 .collect(),
-            resources: resources
-                .into_iter()
-                .map(|r| RegisteredResource {
-                    descriptor: r.descriptor,
-                    route: r.route,
-                    app_url_pattern: None,
-                })
-                .collect(),
+            resources,
+            resource_index,
             resource_templates: template_descriptors,
             resource_template_routes,
             prompts: prompts
@@ -128,6 +141,14 @@ impl FederatedCatalog {
                 })
                 .collect(),
         }
+    }
+
+    /// The first resource the overlay lists under the normalized URI
+    /// `normalized`: the one a read of that URI dispatches to.
+    pub(crate) fn resource(&self, normalized: &str) -> Option<&RegisteredResource> {
+        self.resource_index
+            .get(normalized)
+            .and_then(|&position| self.resources.get(position))
     }
 
     #[must_use]

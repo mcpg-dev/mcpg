@@ -430,6 +430,7 @@ governance:
         config.governance.policy.tool_access.rules,
         vec![ToolTrustRuleConfig {
             tool_name: "mcpg.runtime.snapshot".to_owned(),
+            event_name: None,
             minimum_trust: TrustLevelConfig::Unauthenticated,
             cel_allow_if: Some("principal_id == \"user-1\"".to_owned()),
             required_scopes: Vec::new(),
@@ -546,6 +547,7 @@ fn validate_rejects_manual_policy_rule_for_binding() {
                     cel_allow_if: None,
                     rules: vec![ToolTrustRuleConfig {
                         tool_name: "test.tool".to_owned(),
+                        event_name: None,
                         minimum_trust: TrustLevelConfig::HeaderAsserted,
                         cel_allow_if: None,
                         required_scopes: Vec::new(),
@@ -585,7 +587,7 @@ fn validate_rejects_empty_backend_allow_if() {
                         },
                     ),
                     governance: BackendGovernanceConfig {
-                        minimum_trust: TrustLevelConfig::HeaderAsserted,
+                        minimum_trust: Some(TrustLevelConfig::HeaderAsserted),
                         allow_if: Some("   ".to_owned()),
                         required_scopes: Vec::new(),
                     },
@@ -913,6 +915,7 @@ fn validate_rejects_empty_tool_access_rule_name() {
                     cel_allow_if: None,
                     rules: vec![ToolTrustRuleConfig {
                         tool_name: String::new(),
+                        event_name: None,
                         minimum_trust: TrustLevelConfig::HeaderAsserted,
                         cel_allow_if: None,
                         required_scopes: Vec::new(),
@@ -949,12 +952,14 @@ fn validate_rejects_duplicate_tool_access_rule_names() {
                     rules: vec![
                         ToolTrustRuleConfig {
                             tool_name: "mcpg.runtime.snapshot".to_owned(),
+                            event_name: None,
                             minimum_trust: TrustLevelConfig::HeaderAsserted,
                             cel_allow_if: None,
                             required_scopes: Vec::new(),
                         },
                         ToolTrustRuleConfig {
                             tool_name: "mcpg.runtime.snapshot".to_owned(),
+                            event_name: None,
                             minimum_trust: TrustLevelConfig::Unauthenticated,
                             cel_allow_if: None,
                             required_scopes: Vec::new(),
@@ -1019,6 +1024,7 @@ fn validate_rejects_empty_tool_rule_cel_expression() {
                     cel_allow_if: None,
                     rules: vec![ToolTrustRuleConfig {
                         tool_name: "mcpg.runtime.snapshot".to_owned(),
+                        event_name: None,
                         minimum_trust: TrustLevelConfig::HeaderAsserted,
                         cel_allow_if: Some("  ".to_owned()),
                         required_scopes: Vec::new(),

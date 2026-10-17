@@ -160,19 +160,20 @@ MCPG has no top-level `tenants:` block by design. Per-tenant differentiation com
 
 1. **Tenant identity.** Comes off the verified principal — `identity.subject_id`, `identity.attributes.<claim>`, `identity.roles[]`, `identity.groups[]`. Whichever OIDC claim represents your tenant (commonly `tid`, `org_id`, or a custom claim) ends up under `identity.attributes.<claim>` once the inbound JWT verifier resolves it. No config knob is needed for the tenant ID itself.
 
-2. **Per-tenant binding allowlist.** Goes through `governance.policy.tool_access.rules[].cel_allow_if`. Each binding gets a CEL predicate that references the principal's tenant claim:
+2. **Per-tenant binding allowlist.** A CEL predicate references the principal's tenant claim. A `governance.policy.tool_access.rules[]` entry names one exact tool, never a pattern, so a whole name prefix is matched in the global `cel_allow_if`, which runs for every call and every list entry (a single binding can instead carry its own `governance.allow_if`):
 
    ```yaml
    governance:
      policy:
        tool_access:
          default_minimum_trust: verified
-         rules:
-           - tool_name: "acme.*"
-             cel_allow_if: 'identity.attributes.tenant == "acme" || "platform" in identity.groups'
-           - tool_name: "partner.*"
-             cel_allow_if: 'identity.attributes.tenant == "partner"'
-           # shared.* falls through to default_minimum_trust (any verified caller).
+         cel_allow_if: >-
+           (!tool_name.startsWith("acme.")
+             || ("tenant" in identity.attributes && identity.attributes["tenant"] == "acme")
+             || "platform" in identity.groups)
+           && (!tool_name.startsWith("partner.")
+             || ("tenant" in identity.attributes && identity.attributes["tenant"] == "partner"))
+         # shared.* passes both clauses: any verified caller may use it.
    ```
 
    The CEL predicate runs pre-dispatch alongside trust-floor checks, so a deny is observable through the same audit shape (`mcpg.policy.tool_call.denied`) as any other policy denial.
@@ -272,7 +273,7 @@ Every field on the root `AppConfig`, alphabetised. Click a type to jump to its p
 | `feature_flags` | [`FeatureFlagsConfig`](#featureflagsconfig) | (see type) | Operator-controlled strictness / compatibility flags. Every flag defaults off; flipping one is an explicit acknowledgement that the operator is taking on the risk the default protects against. Collapsing them into this block lets them show up in the curated reference + JSON Schema and audit-emit when active. |
 | `gateway` | [`GatewayConfig`](#gatewayconfig) | (see type) | `gateway:` umbrella — the binary's network face: listener (`server`), admin surface (`admin`), Control Plane attachment (`control_plane`). |
 | `governance` | [`GovernanceConfig`](#governanceconfig) | (see type) | `governance:` umbrella — tool-call lifecycle: identity (`access`) → authorization (`policy`) → human gate (`approvals`) → evidence (`audit`). Co-located under one umbrella so the governance story reads as a coherent block. |
-| `license` | [`LicenseConfig`](#licenseconfig) | (see type) | `license:` — offline license token (or the non-production declaration). The license gate refuses entitlement-gated plugins and feature-gated config blocks (interactive sign-in) the resolved envelope does not admit. With `gateway.control_plane` attached the control plane admits the plugins, while the config blocks are still checked here unless the managed-cloud platform rendered the config. |
+| `license` | [`LicenseConfig`](#licenseconfig) | (see type) | `license:` — offline license token (or the non-production declaration). The license gate refuses entitlement-gated plugins and feature-gated config blocks (interactive sign-in, DPoP, rich authorization requests) the resolved envelope does not admit. On a gateway mcpg.cloud delivers a license to (a delivery its proof shows mcpg.cloud made) this block is ignored, and the envelope is the org license it delivers; under a customer's own control plane the block counts. Every license verifies against the MCPG issuer keys compiled into the binary. |
 | `mcp` | [`McpConfig`](#mcpconfig) | (see type) | `mcp:` namespace — the MCP protocol surface. Two children: `capabilities:` (tools / prompts / resources / resource_templates / tasks / elicitation / sampling / roots — what the server advertises in `initialize`) and `configurations:` (sessions / pipelines / subscriptions / delivery / cancellation — runtime-emergent state). Capability persistence (`store:` / `bus:`) defaults to `kind: cluster` — the cluster coordinator's primitive — and can be overridden per capability with `kind: memory` / `file`. |
 | `observability` | [`ObservabilityConfig`](#observabilityconfig) | (see type) | All observability concerns — log/metric/trace emission, the binding-backend health prober, and the sink fan-out routing for telemetry / log events. Sub-fields all default to safe single-node values so the block is fully optional. |
 | `plugins` | array&lt;[`PluginEntryConfig`](#pluginentryconfig)&gt; | `[]` | Loaded plugin entries — flat array, no wrapper. Each entry is self-contained (id / class / source / signature / config / limits / enforce / granted_capabilities / observability / http_route / disabled). Identity / policy / credential / catalog / cluster plugins all dispatch via the `class:` field. An empty array is the kill switch — no plugins are loaded. |
@@ -666,7 +667,7 @@ Tool annotation hints configurable per binding. Maps to MCP `ToolAnnotations`.
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `allow_if` | string (optional) |  |  |
-| `minimum_trust` | [`TrustLevelConfig`](#trustlevelconfig) | `"header_asserted"` |  |
+| `minimum_trust` | [`TrustLevelConfig`](#trustlevelconfig) (optional) |  | The lowest caller trust level the capability accepts. When unset, a binding takes `governance.policy.tool_access.default_minimum_trust`, and a federation, a registry's `defaults` or an openapi source's auto-exposed capabilities take `header_asserted`. |
 | `required_scopes` | array&lt;string&gt; |  | Scopes the caller's credential MUST carry to invoke this binding (OAuth `scope`, or an AAuth auth token's `scope`). A caller short of them is answered with the step-up challenge naming the missing scopes (`WWW-Authenticate … error="insufficient_scope"`; for an AAuth person or auth-token caller, `AAuth-Requirement: requirement=auth-token` carrying a resource token). Empty (the default) means no scope requirement. |
 
 ### `BackendIconConfig`
@@ -729,6 +730,18 @@ One named budget policy (cost cap / call count / token count).
 | `scope` | string | `"per_identity"` | Scope discriminator (same vocabulary as RateLimitPolicy). |
 | `warn_at_pct` | integer (optional) |  | Emit `governance.quota.warn` when drawdown crosses this percentage of the cap. Defaults to no warning. `0..=100`. |
 | `window` | string |  | Rolling window over which the cap applies. Suffixes `s`/`m`/ `h`/`d`. Maximum `30d`. |
+
+### `BuiltinEventSource`
+
+An event the gateway raises itself.
+
+**Variants:**
+
+- **`mcp.task.updated`** — A task of the subscriber changed status. Delivered only to the principal whose session owns the task.
+
+- **`approval.requested`** — A tool gate asked a person to approve a call.
+
+- **`approval.resolved`** — An approval was granted, denied or ran out of time.
 
 ### `BusOverrideConfig`
 
@@ -951,7 +964,7 @@ Conflict policy on a body-hash mismatch with a stored record. Today only `Reject
 
 **Variants:**
 
-- **`reject`** — Same key + different body hash → JSON-RPC error `-32010 IdempotencyConflict` (HTTP 422).
+- **`reject`** — Same key + different body hash → JSON-RPC error `-33010 IdempotencyConflict` (HTTP 422).
 
 ### `ConsentConfig`
 
@@ -963,6 +976,16 @@ The consent page (`interactive.consent`). It is shown to every dynamically regis
 | `scope_descriptions` | map&lt;string, string&gt; | `{}` | A description shown next to each scope, keyed by scope. Every key must be a scope this server grants (`allowed_scopes`, else `resource_metadata.scopes_supported`); each description is at most 200 characters. |
 | `service_name` | string (optional) |  | The heading of the consent and connect pages (1–80 characters). Defaults to the issuer's host. |
 
+### `ControlEnvelopeKind`
+
+A webhook control envelope the gateway may send.
+
+**Variants:**
+
+- **`gap`** — Events were skipped; carries the cursor to persist.
+
+- **`terminated`** — The subscription ended on the gateway's side.
+
 ### `ControlPlaneAttachConfig`
 
 Control Plane attachment config. See `apps/gateway/src/runtime/cp/attach.rs` for the wiring logic.
@@ -972,7 +995,7 @@ Control Plane attachment config. See `apps/gateway/src/runtime/cp/attach.rs` for
 | `bootstrap_ca_pem` | string (optional) |  | PEM-encoded CA bundle to trust on the very first connect (Register), before the agent has its own creds. Once Register completes, the CP-issued cert/key/ca_chain trio supplants this. Optional; only required when the CP gRPC listener is TLS and the operator hasn't pre-populated a previous run's `agent-creds.json`. |
 | `capture_payloads` | boolean | `false` | **Enterprise opt-in.** When `true`, the gateway captures the JSON-serialized request arguments + response of each tool call and ships them in the `MetricsReport` (Channel-encrypted; the CP further encrypts at-rest with a per-tenant KMS-derived key). The captured bytes can contain PII / secrets, so this is off by default; the CP also gates ingest on the active license carrying the `payload_capture` feature flag, so flipping this `true` without a matching license is a no-op (samples ship but CP drops the payload bytes). |
 | `enrollment_url` | string (optional) |  | One-time enrollment URL minted by the CP UI. Required on first boot; subsequent boots reuse the cached creds in `state_dir`. |
-| `heartbeat_interval_ms` | integer (optional) |  | Seconds between heartbeats. Default 30s. |
+| `heartbeat_interval_ms` | integer (optional) |  | Milliseconds between heartbeats. Default 30000 (30 s); held to 5000–60000, since each heartbeat reply carries the CP's quota status. A platform-provisioned gateway always runs the default. |
 | `instance_uid` | string (optional) |  | Stable per-instance id. Defaults to `${HOSTNAME}-${uuid7-prefix}` when unset. |
 | `state_dir` | string | `"./mcpg-cp-state"` | Where to persist agent creds (`agent-creds.json`) and the LKG cache. Defaults to `./mcpg-cp-state`. |
 | `url` | string |  | gRPC URL of the Control Plane (e.g. `"https://cp.example.com:7844"`). |
@@ -1066,6 +1089,16 @@ Top-level `debug:` block — diagnostic tools surface only. The master switch li
 | `exposure` | [`DebugToolExposureConfig`](#debugtoolexposureconfig) | (see type) |  |
 | `network_profiles` | map&lt;string, [`DebugNetworkToolConfig`](#debugnetworktoolconfig)&gt; | `{}` |  |
 
+### `DeliveryAuditMode`
+
+Granularity of delivery audit records.
+
+**Variants:**
+
+- **`summary`** — Counts per subscription per window.
+
+- **`every`** — One record per delivery request.
+
 ### `DeliveryConfig`
 
 `delivery:` config — delivery bus (the internal pub/sub that fans server-initiated messages out to the SSE stream owning each session) + per-capability `bus:` override. When `bus` is unset, the gateway inherits the cluster's `pub_sub()` primitive.
@@ -1132,6 +1165,218 @@ A dynamic-enum source: a sibling tool whose result supplies options.
 | `tool` | string |  |  |
 | `value_field` | string |  |  |
 
+### `EventAudience`
+
+Whose credential reads an event source.
+
+**Variants:**
+
+- **`shared`** — The gateway's own identity; one source serves every subscriber.
+
+- **`per_principal`** — Each subscriber's own credential. No source kind of this build reads with a subscriber's credential, so this is refused.
+
+### `EventDeliveryMode`
+
+A delivery mode of an event type.
+
+**Variants:**
+
+- **`poll`** — `events/poll`.
+
+- **`push`** — `events/stream`.
+
+- **`webhook`** — `events/subscribe` with a callback URL.
+
+### `EventErrorCodes`
+
+The numbering of the MCP Events error codes on the wire.
+
+**Variants:**
+
+- **`draft`** — `-32011` to `-32015`.
+
+- **`sep_3415`** — `-32023` to `-32027`.
+
+### `EventLogConfig`
+
+`events.log:` — the inbox that `inbound` routes write before an event reaches the log.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `inbox_max_rows` | integer | `10000` | Most rows one source's inbox holds; past it an inbound route answers `503` with `Retry-After`. Default 10 000. |
+| `inbox_ttl_ms` | integer | `86400000` | How long an inbox row waits for the log writer, in milliseconds. An inbound route answers `503` with `Retry-After` once the inbox has not been drained for this long, so the sender keeps the event and retries. Default 86 400 000 (24 hours). |
+
+### `EventReplay`
+
+Whether a type's log serves replay.
+
+**Variants:**
+
+- **`log`** — Cursors resume from the log within retention.
+
+- **`none`** — No cursor is issued; every subscription starts from now.
+
+### `EventRetentionConfig`
+
+`retention:` — the bounds of one type's log. The oldest occurrences are evicted first; an append is never refused. On a gateway a control plane manages, the plan's retention caps are the most each bound can be.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `max_age_ms` | integer | `86400000` | Oldest occurrence kept, in milliseconds. Default 86 400 000 (24 hours). |
+| `max_bytes` | integer (optional) |  | Most bytes kept. Default 8 388 608 (8 MiB). The sum over every type, imported types included, must fit the event-log store: half of the NATS coordinator's events bucket (`jetstream.named_bucket_max_bytes`, 256 MiB by default), or 64 MiB for an in-process memory store. Redis, a `file` store and a store plugin set no limit on the sum. |
+| `max_events` | integer | `10000` | Most occurrences kept. Default 10 000. |
+
+### `EventSourceConfig`
+
+The source of an event type: exactly one of `watch`, `inbound`, `resource` or `builtin`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `builtin` | [`BuiltinEventSource`](#builtineventsource) (optional) |  | An event the gateway itself raises. |
+| `inbound` | [`InboundSourceConfig`](#inboundsourceconfig) (optional) |  | Signed webhooks that third parties POST to `/webhooks/events/{source_id}`. |
+| `resource` | string (optional) |  | The `uri` of the `resources[]` binding whose `watch:` block feeds the type. Every change is one occurrence with `data: {uri, observedAt}`. |
+| `watch` | [`EventWatchSourceConfig`](#eventwatchsourceconfig) (optional) |  | A plugin watch strategy. Every change it reports is one occurrence: with the plugin's payload when `event_type` names one of the event types the plugin declares, else `data: {observedAt}`. |
+
+### `EventSourcesConfig`
+
+`events.sources:` — when event sources run.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `linger_ms` | integer | `300000` | How long a source keeps running after its last subscription ends, in milliseconds. Default 300 000 (5 minutes). |
+
+### `EventTransformConfig`
+
+An operator transform of occurrence data.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `expression` | string |  | The expression handed to the plugin. |
+| `plugin` | string |  | Id of a loaded transform plugin, for example `dev.mcpg.transform.jsonata`. |
+
+### `EventTypeConfig`
+
+One event type the gateway offers (`mcp.capabilities.events[]`).
+
+A type binds exactly one `source`. Subscription `arguments` are a filter applied by `match`, never a parameter of the source.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `always_on` | boolean | `false` | Keep the source running with no subscriber, so the log covers periods without one. Default `false`: a source starts with the first subscription and stops `sources.linger_ms` after the last. |
+| `audience` | [`EventAudience`](#eventaudience) | `"shared"` | Whose credential reads the source. `shared` (default) reads with the gateway's own identity; per-subscriber visibility is then expressed in `match`. |
+| `delivery` | array&lt;[`EventDeliveryMode`](#eventdeliverymode)&gt; | (see type) | Delivery modes offered, intersected with the modes `mcp.configurations.events` enables. Default every mode. The intersection must not be empty. |
+| `description` | string (optional) |  | What an occurrence means, for the client. |
+| `input_schema` | any |  | JSON Schema of the subscription `arguments`. Omitted, a subscription carries no arguments. |
+| `match` | string (optional) |  | CEL expression over `arguments`, `event` (`event.data`, `event.name`, `event.eventId`, `event.timestamp`) and `subscriber` that selects the occurrences a subscription receives. An error or a non-boolean result delivers nothing. |
+| `name` | string |  | The type's name, unique, at most 128 characters of `[A-Za-z0-9._-]`. Publish a new name instead of changing a schema in a way that is not additive. |
+| `payload_schema` | any |  | JSON Schema of each occurrence's `data`. An occurrence that does not match it is dropped and counted. Omitted, any object is accepted. A `watch` or `resource` source sends `{observedAt}` (and `uri` for `resource`), which the schema must accept. |
+| `replay` | [`EventReplay`](#eventreplay) | `"log"` | `log` (default) lets a client resume from a cursor within retention; `none` always answers `cursor: null`. |
+| `retention` | [`EventRetentionConfig`](#eventretentionconfig) | (see type) | How long and how much of this type's log is kept. |
+| `source` | [`EventSourceConfig`](#eventsourceconfig) |  | Where occurrences come from: exactly one of `watch`, `inbound`, `resource` or `builtin`. |
+| `transform` | [`EventTransformConfig`](#eventtransformconfig) (optional) |  | Operator transform applied to each occurrence's `data` before the payload schema check. |
+
+### `EventWatchSourceConfig`
+
+`source.watch:` — a plugin watch strategy.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `event_type` | string (optional) |  | One of the event types the strategy declares in its plugin's `plugin.yaml` (`watch_strategies[].event_types`). The type then carries the plugin's payload, its schemas unless this type declares its own, and resumes where it stopped when the strategy can. A strategy that declares no types is refused at boot. Omitted, every change is a payload-free `{observedAt}` occurrence. Either way the source runs where the strategy places it. |
+| `strategy` | [`WatchStrategyConfig`](#watchstrategyconfig) |  | A plugin-backed strategy: `nats_topic`, `kafka_topic` (it reads with its own `mcpg-events-{name}` group unless `group_id` names one), `sql_polling`, `postgres_listen_notify` or `plugin`. `poll` and `webhook` are refused: `poll` reads a resource the event type does not have, and the `webhook` token route is not an event source (use `inbound`). |
+
+### `EventsAdvertiseLocation`
+
+A place in the `server/discover` capabilities where MCP Events is advertised.
+
+**Variants:**
+
+- **`capability`** — The top-level `capabilities.events` object.
+
+- **`extension`** — The `capabilities.extensions["io.modelcontextprotocol/events"]` entry.
+
+### `EventsAuditConfig`
+
+`events.audit:` — how delivery is audited.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `deliveries` | [`DeliveryAuditMode`](#deliveryauditmode) | `"summary"` | `summary` (default) writes one record per subscription per window with delivery counts; `every` writes one record per delivery request. |
+
+### `EventsConfig`
+
+`events:` config — the experimental MCP Events extension.
+
+Off by default. With `enabled: false` the `events/*` methods answer `-32601` and `server/discover` does not mention events. The extension is served on the `2026-07-28` wire over HTTP only; the `2025-11-25` wire and stdio never carry it. Event types are declared under `mcp.capabilities.events`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `advertise` | array&lt;[`EventsAdvertiseLocation`](#eventsadvertiselocation)&gt; | (see type) | Where `server/discover` advertises the extension. The drafts disagree on the location, so both are on by default: `capability` is the top-level `capabilities.events` object (read by ChatGPT), `extension` is the `capabilities.extensions["io.modelcontextprotocol/events"]` entry. Must name at least one location when `enabled` is `true`. |
+| `allow_ephemeral_subscriptions` | boolean | `false` | Accept webhook subscriptions on a store that loses them on a restart. Every grant is then capped at `webhook.ttl.min_ms`, so a client refreshes before a restart can matter for long. Default `false`. |
+| `audit` | [`EventsAuditConfig`](#eventsauditconfig) | (see type) | Audit of event delivery. |
+| `delivery_paused` | boolean | `false` | Hold every delivery, in every mode, while keeping every subscription and every event within retention: webhook deliveries wait, a poll answers no events and the cursor it was given, and a stream sends heartbeats only. Subscribe and refresh still answer, with `deliveryStatus.active: false` and `lastError: "paused"`. Delivery resumes from each position when this is cleared. Default `false`. |
+| `enabled` | boolean | `false` | Serve the `events/*` methods of every delivery mode enabled below, and advertise the extension. Default `false`. |
+| `error_codes` | [`EventErrorCodes`](#eventerrorcodes) | `"draft"` | How the extension's error codes are numbered. `draft` (default) answers `-32011` to `-32015`, the numbers the ChatGPT profile documents; `sep_3415` answers `-32023` to `-32027`, the numbers the upstream sketch assigns. The documentation names the `draft` numbers. |
+| `inbound_profiles` | array&lt;[`InboundProfileConfig`](#inboundprofileconfig)&gt; |  | Signing profiles of inbound senders beyond the built-in ones (`standard_webhooks`, `github`, `stripe`, `slack`). A route names one in `source.inbound.verify.profile`. |
+| `log` | [`EventLogConfig`](#eventlogconfig) | (see type) | Event log limits. |
+| `log_store` | [`StoreOverrideConfig`](#storeoverrideconfig) (optional) |  | Store of the event log (store role `event-log`). Omitted, the cluster coordinator's store is used. The retention byte budgets of every event type must fit this store (see `mcp.capabilities.events[].retention.max_bytes`). |
+| `poll` | [`EventsPollConfig`](#eventspollconfig) | (see type) | Poll delivery (`events/poll`). |
+| `push` | [`EventsPushConfig`](#eventspushconfig) | (see type) | Push delivery (`events/stream`). |
+| `reauthorize_interval_ms` | integer | `300000` | How often the authorization of a long-lived grant is checked again from its stored identity: each webhook subscription and each open stream. In milliseconds; default 300 000 (5 minutes). |
+| `sources` | [`EventSourcesConfig`](#eventsourcesconfig) | (see type) | Lifecycle of event sources. |
+| `store` | [`StoreOverrideConfig`](#storeoverrideconfig) (optional) |  | Store of the webhook subscription records (store role `event-subscription`). Omitted, the cluster coordinator's store is used, which is in memory on a single node. Webhook delivery refuses a store that does not survive a restart unless `allow_ephemeral_subscriptions` is set; a single node keeps subscriptions with `{kind: file, dir: …}`. |
+| `unsubscribe_unknown` | [`UnsubscribeUnknown`](#unsubscribeunknown) | `"ok"` | The answer to `events/unsubscribe` for a subscription that does not exist. `ok` (default) answers `{}`, as an idempotent unsubscribe; `not_found` answers `-32011` with `data.kind: "subscription"`. |
+| `webhook` | [`EventsWebhookConfig`](#eventswebhookconfig) | (see type) | Webhook delivery (`events/subscribe`). |
+
+### `EventsPollConfig`
+
+`events.poll:` — `events/poll`: a client reads a type's log itself, on any replica, with the cursor of its previous poll. Off by default.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Serve `events/poll`, and offer `poll` on every type whose `delivery` lists it. Default `false`. |
+| `lease_multiplier` | integer | `3` | A poll lease lasts this many `next_poll_ms` after the last poll. While a type has a lease, its source runs. Default 3. |
+| `max_events` | integer | `100` | Events per poll when the client sets no `maxEvents`. Default 100. |
+| `max_events_cap` | integer | `1000` | Most events per poll. Default 1 000. |
+| `max_leases_per_principal` | integer | `100` | Poll leases one principal may hold: one per event type and arguments it polls. Default 100. |
+| `min_next_poll_ms` | integer | `1000` | Shortest wait the gateway asks for, in milliseconds. Default 1 000. |
+| `next_poll_ms` | integer | `5000` | Suggested wait before the next poll, in milliseconds. Default 5 000. |
+| `require_trust` | [`SubscriberTrust`](#subscribertrust) | `"verified"` | The lowest caller trust that may poll. `verified` (default) requires a cryptographically verified principal; `header_asserted` also admits a principal named by a request header. |
+
+### `EventsPushConfig`
+
+`events.push:` — `events/stream`: one long-lived response per subscription, on the replica the client reaches. Off by default.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `enabled` | boolean | `false` | Serve `events/stream`, and offer `push` on every type whose `delivery` lists it. Default `false`. |
+| `heartbeat_interval_ms` | integer | `20000` | Interval of heartbeat frames, in milliseconds, from 1 000 to 30 000. Default 20 000. A client that hears nothing for twice this treats the stream as dead and reconnects with its cursor. |
+| `max_streams_per_principal` | integer | `16` | Streams one principal may hold open across the cluster. Default 16. These do not count against the server-push stream cap of a session. |
+| `require_trust` | [`SubscriberTrust`](#subscribertrust) | `"verified"` | The lowest caller trust that may open a stream. `verified` (default) requires a cryptographically verified principal; `header_asserted` also admits a principal named by a request header. |
+
+### `EventsWebhookConfig`
+
+`events.webhook:` — the webhook delivery profile.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `control_envelopes` | array&lt;[`ControlEnvelopeKind`](#controlenvelopekind)&gt; | (see type) | The control envelopes sent besides events. Default both `gap` and `terminated`; a `verification` envelope is always sent. |
+| `egress` | [`WebhookEgressConfig`](#webhookegressconfig) | (see type) | The outbound client that reaches callback URLs. |
+| `enabled` | boolean | `true` | Accept `events/subscribe` and deliver to callback URLs. Default `true`. Requires a store that survives a restart (or `allow_ephemeral_subscriptions`) and a key that every replica shares: `cluster.state_encryption_key_env` or `mcp.configurations.sessions.synthetic_session_key`. |
+| `limits` | [`WebhookLimitsConfig`](#webhooklimitsconfig) | (see type) | Subscription and delivery limits. |
+| `max_payload_bytes` | integer | `245760` | Largest serialized occurrence, in bytes; a larger occurrence is not delivered. At most 245 760 (the default), so the whole request body stays within 262 144 bytes. |
+| `require_trust` | [`SubscriberTrust`](#subscribertrust) | `"verified"` | The lowest caller trust that may subscribe. `verified` (default) requires a cryptographically verified principal; `header_asserted` also admits a principal named by a request header and is for self-hosted deployments that trust their front proxy. |
+| `retry` | [`WebhookRetryConfig`](#webhookretryconfig) | (see type) | Retries of one delivery. |
+| `secret_rotation_grace_ms` | integer | `600000` | How long the previous secret keeps signing after a subscribe replaces it, in milliseconds. Default 600 000 (10 minutes). |
+| `suspension` | [`WebhookSuspensionConfig`](#webhooksuspensionconfig) | (see type) | When failing deliveries suspend a subscription. |
+| `ttl` | [`WebhookTtlConfig`](#webhookttlconfig) | (see type) | Lifetime of a subscription grant. |
+| `verification` | [`WebhookVerificationConfig`](#webhookverificationconfig) | (see type) | Proof that a callback endpoint wants the deliveries. |
+
+### `FailureRate`
+
+A share between 0 and 1.
+
+Type: number
+
 ### `FeatureFlagsConfig`
 
 Operator-controlled strictness / compat flags.
@@ -1159,7 +1404,8 @@ One federated upstream MCP server.
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `cache` | [`FederationCacheConfig`](#federationcacheconfig) | (see type) | Capability-cache behaviour (TTL refresh). |
-| `filter` | [`FilterConfig`](#filterconfig) | (see type) | Allow/deny filtering of imported tool names. |
+| `events` | [`FederationEventsConfig`](#federationeventsconfig) | (see type) | How imported event types are read from the upstream. |
+| `filter` | [`FilterConfig`](#filterconfig) | (see type) | Allow/deny filtering of imported tool and event type names. |
 | `governance` | [`BackendGovernanceConfig`](#backendgovernanceconfig) | (see type) | Governance inherited by every capability imported from this upstream — identical block to a native binding's, so the gate chain treats a federated call exactly like a native one. |
 | `import` | [`ImportConfig`](#importconfig) | (see type) | Which capability surfaces to import. |
 | `name` | string |  | Source id. Also the default capability-prefix namespace and the `federated_from` label on synthetic capabilities. |
@@ -1170,13 +1416,25 @@ One federated upstream MCP server.
 | `synthesize` | [`SynthesizeConfig`](#synthesizeconfig) | (see type) | Change-notification synthesis for upstreams that cannot push. |
 | `upstream` | [`UpstreamConfig`](#upstreamconfig) |  | Upstream connection (url, transport, auth, safety). |
 
-### `FilterConfig`
+### `FederationEventsConfig`
 
-Allow/deny filtering of imported tool names (glob `*` suffix).
+How imported MCP Events types are read from the upstream.
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
+| `delivery` | [`UpstreamEventDelivery`](#upstreameventdelivery) | `"auto"` | The upstream delivery mode each upstream subscription uses. |
+| `retention` | [`EventRetentionConfig`](#eventretentionconfig) | (see type) | What the gateway keeps of each imported type's events, as `retention` does for a configured type. Imported types count against the event-log store's byte budget after the configured ones; a type that does not fit is not served. |
+| `sharing` | [`UpstreamEventSharing`](#upstreameventsharing) | `"fan_in"` | Whose upstream subscriptions serve the subscribers. |
+
+### `FilterConfig`
+
+Allow/deny filtering of imported tool and event type names (glob `*` suffix).
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `exclude_events` | array&lt;string&gt; | `[]` |  |
 | `exclude_tools` | array&lt;string&gt; | `[]` |  |
+| `include_events` | array&lt;string&gt; | (see type) |  |
 | `include_tools` | array&lt;string&gt; | (see type) |  |
 
 ### `GatewayAppConfig`
@@ -1283,6 +1541,18 @@ Periodic health-probe configuration. The probe is the only writer of `PluginStat
 | `interval_ms` | integer | `30000` | Milliseconds between probe cycles. Default: 30000 (30s). |
 | `probe_timeout_ms` | integer | `5000` | Per-probe deadline in milliseconds. A plugin whose FFI call exceeds this is counted as a failure. Default: 5000 (5s). |
 
+### `HmacAlgorithm`
+
+The hash of an HMAC signature.
+
+**Variants:**
+
+- **`sha1`** — HMAC-SHA1, 20-byte digests.
+
+- **`sha256`** — HMAC-SHA256, 32-byte digests.
+
+- **`sha512`** — HMAC-SHA512, 64-byte digests.
+
 ### `IdempotencyConfig`
 
 `idempotency:` config — opt-in dedupe for `tools/call` and `tasks/create`. When `enabled: false` (the default), the gateway omits the `dev.mcpg/idempotency` extension from its `initialize` capability advertisement and silently ignores any `_meta["dev.mcpg/idempotency-key"]` the caller sets.
@@ -1328,10 +1598,87 @@ Which capability surfaces to import.
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
+| `events` | boolean | `false` | Import the upstream's MCP Events types. Each serves downstream from the gateway's own log, in every delivery mode the gateway enables, and is fed by one upstream subscription per distinct set of arguments in demand, held with this federation's catalogue credential. Needs an upstream on the `2026-07-28` wire over `streamable_http` that advertises events; any other imports none. |
 | `prompts` | boolean | `false` |  |
 | `resource_templates` | boolean | `false` |  |
 | `resources` | boolean | `false` |  |
 | `tools` | boolean | `true` |  |
+
+### `InboundHandshakeConfig`
+
+An entry of `handshakes:` — a request the route answers itself.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `reply` | map&lt;string, string&gt; |  | The JSON object of a `200` reply: each key takes the string at a JSON pointer into the body, as a URL challenge is echoed. Omitted, the route acknowledges with `202`. |
+| `when` | [`InboundWhenConfig`](#inboundwhenconfig) |  | The requests it answers. Every listed header and body field must match. |
+
+### `InboundProfileConfig`
+
+An entry of `inbound_profiles:` — how one kind of sender signs its webhooks: an HMAC of a message built from the raw body, a signed timestamp and headers. Routes name it in `verify.profile`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `algorithm` | [`HmacAlgorithm`](#hmacalgorithm) | `"sha256"` | The HMAC hash. Default `sha256`. |
+| `event_id` | [`InboundValueConfig`](#inboundvalueconfig) (optional) |  | Where the sender puts its event id. A route's own `event_id` takes its place. |
+| `event_time` | string (optional) |  | JSON pointer to the event time in the body, RFC 3339 or Unix seconds. A route's own `timestamp` takes its place. |
+| `handshakes` | array&lt;[`InboundHandshakeConfig`](#inboundhandshakeconfig)&gt; |  | Requests the route answers itself, never as events: a sender's ping or URL challenge. The first match applies. |
+| `name` | string |  | The name routes give in `verify.profile`. At most 64 characters of `[a-z0-9_-]`; a built-in name cannot be declared again. |
+| `secret` | [`SecretFormatConfig`](#secretformatconfig) | (see type) | How a configured secret becomes the HMAC key. |
+| `signature` | [`SignatureFormatConfig`](#signatureformatconfig) |  | Where the request carries its signatures. |
+| `signed_payload` | string | `"{body}"` | The signed message. `{body}` is the raw body and must appear once; `{timestamp}` is the signed timestamp; `{header:NAME}` is the value of request header `NAME`. Default `{body}`. |
+| `signed_timestamp` | [`SignedTimestampConfig`](#signedtimestampconfig) (optional) |  | The signed Unix-seconds timestamp, for a sender that signs one. A request outside the tolerance is refused as stale. |
+
+### `InboundRateLimitConfig`
+
+Request rate of one inbound source on each replica.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `burst` | integer | `100` | Requests accepted in a burst. Default 100. |
+| `per_sec` | integer | `50` | Sustained requests per second. Default 50. |
+
+### `InboundSourceConfig`
+
+`source.inbound:` — a signed inbound webhook route.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `allow_unsigned` | boolean | `false` | Accept requests nobody signed. Anyone who can reach the route can then inject events. Default `false`. |
+| `event_id` | string (optional) |  | JSON pointer to the sender's event id in the body (for example `/id`). Omitted, the scheme's id is used: the `webhook-id` header of Standard Webhooks, `X-GitHub-Delivery` of GitHub, `/id` of Stripe, `/event_id` of Slack; with none, the gateway mints an id. A repeated id is accepted once. |
+| `rate_limit` | [`InboundRateLimitConfig`](#inboundratelimitconfig) | (see type) | Requests accepted per second on each replica; past it the route answers `429` with `Retry-After`. |
+| `source_id` | string |  | The route segment: senders POST to `/webhooks/events/{source_id}`. At most 64 characters of `[A-Za-z0-9_-]`. Types that share a route each take the requests their `when` keeps, and declare the same `verify`, `allow_unsigned` and `rate_limit`. |
+| `timestamp` | string (optional) |  | JSON pointer to the event time in the body, RFC 3339 or Unix seconds. Omitted, the scheme's time (`/created` of Stripe, `/event_time` of Slack), else the time the request arrived. |
+| `verify` | [`InboundVerifyConfig`](#inboundverifyconfig) (optional) |  | How a request proves its sender. Required unless `allow_unsigned` is set. |
+| `when` | [`InboundWhenConfig`](#inboundwhenconfig) (optional) |  | Requests to keep; any other request is acknowledged and dropped. |
+
+### `InboundValueConfig`
+
+A value of the request. Name exactly one of `header` and `pointer`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `header` | string (optional) |  | A request header. |
+| `pointer` | string (optional) |  | A JSON pointer into the body. |
+
+### `InboundVerifyConfig`
+
+`verify:` — how an inbound request proves its sender: a signing profile and this route's secrets.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `profile` | string |  | The signing profile: a built-in one (`standard_webhooks`, `github`, `stripe`, `slack`) or the `name` of an entry of `mcp.configurations.events.inbound_profiles`. |
+| `secrets` | array&lt;string&gt; |  | Shared secrets, usually `${secret.NAME}`. Several are accepted at once during a rotation. |
+| `tolerance_secs` | integer (optional) |  | Largest age or skew of the signed timestamp, in seconds, in place of the profile's. Only for a profile that signs a timestamp. |
+
+### `InboundWhenConfig`
+
+`when:` — the requests an inbound source keeps. Every listed header and every listed body field must match.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `body` | map&lt;string, any&gt; | `{}` | JSON pointer into the body to the exact JSON value it must hold. |
+| `header` | map&lt;string, string&gt; | `{}` | Header name to the exact value it must carry. |
 
 ### `InspectorSidecarConfig`
 
@@ -1409,12 +1756,14 @@ The `config:` field is a free-form JSON object passed to the resolved handle (bu
 
 ### `LicenseConfig`
 
+The licence of a gateway that mcpg.cloud does not license. A gateway mcpg.cloud delivers a licence to — the delivery carries a proof, signed with an MCPG key, that mcpg.cloud made it on that very connection — ignores the whole block (token, `token_file` and `non_production_use`) and runs on that licence, so a config never chooses its own licence there. Under a customer's own control plane, and until a delivery arrives, the block counts, and takes precedence over a self-host licence that control plane relays.
+
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `non_production_use` | boolean | `false` | Declares this deployment non-production. Entitlement-gated plugins and feature-gated config blocks (interactive sign-in, DPoP and rich authorization requests at the embedded authorization server) then load without a token under their license's free non-production grant (development, testing, evaluation, staging), with a boot warning naming them. Production use still requires an entitling token. |
-| `pubkey_pem` | string (optional) |  | Trusted license-signing public key (SPKI PEM, Ed25519) — the verification anchor for the configured token (`mcpg-license keygen --public-out`). Required when a token is configured; an unverifiable token refuses boot rather than silently degrading to community. |
-| `token` | string (optional) |  | The signed license JWT, inline (commonly `${env.MCPG_LICENSE}`). Exactly one of `token` / `token_file` may be set. |
-| `token_file` | string (optional) |  | Path to a file holding the signed license JWT (e.g. a mounted secret). Exactly one of `token` / `token_file` may be set. |
+| `non_production_use` | boolean | `false` | Declares this deployment non-production. Entitlement-gated plugins and feature-gated config blocks (interactive sign-in, DPoP and rich authorization requests at the embedded authorization server) then load without a token under their license's free non-production grant (development, testing, evaluation, staging). The declaration is visible: a boot warning repeated daily, the admin health endpoint's `license.non_production`, and the `non_production` label of the `mcpg_license_info` metric. Production use still requires an entitling token. A gateway mcpg.cloud delivers a licence to ignores it. |
+| `pubkey_pem` | string (optional) |  | Deprecated and ignored. A license verifies only against the MCPG issuer keys compiled into the binary, never a key from configuration; setting this logs a warning. |
+| `token` | string (optional) |  | The MCPG-issued self-host license JWT, inline. Supply via `${env.X}` (commonly `${env.MCPG_LICENSE}`) or `${secret.NAME}`. A secret-provider reference (`cred://`, or a `vault://` path) is not resolved here: the licence is read before any plugin loads, because it decides which plugins may load, and the Vault provider is itself a licensed plugin. Exactly one of `token` / `token_file` may be set. It verifies against the MCPG issuer keys compiled into the binary. A token that does not verify refuses boot when the config has an entitlement-gated plugin or a licensed authorization-server block, rather than silently degrading them to community; with neither, the gateway logs a warning and runs the community tier. An expired token keeps its plan for a 14-day grace period, with warnings from 30 days before expiry. |
+| `token_file` | string (optional) |  | Path to a file holding the MCPG-issued self-host license JWT (e.g. a mounted secret), read verbatim. Exactly one of `token` / `token_file` may be set. |
 
 ### `LoginAssertionAudience`
 
@@ -1493,6 +1842,7 @@ Matches the protocol's `initialize` handshake's `capabilities` vocabulary: tools
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `elicitation` | [`McpElicitationConfig`](#mcpelicitationconfig) | (see type) | MCP elicitation — server-initiated prompt requests the gateway emits during pipeline execution. |
+| `events` | array&lt;[`EventTypeConfig`](#eventtypeconfig)&gt; |  | MCP Events (experimental) event types — what `events/list` offers and the delivery modes deliver. Each type binds one source: a plugin watch strategy, a signed inbound webhook route, a resource binding's watch, or an event the gateway raises itself. Served only while `mcp.configurations.events.enabled` is `true`. |
 | `prompts` | array&lt;[`BackendConfig`](#backendconfig)&gt; | `[]` | Operator-declared prompts — the bindings that surface via `prompts/list` and `prompts/get`. Carry `prompt_arguments`. |
 | `resource_templates` | array&lt;[`BackendConfig`](#backendconfig)&gt; | `[]` | Operator-declared resource templates — the bindings that surface via `resources/templates/list` and match `resources/read` URIs by template. Carry `uri_template` instead of `uri`. |
 | `resources` | array&lt;[`BackendConfig`](#backendconfig)&gt; | `[]` | Operator-declared resources — the bindings that surface via `resources/list` and `resources/read`. Carry `uri`, `mime_type`, `mcp_app_url`, watch config. |
@@ -1524,6 +1874,7 @@ Two children that mirror MCP's own vocabulary: - `capabilities:` — what the se
 | `apps` | [`AppsConfig`](#appsconfig) | (see type) | `io.modelcontextprotocol/ui` (SEP-1865 MCP Apps) extension config. Off by default; `enabled: true` lights up the capability advertisement (downstream + upstream) and the tighten-only CSP/permission egress policy. |
 | `cancellation` | [`CancellationConfig`](#cancellationconfig) | (see type) |  |
 | `delivery` | [`DeliveryConfig`](#deliveryconfig) | `{}` |  |
+| `events` | [`EventsConfig`](#eventsconfig) | (see type) | `io.modelcontextprotocol/events` (MCP Events, experimental) extension config. Off by default; `enabled: true` serves the `events/*` methods on the `2026-07-28` wire and advertises them in `server/discover`. |
 | `idempotency` | [`IdempotencyConfig`](#idempotencyconfig) | (see type) | `dev.mcpg/idempotency` extension config. Off by default; flipping `enabled: true` lights up the SEP-2133 capability advertisement and the dispatcher dedupe path. |
 | `pipelines` | [`PipelinesConfig`](#pipelinesconfig) | `{}` |  |
 | `request_state` | [`RequestStateConfig`](#requeststateconfig) | (see type) | MRTR `requestState` codec configuration (2026-07-28 modern wire). Inert when no modern client connects; absent encryption_key the codec uses an ephemeral key at boot. |
@@ -1587,6 +1938,7 @@ Prefixes applied to imported capability names / URIs.
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
+| `event_prefix` | string (optional) |  | Prepended to every imported event type name (e.g. `"github."`). The result must still be a valid event name. |
 | `prompt_prefix` | string (optional) |  | Prepended to every imported prompt name. |
 | `resource_uri_prefix` | string (optional) |  | Prepended to every imported resource URI (e.g. `"mcp://notion/"`). |
 | `tool_prefix` | string (optional) |  | Prepended to every imported tool name (e.g. `"notion."`). |
@@ -2052,6 +2404,17 @@ A named schema entry in the registry. Exactly one source must be provided.
 | `inline` | any |  | Inline JSON Schema definition. |
 | `url` | string (optional) |  | URL to fetch the JSON Schema from at startup. |
 
+### `SecretFormatConfig`
+
+`secret:` — how a configured secret becomes the HMAC key.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `encoding` | [`TextEncoding`](#textencoding) | `"utf8"` | How the rest of the secret encodes the key. Default `utf8`. |
+| `max_bytes` | integer (optional) |  | Longest key, in decoded bytes; a longer secret is refused at boot. Unset, no limit. |
+| `min_bytes` | integer (optional) |  | Shortest key, in decoded bytes; a shorter secret is refused at boot. At least 1. Unset, any non-empty key. |
+| `prefix` | string (optional) |  | Text every secret starts with, removed before decoding; a secret without it is refused at boot. |
+
 ### `SecretsConfig`
 
 `gateway.secrets:` — directory-backed `${secret.NAME}` values, hot-reloaded on change. Every `${secret.NAME}` in the config resolves to the exact bytes of `<dir>/<NAME>` at config load. With `dir` unset, any `${secret.*}` reference is a config error.
@@ -2156,6 +2519,18 @@ Consolidates three signature concerns into one per-plugin block: - The content-h
 | `sha256` | string (optional) |  | SHA-256 content hash to pin (hex-encoded). When set, the gateway refuses to load the artifact if its computed hash doesn't match. |
 | `trusted_keys` | array&lt;[`TrustedKeyConfig`](#trustedkeyconfig)&gt; |  | Ed25519 verification keys this artifact's signature must verify against. Empty = inherit gateway-wide defaults. |
 
+### `SignatureFormatConfig`
+
+`signature:` — where a request carries its signatures.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `encoding` | [`TextEncoding`](#textencoding) | `"hex"` | How a digest is written: `hex` (default) or `base64`. |
+| `header` | string |  | The header with the signatures. It must appear once. |
+| `key` | string (optional) |  | Items are `key=value` pairs, and the signatures are the values of this key. Needs `separator`. |
+| `prefix` | string | `""` | Text before each digest, removed before decoding. An item without it is skipped. |
+| `separator` | string (optional) |  | The header holds several items split by this text. Omitted, the whole value is one item. |
+
 ### `SignaturePolicy`
 
 Signature verification policy for native plugin artefacts. The Ed25519 signature attached to the artefact (`<artifact>.sig` or the packaged `plugin.sig`) is the primary check; this policy governs behaviour when the signature is missing or invalid. Set per-plugin via `plugins[*].signature.policy:`, or as a gateway-wide default via `gateway.plugin_registry.default_signature_policy:`.
@@ -2167,6 +2542,16 @@ Signature verification policy for native plugin artefacts. The Ed25519 signature
 - **`warn`** — Log a warning for missing or invalid signatures but proceed with the load — ONLY while no trusted keys are configured. The built-in official key means an inheriting entry always has keys, so this behaves like `enforce` unless a config empties the trust set.
 
 - **`enforce`** — Refuse to load any artefact whose signature is missing or does not verify against the configured trusted keys. The default: a stock gateway loads only signed plugins.
+
+### `SignedTimestampConfig`
+
+`signed_timestamp:` — where the signed timestamp is. Name exactly one of `header` and `key`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `header` | string (optional) |  | The header that carries it. |
+| `key` | string (optional) |  | The `key=value` item of the signature header that carries it. |
+| `tolerance_secs` | integer | `300` | Largest age or skew, in seconds. Default 300. |
 
 ### `SigningAlgorithm`
 
@@ -2267,6 +2652,16 @@ The subject token an `oauth_impersonation` credential issuer exchanges.
 
 - **`idp_id_token`** — An ID token of the caller's stored enterprise IdP sign-in.
 
+### `SubscriberTrust`
+
+Lowest trust tier allowed to hold a webhook subscription.
+
+**Variants:**
+
+- **`verified`** — A cryptographically verified principal.
+
+- **`header_asserted`** — Also a principal named by a trusted request header.
+
 ### `SubscriptionsConfig`
 
 `subscriptions:` config (resource subscriptions) — subscription store + per-capability `store:` override + per-session quota. When `store` is unset, the subscription KV inherits from the cluster's `key_value_store()` primitive.
@@ -2322,6 +2717,18 @@ Gate on synthesized change notifications.
 | `result_wait_ms` | integer | `30000` | Upper bound on a single `tasks/result` HTTP blocking wait. Clients that need longer-running tasks reconnect via GET SSE and `Last-Event-Id` until the task goes terminal. |
 | `store` | [`StoreOverrideConfig`](#storeoverrideconfig) (optional) |  |  |
 
+### `TextEncoding`
+
+How bytes are written as text.
+
+**Variants:**
+
+- **`utf8`** — The text's own UTF-8 bytes.
+
+- **`hex`** — Hexadecimal.
+
+- **`base64`** — Standard base64, with or without padding.
+
 ### `TlsConfig`
 
 TLS configuration for the HTTP transport.
@@ -2362,9 +2769,10 @@ TLS configuration for the HTTP transport.
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `cel_allow_if` | string (optional) |  |  |
+| `event_name` | string (optional) |  | The MCP Events type the rule governs: who may see it in `events/list` and subscribe to it. A rule here never governs a tool of the same name. Set this or `tool_name`. |
 | `minimum_trust` | [`TrustLevelConfig`](#trustlevelconfig) |  |  |
 | `required_scopes` | array&lt;string&gt; |  | OAuth scopes the caller's token MUST carry to invoke this tool (SEP-2350). A caller authenticated but lacking any of these is denied with HTTP 403 + a `WWW-Authenticate: Bearer error="insufficient_scope", scope="…"` step-up challenge naming the missing scopes, rather than a bare 403 — so a capability-aware client can request the additional scopes and retry. Empty (the default) means no scope requirement. |
-| `tool_name` | string |  |  |
+| `tool_name` | string |  | The tool, prompt or resource the rule governs. Set this or `event_name`. |
 
 ### `TracesConfig`
 
@@ -2389,6 +2797,8 @@ Transport mode determines whether MCPG runs as an HTTP server or a stdio JSON-RP
 - `stdio`
 
 ### `TrustLevelConfig`
+
+A caller trust level, lowest first.
 
 **Allowed values:**
 
@@ -2465,7 +2875,7 @@ Reverse-tunnel egress config. The gateway dials out to a relay and answers tunne
 | `enabled` | boolean | `false` | Master switch. `false` (default) dials no tunnel. |
 | `exposure` | [`TunnelExposure`](#tunnelexposure) | `"public"` | `public` allocates a `<id>.tunnels.mcpg.cloud` URL (dev preview, third-party MCP clients); `private` (federation-only) allocates no public address and is reachable only as a `tunnel://` federation upstream from the same org. |
 | `mode` | [`TunnelTrustMode`](#tunneltrustmode) | `"relay_terminated"` | `relay_terminated` (the relay sees plaintext) or `e2ee` (relay splices ciphertext — requires `private` exposure, mcpg-to-mcpg only). |
-| `name` | string (optional) |  | Optional stable tunnel name; the relay allocates one when unset. |
+| `name` | string (optional) |  | Optional stable tunnel name, held by one gateway at a time within the org. When unset, the tunnel is named after this gateway's instance uid, which changes on every restart. A `public` tunnel's name is its host label (`<name>.tunnels.mcpg.cloud`), so it must be one DNS label: 1 to 63 letters, digits and `-`, neither starting nor ending with `-`, compared lowercase. The relay refuses any other public name with `tunnel_name_invalid`. |
 | `relay_url` | string | `"wss://relay.tunnels.mcpg.cloud"` | Relay endpoint to dial (e.g. `wss://relay.tunnels.mcpg.cloud`). |
 
 ### `TunnelExposure`
@@ -2528,6 +2938,16 @@ How a single field renders, plus its client-evaluated rules.
 | `visible_if` | string (optional) |  | Client-evaluated visibility expression. |
 | `widget` | [`WidgetKind`](#widgetkind) |  |  |
 
+### `UnsubscribeUnknown`
+
+The answer to an `events/unsubscribe` naming no live subscription.
+
+**Variants:**
+
+- **`ok`** — `{}`, the same answer as for a subscription that existed.
+
+- **`not_found`** — `-32011` with `data.kind: "subscription"`.
+
 ### `UpstreamConfig`
 
 Upstream connection details.
@@ -2543,6 +2963,30 @@ Upstream connection details.
 | `transport` | [`UpstreamTransport`](#upstreamtransport) | `"streamable_http"` | Wire transport. |
 | `upstream_safety` | [`UpstreamSafetyConfig`](#upstreamsafetyconfig) | (see type) | SSRF / DNS-rebinding posture (http) + local-exec posture (stdio). |
 | `url` | string | `""` | Base MCP endpoint URL (the upstream's `/mcp`). Required for the `streamable_http` transport; unused (empty) for `stdio`. |
+
+### `UpstreamEventDelivery`
+
+The upstream delivery mode of an imported event type.
+
+**Variants:**
+
+- **`auto`** — `webhook` when the type offers it and the gateway has a public address (`gateway.server.canonical_url`, or a public tunnel), else `push` when offered, else `poll`.
+
+- **`webhook`** — An upstream webhook subscription per upstream subscription, delivering to `/webhooks/mcp-events/{federation}/{id}` on this gateway.
+
+- **`push`** — One `events/stream` per upstream subscription.
+
+- **`poll`** — An `events/poll` loop per upstream subscription.
+
+### `UpstreamEventSharing`
+
+Whose upstream subscriptions serve the subscribers of an imported type.
+
+**Variants:**
+
+- **`fan_in`** — One upstream subscription per set of arguments, held with the federation's catalogue credential, shared by every subscriber of those arguments.
+
+- **`per_principal`** — One upstream subscription per subscriber and set of arguments, held with that subscriber's own upstream credential, minted from their stored sign-in. Needs `auth.mode: oauth_impersonation` with `subject_token: idp_refresh_token` or `idp_id_token`.
 
 ### `UpstreamProtocolVersion`
 
@@ -2622,6 +3066,18 @@ Type: array&lt;string&gt; | [`TaggedVariableCompletionSource`](#taggedvariableco
   - `refresh_interval_secs`: integer
   - `timeout_ms`: integer
 
+### `VerificationMode`
+
+A proof of intent a callback endpoint may give.
+
+**Variants:**
+
+- **`challenge`** — A signed challenge the endpoint echoes in a 2xx response.
+
+- **`allowlist`** — The callback host is on `verification.allowlist`.
+
+- **`well_known`** — The callback's origin publishes `/.well-known/mcp-webhook-receiver.json` naming it: `{"callbacks": [...]}`, each entry a URL or a prefix ending in `/`. Provisional: the upstream sketch has not fixed the document's shape.
+
 ### `WatchStrategyConfig`
 
 **Variants:**
@@ -2633,7 +3089,7 @@ Type: array&lt;string&gt; | [`TaggedVariableCompletionSource`](#taggedvariableco
   - `subject`: string
 
 - **`kafka_topic`** — Subscribe to a Kafka topic — any message means the resource changed.
-  - `group_id`: string
+  - `group_id`: string (optional)
   - `topic`: string
 
 - **`webhook`** — Receive webhook POSTs from 3rd-party systems. MCPG exposes `/webhooks/resource-updated/{token}` and triggers `notifications/resources/updated` when a POST is received.
@@ -2646,8 +3102,80 @@ Type: array&lt;string&gt; | [`TaggedVariableCompletionSource`](#taggedvariableco
   - `channel`: string
   - `url`: string
 
-- **`plugin`** — Generic escape hatch — delegate to ANY loaded `watch_strategy` plugin by its `kind()` discriminator. Use this for custom watch plugins that have no dedicated typed variant above (e.g. the Twilio plugin's `twilio_inbound` strategy). The remaining fields flatten into the spec passed verbatim to the plugin's `watch()`, so the plugin owns and validates its own spec schema.
+- **`plugin`** — Generic escape hatch — delegate to ANY loaded `watch_strategy` plugin by its `kind()` discriminator. Use this for custom watch plugins that have no dedicated typed variant above (e.g. the Twilio plugin's `twilio_inbound` strategy). The remaining fields flatten into the spec passed to the plugin's `watch()`, so the plugin owns and validates its own spec schema. As in every strategy, `${env.X}`, `${secret.X}` and secret provider URIs in its strings are resolved first.
   - `kind`: string
+
+### `WebhookEgressConfig`
+
+`events.webhook.egress:` — the client that reaches callback URLs. It resolves the host on every attempt, refuses a host when any address is not globally routable, connects to the checked address, and never follows a redirect.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `allow_private_backends` | boolean | `false` | Admit callback hosts outside the public internet. For self-hosted deployments that deliver inside their own network. Default `false`. |
+| `allowed_ports` | array&lt;integer&gt; | `[]` | Ports a callback URL may name. Empty (default) allows any port. |
+| `attempt_timeout_ms` | integer | `10000` | Time allowed for one whole request, in milliseconds. Default 10 000. |
+| `connect_timeout_ms` | integer | `3000` | Time allowed to open a connection, in milliseconds. Default 3 000. |
+| `deny_hosts` | array&lt;string&gt; | `[]` | Hosts never contacted: a domain (with every name under it) or an IP address. Applies to existing subscriptions from their next delivery. |
+| `probe_url` | string (optional) |  | A URL fetched with `GET`, through this egress policy, when webhook delivery starts and whenever the egress settings change. Any HTTP answer shows callbacks are reachable and sets `mcpg_events_egress_probe_ok` to `1`; no answer sets it to `0` and logs a warning. Must pass the policy above. Omitted, no probe. |
+
+### `WebhookLimitsConfig`
+
+`events.webhook.limits:` — subscription and delivery limits. A subscribe past a subscription limit answers `-32013` naming the limit.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `per_host_concurrency` | integer | `8` | Concurrent delivery requests to one callback host. Default 8. |
+| `per_principal` | integer | `100` | Subscriptions one principal may hold. Default 100. |
+| `per_principal_callback_hosts` | integer | `5` | Distinct callback hosts one principal may name. Default 5. |
+| `per_subscription_in_flight` | integer | `4` | Deliveries of one subscription in flight at once. Default 4. |
+| `per_type` | integer | `5000` | Subscriptions on one event type. Default 5 000. |
+| `total` | integer | `10000` | Subscriptions on this gateway. Default 10 000. |
+
+### `WebhookRetryConfig`
+
+`events.webhook.retry:` — retries of one delivery. A `410` or `413` answer is never retried.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `honor_retry_after` | boolean | `true` | Wait as long as a `Retry-After` answer asks, inside the window. Default `true`. |
+| `max_attempts` | integer | `5` | Attempts per delivery, the first included. Default 5. |
+| `window_ms` | integer | `900000` | Time after the first attempt within which retries happen, in milliseconds. Default 900 000 (15 minutes). On a gateway a control plane manages, the plan's retry window is the most it can be. |
+
+### `WebhookSuspensionConfig`
+
+`events.webhook.suspension:` — when failing deliveries suspend a subscription. A refresh reactivates it.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `drop_no_expiry_after_ms` | integer | `604800000` | How long a suspended subscription with no expiry is kept before it is dropped, in milliseconds. Default 604 800 000 (7 days). |
+| `failure_rate` | [`FailureRate`](#failurerate) | `0.95` | Share of failed attempts within `window_ms` that suspends delivery, greater than 0 and at most 1. Default 0.95. |
+| `min_attempts` | integer | `100` | Fewest attempts within the window before the rate counts. Default 100. |
+| `window_ms` | integer | `3600000` | The window the failure rate is measured over, in milliseconds. Default 3 600 000 (1 hour). |
+
+### `WebhookTtlConfig`
+
+`events.webhook.ttl:` — subscription grant lifetimes.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `allow_no_expiry` | boolean | `false` | Grant a subscription with no expiry when the client sends `ttlMs: null`. Off by default, when such a request receives a `max_ms` grant instead. |
+| `clamp_to_token_expiry` | boolean | `true` | Never grant past the expiry of the subscriber's access token, when it is known (never below `min_ms`). Default `true`. |
+| `default_ms` | integer | `3600000` | Grant for a subscribe that sends no `ttlMs`, in milliseconds. Default 3 600 000 (1 hour). |
+| `max_ms` | integer | `86400000` | Longest grant; a longer `ttlMs` is lowered to it. Default 86 400 000 (24 hours). |
+| `min_ms` | integer | `300000` | Shortest grant; a shorter `ttlMs` is raised to it. Default 300 000 (5 minutes). |
+
+### `WebhookVerificationConfig`
+
+`events.webhook.verification:` — how a callback endpoint proves it wants the deliveries before the first one.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `allowlist` | array&lt;string&gt; | `[]` | Callback hosts admitted without a challenge when `modes` lists `allowlist`. |
+| `cache_ttl_ms` | integer | `86400000` | How long a passed verification is reused for the same principal and callback URL, in milliseconds. Default 86 400 000 (24 hours). |
+| `modes` | array&lt;[`VerificationMode`](#verificationmode)&gt; | (see type) | Accepted proofs. `challenge` (default, and always required) POSTs a signed challenge that the endpoint echoes; `allowlist` also admits the hosts in `allowlist` without one; `well_known` admits a callback its origin's receiver document names. |
+| `per_host_in_flight` | integer | `3` | Challenge requests in flight to one callback host. Default 3. |
+| `per_host_per_min` | integer | `6` | Challenge requests per callback host per minute, across the cluster. Default 6. |
+| `timeout_ms` | integer | `10000` | Time allowed for a challenge request, in milliseconds. Default 10 000. |
 
 ### `WidgetKind`
 

@@ -165,6 +165,20 @@ impl GatewayRuntime {
             }
         }
 
+        // A licence hold never fails readiness: the held gateway still serves
+        // its listings and refuses calls with a reason, and a restart would
+        // bring no licence.
+        if let Some(detail) = self.license_state().degradation() {
+            checks.push(ReadinessCheck {
+                name: "license".to_owned(),
+                status: ReadinessStatus::Degraded,
+                detail,
+            });
+            if status == ReadinessStatus::Ready {
+                status = ReadinessStatus::Degraded;
+            }
+        }
+
         ReadinessSnapshot { status, checks }
     }
 

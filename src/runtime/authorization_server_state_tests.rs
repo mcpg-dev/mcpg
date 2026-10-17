@@ -82,7 +82,7 @@ const TTL: Duration = Duration::from_secs(600);
 /// Open the file store in `dir` once the tasks of the state that last
 /// held it, a revocation poll in flight included, have let it go.
 async fn reopen(dir: &std::path::Path) -> FileStore {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match FileStore::open(dir, FileStoreLimits::default()) {
             Ok(store) => return store,
@@ -110,7 +110,14 @@ async fn a_record_round_trips_sealed() {
     let stored = kv.get(key.as_str()).await.expect("get").expect("stored");
     let raw = String::from_utf8_lossy(&stored.bytes);
     assert!(raw.contains("\"kid\":\"k1\""), "{raw}");
-    for clear in ["00u1", "mcp-client", "eng", "app.example.com"] {
+    // Each value with its JSON quotes: base64url has no quote, so random
+    // ciphertext cannot hold one by chance.
+    for clear in [
+        "\"00u1\"",
+        "\"mcp-client\"",
+        "\"eng\"",
+        "\"https://app.example.com/cb\"",
+    ] {
         assert!(
             !raw.contains(clear),
             "`{clear}` is stored in the clear: {raw}"

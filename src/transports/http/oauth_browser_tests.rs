@@ -61,6 +61,14 @@ fn authorization_server(issuer: &str, extra: serde_json::Value) -> serde_json::V
 
 /// A gateway configured with `authorization_server`, when set.
 fn app_state(authorization_server: Option<serde_json::Value>) -> AppState {
+    app_state_with(authorization_server, |_, _| {})
+}
+
+/// [`app_state`], with `adjust` run on the runtime before the state is built.
+fn app_state_with(
+    authorization_server: Option<serde_json::Value>,
+    adjust: impl FnOnce(&AppConfig, &mut crate::runtime::GatewayRuntime),
+) -> AppState {
     let mut config = AppConfig::default();
     config.gateway.server.trust_proxy_ip = true;
     config.gateway.server.cors = Some(
@@ -95,6 +103,7 @@ fn app_state(authorization_server: Option<serde_json::Value>) -> AppState {
         crate::app::build_ema_authorization_server(&config, ReplayLedger::in_process())
             .expect("authorization server builds"),
     );
+    adjust(&config, &mut runtime);
     AppState {
         config: Arc::new(ArcSwap::from_pointee(config.clone())),
         base_config: Arc::new(ArcSwap::from_pointee(config)),
@@ -615,18 +624,19 @@ async fn the_csrf_cookie_is_host_only_strict_and_secure() {
     assert_eq!(cookies.len(), 1, "{cookies:?}");
     let cookie = &cookies[0];
     assert!(cookie.starts_with("__Host-mcpg_csrf="), "{cookie}");
-    for attribute in [
-        "Path=/",
-        "Max-Age=600",
-        "HttpOnly",
-        "SameSite=Strict",
-        "Secure",
-    ] {
+    for attribute in ["Path=/", "HttpOnly", "SameSite=Strict", "Secure"] {
         assert!(
             cookie.split("; ").any(|part| part == attribute),
             "{attribute} in {cookie}"
         );
     }
+    // The cookie lives as long as the 600 s form, less what has passed of it.
+    let max_age: u64 = cookie
+        .split("; ")
+        .find_map(|part| part.strip_prefix("Max-Age="))
+        .and_then(|age| age.parse().ok())
+        .unwrap_or_else(|| panic!("Max-Age in {cookie}"));
+    assert!((590..=600).contains(&max_age), "{cookie}");
     assert!(!cookie.contains("Domain"), "{cookie}");
 }
 
@@ -1602,4 +1612,85 @@ async fn registration_errors_carry_their_status_and_headers() {
         body_json(response).await["error"],
         "temporarily_unavailable"
     );
+}
+
+/// While the licence holds a surface of the embedded authorization server,
+/// every endpoint of the server answers `503 temporarily_unavailable`:
+/// metadata, sign-in, consent, token, keys, registration and revocation.
+/// The resource's own metadata keeps answering, and the same server with no
+/// hold serves.
+#[tokio::test]
+async fn a_held_authorization_server_surface_stops_every_oauth_endpoint() {
+    use crate::license_gate::{
+        Delivery, GateInputs, Origin, evaluate, licensed_config_surfaces, surface_key,
+    };
+    use crate::runtime::authorization_server::{
+        JWKS_PATH, TOKEN_PATH, dcr::REGISTRATION_PATH, interactive::CONSENT_PATH,
+        revocation::REVOCATION_PATH,
+    };
+
+    let held = router(
+        app_state_with(
+            Some(authorization_server(ISSUER, serde_json::json!({}))),
+            |config, runtime| {
+                let loaded = licensed_config_surfaces(config)
+                    .into_iter()
+                    .map(|(_, path)| surface_key(&path))
+                    .collect();
+                let community = Delivery::received(String::new(), "acme".into(), Origin::Proven);
+                let outcome = evaluate(
+                    config,
+                    &GateInputs {
+                        delivery: &community,
+                        bound_plugins: None,
+                        admitted: &loaded,
+                        withheld: &[],
+                        restart: false,
+                        now: chrono::Utc::now().timestamp(),
+                    },
+                )
+                .expect("held, not refused");
+                assert!(!outcome.held.is_empty());
+                runtime.set_license_state((&outcome).into());
+            },
+        ),
+        "/health",
+        "/mcp",
+    );
+    let post = |path: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(header::HOST, "gw.test")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+    };
+    for (name, request) in [
+        ("metadata", get("/.well-known/oauth-authorization-server")),
+        ("sign-in", get(&desktop_path())),
+        ("consent", post(CONSENT_PATH)),
+        ("token", post(TOKEN_PATH)),
+        ("keys", get(JWKS_PATH)),
+        ("registration", post(REGISTRATION_PATH)),
+        ("revocation", post(REVOCATION_PATH)),
+    ] {
+        let response = send(&held, request).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{name}");
+        let body = body_json(response).await;
+        assert_eq!(body["error"], "temporarily_unavailable", "{name}: {body}");
+        assert!(
+            body["error_description"]
+                .as_str()
+                .is_some_and(|d| d.contains("authorization_server")),
+            "{name}: {body}"
+        );
+    }
+    let response = send(&held, get("/.well-known/oauth-protected-resource")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = send(
+        &signing_in(),
+        get("/.well-known/oauth-authorization-server"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 }

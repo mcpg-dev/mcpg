@@ -58,10 +58,21 @@ impl AdminService {
         &self.config
     }
 
+    /// The events core, once the gateway installed one.
+    pub fn events_core(&self) -> Option<Arc<crate::runtime::events::EventsCore>> {
+        self.runtime
+            .load()
+            .shared_services
+            .load_full()
+            .and_then(|services| services.events_core.get().cloned())
+    }
+
     /// GET /admin/v1/health
     pub fn health(&self) -> AdminHealthResponse {
+        let degraded = self.runtime.load().license_state().degradation().is_some();
         AdminHealthResponse {
-            status: "ok".to_owned(),
+            status: if degraded { "degraded" } else { "ok" }.to_owned(),
+            license: crate::license_gate::current_status().map(|s| (*s).clone()),
         }
     }
 
@@ -401,6 +412,10 @@ impl AdminService {
     }
 
     /// POST /admin/v1/policy:preview — Compare candidate policy against baseline.
+    ///
+    /// Both sides are the built-in gate, deciding each name under the route
+    /// the running catalog gives it; `not_modeled` lists what the preview
+    /// leaves out.
     pub fn policy_preview(
         &self,
         candidate_yaml: &str,
@@ -417,19 +432,36 @@ impl AdminService {
                         additive: 0,
                         subtractive: 0,
                     },
+                    not_modeled: policy_preview_not_modeled(),
                     error: Some(e.to_string()),
                 };
             }
         };
 
         let rt = self.runtime.load();
+        let routes: Vec<crate::runtime::policy::PreviewRoute> = test_cases
+            .iter()
+            .map(|case| rt.preview_route(&case.tool_name))
+            .collect();
+        let candidate_gate = Self::candidate_policy_gate(
+            &candidate_config,
+            &self.app_state.registry_overlay.load(),
+            routes
+                .iter()
+                .filter_map(crate::runtime::policy::PreviewRoute::federation),
+        );
 
-        // Evaluate each test case against baseline (current runtime)
         let mut results = Vec::new();
-        for case in &test_cases {
-            let baseline_decision = rt.evaluate_policy_for_preview(&case.tool_name, &case.identity);
-            let candidate_decision =
-                Self::evaluate_candidate_policy(&candidate_config, &case.tool_name, &case.identity);
+        for (case, route) in test_cases.iter().zip(&routes) {
+            let policy_context = case.identity.policy_context(&case.tool_name);
+            let baseline_decision =
+                preview_decision(rt.evaluate_policy_for_preview(&policy_context, route));
+            let candidate_decision = match &candidate_gate {
+                Some(gate) => {
+                    preview_decision(gate.evaluate(&policy_context, route.policy_route()))
+                }
+                None => "error".to_owned(),
+            };
             let mismatch = baseline_decision != candidate_decision;
             let severity = if mismatch {
                 if baseline_decision == "allow" && candidate_decision == "deny" {
@@ -449,6 +481,8 @@ impl AdminService {
                 candidate_decision: candidate_decision.clone(),
                 mismatch,
                 severity: severity.to_owned(),
+                surface: route.surface().to_owned(),
+                federation: route.federation().map(str::to_owned),
             });
         }
 
@@ -465,102 +499,50 @@ impl AdminService {
         PolicyPreviewResult {
             results,
             summary,
+            not_modeled: policy_preview_not_modeled(),
             error: None,
         }
     }
 
-    fn evaluate_candidate_policy(
+    /// The built-in gate a candidate config would boot with: its central and
+    /// binding rules exactly as the gateway builds them, and the governance
+    /// of each federation it declares or, for a federation in `routed` it
+    /// does not declare, of the registry `overlay` records as the one that
+    /// synthesized it. `None` when a rule does not compile.
+    fn candidate_policy_gate<'a>(
         candidate_config: &crate::config::AppConfig,
-        tool_name: &str,
-        identity: &TestIdentity,
-    ) -> String {
-        use crate::runtime::RequestTrustLevel;
-        use crate::runtime::policy::{
-            PreDispatchPolicyGate, ToolAccessPolicyConfig, ToolTrustRule,
-        };
+        overlay: &crate::runtime::registry_sync::RegistryOverlay,
+        routed: impl Iterator<Item = &'a str>,
+    ) -> Option<crate::runtime::policy::PreDispatchPolicyGate> {
+        use crate::runtime::federation::engine::{federation_governance, governance_for};
+        use crate::runtime::policy::{FederatedToolPolicies, PreDispatchPolicyGate};
 
-        fn map_trust(tl: crate::config::TrustLevelConfig) -> RequestTrustLevel {
-            match tl {
-                crate::config::TrustLevelConfig::Unauthenticated => {
-                    RequestTrustLevel::Unauthenticated
-                }
-                crate::config::TrustLevelConfig::HeaderAsserted => {
-                    RequestTrustLevel::HeaderAsserted
-                }
-                crate::config::TrustLevelConfig::Verified => RequestTrustLevel::Verified,
+        let gate = PreDispatchPolicyGate::try_new(crate::app::build_tool_access_policy_config(
+            candidate_config,
+        ))
+        .ok()?;
+        let federations = &candidate_config.mcp.federations;
+        let mut governance: Vec<_> = federations.iter().map(federation_governance).collect();
+        for name in routed {
+            if federations.iter().any(|fed| fed.name == name)
+                || governance.iter().any(|g| g.federation == name)
+            {
+                continue;
+            }
+            if let Some(registry_governance) =
+                crate::runtime::registry_sync::synthesized_federation_governance(
+                    candidate_config,
+                    overlay,
+                    name,
+                )
+            {
+                governance.push(governance_for(name, registry_governance));
             }
         }
-
-        let mut rules: Vec<ToolTrustRule> = candidate_config
-            .governance
-            .policy
-            .tool_access
-            .rules
-            .iter()
-            .map(|r| ToolTrustRule {
-                tool_name: r.tool_name.clone(),
-                minimum_trust: map_trust(r.minimum_trust),
-                cel_allow_if: r.cel_allow_if.clone(),
-                required_scopes: r.required_scopes.clone(),
-            })
-            .collect();
-
-        // Include binding governance rules (same as app::build_tool_access_policy_config)
-        for (_, binding) in candidate_config.all_bindings() {
-            rules.push(ToolTrustRule {
-                tool_name: binding.name.clone(),
-                minimum_trust: map_trust(binding.governance.minimum_trust),
-                cel_allow_if: binding.governance.allow_if.clone(),
-                required_scopes: Vec::new(),
-            });
-        }
-
-        let policy_config = ToolAccessPolicyConfig {
-            default_minimum_trust: map_trust(
-                candidate_config
-                    .governance
-                    .policy
-                    .tool_access
-                    .default_minimum_trust,
-            ),
-            cel_allow_if: candidate_config
-                .governance
-                .policy
-                .tool_access
-                .cel_allow_if
-                .clone(),
-            rules,
-        };
-
-        let gate = match PreDispatchPolicyGate::try_new(policy_config) {
-            Ok(g) => g,
-            Err(_) => return "error".to_owned(),
-        };
-
-        let trust_level = match identity.trust_level.as_str() {
-            "unauthenticated" => RequestTrustLevel::Unauthenticated,
-            "header_asserted" => RequestTrustLevel::HeaderAsserted,
-            "verified" => RequestTrustLevel::Verified,
-            _ => RequestTrustLevel::Unauthenticated,
-        };
-
-        let policy_ctx = crate::runtime::policy::ToolPolicyContext {
-            tool_name: tool_name.to_owned(),
-            trust_level,
-            principal_id: identity.subject_id.clone(),
-            issuer: None,
-            auth_provider: None,
-            identity_kind: identity.kind.clone(),
-            roles: identity.roles.clone(),
-            groups: identity.groups.clone(),
-            scopes: vec![],
-            attributes: std::collections::BTreeMap::new(),
-        };
-
-        match gate.evaluate_tool_call(&policy_ctx) {
-            crate::runtime::policy::PreDispatchPolicyOutcome::Allow => "allow".to_owned(),
-            crate::runtime::policy::PreDispatchPolicyOutcome::Deny(_) => "deny".to_owned(),
-        }
+        gate.federated_policy_handle().store(std::sync::Arc::new(
+            FederatedToolPolicies::from_federations(governance),
+        ));
+        Some(gate)
     }
 
     /// POST /admin/v1/config:reload — trigger a config hot-reload.
@@ -625,6 +607,10 @@ impl AdminService {
 #[derive(Debug, Clone, Serialize)]
 pub struct AdminHealthResponse {
     pub status: String,
+    /// The licence the gateway runs under: plan, source, expiry state, the
+    /// non-production marker, and any plugins withheld for want of a licence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub license: Option<crate::license_gate::LicenseStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -842,12 +828,72 @@ pub struct TestIdentity {
     pub roles: Vec<String>,
     #[serde(default)]
     pub groups: Vec<String>,
+    /// OAuth scopes the caller holds, checked against `required_scopes`.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub attributes: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub auth_provider: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+}
+
+impl TestIdentity {
+    /// The gate's view of this identity asking for `name`. An unknown
+    /// `trust_level` is the lowest.
+    pub(crate) fn policy_context(&self, name: &str) -> crate::runtime::policy::ToolPolicyContext {
+        use crate::runtime::RequestTrustLevel;
+        let trust_level = match self.trust_level.as_str() {
+            "header_asserted" => RequestTrustLevel::HeaderAsserted,
+            "verified" => RequestTrustLevel::Verified,
+            _ => RequestTrustLevel::Unauthenticated,
+        };
+        crate::runtime::policy::ToolPolicyContext {
+            tool_name: name.to_owned(),
+            trust_level,
+            principal_id: self.subject_id.clone(),
+            issuer: self.issuer.clone(),
+            auth_provider: self.auth_provider.clone(),
+            identity_kind: self.kind.clone(),
+            roles: self.roles.clone(),
+            groups: self.groups.clone(),
+            scopes: self.scopes.clone(),
+            attributes: self.attributes.clone(),
+        }
+    }
+}
+
+fn preview_decision(outcome: crate::runtime::policy::PreDispatchPolicyOutcome) -> String {
+    match outcome {
+        crate::runtime::policy::PreDispatchPolicyOutcome::Allow => "allow".to_owned(),
+        crate::runtime::policy::PreDispatchPolicyOutcome::Deny(_) => "deny".to_owned(),
+    }
+}
+
+/// What `policy:preview` does not decide, returned with every preview so a
+/// caller never reads an `allow` as the whole answer.
+fn policy_preview_not_modeled() -> Vec<String> {
+    [
+        "governance.policy.engine: external policy engines are not consulted",
+        "tool_gate plugins (approval, DLP, payment, rate limits) are not consulted",
+        "governance.quotas are neither checked nor charged",
+        "routes come from the running catalog: a name the candidate adds, removes or moves \
+         between the gateway and a federation is decided under the route it has now, and a \
+         name nothing serves now is decided as a surface the gateway serves itself",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PolicyPreviewResult {
     pub results: Vec<PolicyComparisonResult>,
     pub summary: PolicyPreviewSummary,
+    /// The layers and inputs the preview leaves out; both decisions are the
+    /// built-in gate's alone.
+    pub not_modeled: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -859,6 +905,13 @@ pub struct PolicyComparisonResult {
     pub candidate_decision: String,
     pub mismatch: bool,
     pub severity: String,
+    /// Where the running catalog found the name: `tool`, `prompt`,
+    /// `resource`, or `unrouted`.
+    pub surface: String,
+    /// The federation the name is routed to, whose governance both
+    /// decisions include.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub federation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -867,6 +920,146 @@ pub struct PolicyPreviewSummary {
     pub mismatches: usize,
     pub additive: usize,
     pub subtractive: usize,
+}
+
+#[cfg(test)]
+mod policy_preview_tests {
+    use super::*;
+    use crate::backends::{BackendInvocationRoute, ResourceRoute};
+    use crate::runtime::policy::PreviewRoute;
+
+    const CANDIDATE: &str = r#"
+gateway:
+  server:
+    bind_address: "127.0.0.1:0"
+governance:
+  policy:
+    tool_access:
+      default_minimum_trust: header_asserted
+mcp:
+  capabilities:
+    tools:
+      - name: deploy
+        description: deploy
+        backend: { kind: mock }
+        governance: { minimum_trust: header_asserted, required_scopes: [ops.deploy] }
+    resources:
+      - name: secret
+        description: secret
+        uri: "secret://vault/credentials"
+        backend: { kind: mock }
+        governance: { minimum_trust: verified }
+  federations:
+    - name: crm
+      upstream: { url: "https://crm.example/mcp" }
+      governance: { minimum_trust: verified, required_scopes: [crm.read] }
+  registries:
+    - name: acme
+      url: "https://registry.example"
+      defaults: { governance: { minimum_trust: verified } }
+"#;
+
+    fn identity(trust_level: &str, scopes: &[&str]) -> TestIdentity {
+        TestIdentity {
+            kind: "test".to_owned(),
+            trust_level: trust_level.to_owned(),
+            subject_id: Some("user-1".to_owned()),
+            roles: Vec::new(),
+            groups: Vec::new(),
+            scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+            attributes: std::collections::BTreeMap::new(),
+            auth_provider: None,
+            issuer: None,
+        }
+    }
+
+    fn federated_tool(federation: &str) -> PreviewRoute {
+        PreviewRoute::Tool(BackendInvocationRoute::Federated {
+            source: federation.to_owned(),
+            upstream_name: "search".to_owned(),
+        })
+    }
+
+    /// The candidate side of the preview decides a name the way the gate
+    /// would under the candidate: the governance of the federation the name
+    /// is routed to (declared, or synthesized by a declared registry), a
+    /// binding's `required_scopes`, and a resource binding's rule for a
+    /// read under another spelling of its URI.
+    #[test]
+    fn a_candidate_is_decided_the_way_the_gate_decides_it() {
+        let candidate =
+            crate::config::AppConfig::load_from_yaml_str(CANDIDATE).expect("valid candidate");
+        let crm = federated_tool("crm");
+        let synthesized = federated_tool("acme--com.acme--crm");
+        let dropped = federated_tool("gone");
+        let secret = PreviewRoute::Resource(ResourceRoute::Binding {
+            profile: "secret".to_owned(),
+        });
+        let deploy = PreviewRoute::Tool(BackendInvocationRoute::MockResponse {
+            profile: "deploy".to_owned(),
+        });
+        let routes = [&crm, &synthesized, &dropped, &secret, &deploy];
+        let mut overlay = crate::runtime::registry_sync::RegistryOverlay::default();
+        overlay
+            .owners
+            .insert("acme--com.acme--crm".to_owned(), "acme".to_owned());
+        let gate = AdminService::candidate_policy_gate(
+            &candidate,
+            &overlay,
+            routes.iter().filter_map(|route| route.federation()),
+        )
+        .expect("the candidate compiles");
+        let decide = |name: &str, route: &PreviewRoute, identity: TestIdentity| {
+            preview_decision(gate.evaluate(&identity.policy_context(name), route.policy_route()))
+        };
+
+        let cases = [
+            ("search", &crm, identity("header_asserted", &[]), "deny"),
+            ("search", &crm, identity("verified", &[]), "deny"),
+            ("search", &crm, identity("verified", &["crm.read"]), "allow"),
+            (
+                "com.acme.crm.search",
+                &synthesized,
+                identity("header_asserted", &[]),
+                "deny",
+            ),
+            (
+                "com.acme.crm.search",
+                &synthesized,
+                identity("verified", &[]),
+                "allow",
+            ),
+            ("gone.search", &dropped, identity("verified", &[]), "deny"),
+            (
+                "SECRET://vault/credentials",
+                &secret,
+                identity("header_asserted", &[]),
+                "deny",
+            ),
+            (
+                "SECRET://vault/credentials",
+                &secret,
+                identity("verified", &[]),
+                "allow",
+            ),
+            ("deploy", &deploy, identity("verified", &[]), "deny"),
+            (
+                "deploy",
+                &deploy,
+                identity("verified", &["ops.deploy"]),
+                "allow",
+            ),
+        ];
+        for (name, route, identity, expected) in cases {
+            let trust_level = identity.trust_level.clone();
+            assert_eq!(
+                decide(name, route, identity),
+                expected,
+                "{name} at {trust_level} under {:?}",
+                route.federation()
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

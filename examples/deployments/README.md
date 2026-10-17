@@ -20,9 +20,10 @@ Each YAML carries a `# yaml-language-server: $schema=./config.schema.json` heade
 | [`production-nats-cluster.yaml`](production-nats-cluster.yaml) | NATS JetStream variant of the cluster topology. Pick this when your platform already runs NATS. |
 | [`air-gapped.yaml`](air-gapped.yaml) | Zero-outbound deploy. Local plugin tree, static JWKS, file storage, file audit. |
 | [`multi-tenant.yaml`](multi-tenant.yaml) | Single gateway, many tenants. Per-tenant session quota, per-tenant rate limit, group-gated admin tools. |
-| [`enterprise-managed-auth.yaml`](enterprise-managed-auth.yaml) | Embedded authorization server that redeems Okta Cross App Access (Agent SSO) ID-JAGs for MCP clients such as Claude and VS Code. NATS cluster with a shared single-use ledger. EMA needs no license; the NATS coordinator needs a Team or Enterprise license. |
+| [`enterprise-managed-auth.yaml`](enterprise-managed-auth.yaml) | Embedded authorization server that redeems Okta Cross App Access (Agent SSO) ID-JAGs for MCP clients such as Claude and VS Code. NATS cluster with a shared single-use ledger. EMA needs no license; the NATS coordinator needs an Enterprise license. |
 | [`interactive-login-okta.yaml`](interactive-login-okta.yaml) | Embedded authorization server with Okta: EMA ID-JAGs, interactive sign-in for Claude Code / VS Code / CLIs, and a Cross App Access upstream per user. Enterprise license (`sso.interactive_login`). |
 | [`mcp-apps.yaml`](mcp-apps.yaml) | MCP Apps: front Apps-capable servers (passthrough, capability advertisement, tighten-only CSP) and author UIs from config. |
+| [`mcp-events-chatgpt.yaml`](mcp-events-chatgpt.yaml) | MCP Events for a ChatGPT developer-mode test: a cron event type and an on-demand signed inbound type, file stores, and ChatGPT sign-in through the embedded authorization server with dynamic client registration. Short-lived; non-production license declaration. |
 
 ## How they're meant to be used
 
@@ -40,9 +41,9 @@ These are **starting points**, not turnkey configs. Treat each YAML as a layer-z
 ## What's not in here
 
 - **`MCPG_*` env vars** — every template has a comment block listing the env vars it expects. The gateway resolves `${env.X}` at config-load time, and `MCPG_*` overrides apply last (after every file).
-- **Plugin sourcing** — templates that pull plugins name either the published coordinates (`ghcr.io/mcpg-dev/plugins/<name>:<version>`) or a placeholder mirror (`registry.acme.example`), each pinned to a release; use the plugin releases that match the gateway you run. To pull through your own registry, list it under `gateway.plugin_registry.mirrors` (a mirror replaces the registry host and keeps the repository path) or point each `oci:` at it — `gateway.plugin_registry.default_registry` applies only to references that name no registry. For fully sealed deploys, pre-stage the artifacts and use `source.path` (see `air-gapped.yaml`).
+- **Plugin sourcing** — templates that pull plugins name either the published coordinates (`ghcr.io/mcpg-dev/plugins/<name>:<version>`) or a placeholder mirror (`registry.acme.example`), each pinned to a release, except the short-lived `mcp-events-chatgpt.yaml`, which takes the floating `protocol-1` tag; use the plugin releases that match the gateway you run. To pull through your own registry, list it under `gateway.plugin_registry.mirrors` (a mirror replaces the registry host and keeps the repository path) or point each `oci:` at it — `gateway.plugin_registry.default_registry` applies only to references that name no registry. For fully sealed deploys, pre-stage the artifacts and use `source.path` (see `air-gapped.yaml`).
 - **TLS materials** — production templates assume cert/key paths exist on disk. Wire your secret manager / cert-manager into the listed paths.
-- **A license token** — the `redis` and `nats` cluster coordinators are licensed plugins. The templates that use one read a license from `/etc/mcpg/license/license.jwt` and refuse to boot without a license that entitles `cluster.*` plugins (Team, Enterprise). To evaluate one outside production, replace the `license` block with `non_production_use: true`.
+- **A license token** — the `redis` and `nats` cluster coordinators are licensed plugins. The templates that use one read a license from `/etc/mcpg/license/license.jwt` and refuse to boot without a license that entitles `cluster.*` plugins (Enterprise: high availability is an Enterprise feature). To evaluate one outside production, replace the `license` block with `non_production_use: true`.
 
 ## Schema drift
 

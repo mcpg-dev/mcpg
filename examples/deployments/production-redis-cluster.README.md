@@ -28,7 +28,6 @@ Like single-redis, the `plugins` list names every plugin the file uses: `dev.mcp
 - `MCPG_REDIS_URL` — Redis cluster connection.
 - `MCPG_REDIS_PASSWORD` — Redis password, passed out of the URL.
 - `MCPG_CLUSTER_STATE_KEY` — URL-safe-base64 32-byte state-encryption key, identical on every replica (`openssl rand -base64 32 | tr '+/' '-_'`). Required whenever `cluster.kind` is not `single_node`.
-- `MCPG_LICENSE_PUBKEY` — the public key (SPKI PEM) that verifies the license token.
 - `ACCOUNTS_API_TOKEN` — for the placeholder binding (drop with the binding).
 
 ## Operational notes

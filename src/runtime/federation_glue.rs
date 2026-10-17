@@ -23,21 +23,20 @@ impl GatewayRuntime {
         );
     }
 
-    /// Re-wire federation on config reload. Seeds the
-    /// freshly-built capability + policy overlays from the previous
-    /// runtime so federated tools — and their governance — don't flicker
-    /// while a re-import runs, and carries forward the prior engine's live
-    /// upstream sessions for unchanged federations (changed/removed ones
-    /// re-establish lazily). When the federation config is unchanged, skips
-    /// the re-import entirely: the seeded capabilities stand and no upstream
-    /// is reconnected. A reload that removed all federations leaves the
-    /// fresh, empty overlays untouched.
+    /// Re-wire federation on config reload. The new engine adopts the prior
+    /// engine's import cache and publishes it under the reloaded config's
+    /// governance, so federated tools don't flicker while a re-import runs
+    /// and never keep the prior config's floor, scopes or `allow_if`. It
+    /// also carries forward the prior engine's live upstream sessions for
+    /// unchanged federations (changed/removed ones re-establish lazily).
+    /// When the federation config is unchanged, skips the re-import
+    /// entirely: the carried capabilities stand and no upstream is
+    /// reconnected. A reload that removed all federations leaves the fresh,
+    /// empty overlays untouched.
     pub(crate) fn rewire_federations(
         &self,
         federations: Vec<crate::config::FederationConfig>,
         gateway_via: String,
-        prior_capabilities: Arc<crate::backends::FederatedCatalog>,
-        prior_policies: Arc<policy::FederatedToolPolicies>,
         prior_engine: Option<Arc<federation::engine::FederationEngine>>,
         reimport: bool,
         cluster_tenant_segment: Option<String>,
@@ -45,12 +44,6 @@ impl GatewayRuntime {
         if federations.is_empty() {
             return;
         }
-        self.capability_registry
-            .federated_overlay()
-            .store(prior_capabilities);
-        self.pre_dispatch_policy
-            .federated_policy_handle()
-            .store(prior_policies);
         self.install_federation_engine(
             federations,
             gateway_via,
@@ -118,15 +111,15 @@ impl GatewayRuntime {
                 }
             }))
             .with_apps_upstream_advertisement(self.apps_federate_upstream)
-            .with_tunnel_federation(self.tunnel_federation.clone()),
+            .with_tunnel_federation(self.tunnel_federation.clone())
+            .with_event_types(Arc::clone(&self.federated_events)),
         );
         // Carry forward upstream sessions for unchanged federations across a
         // config reload; changed/removed ones re-establish.
         if let Some(prior) = &prior_engine {
             engine.adopt_satellites(prior);
-            // The seeded overlay only holds until something republishes; the
-            // import cache is what republish rebuilds from, so it has to come
-            // across too or the first per-federation refresh wipes the rest.
+            // Every republish rebuilds from the import cache, so it has to
+            // come across or the first per-federation refresh wipes the rest.
             engine.adopt_imported(prior);
         }
         self.execution_dispatcher

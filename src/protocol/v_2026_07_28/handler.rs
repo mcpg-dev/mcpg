@@ -42,6 +42,7 @@ use crate::protocol::shared::jsonrpc::{
 use crate::protocol::shared::messages::{ProtocolMessage, TransportRejection};
 use crate::protocol::shared::traits::ProtocolHandler;
 use crate::protocol::v_2026_07_28::dispatch::completion::dispatch_completion_complete;
+use crate::protocol::v_2026_07_28::dispatch::events::dispatch_events_extension;
 use crate::protocol::v_2026_07_28::dispatch::lifecycle::build_discover_result;
 use crate::protocol::v_2026_07_28::dispatch::prompts::{
     dispatch_prompts_get, dispatch_prompts_list,
@@ -91,6 +92,26 @@ impl ProtocolHandler for Handler {
 
     fn version(&self) -> ProtocolVersion {
         ProtocolVersion::V_2026_07_28
+    }
+
+    /// `subscriptions/listen` and an `events/stream` request (one with an
+    /// id) are long-lived POST-SSE responses.
+    fn long_lived_stream_plan(
+        &self,
+        body: &Value,
+    ) -> Option<crate::protocol::shared::traits::StreamPlan> {
+        use crate::protocol::shared::traits::StreamPlan;
+        match body.get("method").and_then(Value::as_str)? {
+            crate::protocol::v_2026_07_28::wire::subscriptions::METHOD_SUBSCRIPTIONS_LISTEN => {
+                Some(StreamPlan::SubscriptionsListen)
+            }
+            crate::protocol::v_2026_07_28::extensions::events::wire::METHOD_STREAM_EVENTS
+                if body.get("id").is_some() =>
+            {
+                Some(StreamPlan::EventsStream)
+            }
+            _ => None,
+        }
     }
 
     /// SEP-2243 mirrors selected body fields into HTTP routing headers
@@ -225,6 +246,15 @@ impl ProtocolHandler for Handler {
             // be `=?base64?…?=`-wrapped and is decoded before
             // comparison.
             if let Some(source_field) = name_source_field(body_method) {
+                validate_name_header(headers, body, source_field, body_id.clone())?;
+            } else if let Some(source_field) =
+                crate::protocol::v_2026_07_28::extensions::events::wire::optional_name_header_field(
+                    body_method,
+                )
+                && headers.contains_key(crate::protocol::v_2026_07_28::wire::NAME_HEADER)
+            {
+                // Events methods take `Mcp-Name` optionally: a client may
+                // send it, and then it must agree with the body.
                 validate_name_header(headers, body, source_field, body_id.clone())?;
             }
 
@@ -401,6 +431,9 @@ impl ProtocolHandler for Handler {
             }
             ProtocolOperation::TasksExtension(op) => {
                 dispatch_tasks_extension(ctx, services, op).await
+            }
+            ProtocolOperation::EventsExtension(op) => {
+                dispatch_events_extension(ctx, services, op).await
             }
         }
     }
@@ -884,6 +917,86 @@ mod tests {
         assert_eq!(err.status, 400);
         assert_eq!(err.error_code, -32020);
         assert!(err.message.contains("Mcp-Name"));
+    }
+
+    fn events_subscribe_body(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "events/subscribe",
+            "params": {
+                "name": name,
+                "delivery": {
+                    "url": "https://h.example/hook",
+                    "secret": "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
+                },
+            },
+        })
+    }
+
+    /// `Mcp-Name` is optional on `events/*`: absent is fine, present must
+    /// agree with `params.name`.
+    #[test]
+    fn events_mcp_name_is_optional_but_checked_when_sent() {
+        let h = Handler::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(METHOD_HEADER, "events/subscribe".parse().unwrap());
+        let body = events_subscribe_body("orders.created");
+        assert!(h.validate_transport_headers(&headers, &body).is_ok());
+
+        headers.insert(NAME_HEADER, "orders.created".parse().unwrap());
+        assert!(h.validate_transport_headers(&headers, &body).is_ok());
+
+        headers.insert(NAME_HEADER, "orders.deleted".parse().unwrap());
+        let err = h.validate_transport_headers(&headers, &body).unwrap_err();
+        assert_eq!(err.status, 400);
+        assert_eq!(err.error_code, -32020);
+        assert!(err.message.contains("Mcp-Name"));
+    }
+
+    /// `events/list` names no type, so an `Mcp-Name` on it is ignored like
+    /// on any other method that does not mirror a name.
+    #[test]
+    fn events_list_ignores_mcp_name() {
+        let h = Handler::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(METHOD_HEADER, "events/list".parse().unwrap());
+        headers.insert(NAME_HEADER, "anything".parse().unwrap());
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "events/list" });
+        assert!(h.validate_transport_headers(&headers, &body).is_ok());
+    }
+
+    #[test]
+    fn events_methods_parse_with_their_labels() {
+        let h = Handler::new();
+        let msg = h
+            .parse(events_subscribe_body("orders.created"))
+            .expect("parse ok");
+        assert_eq!(msg.label, "events_ext.subscribe");
+        assert_eq!(msg.jsonrpc_id, Some(serde_json::json!(12)));
+        assert_eq!(msg.mcp_method.as_deref(), Some("events/subscribe"));
+    }
+
+    /// With events off (the default) the methods do not exist: the
+    /// modern wire's `-32601` on HTTP 404.
+    #[tokio::test]
+    async fn events_methods_are_method_not_found_by_default() {
+        let h = Handler::new();
+        let ctx = make_test_request_context();
+        let services =
+            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
+        for body in [
+            serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "events/list" }),
+            events_subscribe_body("orders.created"),
+        ] {
+            let msg = h.parse(body).expect("parse ok");
+            let response = h.dispatch(&ctx, msg, &services).await;
+            assert_eq!(response.http_status, 404);
+            match response.response {
+                ProtocolResponse::JsonRpcError(err) => assert_eq!(err.error.code, -32601),
+                other => panic!("expected JsonRpcError, got {other:?}"),
+            }
+        }
     }
 
     #[test]

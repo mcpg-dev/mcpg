@@ -26,8 +26,9 @@ use crate::protocol::{
 };
 use crate::runtime::RequestTrustLevel;
 use crate::runtime::delivery_bus::DeliveryBus;
+use crate::runtime::events::catalog::{FederatedEventType, FederatedEvents};
 use crate::runtime::pipeline_store::{DeliveryKind, DeliveryMessage};
-use crate::runtime::policy::{FederatedToolPolicies, ToolTrustRule};
+use crate::runtime::policy::{FederatedToolPolicies, FederationGovernance};
 use crate::runtime::session_store::{SessionPhase, SessionStore};
 use crate::runtime::subscription_store::SubscriptionStore;
 use mcpg_plugin_host::PluginRegistry;
@@ -48,6 +49,58 @@ const IMPORT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a bridged server-request waits for the downstream client (P3).
 const BRIDGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Most event types imported from one upstream.
+const MAX_IMPORTED_EVENT_TYPES: usize = 1_000;
+
+/// Whether `capabilities`, as an upstream advertised them, include MCP
+/// Events; `None` when the upstream showed none.
+fn advertises_events(capabilities: Option<&Value>) -> Option<bool> {
+    use mcpg_mcp_wire::v_2026_07_28::extensions::events::wire::EventsCapability;
+    capabilities.map(|capabilities| EventsCapability::advertised_in(capabilities).is_some())
+}
+
+/// Every event type `upstream` lists. An upstream that does not serve MCP
+/// Events lists none, with a warning: `fed` asked for its event types.
+async fn list_upstream_events(
+    fed: &FederationConfig,
+    upstream: &dyn McpUpstream,
+) -> Result<
+    Vec<mcpg_mcp_wire::v_2026_07_28::extensions::events::wire::EventDescriptor>,
+    UpstreamError,
+> {
+    let not_served = || {
+        tracing::warn!(
+            federation = %fed.name,
+            "import.events is set, but the upstream does not serve MCP Events; no event types are imported"
+        );
+        Ok(Vec::new())
+    };
+    if !upstream.wire_is_modern()
+        || advertises_events(upstream.server_capabilities()) == Some(false)
+    {
+        return not_served();
+    }
+    let mut events = match upstream.list_events().await {
+        Ok(events) => events,
+        Err(UpstreamError::Unsupported(_)) => return not_served(),
+        Err(error)
+            if error.jsonrpc_code() == Some(i64::from(crate::protocol::METHOD_NOT_FOUND_CODE)) =>
+        {
+            return not_served();
+        }
+        Err(error) => return Err(error),
+    };
+    if events.len() > MAX_IMPORTED_EVENT_TYPES {
+        tracing::warn!(
+            federation = %fed.name,
+            limit = MAX_IMPORTED_EVENT_TYPES,
+            "the upstream lists more event types than are imported; the rest are left out"
+        );
+        events.truncate(MAX_IMPORTED_EVENT_TYPES);
+    }
+    Ok(events)
+}
 
 /// Mint a fresh, namespaced id for a bridged server-request. The `fed-` prefix
 /// keeps it disjoint from the gateway's pipeline server-request ids and from
@@ -409,10 +462,39 @@ struct ImportedParts {
     resources: Vec<FederatedResource>,
     resource_templates: Vec<FederatedResourceTemplate>,
     prompts: Vec<FederatedPrompt>,
-    rules: Vec<ToolTrustRule>,
+    events: Vec<FederatedEventType>,
 }
 
 impl ImportedParts {
+    /// What `fed`'s `import` switches and filters still admit of an import
+    /// made under an earlier config.
+    fn admitted_by(mut self, fed: &FederationConfig) -> Self {
+        if !fed.import.events {
+            self.events.clear();
+        }
+        self.events
+            .retain(|event| fed.filter.admits_event(&event.upstream_name));
+        if !fed.import.tools {
+            self.tools.clear();
+        }
+        self.tools.retain(|tool| match &tool.route {
+            BackendInvocationRoute::Federated { upstream_name, .. } => {
+                fed.filter.admits(upstream_name)
+            }
+            _ => false,
+        });
+        if !fed.import.resources {
+            self.resources.clear();
+        }
+        if !fed.import.resource_templates {
+            self.resource_templates.clear();
+        }
+        if !fed.import.prompts {
+            self.prompts.clear();
+        }
+        self
+    }
+
     /// Per-kind fingerprints over the client-visible descriptors (routes /
     /// rules are dispatch detail — a change there is not a list change).
     /// Templates fold into the resources fingerprint: both surface under
@@ -493,7 +575,7 @@ pub(crate) struct FederationEngine {
     gateway_via: String,
     /// Federated-tool governance rules (prefixed tool name → rule),
     /// shared with the `PreDispatchPolicyGate` so synthetic tools enforce
-    /// their federation's `minimum_trust` / `allow_if`.
+    /// their federation's `minimum_trust` / `required_scopes` / `allow_if`.
     policy: Arc<ArcSwap<FederatedToolPolicies>>,
     /// Per-(mcpg session, federation) upstream sessions used for
     /// dispatch (D5), separate from the transient import sessions.
@@ -516,6 +598,9 @@ pub(crate) struct FederationEngine {
     /// single upstream's refresh republishes the overlay without re-listing
     /// the others.
     imported: Mutex<HashMap<String, ImportedParts>>,
+    /// Where every republish puts the imported MCP Events types, for the
+    /// events core. `None` in unit tests that do not import events.
+    event_types: Option<Arc<tokio::sync::watch::Sender<FederatedEvents>>>,
     /// Wire detected per `protocol_version: auto` federation (name →
     /// modern?). Written after any successful probing connect; read by
     /// `connect_opts` so later satellites / listeners skip the probe.
@@ -577,10 +662,24 @@ impl FederationEngine {
             notifier: None,
             server_request_bridge: None,
             imported: Mutex::new(HashMap::new()),
+            event_types: None,
             detected_wires: DashMap::new(),
             apps_advertise_upstream: false,
             tunnel_federation: None,
         }
+    }
+
+    /// Publish the imported MCP Events types on `sink` now and at every
+    /// republish.
+    #[must_use]
+    pub fn with_event_types(
+        mut self,
+        sink: Arc<tokio::sync::watch::Sender<FederatedEvents>>,
+    ) -> Self {
+        self.event_types = Some(sink);
+        let cache = self.imported.lock().expect("imported lock").clone();
+        self.publish_event_types(&cache);
+        self
     }
 
     /// Opt into advertising the SEP-1865 `io.modelcontextprotocol/ui`
@@ -669,25 +768,17 @@ impl FederationEngine {
         let mut cache: HashMap<String, ImportedParts> = HashMap::new();
         for fed in &self.federations {
             match self.import_one(fed).await {
-                Ok((tools, resources, resource_templates, prompts, rules)) => {
+                Ok(parts) => {
                     tracing::info!(
                         federation = %fed.name,
-                        tools = tools.len(),
-                        resources = resources.len(),
-                        resource_templates = resource_templates.len(),
-                        prompts = prompts.len(),
+                        tools = parts.tools.len(),
+                        resources = parts.resources.len(),
+                        resource_templates = parts.resource_templates.len(),
+                        prompts = parts.prompts.len(),
+                        events = parts.events.len(),
                         "federation capabilities imported"
                     );
-                    cache.insert(
-                        fed.name.clone(),
-                        ImportedParts {
-                            tools,
-                            resources,
-                            resource_templates,
-                            prompts,
-                            rules,
-                        },
-                    );
+                    cache.insert(fed.name.clone(), parts);
                 }
                 Err(e) => {
                     record_import_failure(fed, &e);
@@ -716,14 +807,7 @@ impl FederationEngine {
             .find(|f| f.name == fed_name)
             .cloned()?;
         match self.import_one(&fed).await {
-            Ok((tools, resources, resource_templates, prompts, rules)) => {
-                let parts = ImportedParts {
-                    tools,
-                    resources,
-                    resource_templates,
-                    prompts,
-                    rules,
-                };
+            Ok(parts) => {
                 let new_fingerprints = parts.fingerprints();
                 let changed = {
                     let mut imported = self.imported.lock().expect("imported lock");
@@ -751,64 +835,72 @@ impl FederationEngine {
     /// Rebuild + atomically swap the overlay and governance from the
     /// per-federation import cache. Synchronous (no await) so holding the
     /// cache lock is safe.
+    ///
+    /// Governance is derived from this engine's federation config on every
+    /// publish, never carried from an earlier one, so capabilities imported
+    /// under a previous config answer to the config in force.
     fn republish(&self) {
+        // Both stores happen under the cache lock. Two refreshes that
+        // published outside it could interleave into one's governance beside
+        // the other's newer catalog, leaving a new capability with no rule.
         let cache = self.imported.lock().expect("imported lock");
         let mut tools = Vec::new();
         let mut resources = Vec::new();
         let mut resource_templates = Vec::new();
         let mut prompts = Vec::new();
-        let mut rules = Vec::new();
-        for parts in cache.values() {
-            tools.extend(parts.tools.iter().cloned());
-            resources.extend(parts.resources.iter().cloned());
-            resource_templates.extend(parts.resource_templates.iter().cloned());
-            prompts.extend(parts.prompts.iter().cloned());
-            rules.extend(parts.rules.iter().cloned());
+        let mut governance = Vec::with_capacity(self.federations.len());
+        for fed in &self.federations {
+            if let Some(parts) = cache.get(&fed.name) {
+                tools.extend(parts.tools.iter().cloned());
+                resources.extend(parts.resources.iter().cloned());
+                resource_templates.extend(parts.resource_templates.iter().cloned());
+                prompts.extend(parts.prompts.iter().cloned());
+            }
+            governance.push(federation_governance(fed));
         }
-        drop(cache);
+        // Governance first: a capability must never be listed before the
+        // rule that guards it is in place. An unchanged rule keeps its
+        // version, so the decisions cached under it survive the refresh.
+        let next = self.policy.load().republished(governance);
+        self.policy.store(Arc::new(next));
         self.overlay.store(Arc::new(FederatedCatalog::from_parts(
             tools,
             resources,
             resource_templates,
             prompts,
         )));
-        // Prefix rules let a federation's governance reach surfaces whose
-        // exact client-facing name isn't known at import — concrete reads of
-        // a federated resource template arrive as `<resource_uri_prefix>…`.
-        // One entry per federation that declares a resource URI prefix.
-        let prefix_rules: Vec<(String, ToolTrustRule)> = self
-            .federations
-            .iter()
-            .filter_map(|fed| {
-                let prefix = fed.naming.resource_uri_prefix.as_deref().unwrap_or("");
-                if prefix.is_empty() {
-                    return None;
-                }
-                Some((prefix.to_owned(), self.governance_rule(fed, prefix)))
-            })
-            .collect();
-        match FederatedToolPolicies::compile(rules, prefix_rules) {
-            Ok(policies) => self.policy.store(Arc::new(policies)),
-            Err(e) => tracing::error!(
-                error = %e,
-                "failed to compile federated tool governance; synthetic tools fall back to the global policy"
-            ),
-        }
+        self.publish_event_types(&cache);
+        drop(cache);
     }
 
-    async fn import_one(
-        &self,
-        fed: &FederationConfig,
-    ) -> Result<
-        (
-            Vec<FederatedTool>,
-            Vec<FederatedResource>,
-            Vec<FederatedResourceTemplate>,
-            Vec<FederatedPrompt>,
-            Vec<ToolTrustRule>,
-        ),
-        UpstreamError,
-    > {
+    /// Put the imported MCP Events types of `cache` on the event type
+    /// sink, when they changed.
+    fn publish_event_types(&self, cache: &HashMap<String, ImportedParts>) {
+        let Some(sink) = &self.event_types else {
+            return;
+        };
+        let events = crate::runtime::events::catalog::ImportedEvents {
+            types: self
+                .federations
+                .iter()
+                .filter_map(|fed| cache.get(&fed.name))
+                .flat_map(|parts| parts.events.iter().cloned())
+                .collect(),
+            pending: self
+                .federations
+                .iter()
+                .any(|fed| fed.import.events && !cache.contains_key(&fed.name)),
+        };
+        sink.send_if_modified(|current| {
+            let changed = **current != events;
+            if changed {
+                *current = Arc::new(events);
+            }
+            changed
+        });
+    }
+
+    async fn import_one(&self, fed: &FederationConfig) -> Result<ImportedParts, UpstreamError> {
         let bearer = self.catalog_bearer(fed).await?;
         let upstream = connect_upstream(self.connect_opts(fed, None, bearer).await?).await?;
         self.record_detected_wire(fed, upstream.as_ref());
@@ -832,61 +924,86 @@ impl FederationEngine {
         } else {
             Ok(Vec::new())
         };
+        let listed_events = if fed.import.events {
+            list_upstream_events(fed, upstream.as_ref()).await
+        } else {
+            Ok(Vec::new())
+        };
         // The import session is transient — dispatch uses its own
         // per-client satellites.
         upstream.close().await;
 
-        let mut tools = Vec::new();
-        let mut rules = Vec::new();
-        for tool in listed_tools?
+        let tools = listed_tools?
             .into_iter()
             .filter(|t| fed.filter.admits(&t.name))
-        {
-            let federated = self.to_federated_tool(fed, tool);
-            rules.push(self.governance_rule(fed, &federated.descriptor.name));
-            tools.push(federated);
-        }
-        // The federation's `governance` block applies to ALL imported
-        // surfaces, not just tools — prompts/get, resources/read and
-        // completion now run the trust floor, so each federated prompt
-        // (keyed by name), resource (keyed by prefixed URI) and resource
-        // template (keyed by prefixed URI template) needs its inherited
-        // rule too, or it would fall back to the gateway's global default
-        // trust instead of the federation's declared level.
-        let resources: Vec<_> = listed_resources?
+            .map(|t| self.to_federated_tool(fed, t))
+            .collect();
+        let resources = listed_resources?
             .into_iter()
             .map(|r| self.to_federated_resource(fed, r))
             .collect();
-        for r in &resources {
-            rules.push(self.governance_rule(fed, &r.descriptor.uri));
-        }
-        let resource_templates: Vec<_> = listed_templates?
+        let resource_templates = listed_templates?
             .into_iter()
             .map(|t| self.to_federated_resource_template(fed, t))
             .collect();
-        for t in &resource_templates {
-            rules.push(self.governance_rule(fed, &t.descriptor.uri_template));
-        }
-        let prompts: Vec<_> = listed_prompts?
+        let prompts = listed_prompts?
             .into_iter()
             .map(|p| self.to_federated_prompt(fed, p))
             .collect();
-        for p in &prompts {
-            rules.push(self.governance_rule(fed, &p.descriptor.name));
-        }
-        Ok((tools, resources, resource_templates, prompts, rules))
+        let events = listed_events?
+            .into_iter()
+            .filter(|descriptor| fed.filter.admits_event(&descriptor.name))
+            .map(|descriptor| FederatedEventType {
+                federation: fed.name.clone(),
+                name: format!("{}{}", fed.event_prefix(), descriptor.name),
+                upstream_name: descriptor.name.clone(),
+                descriptor,
+                delivery: fed.events.delivery,
+                sharing: fed.events.sharing,
+                retention: fed.events.retention.clone(),
+            })
+            .collect();
+        Ok(ImportedParts {
+            tools,
+            resources,
+            resource_templates,
+            prompts,
+            events,
+        })
     }
 
-    /// Build the per-tool governance rule for a synthetic (prefixed)
-    /// federated tool, inheriting the federation's `governance` block so
-    /// the policy gate treats it exactly like a native tool.
-    fn governance_rule(&self, fed: &FederationConfig, tool_name: &str) -> ToolTrustRule {
-        ToolTrustRule {
-            tool_name: tool_name.to_owned(),
-            minimum_trust: trust_from_config(fed.governance.minimum_trust),
-            cel_allow_if: fed.governance.allow_if.clone(),
-            required_scopes: Vec::new(),
-        }
+    /// A connection to the upstream of `federation` for reading its MCP
+    /// Events. Without `subscriber` it is made with the federation's
+    /// catalogue credential: the upstream subscription serves every
+    /// downstream subscriber of its arguments, so it is held as the gateway.
+    /// With `subscriber`, a verified identity, it is made with that
+    /// subscriber's own upstream credential, minted from their stored
+    /// sign-in, and serves them alone.
+    pub(crate) async fn events_upstream(
+        &self,
+        federation: &str,
+        subscriber: Option<&crate::runtime::RequestIdentity>,
+    ) -> Result<Arc<dyn McpUpstream>, UpstreamError> {
+        let fed = self
+            .federations
+            .iter()
+            .find(|fed| fed.name == federation)
+            .ok_or_else(|| UpstreamError::Connect(format!("no federation `{federation}`")))?;
+        let bearer = match subscriber {
+            None => self.catalog_bearer(fed).await?,
+            Some(identity) => {
+                let principal = identity.synthetic_principal_key();
+                let caller = FederationCaller {
+                    principal: principal.as_deref(),
+                    identity: Some(identity),
+                    ..FederationCaller::default()
+                };
+                self.bearer_for(fed, caller).await?
+            }
+        };
+        let upstream = connect_upstream(self.connect_opts(fed, None, bearer).await?).await?;
+        self.record_detected_wire(fed, upstream.as_ref());
+        Ok(upstream)
     }
 
     /// Record the wire a probing connect resolved so later connects to
@@ -1621,35 +1738,41 @@ impl FederationEngine {
     /// Carry the prior engine's per-federation import cache across a reload.
     ///
     /// [`Self::republish`] rebuilds the whole overlay from this cache, so a
-    /// fresh engine that starts empty publishes an empty catalog the first
-    /// time anything republishes — and a TTL refresh or an upstream
-    /// `list_changed` for ONE federation is enough to trigger that, wiping
-    /// every other federation's tools and resources even though the reload
-    /// seeded the overlay correctly. The seeded overlay only survives until
-    /// the first republish; the cache is what has to be carried.
+    /// fresh engine that starts empty would publish an empty catalog the
+    /// first time a TTL refresh or an upstream `list_changed` for ONE
+    /// federation republishes, wiping every other federation's capabilities.
     ///
     /// Scoped to federations this engine still declares: a removed one must
     /// not be resurrected. Entries for changed federations are carried so
     /// clients keep seeing them, and the re-import that a config change
     /// triggers refreshes them.
+    ///
+    /// Publishes at once, so the carried capabilities answer to this
+    /// engine's config from the first request: a reload that tightens a
+    /// federation's floor, scopes or `allow_if`, excludes a tool or turns an
+    /// import off applies before its re-import completes, not after.
     pub(crate) fn adopt_imported(&self, prior: &FederationEngine) {
-        let Ok(prior_cache) = prior.imported.lock() else {
-            return;
+        let carried: Vec<(String, ImportedParts)> = match prior.imported.lock() {
+            Ok(prior_cache) => self
+                .federations
+                .iter()
+                .filter_map(|fed| {
+                    let parts = prior_cache.get(&fed.name)?.clone();
+                    Some((fed.name.clone(), parts.admitted_by(fed)))
+                })
+                .collect(),
+            Err(_) => Vec::new(),
         };
-        let Ok(mut cache) = self.imported.lock() else {
-            return;
-        };
-        let mut carried = 0usize;
-        for (fed_name, parts) in prior_cache.iter() {
-            if !self.federations.iter().any(|f| &f.name == fed_name) {
-                continue;
-            }
-            cache.insert(fed_name.clone(), parts.clone());
-            carried += 1;
+        if !carried.is_empty() {
+            tracing::debug!(
+                carried = carried.len(),
+                "carried federated import cache across reload"
+            );
         }
-        if carried > 0 {
-            tracing::debug!(carried, "carried federated import cache across reload");
+        if let Ok(mut cache) = self.imported.lock() {
+            cache.extend(carried);
         }
+        self.republish();
     }
 
     /// Spawn one persistent notification-listener task per federation (P2-D).
@@ -1745,8 +1868,20 @@ impl FederationEngine {
         let bearer = self.catalog_bearer(fed).await?;
         let upstream = connect_upstream(self.connect_opts(fed, None, bearer).await?).await?;
         self.record_detected_wire(fed, upstream.as_ref());
+        let events = fed.import.events
+            && upstream.wire_is_modern()
+            && advertises_events(upstream.server_capabilities()) != Some(false);
         // The trait returns a boxed (Unpin) stream, so no `pin_mut!` needed.
-        let mut stream = upstream.open_notifications().await?;
+        let mut stream = if events {
+            upstream
+                .open_subscriptions(&super::upstream::SubscriptionSpec {
+                    events_list_changed: true,
+                    ..super::upstream::SubscriptionSpec::all_list_changed()
+                })
+                .await?
+        } else {
+            upstream.open_notifications().await?
+        };
         while let Some(notif) = stream.next().await {
             self.handle_notification(fed, &notif).await;
         }
@@ -1756,6 +1891,7 @@ impl FederationEngine {
 
     /// React to one upstream notification. `*/list_changed` refreshes the
     /// overlay (re-import) and forwards the same kind to MCPG's clients;
+    /// the events core announces a change of the event types itself.
     /// `resources/updated` re-prefixes the URI and forwards it to subscribers.
     /// Other methods are ignored (the engine advertises no
     /// server-request capability upstream).
@@ -1768,7 +1904,8 @@ impl FederationEngine {
             "notifications/tools/list_changed"
                 | "notifications/resources/list_changed"
                 | "notifications/prompts/list_changed"
-        );
+        ) || method
+            == mcpg_mcp_wire::v_2026_07_28::extensions::events::wire::METHOD_NOTIFICATIONS_LIST_CHANGED;
         if is_list_changed {
             tracing::info!(
                 federation = %fed.name, %method,
@@ -1848,9 +1985,10 @@ impl FederationEngine {
         fed: &FederationConfig,
         resource: UpstreamResource,
     ) -> FederatedResource {
+        let uri = federated_resource_uri(fed, &resource.uri);
         FederatedResource {
             descriptor: ResourceDescriptor {
-                uri: federated_resource_uri(fed, &resource.uri),
+                uri: uri.clone(),
                 name: resource.name,
                 title: resource.title,
                 description: resource.description,
@@ -1867,6 +2005,7 @@ impl FederationEngine {
             route: ResourceRoute::Federated {
                 source: fed.name.clone(),
                 upstream_uri: resource.uri,
+                listed_as: uri,
             },
         }
     }
@@ -1980,6 +2119,30 @@ fn record_import_failure(fed: &FederationConfig, error: &UpstreamError) {
             "upstream refused the anonymous catalogue session; set upstream.auth.import \
              to a service_token or oauth_client_credentials credential to list it"
         );
+    }
+}
+
+/// The governance everything the router sends to `fed` inherits — its
+/// whole `governance` block, as a native binding's is. A federation with
+/// nothing imported still publishes its rule.
+pub(crate) fn federation_governance(fed: &FederationConfig) -> FederationGovernance {
+    governance_for(&fed.name, &fed.governance)
+}
+
+/// `governance` as the rule of the federation named `federation`.
+pub(crate) fn governance_for(
+    federation: &str,
+    governance: &crate::config::BackendGovernanceConfig,
+) -> FederationGovernance {
+    FederationGovernance {
+        federation: federation.to_owned(),
+        minimum_trust: trust_from_config(
+            governance
+                .minimum_trust
+                .unwrap_or(crate::config::FEDERATED_DEFAULT_MINIMUM_TRUST),
+        ),
+        cel_allow_if: governance.allow_if.clone(),
+        required_scopes: governance.required_scopes.clone(),
     }
 }
 
@@ -2368,9 +2531,11 @@ import: {{ resources: true }}
             ResourceRoute::Federated {
                 source,
                 upstream_uri,
+                listed_as,
             } => {
                 assert_eq!(source, "notion");
                 assert_eq!(upstream_uri, "ui://srv/chart");
+                assert_eq!(listed_as, "ui://notion/srv/chart");
             }
             other => panic!("expected Federated route, got {other:?}"),
         }
@@ -3764,15 +3929,15 @@ import: {{ resources: true }}
     fn import_failures_are_classified_and_hinted() {
         let unauthorized = UpstreamError::Http {
             status: 401,
-            jsonrpc_code: None,
+            error: None,
         };
         let forbidden = UpstreamError::Http {
             status: 403,
-            jsonrpc_code: None,
+            error: None,
         };
         let server_error = UpstreamError::Http {
             status: 500,
-            jsonrpc_code: None,
+            error: None,
         };
         assert_eq!(import_failure_reason(&unauthorized), "unauthorized");
         assert_eq!(import_failure_reason(&forbidden), "unauthorized");
@@ -4450,6 +4615,632 @@ import: {{ resources: true }}
         );
     }
 
+    /// A federation config with `governance` set from YAML flow syntax,
+    /// deliberately not validated so a broken `allow_if` reaches the engine.
+    fn governed_fed(name: &str, url: &str, governance: &str) -> FederationConfig {
+        serde_yaml::from_str(&format!(
+            "name: {name}\ngovernance: {governance}\nupstream:\n  url: \"{url}\"\n  upstream_safety: {{ allow_private_backends: true, allow_insecure_http: true }}\nnaming: {{ tool_prefix: \"{name}.\" }}"
+        ))
+        .expect("parse fed config")
+    }
+
+    fn gate_with_default_floor(
+        default_minimum_trust: RequestTrustLevel,
+    ) -> crate::runtime::policy::PreDispatchPolicyGate {
+        crate::runtime::policy::PreDispatchPolicyGate::try_new(
+            crate::runtime::ToolAccessPolicyConfig {
+                default_minimum_trust,
+                cel_allow_if: None,
+                rules: Vec::new(),
+            },
+        )
+        .expect("policy valid")
+    }
+
+    fn policy_context(
+        tool: &str,
+        trust_level: RequestTrustLevel,
+        scopes: &[&str],
+    ) -> crate::runtime::policy::ToolPolicyContext {
+        crate::runtime::policy::ToolPolicyContext {
+            tool_name: tool.to_owned(),
+            trust_level,
+            principal_id: Some("user-1".to_owned()),
+            auth_provider: Some("oidc".to_owned()),
+            identity_kind: "verified".to_owned(),
+            roles: Vec::new(),
+            groups: Vec::new(),
+            scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+            attributes: std::collections::BTreeMap::new(),
+            issuer: None,
+        }
+    }
+
+    /// The decision `tools/call` gets for `context.tool_name`: routed as the
+    /// registry routes it, then gated under that route.
+    fn tool_decision(
+        registry: &CapabilityRegistry,
+        gate: &crate::runtime::policy::PreDispatchPolicyGate,
+        context: &crate::runtime::policy::ToolPolicyContext,
+    ) -> crate::runtime::policy::PreDispatchPolicyOutcome {
+        let route = registry
+            .tool_route(&context.tool_name)
+            .expect("a routed tool");
+        gate.evaluate(
+            context,
+            crate::runtime::policy::PolicyRoute::for_tool(&route),
+        )
+    }
+
+    fn allowed(
+        registry: &CapabilityRegistry,
+        gate: &crate::runtime::policy::PreDispatchPolicyGate,
+        context: &crate::runtime::policy::ToolPolicyContext,
+    ) -> bool {
+        matches!(
+            tool_decision(registry, gate, context),
+            crate::runtime::policy::PreDispatchPolicyOutcome::Allow
+        )
+    }
+
+    /// One federation whose `allow_if` does not compile must not take the
+    /// other federations' governance down with it, and its own tools are
+    /// refused rather than handed to the gateway-wide default floor.
+    #[tokio::test]
+    async fn an_uncompilable_allow_if_refuses_only_its_own_federation() {
+        let url_a = spawn_mock().await;
+        let url_b = spawn_mock().await;
+        let gate = gate_with_default_floor(RequestTrustLevel::HeaderAsserted);
+        let registry = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![
+                governed_fed("aaa", &url_a, "{ minimum_trust: unauthenticated }"),
+                governed_fed(
+                    "bbb",
+                    &url_b,
+                    "{ minimum_trust: unauthenticated, allow_if: 'tool_name == ' }",
+                ),
+            ],
+            registry.federated_overlay(),
+            gate.federated_policy_handle(),
+            "via-1",
+        );
+        engine.import_all().await;
+        let names: Vec<String> = registry.tools().into_iter().map(|t| t.name).collect();
+        assert!(names.iter().any(|n| n == "bbb.search"), "{names:?}");
+
+        // The healthy federation's floor is below the gateway default.
+        assert!(allowed(
+            &registry,
+            &gate,
+            &policy_context("aaa.search", RequestTrustLevel::Unauthenticated, &[])
+        ));
+        for trust in [
+            RequestTrustLevel::Unauthenticated,
+            RequestTrustLevel::HeaderAsserted,
+            RequestTrustLevel::Verified,
+        ] {
+            let context = policy_context("bbb.search", trust, &[]);
+            match tool_decision(&registry, &gate, &context) {
+                crate::runtime::policy::PreDispatchPolicyOutcome::Deny(denial) => assert_eq!(
+                    denial.audit_reason,
+                    "federation_governance_uncompiled:bbb.search:bbb"
+                ),
+                crate::runtime::policy::PreDispatchPolicyOutcome::Allow => {
+                    panic!("bbb.search must be refused at {trust:?}")
+                }
+            }
+        }
+    }
+
+    /// `governance.required_scopes` on a federation reaches the policy gate
+    /// for every capability it imports.
+    #[tokio::test]
+    async fn federation_required_scopes_are_enforced_on_imported_tools() {
+        let url = spawn_mock().await;
+        let gate = gate_with_default_floor(RequestTrustLevel::Unauthenticated);
+        let registry = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![governed_fed(
+                "crm",
+                &url,
+                "{ minimum_trust: verified, required_scopes: [crm.read] }",
+            )],
+            registry.federated_overlay(),
+            gate.federated_policy_handle(),
+            "via-1",
+        );
+        engine.import_all().await;
+
+        match tool_decision(
+            &registry,
+            &gate,
+            &policy_context("crm.search", RequestTrustLevel::Verified, &["crm.write"]),
+        ) {
+            crate::runtime::policy::PreDispatchPolicyOutcome::Deny(denial) => {
+                assert_eq!(denial.http_status, 403);
+                assert_eq!(
+                    denial.insufficient_scope.as_deref(),
+                    Some(["crm.read".to_owned()].as_slice())
+                );
+            }
+            crate::runtime::policy::PreDispatchPolicyOutcome::Allow => {
+                panic!("a caller without crm.read must be refused")
+            }
+        }
+        assert!(allowed(
+            &registry,
+            &gate,
+            &policy_context("crm.search", RequestTrustLevel::Verified, &["crm.read"])
+        ));
+    }
+
+    fn upstream_resource(uri: &str) -> UpstreamResource {
+        UpstreamResource {
+            uri: uri.into(),
+            name: uri.into(),
+            title: None,
+            description: None,
+            mime_type: None,
+            meta: None,
+        }
+    }
+
+    fn upstream_template(uri_template: &str) -> UpstreamResourceTemplate {
+        UpstreamResourceTemplate {
+            uri_template: uri_template.into(),
+            name: uri_template.into(),
+            title: None,
+            description: None,
+            mime_type: None,
+            meta: None,
+        }
+    }
+
+    /// The decision `resources/read` gets for `uri`: routed as the read path
+    /// routes it, then gated under that route.
+    fn read_allowed(
+        registry: &CapabilityRegistry,
+        gate: &crate::runtime::policy::PreDispatchPolicyGate,
+        uri: &str,
+        trust_level: RequestTrustLevel,
+    ) -> bool {
+        let route = registry.resource_route(uri).expect("a routed URI");
+        matches!(
+            gate.evaluate(
+                &policy_context(uri, trust_level, &[]),
+                crate::runtime::policy::PolicyRoute::for_resource(&route)
+            ),
+            crate::runtime::policy::PreDispatchPolicyOutcome::Allow
+        )
+    }
+
+    /// A resource read answers to the federation the router sends it to,
+    /// under every URI the router accepts for it. A URI the router serves
+    /// natively keeps the gateway's policy even when a federation's template
+    /// or URI also matches it, so a lenient federation cannot lower the
+    /// floor of a native binding.
+    #[test]
+    fn a_resource_read_answers_to_the_federation_its_route_names() {
+        let native_page: crate::config::BackendConfig = serde_yaml::from_str(
+            "name: page\ndescription: native page\nuri_template: \"wiki://pages/{id}\"\nbackend: { kind: mock }\n",
+        )
+        .expect("parse binding");
+        let registry = CapabilityRegistry::new(
+            false,
+            crate::backends::DebugToolBackends::default(),
+            crate::backends::DebugToolExposure::default(),
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&native_page),
+            None,
+        );
+        let gate = gate_with_default_floor(RequestTrustLevel::HeaderAsserted);
+        let fed = governed_fed(
+            "wiki",
+            "https://x/mcp",
+            "{ minimum_trust: unauthenticated }",
+        );
+        let engine = FederationEngine::new(
+            vec![fed.clone()],
+            registry.federated_overlay(),
+            gate.federated_policy_handle(),
+            "via-1",
+        );
+        let parts = ImportedParts {
+            resources: vec![
+                engine.to_federated_resource(&fed, upstream_resource("https://wiki.example/home")),
+            ],
+            resource_templates: vec![
+                engine.to_federated_resource_template(&fed, upstream_template("wiki://pages/{id}")),
+                engine.to_federated_resource_template(&fed, upstream_template("notes/{id}")),
+            ],
+            ..ImportedParts::default()
+        };
+        engine
+            .imported
+            .lock()
+            .expect("imported lock")
+            .insert(fed.name.clone(), parts);
+        engine.republish();
+
+        for uri in [
+            "notes/7",
+            "https://wiki.example/home",
+            "HTTPS://Wiki.Example:443/home",
+        ] {
+            assert!(
+                read_allowed(&registry, &gate, uri, RequestTrustLevel::Unauthenticated),
+                "{uri} is the federation's and takes its floor"
+            );
+        }
+        assert!(
+            !read_allowed(
+                &registry,
+                &gate,
+                "wiki://pages/7",
+                RequestTrustLevel::Unauthenticated
+            ),
+            "the native template serves wiki://pages/7; the federation's floor must not apply"
+        );
+        assert!(read_allowed(
+            &registry,
+            &gate,
+            "wiki://pages/7",
+            RequestTrustLevel::HeaderAsserted
+        ));
+    }
+
+    /// A native binding under a federation's `resource_uri_prefix` is still
+    /// the native binding's: only a read routed to the federation answers to
+    /// the federation's rule.
+    #[test]
+    fn a_native_read_under_a_federation_prefix_keeps_the_gateway_policy() {
+        let native_admin: crate::config::BackendConfig = serde_yaml::from_str(
+            "name: admin\ndescription: native admin\nuri_template: \"mcp://notion/admin/{id}\"\nbackend: { kind: mock }\n",
+        )
+        .expect("parse binding");
+        let registry = CapabilityRegistry::new(
+            false,
+            crate::backends::DebugToolBackends::default(),
+            crate::backends::DebugToolExposure::default(),
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&native_admin),
+            None,
+        );
+        let gate = gate_with_default_floor(RequestTrustLevel::HeaderAsserted);
+        let mut fed = governed_fed(
+            "notion",
+            "https://x/mcp",
+            "{ minimum_trust: unauthenticated }",
+        );
+        fed.naming.resource_uri_prefix = Some("mcp://notion/".into());
+        let engine = FederationEngine::new(
+            vec![fed.clone()],
+            registry.federated_overlay(),
+            gate.federated_policy_handle(),
+            "via-1",
+        );
+        let parts = ImportedParts {
+            resource_templates: vec![
+                engine.to_federated_resource_template(&fed, upstream_template("pages/{id}")),
+            ],
+            ..ImportedParts::default()
+        };
+        engine
+            .imported
+            .lock()
+            .expect("imported lock")
+            .insert(fed.name.clone(), parts);
+        engine.republish();
+
+        assert!(read_allowed(
+            &registry,
+            &gate,
+            "mcp://notion/pages/7",
+            RequestTrustLevel::Unauthenticated
+        ));
+        assert!(!read_allowed(
+            &registry,
+            &gate,
+            "mcp://notion/admin/7",
+            RequestTrustLevel::Unauthenticated
+        ));
+    }
+
+    /// Every surface a federation imports answers to its rule, including a
+    /// concrete read of one of its resource templates when it declares no
+    /// `resource_uri_prefix` to match on.
+    #[test]
+    fn federation_governance_covers_every_imported_surface() {
+        let registry = CapabilityRegistry::default();
+        let gate = gate_with_default_floor(RequestTrustLevel::Unauthenticated);
+        let fed = governed_fed("wiki", "https://x/mcp", "{ minimum_trust: verified }");
+        let engine = FederationEngine::new(
+            vec![fed.clone()],
+            registry.federated_overlay(),
+            gate.federated_policy_handle(),
+            "via-1",
+        );
+        let parts = ImportedParts {
+            tools: vec![engine.to_federated_tool(
+                &fed,
+                UpstreamTool {
+                    name: "search".into(),
+                    title: None,
+                    description: None,
+                    input_schema: Some(json!({"type": "object"})),
+                    output_schema: None,
+                    annotations: None,
+                    meta: None,
+                },
+            )],
+            resources: vec![engine.to_federated_resource(
+                &fed,
+                UpstreamResource {
+                    uri: "https://wiki.example/home".into(),
+                    name: "home".into(),
+                    title: None,
+                    description: None,
+                    mime_type: None,
+                    meta: None,
+                },
+            )],
+            resource_templates: vec![engine.to_federated_resource_template(
+                &fed,
+                UpstreamResourceTemplate {
+                    uri_template: "wiki://pages/{id}".into(),
+                    name: "page".into(),
+                    title: None,
+                    description: None,
+                    mime_type: None,
+                    meta: None,
+                },
+            )],
+            prompts: vec![engine.to_federated_prompt(
+                &fed,
+                UpstreamPrompt {
+                    name: "summarize".into(),
+                    title: None,
+                    description: None,
+                    arguments: Vec::new(),
+                    meta: None,
+                },
+            )],
+            events: Vec::new(),
+        };
+        engine
+            .imported
+            .lock()
+            .expect("imported lock")
+            .insert(fed.name.clone(), parts);
+        engine.republish();
+
+        use crate::runtime::policy::PolicyRoute;
+        let tool = registry.tool_route("wiki.search").expect("a routed tool");
+        let prompt = registry.prompt_route("summarize").expect("a routed prompt");
+        let templates = registry.resource_templates_with_source();
+        let (template, source) = templates
+            .iter()
+            .find(|(t, _)| t.uri_template == "wiki://pages/{id}")
+            .expect("a listed template");
+        for (name, route) in [
+            ("wiki.search", PolicyRoute::for_tool(&tool)),
+            ("summarize", PolicyRoute::for_prompt(&prompt)),
+            (
+                template.uri_template.as_str(),
+                PolicyRoute::served_by(source.as_deref()),
+            ),
+        ] {
+            for trust_level in [
+                RequestTrustLevel::Unauthenticated,
+                RequestTrustLevel::Verified,
+            ] {
+                assert_eq!(
+                    matches!(
+                        gate.evaluate(&policy_context(name, trust_level, &[]), route),
+                        crate::runtime::policy::PreDispatchPolicyOutcome::Allow
+                    ),
+                    trust_level == RequestTrustLevel::Verified,
+                    "{name} at {trust_level:?} must answer to the federation's floor"
+                );
+            }
+        }
+        for uri in ["https://wiki.example/home", "wiki://pages/7"] {
+            for trust_level in [
+                RequestTrustLevel::Unauthenticated,
+                RequestTrustLevel::Verified,
+            ] {
+                assert_eq!(
+                    read_allowed(&registry, &gate, uri, trust_level),
+                    trust_level == RequestTrustLevel::Verified,
+                    "a read of {uri} at {trust_level:?}"
+                );
+            }
+        }
+    }
+
+    /// A name a federation lists on one surface does not bring its rule to a
+    /// surface of another kind the gateway serves under that name: an
+    /// upstream prompt named like a gateway-internal tool leaves the tool on
+    /// the gateway's floor, while the prompt itself answers to the
+    /// federation.
+    #[test]
+    fn a_federated_name_does_not_govern_a_native_surface_of_another_kind() {
+        let registry = CapabilityRegistry::new(
+            true,
+            crate::backends::DebugToolBackends::default(),
+            crate::backends::DebugToolExposure::default(),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        );
+        let gate = gate_with_default_floor(RequestTrustLevel::HeaderAsserted);
+        let fed = governed_fed(
+            "open",
+            "https://x/mcp",
+            "{ minimum_trust: unauthenticated }",
+        );
+        let engine = FederationEngine::new(
+            vec![fed.clone()],
+            registry.federated_overlay(),
+            gate.federated_policy_handle(),
+            "via-1",
+        );
+        let parts = ImportedParts {
+            prompts: vec![engine.to_federated_prompt(
+                &fed,
+                UpstreamPrompt {
+                    name: "mcpg.runtime.snapshot".into(),
+                    title: None,
+                    description: None,
+                    arguments: Vec::new(),
+                    meta: None,
+                },
+            )],
+            ..ImportedParts::default()
+        };
+        engine
+            .imported
+            .lock()
+            .expect("imported lock")
+            .insert(fed.name.clone(), parts);
+        engine.republish();
+
+        let anonymous = policy_context(
+            "mcpg.runtime.snapshot",
+            RequestTrustLevel::Unauthenticated,
+            &[],
+        );
+        assert!(
+            !allowed(&registry, &gate, &anonymous),
+            "the internal tool keeps the gateway's header_asserted floor"
+        );
+        let prompt = registry
+            .prompt_route("mcpg.runtime.snapshot")
+            .expect("the federated prompt routes");
+        assert!(matches!(
+            gate.evaluate(
+                &anonymous,
+                crate::runtime::policy::PolicyRoute::for_prompt(&prompt)
+            ),
+            crate::runtime::policy::PreDispatchPolicyOutcome::Allow
+        ));
+    }
+
+    /// A reload that tightens a federation's governance applies to the
+    /// capabilities carried from the prior engine at once, before any
+    /// re-import, and never leaves them under the prior rule.
+    #[tokio::test]
+    async fn adopt_imported_governs_carried_capabilities_by_the_new_config() {
+        let url = spawn_mock().await;
+        let old_gate = gate_with_default_floor(RequestTrustLevel::Unauthenticated);
+        let reg_old = CapabilityRegistry::default();
+        let old = FederationEngine::new(
+            vec![governed_fed(
+                "aaa",
+                &url,
+                "{ minimum_trust: unauthenticated }",
+            )],
+            reg_old.federated_overlay(),
+            old_gate.federated_policy_handle(),
+            "via-1",
+        );
+        old.import_all().await;
+
+        let new_gate = gate_with_default_floor(RequestTrustLevel::Unauthenticated);
+        let reg_new = CapabilityRegistry::default();
+        let new = FederationEngine::new(
+            vec![governed_fed(
+                "aaa",
+                &url,
+                "{ minimum_trust: verified, allow_if: '\"ops\" in identity.groups' }",
+            )],
+            reg_new.federated_overlay(),
+            new_gate.federated_policy_handle(),
+            "via-1",
+        );
+        new.adopt_imported(&old);
+
+        let names: Vec<String> = reg_new.tools().into_iter().map(|t| t.name).collect();
+        assert!(names.iter().any(|n| n == "aaa.search"), "{names:?}");
+        assert!(!allowed(
+            &reg_new,
+            &new_gate,
+            &policy_context("aaa.search", RequestTrustLevel::Unauthenticated, &[])
+        ));
+        assert!(!allowed(
+            &reg_new,
+            &new_gate,
+            &policy_context("aaa.search", RequestTrustLevel::Verified, &[])
+        ));
+        let mut ops = policy_context("aaa.search", RequestTrustLevel::Verified, &[]);
+        ops.groups = vec!["ops".to_owned()];
+        assert!(allowed(&reg_new, &new_gate, &ops));
+    }
+
+    /// A reload that excludes a tool or turns an import off withdraws the
+    /// carried capability at once, not when the re-import lands.
+    #[tokio::test]
+    async fn adopt_imported_applies_the_new_filter_and_import_switches() {
+        let url = spawn_mock().await;
+        let old = FederationEngine::new(
+            vec![fed_config(&url)],
+            CapabilityRegistry::default().federated_overlay(),
+            empty_policy(),
+            "via-1",
+        );
+        old.import_all().await;
+        let carried: Vec<String> = old
+            .imported
+            .lock()
+            .expect("imported lock")
+            .get("notion")
+            .expect("imported")
+            .tools
+            .iter()
+            .map(|t| t.descriptor.name.clone())
+            .collect();
+        assert!(
+            carried.iter().any(|n| n == "notion.create_page"),
+            "{carried:?}"
+        );
+
+        let mut narrowed = fed_config(&url);
+        narrowed.filter.exclude_tools.push("create_page".to_owned());
+        let reg_narrowed = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![narrowed.clone()],
+            reg_narrowed.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        );
+        engine.adopt_imported(&old);
+        let names: Vec<String> = reg_narrowed.tools().into_iter().map(|t| t.name).collect();
+        assert!(names.iter().any(|n| n == "notion.search"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "notion.create_page"),
+            "{names:?}"
+        );
+
+        narrowed.import.tools = false;
+        narrowed.import.prompts = true;
+        let reg_off = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![narrowed],
+            reg_off.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        );
+        engine.adopt_imported(&old);
+        assert!(reg_off.tools().is_empty());
+    }
+
     #[tokio::test]
     async fn adopt_satellites_carries_only_unchanged_federations() {
         let url = spawn_mock().await;
@@ -4612,6 +5403,37 @@ import: {{ resources: true }}
             inits.load(Ordering::Relaxed),
             1,
             "carried satellite reused across reload, not reconnected"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_imports_are_pending_until_the_first_import() {
+        let url = spawn_mock().await;
+        let mut fed = fed_config(&url);
+        fed.import.events = true;
+        let sink = Arc::new(tokio::sync::watch::channel(FederatedEvents::default()).0);
+        let registry = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![fed],
+            registry.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        )
+        .with_event_types(Arc::clone(&sink));
+        assert!(
+            sink.borrow().pending,
+            "a federation that imports event types has no import yet"
+        );
+        engine.import_all().await;
+        let imported = sink.borrow().clone();
+        assert!(
+            imported.types.is_empty(),
+            "a legacy upstream serves no MCP Events"
+        );
+        assert!(!imported.pending, "the import settled");
+        assert!(
+            registry.tools().iter().any(|t| t.name == "notion.search"),
+            "the other capabilities import as before"
         );
     }
 }

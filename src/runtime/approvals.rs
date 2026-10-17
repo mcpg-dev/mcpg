@@ -165,9 +165,29 @@ pub struct ApprovalRegistry {
     /// would let anything with publish rights on the shared broker approve
     /// a call the operator required a person to sign off.
     resolution_bus: Option<Arc<dyn mcpg_cluster_api::PubSub>>,
+    /// Told when an approval is requested and when it is decided.
+    observer: parking_lot::RwLock<Option<Arc<dyn ApprovalObserver>>>,
+}
+
+/// Told when a tool gate asks a person to approve a call, and how that
+/// ends. Called on the awaiting task, so an implementation hands slow work
+/// off.
+pub trait ApprovalObserver: Send + Sync {
+    fn requested(&self, approval_id: &str, tool_name: &str, summary: &str, deadline_at: &str);
+    /// `outcome` is `approved`, `denied` or `expired`.
+    fn resolved(&self, approval_id: &str, tool_name: &str, outcome: &'static str);
 }
 
 impl ApprovalRegistry {
+    /// Tell `observer` of every approval from now on.
+    pub fn set_observer(&self, observer: Arc<dyn ApprovalObserver>) {
+        *self.observer.write() = Some(observer);
+    }
+
+    fn observer(&self) -> Option<Arc<dyn ApprovalObserver>> {
+        self.observer.read().clone()
+    }
+
     /// Build a new registry. `signing_key` must be at least 32
     /// bytes; callers SHOULD load it from a per-deploy secret
     /// (e.g. `APPROVAL_SIGNING_KEY` env). `callback_base_url`
@@ -185,6 +205,7 @@ impl ApprovalRegistry {
             node_id: String::new(),
             backstop_kv: None,
             resolution_bus: None,
+            observer: parking_lot::RwLock::new(None),
         }
     }
 
@@ -624,6 +645,10 @@ pub async fn await_pending_approval(ctx: AwaitContext<'_>) -> AwaitOutcome {
         );
         let _ = ctx.plugin_registry.emit_audit_event(&event).await;
     }
+    let observer = ctx.registry.observer();
+    if let Some(observer) = &observer {
+        observer.requested(&approval_id, &ctx.tool_name, &ctx.summary, &ctx.deadline_at);
+    }
     let request = mcpg_plugin_protocol::approval_notifier::NotificationRequest {
         approval_id: approval_id.clone(),
         summary: ctx.summary.clone(),
@@ -699,6 +724,9 @@ pub async fn await_pending_approval(ctx: AwaitContext<'_>) -> AwaitOutcome {
                 reason.as_deref(),
             );
             let _ = ctx.plugin_registry.emit_audit_event(&event).await;
+            if let Some(observer) = &observer {
+                observer.resolved(&approval_id, &ctx.tool_name, "approved");
+            }
             AwaitOutcome::Approved {
                 approver_subject,
                 reason,
@@ -719,6 +747,9 @@ pub async fn await_pending_approval(ctx: AwaitContext<'_>) -> AwaitOutcome {
                 reason.as_deref(),
             );
             let _ = ctx.plugin_registry.emit_audit_event(&event).await;
+            if let Some(observer) = &observer {
+                observer.resolved(&approval_id, &ctx.tool_name, "denied");
+            }
             AwaitOutcome::Denied {
                 http_status: 403,
                 code: -32044,
@@ -742,6 +773,9 @@ pub async fn await_pending_approval(ctx: AwaitContext<'_>) -> AwaitOutcome {
                 &ctx.deadline_at,
             );
             let _ = ctx.plugin_registry.emit_audit_event(&event).await;
+            if let Some(observer) = &observer {
+                observer.resolved(&approval_id, &ctx.tool_name, "expired");
+            }
             AwaitOutcome::Denied {
                 http_status: 408,
                 code: -32099,

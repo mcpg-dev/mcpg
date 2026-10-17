@@ -99,7 +99,10 @@ fn admitted_by(cel_allow_if: &str, identity: RequestIdentity) -> bool {
         TransportKind::Http,
     );
     matches!(
-        gate.evaluate_tool_call(&ToolPolicyContext::from_request_context(&context, "deploy")),
+        gate.evaluate(
+            &ToolPolicyContext::from_request_context(&context, "deploy"),
+            crate::runtime::policy::PolicyRoute::gateway(),
+        ),
         PreDispatchPolicyOutcome::Allow
     )
 }

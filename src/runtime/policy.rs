@@ -14,8 +14,156 @@ use cel::{
     objects::{Key as CelKey, Map as CelMap},
 };
 
+use crate::backends::{BackendInvocationRoute, PromptRoute, ResourceRoute};
 use crate::config::PolicyCacheConfig;
 use crate::runtime::{RequestContext, RequestTrustLevel};
+
+/// Where the router sends a request, as far as the gate needs to know: the
+/// federation that serves it, and a name other than the one the caller
+/// used that a rule for the served capability can be filed under.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PolicyRoute<'a> {
+    federation: Option<&'a str>,
+    listed_as: Option<&'a str>,
+    /// The kind of surface the request names, when the caller knows it. A
+    /// binding's rule applies only to a request for its own kind.
+    surface: Option<PolicySurface>,
+    /// What CEL reads as `arguments`: an event subscription's arguments.
+    arguments: Option<&'a serde_json::Value>,
+}
+
+/// The kind of surface a request names, and a binding's rule governs: a name
+/// can be a tool, a prompt and a resource at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PolicySurface {
+    Tool,
+    Prompt,
+    /// A resource or a resource template.
+    Resource,
+    /// An event type, named `event:<name>`.
+    Event,
+}
+
+impl PolicySurface {
+    /// What CEL reads as `surface`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::Prompt => "prompt",
+            Self::Resource => "resource",
+            Self::Event => "event",
+        }
+    }
+}
+
+impl<'a> PolicyRoute<'a> {
+    /// A surface the gateway serves itself: only the rules filed under the
+    /// name the caller used apply.
+    pub(crate) const fn gateway() -> Self {
+        Self {
+            federation: None,
+            listed_as: None,
+            surface: None,
+            arguments: None,
+        }
+    }
+
+    /// Served by `federation` when it is `Some`, by the gateway otherwise.
+    pub(crate) const fn served_by(federation: Option<&'a str>) -> Self {
+        Self {
+            federation,
+            listed_as: None,
+            surface: None,
+            arguments: None,
+        }
+    }
+
+    /// The same route for a request that names a `surface`.
+    pub(crate) const fn on(mut self, surface: PolicySurface) -> Self {
+        self.surface = Some(surface);
+        self
+    }
+
+    /// An event type the gateway serves, for a caller with `arguments`
+    /// (none for a listing).
+    pub(crate) const fn event(arguments: Option<&'a serde_json::Value>) -> Self {
+        let mut route = Self::gateway().on(PolicySurface::Event);
+        route.arguments = arguments;
+        route
+    }
+
+    pub(crate) fn for_tool(route: &'a BackendInvocationRoute) -> Self {
+        Self::served_by(route.federation()).on(PolicySurface::Tool)
+    }
+
+    pub(crate) fn for_prompt(route: &'a PromptRoute) -> Self {
+        Self::served_by(route.federation()).on(PolicySurface::Prompt)
+    }
+
+    /// A read may name its resource by another spelling of the URI, or by a
+    /// concrete URI a template matches, so the route also carries a name
+    /// the served resource's rule is filed under: the native binding it
+    /// dispatches to (a binding's rule is always filed under its name), or
+    /// the URI or URI template a federation lists it as.
+    pub(crate) fn for_resource(route: &'a ResourceRoute) -> Self {
+        let route = match route {
+            ResourceRoute::Federated {
+                source, listed_as, ..
+            } => Self {
+                federation: Some(source),
+                listed_as: Some(listed_as),
+                surface: None,
+                arguments: None,
+            },
+            ResourceRoute::Binding { profile } | ResourceRoute::Template { profile, .. } => Self {
+                federation: None,
+                listed_as: Some(profile),
+                surface: None,
+                arguments: None,
+            },
+            ResourceRoute::RuntimeOverview | ResourceRoute::GatewayApp { .. } => Self::gateway(),
+        };
+        route.on(PolicySurface::Resource)
+    }
+}
+
+/// The route the running catalog gives a name the admin policy preview asks
+/// about, owned so the running and the candidate policy decide under it.
+#[derive(Debug, Clone)]
+pub(crate) enum PreviewRoute {
+    Tool(BackendInvocationRoute),
+    Prompt(PromptRoute),
+    Resource(ResourceRoute),
+    /// Nothing in the running catalog answers to the name.
+    Unrouted,
+}
+
+impl PreviewRoute {
+    pub(crate) fn policy_route(&self) -> PolicyRoute<'_> {
+        match self {
+            Self::Tool(route) => PolicyRoute::for_tool(route),
+            Self::Prompt(route) => PolicyRoute::for_prompt(route),
+            Self::Resource(route) => PolicyRoute::for_resource(route),
+            Self::Unrouted => PolicyRoute::gateway(),
+        }
+    }
+
+    /// The surface the name was found on: `tool`, `prompt`, `resource`, or
+    /// `unrouted`.
+    pub(crate) fn surface(&self) -> &'static str {
+        match self {
+            Self::Tool(_) => "tool",
+            Self::Prompt(_) => "prompt",
+            Self::Resource(_) => "resource",
+            Self::Unrouted => "unrouted",
+        }
+    }
+
+    /// The federation the route sends the name to.
+    pub(crate) fn federation(&self) -> Option<&str> {
+        self.policy_route().federation
+    }
+}
 
 /// Configuration for the pre-dispatch policy gate: minimum trust levels
 /// and optional CEL expressions that determine whether a tool call is allowed.
@@ -46,6 +194,10 @@ pub struct ToolTrustRule {
     /// A caller missing any of these is denied 403 + an
     /// `insufficient_scope` step-up challenge.
     pub required_scopes: Vec<String>,
+    /// The kind of surface the rule governs: a binding's rule governs only
+    /// its own kind, so a prompt's rule never reaches a tool of the same
+    /// name. `None` (a central rule) governs every surface of the name.
+    pub surface: Option<PolicySurface>,
 }
 
 /// Input to the policy evaluator: tool name + caller identity attributes.
@@ -216,40 +368,77 @@ impl PreDispatchPolicyGate {
         })
     }
 
-    /// Shared handle to the federated-tool policy overlay. The
-    /// `FederationEngine` stores compiled per-federation rules here at
-    /// import time so synthetic tools inherit `governance.minimum_trust`
-    /// / `allow_if`.
+    /// Shared handle to the federated policy overlay. The
+    /// `FederationEngine` stores each federation's compiled rule here so
+    /// everything routed to that federation inherits its `governance`.
     pub(crate) fn federated_policy_handle(&self) -> Arc<ArcSwap<FederatedToolPolicies>> {
         Arc::clone(&self.tool_access_policy.federated)
     }
 
-    pub(crate) fn evaluate_tool_call(
+    /// Decide a request for the surface `policy_context` names, as the
+    /// router sends it: `route` says which federation serves it, if any.
+    pub(crate) fn evaluate(
         &self,
         policy_context: &ToolPolicyContext,
+        route: PolicyRoute<'_>,
     ) -> PreDispatchPolicyOutcome {
-        // Check cache first
+        // One snapshot for the whole decision, so the trust floor, the scopes
+        // and the per-tool CEL all judge the same federated governance.
+        let federated = self.tool_access_policy.federated.load();
         if let Some(ref cache) = self.cache {
-            let cache_key = policy_context.cache_key();
+            // A federation's rule changes without a new gate, so a decision
+            // routed to one is only reused under the version of its rule it
+            // was made under. A decision for a native route depends on no
+            // federation and survives every republish.
+            let depends_on = route
+                .federation
+                .map(|federation| (federation.to_owned(), federated.version(federation)));
+            let mut cache_key = format!(
+                "{}|{:?}|{:?}|{:?}",
+                policy_context.cache_key(),
+                depends_on,
+                route.listed_as,
+                route.surface,
+            );
+            // CEL reads the arguments, so they are part of the decision.
+            if let Some(arguments) = route.arguments {
+                cache_key.push_str("|args:");
+                cache_key.push_str(&hex::encode(hmac_sha256::Hash::hash(
+                    &mcpg_mcp_wire::shared::canonical::canonical_value_bytes(arguments),
+                )));
+            }
             if let Some(cached) = cache.get(&cache_key) {
                 metrics::counter!("mcpg_policy_cache_hits_total").increment(1);
                 return cached;
             }
             metrics::counter!("mcpg_policy_cache_misses_total").increment(1);
 
-            let outcome = self.evaluate_uncached(policy_context);
-            cache.put(cache_key, outcome.clone());
+            let outcome = self.evaluate_uncached(policy_context, &federated, route);
+            cache.put(cache_key, outcome.clone(), depends_on, &federated);
             return outcome;
         }
 
-        self.evaluate_uncached(policy_context)
+        self.evaluate_uncached(policy_context, &federated, route)
     }
 
-    fn evaluate_uncached(&self, policy_context: &ToolPolicyContext) -> PreDispatchPolicyOutcome {
+    fn evaluate_uncached(
+        &self,
+        policy_context: &ToolPolicyContext,
+        federated: &FederatedToolPolicies,
+        route: PolicyRoute<'_>,
+    ) -> PreDispatchPolicyOutcome {
+        let policy = &self.tool_access_policy;
+        let rules = match policy.rules_for(policy_context, federated, route) {
+            Ok(rules) => rules,
+            Err(denial) => return PreDispatchPolicyOutcome::Deny(denial),
+        };
+
         // Evaluate in order: trust level floor, then global CEL, then per-tool CEL.
-        let minimum_trust = self
-            .tool_access_policy
-            .required_trust_for(&policy_context.tool_name);
+        let minimum_trust = rules
+            .iter()
+            .map(|rule| rule.minimum_trust)
+            .max()
+            .unwrap_or(policy.default_minimum_trust);
 
         if policy_context.trust_level < minimum_trust {
             return PreDispatchPolicyOutcome::Deny(PolicyDenial {
@@ -271,34 +460,32 @@ impl PreDispatchPolicyGate {
         // distinct, flagged 403 so the transport mints the step-up
         // `insufficient_scope` challenge. Evaluated before CEL so the
         // scope-shaped denial isn't masked by a generic `allow_if` failure.
-        if let Some(denial) = self
-            .tool_access_policy
-            .evaluate_required_scopes(policy_context)
-        {
+        if let Some(denial) = ToolAccessPolicy::scope_denial(&rules, policy_context) {
             return PreDispatchPolicyOutcome::Deny(denial);
         }
 
-        if let Some(denial) = self
-            .tool_access_policy
-            .evaluate_cel_allow_if(policy_context)
-        {
+        if let Some(denial) = policy.evaluate_cel_allow_if(policy_context, route) {
             return PreDispatchPolicyOutcome::Deny(denial);
         }
 
-        if let Some(denial) = self
-            .tool_access_policy
-            .evaluate_per_tool_cel_allow_if(policy_context)
-        {
-            return PreDispatchPolicyOutcome::Deny(denial);
+        for rule in &rules {
+            if let Some(denial) = ToolAccessPolicy::eval_rule_cel(rule, policy_context, route) {
+                return PreDispatchPolicyOutcome::Deny(denial);
+            }
         }
 
         PreDispatchPolicyOutcome::Allow
     }
 
-    /// Returns true if a tool should be visible to the caller in discovery responses.
-    pub(crate) fn is_tool_visible(&self, policy_context: &ToolPolicyContext) -> bool {
+    /// Whether a listed surface is shown to the caller: exactly when a
+    /// request for it, routed as `route`, would be allowed.
+    pub(crate) fn is_visible(
+        &self,
+        policy_context: &ToolPolicyContext,
+        route: PolicyRoute<'_>,
+    ) -> bool {
         matches!(
-            self.evaluate_tool_call(policy_context),
+            self.evaluate(policy_context, route),
             PreDispatchPolicyOutcome::Allow
         )
     }
@@ -327,6 +514,22 @@ struct PolicyCache {
 struct CacheEntry {
     outcome: PreDispatchPolicyOutcome,
     inserted_at: Instant,
+    /// The federation whose rule the decision was made under, and that
+    /// rule's version.
+    depends_on: Option<(String, u64)>,
+}
+
+impl CacheEntry {
+    /// Whether a lookup can still find this entry: a decision made under a
+    /// federation rule that has since changed is keyed by a version no
+    /// lookup asks for again.
+    fn is_live(&self, ttl: Duration, federated: &FederatedToolPolicies) -> bool {
+        self.inserted_at.elapsed() <= ttl
+            && self
+                .depends_on
+                .as_ref()
+                .is_none_or(|(federation, version)| federated.version(federation) == *version)
+    }
 }
 
 impl PolicyCache {
@@ -347,22 +550,30 @@ impl PolicyCache {
         Some(entry.outcome.clone())
     }
 
-    fn put(&self, key: String, outcome: PreDispatchPolicyOutcome) {
+    /// Cache `outcome` under `key`. `depends_on` is the federation rule it
+    /// was decided under and `federated` the set in force, so a full cache
+    /// first drops what no lookup can reach any more.
+    fn put(
+        &self,
+        key: String,
+        outcome: PreDispatchPolicyOutcome,
+        depends_on: Option<(String, u64)>,
+        federated: &FederatedToolPolicies,
+    ) {
         let Ok(mut entries) = self.entries.lock() else {
             return;
         };
 
-        // Evict expired entries if at capacity
         if entries.len() >= self.max_entries {
             let ttl = self.ttl;
             let before = entries.len();
-            entries.retain(|_, entry| entry.inserted_at.elapsed() <= ttl);
+            entries.retain(|_, entry| entry.is_live(ttl, federated));
             let evicted = before - entries.len();
             if evicted > 0 {
                 metrics::counter!("mcpg_policy_cache_evictions_total").increment(evicted as u64);
             }
 
-            // If still at capacity after eviction, skip insertion
+            // Every entry is still reachable: the cache is at its bound.
             if entries.len() >= self.max_entries {
                 return;
             }
@@ -373,6 +584,7 @@ impl PolicyCache {
             CacheEntry {
                 outcome,
                 inserted_at: Instant::now(),
+                depends_on,
             },
         );
     }
@@ -392,25 +604,29 @@ impl std::fmt::Debug for PolicyCache {
 #[derive(Debug)]
 struct ToolAccessPolicy {
     default_minimum_trust: RequestTrustLevel,
-    per_tool_rules: HashMap<String, ToolRulePolicy>,
+    /// Every rule filed under a name. A central rule and a binding's rule
+    /// can share one (a resource's URI or a template), and both apply.
+    per_tool_rules: HashMap<String, Vec<ToolRulePolicy>>,
     cel_allow_if: Option<CelToolAccessPolicy>,
-    /// Per-tool rules for federated tools, published by the
-    /// `FederationEngine` (shared handle). Consulted after
-    /// `per_tool_rules` so a native rule always wins.
+    /// Each federation's rule, published by the `FederationEngine` (shared
+    /// handle). A request routed to a federation must pass it as well as
+    /// every rule in `per_tool_rules` that names the request.
     federated: Arc<ArcSwap<FederatedToolPolicies>>,
 }
 
 impl ToolAccessPolicy {
     fn from_config(config: ToolAccessPolicyConfig) -> Result<Self> {
+        let mut per_tool_rules: HashMap<String, Vec<ToolRulePolicy>> = HashMap::new();
+        for rule in config.rules {
+            let policy = ToolRulePolicy::from_rule(rule)?;
+            per_tool_rules
+                .entry(policy.tool_name.clone())
+                .or_default()
+                .push(policy);
+        }
         Ok(Self {
             default_minimum_trust: config.default_minimum_trust,
-            per_tool_rules: config
-                .rules
-                .into_iter()
-                .map(|rule| {
-                    ToolRulePolicy::from_rule(rule).map(|policy| (policy.tool_name.clone(), policy))
-                })
-                .collect::<Result<HashMap<_, _>>>()?,
+            per_tool_rules,
             cel_allow_if: config
                 .cel_allow_if
                 .map(|source| {
@@ -424,24 +640,67 @@ impl ToolAccessPolicy {
         })
     }
 
-    fn required_trust_for(&self, tool_name: &str) -> RequestTrustLevel {
-        if let Some(rule) = self.per_tool_rules.get(tool_name) {
-            return rule.minimum_trust;
+    /// The per-tool rules that govern a request, all of which must pass:
+    /// every native or central rule filed under the name the caller used or
+    /// under the name the route lists the capability as (a native rule only
+    /// when it governs the kind of surface requested), plus the rule of the
+    /// federation the route sends it to. A native or central
+    /// rule can therefore tighten a federation's rule but never loosen it,
+    /// and a federation's rule never reaches a surface the gateway serves
+    /// itself. Empty when no rule applies, so only the global floor and
+    /// `cel_allow_if` do.
+    ///
+    /// `Err` when the route names a federation whose governance did not
+    /// compile or that published none: its capabilities are refused rather
+    /// than handed to the global policy, which would drop that federation's
+    /// own floor, scopes and `allow_if`.
+    fn rules_for<'a>(
+        &'a self,
+        policy_context: &ToolPolicyContext,
+        federated: &'a FederatedToolPolicies,
+        route: PolicyRoute<'_>,
+    ) -> std::result::Result<Vec<&'a ToolRulePolicy>, PolicyDenial> {
+        let tool_name = policy_context.tool_name.as_str();
+        let listed_as = route.listed_as.filter(|listed| *listed != tool_name);
+        // A binding's rule names a surface of its own kind; a request of
+        // unknown kind is held to every rule of the name.
+        let governs = |rule: &&ToolRulePolicy| match (rule.surface, route.surface) {
+            (Some(governed), Some(requested)) => governed == requested,
+            _ => true,
+        };
+        let mut rules: Vec<&ToolRulePolicy> = std::iter::once(tool_name)
+            .chain(listed_as)
+            .filter_map(|name| self.per_tool_rules.get(name))
+            .flatten()
+            .filter(governs)
+            .collect();
+        let Some(federation) = route.federation else {
+            return Ok(rules);
+        };
+        let refused = |reason: &str| PolicyDenial {
+            code: -32603,
+            http_status: 500,
+            message: "tool access policy evaluation failed".to_owned(),
+            audit_reason: format!("{reason}:{tool_name}:{federation}"),
+            insufficient_scope: None,
+        };
+        match federated.rule(federation) {
+            Some(FederatedRule::Governed(policy)) => rules.push(policy),
+            Some(FederatedRule::Uncompiled) => {
+                return Err(refused("federation_governance_uncompiled"));
+            }
+            None => return Err(refused("federation_governance_missing")),
         }
-        if let Some(trust) = self
-            .federated
-            .load()
-            .rule_for(tool_name)
-            .map(|rule| rule.minimum_trust)
-        {
-            return trust;
-        }
-        self.default_minimum_trust
+        Ok(rules)
     }
 
-    fn evaluate_cel_allow_if(&self, policy_context: &ToolPolicyContext) -> Option<PolicyDenial> {
+    fn evaluate_cel_allow_if(
+        &self,
+        policy_context: &ToolPolicyContext,
+        route: PolicyRoute<'_>,
+    ) -> Option<PolicyDenial> {
         let cel_policy = self.cel_allow_if.as_ref()?;
-        match cel_policy.evaluate(policy_context) {
+        match cel_policy.evaluate_on(policy_context, route) {
             Ok(true) => None,
             Ok(false) => Some(PolicyDenial {
                 code: -32022,
@@ -469,38 +728,22 @@ impl ToolAccessPolicy {
         }
     }
 
-    fn evaluate_per_tool_cel_allow_if(
-        &self,
-        policy_context: &ToolPolicyContext,
-    ) -> Option<PolicyDenial> {
-        if let Some(rule) = self.per_tool_rules.get(&policy_context.tool_name) {
-            return Self::eval_rule_cel(rule, policy_context);
-        }
-        let federated = self.federated.load();
-        let rule = federated.rule_for(&policy_context.tool_name)?;
-        Self::eval_rule_cel(rule, policy_context)
-    }
-
-    /// SEP-2350 scope enforcement. Resolves the rule for the tool (native
-    /// first, then federated) and denies with a step-up-flagged
-    /// [`PolicyDenial`] when the caller is missing any required scope. A
-    /// native rule wins over a federated one, mirroring the CEL/trust path.
-    fn evaluate_required_scopes(&self, policy_context: &ToolPolicyContext) -> Option<PolicyDenial> {
-        if let Some(rule) = self.per_tool_rules.get(&policy_context.tool_name) {
-            return Self::scope_denial(rule, policy_context);
-        }
-        // Federated rules live behind an ArcSwap; resolve and check eagerly
-        // within the guard's lifetime.
-        let federated = self.federated.load();
-        let rule = federated.rule_for(&policy_context.tool_name)?;
-        Self::scope_denial(rule, policy_context)
-    }
-
+    /// SEP-2350 scope enforcement over the rules [`Self::rules_for`]
+    /// resolved: denies with a step-up-flagged [`PolicyDenial`] naming every
+    /// required scope the caller is missing.
     fn scope_denial(
-        rule: &ToolRulePolicy,
+        rules: &[&ToolRulePolicy],
         policy_context: &ToolPolicyContext,
     ) -> Option<PolicyDenial> {
-        let missing = rule.missing_scopes(policy_context);
+        let mut missing: Vec<String> = Vec::new();
+        for scope in rules
+            .iter()
+            .flat_map(|rule| rule.missing_scopes(policy_context))
+        {
+            if !missing.contains(&scope) {
+                missing.push(scope);
+            }
+        }
         if missing.is_empty() {
             return None;
         }
@@ -524,10 +767,11 @@ impl ToolAccessPolicy {
     fn eval_rule_cel(
         rule: &ToolRulePolicy,
         policy_context: &ToolPolicyContext,
+        route: PolicyRoute<'_>,
     ) -> Option<PolicyDenial> {
         let cel_policy = rule.cel_allow_if.as_ref()?;
 
-        match cel_policy.evaluate(policy_context) {
+        match cel_policy.evaluate_on(policy_context, route) {
             Ok(true) => None,
             Ok(false) => Some(PolicyDenial {
                 code: -32005,
@@ -562,81 +806,147 @@ struct ToolRulePolicy {
     minimum_trust: RequestTrustLevel,
     cel_allow_if: Option<CelToolAccessPolicy>,
     required_scopes: Vec<String>,
+    surface: Option<PolicySurface>,
 }
 
-/// Runtime-mutable per-tool policy for FEDERATED tools, published by the
-/// `FederationEngine` at import time so synthetic tools inherit their
-/// federation's governance. Keyed by the client-facing (prefixed) tool
-/// name.
+/// One federation's governance as the `FederationEngine` publishes it: the
+/// rule everything the router sends to that federation inherits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FederationGovernance {
+    pub federation: String,
+    pub minimum_trust: RequestTrustLevel,
+    pub cel_allow_if: Option<String>,
+    pub required_scopes: Vec<String>,
+}
+
+/// A federation's compiled rule.
+#[derive(Debug)]
+enum FederatedRule {
+    Governed(ToolRulePolicy),
+    /// The federation's governance did not compile. Every capability it
+    /// serves is refused.
+    Uncompiled,
+}
+
+impl FederatedRule {
+    fn compile(governance: &FederationGovernance) -> Self {
+        let federation = &governance.federation;
+        let rule = ToolTrustRule {
+            tool_name: federation.clone(),
+            minimum_trust: governance.minimum_trust,
+            cel_allow_if: governance.cel_allow_if.clone(),
+            required_scopes: governance.required_scopes.clone(),
+            surface: None,
+        };
+        match ToolRulePolicy::compile(
+            rule,
+            format!("mcp.federations[{federation}].governance.allow_if"),
+        ) {
+            Ok(policy) => Self::Governed(policy),
+            Err(error) => {
+                tracing::error!(
+                    federation = %federation,
+                    error = %format!("{error:#}"),
+                    "federation governance did not compile; every capability it serves is refused"
+                );
+                Self::Uncompiled
+            }
+        }
+    }
+}
+
+/// Runtime-mutable policy for FEDERATED capabilities, published by the
+/// `FederationEngine`: one rule per federation, keyed by federation name.
+///
+/// The gate applies a federation's rule to exactly what the router sends to
+/// that federation, never by matching names: the router serves a name or a
+/// URI natively before any federation, so a federation whose names, URIs,
+/// templates or prefix merely match a request must not govern it.
 #[derive(Debug, Default)]
 pub(crate) struct FederatedToolPolicies {
-    rules: HashMap<String, ToolRulePolicy>,
-    /// Prefix-keyed rules for federated surfaces whose client-facing name
-    /// is NOT known exactly at import time — concrete reads of a federated
-    /// resource *template* arrive as `<resource_uri_prefix><concrete-uri>`,
-    /// which can't be enumerated. Each entry is `(prefix, rule)`; a name
-    /// with no exact rule falls back to the first prefix it starts with.
-    prefix_rules: Vec<(String, ToolRulePolicy)>,
+    rules: HashMap<String, PublishedRule>,
+}
+
+/// One federation's rule as published, with the version the decisions
+/// cached under it are keyed by.
+#[derive(Debug)]
+struct PublishedRule {
+    governance: FederationGovernance,
+    rule: Arc<FederatedRule>,
+    /// Never reused for other governance, so a cached decision never
+    /// outlives the rule it was made under.
+    version: u64,
 }
 
 impl FederatedToolPolicies {
-    /// Compile federated tool rules (CEL compiled once here, not per
-    /// call). Mirrors the native per-tool rule path. `prefix_rules` carry a
-    /// match prefix (the federation's `resource_uri_prefix`) so template
-    /// reads inherit their federation's governance too.
-    pub(crate) fn compile(
-        rules: Vec<ToolTrustRule>,
-        prefix_rules: Vec<(String, ToolTrustRule)>,
-    ) -> Result<Self> {
-        let mut map = HashMap::with_capacity(rules.len());
-        for rule in rules {
-            let policy = ToolRulePolicy::from_rule(rule)?;
-            map.insert(policy.tool_name.clone(), policy);
-        }
-        let mut prefixes = Vec::with_capacity(prefix_rules.len());
-        for (prefix, rule) in prefix_rules {
-            if prefix.is_empty() {
-                // An empty prefix would match every request — skip it so a
-                // prefix-less federation can't blanket the whole gateway.
-                continue;
-            }
-            prefixes.push((prefix, ToolRulePolicy::from_rule(rule)?));
-        }
-        Ok(Self {
-            rules: map,
-            prefix_rules: prefixes,
-        })
+    /// Compile each federation's rule once. A federation whose rule does not
+    /// compile is recorded as refused; the others keep their own rules.
+    pub(crate) fn from_federations(
+        federations: impl IntoIterator<Item = FederationGovernance>,
+    ) -> Self {
+        Self::default().republished(federations)
     }
 
-    /// Resolve the governance rule for a client-facing name: exact match
-    /// first, then the first prefix rule the name starts with.
-    fn rule_for(&self, name: &str) -> Option<&ToolRulePolicy> {
-        if let Some(rule) = self.rules.get(name) {
-            return Some(rule);
-        }
-        self.prefix_rules
-            .iter()
-            .find(|(prefix, _)| name.starts_with(prefix.as_str()))
-            .map(|(_, rule)| rule)
+    /// The set `federations` publishes after this one. A federation whose
+    /// governance is unchanged keeps its compiled rule and its version, so
+    /// the decisions cached under it stay valid; a new or changed one is
+    /// compiled under a new version.
+    pub(crate) fn republished(
+        &self,
+        federations: impl IntoIterator<Item = FederationGovernance>,
+    ) -> Self {
+        static VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let rules = federations
+            .into_iter()
+            .map(|governance| {
+                let published = match self.rules.get(&governance.federation) {
+                    Some(previous) if previous.governance == governance => PublishedRule {
+                        governance,
+                        rule: Arc::clone(&previous.rule),
+                        version: previous.version,
+                    },
+                    _ => PublishedRule {
+                        rule: Arc::new(FederatedRule::compile(&governance)),
+                        version: VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                        governance,
+                    },
+                };
+                (published.governance.federation.clone(), published)
+            })
+            .collect();
+        Self { rules }
+    }
+
+    fn rule(&self, federation: &str) -> Option<&FederatedRule> {
+        self.rules
+            .get(federation)
+            .map(|published| published.rule.as_ref())
+    }
+
+    /// The version of `federation`'s published rule; 0 when it has none.
+    fn version(&self, federation: &str) -> u64 {
+        self.rules
+            .get(federation)
+            .map_or(0, |published| published.version)
     }
 }
 
 impl ToolRulePolicy {
     fn from_rule(rule: ToolTrustRule) -> Result<Self> {
-        let tool_name = rule.tool_name;
+        let config_path = format!("policy.tool_access.rules[{}].cel_allow_if", rule.tool_name);
+        Self::compile(rule, config_path)
+    }
+
+    fn compile(rule: ToolTrustRule, config_path: String) -> Result<Self> {
         Ok(Self {
             minimum_trust: rule.minimum_trust,
             cel_allow_if: rule
                 .cel_allow_if
-                .map(|source| {
-                    CelToolAccessPolicy::compile(
-                        source,
-                        format!("policy.tool_access.rules[{tool_name}].cel_allow_if"),
-                    )
-                })
+                .map(|source| CelToolAccessPolicy::compile(source, config_path))
                 .transpose()?,
             required_scopes: rule.required_scopes,
-            tool_name,
+            tool_name: rule.tool_name,
+            surface: rule.surface,
         })
     }
 
@@ -665,11 +975,28 @@ impl CelToolAccessPolicy {
         Ok(Self { source, program })
     }
 
+    #[cfg(test)]
     fn evaluate(&self, policy_context: &ToolPolicyContext) -> Result<bool> {
+        self.evaluate_on(policy_context, PolicyRoute::gateway())
+    }
+
+    fn evaluate_on(
+        &self,
+        policy_context: &ToolPolicyContext,
+        route: PolicyRoute<'_>,
+    ) -> Result<bool> {
         let mut context = CelContext::default();
         context
             .add_variable("tool_name", policy_context.tool_name.as_str())
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        context
+            .add_variable("surface", route.surface.map_or("", PolicySurface::as_str))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let arguments = route
+            .arguments
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        context.add_variable_from_value("arguments", mcpg_expr::json_to_cel(&arguments));
         context
             .add_variable("trust_level", policy_context.trust_level_name())
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -870,49 +1197,900 @@ mod tests {
         }
     }
 
+    impl PreDispatchPolicyGate {
+        /// A request for a surface the gateway serves itself.
+        fn evaluate_tool_call(
+            &self,
+            policy_context: &ToolPolicyContext,
+        ) -> PreDispatchPolicyOutcome {
+            self.evaluate(policy_context, PolicyRoute::gateway())
+        }
+
+        /// Publish `federations` after the current set, as the federation
+        /// engine does on every refresh.
+        fn store_federations<const N: usize>(&self, federations: [FederationGovernance; N]) {
+            let handle = self.federated_policy_handle();
+            let next = handle.load().republished(federations);
+            handle.store(Arc::new(next));
+        }
+
+        fn cached_decisions(&self) -> usize {
+            self.cache
+                .as_ref()
+                .map_or(0, |cache| cache.entries.lock().expect("cache lock").len())
+        }
+    }
+
+    fn allows(outcome: PreDispatchPolicyOutcome) -> bool {
+        matches!(outcome, PreDispatchPolicyOutcome::Allow)
+    }
+
     #[test]
     fn federated_tools_inherit_their_federation_governance() {
         let gate = PreDispatchPolicyGate::try_new(ToolAccessPolicyConfig::default())
             .expect("default policy valid");
-        // The engine publishes per-federation rules at import time.
-        gate.federated_policy_handle().store(std::sync::Arc::new(
-            FederatedToolPolicies::compile(
-                vec![
-                    ToolTrustRule {
-                        tool_name: "notion.search".to_owned(),
-                        minimum_trust: RequestTrustLevel::Unauthenticated,
-                        cel_allow_if: None,
-                        required_scopes: Vec::new(),
-                    },
-                    ToolTrustRule {
-                        tool_name: "notion.admin".to_owned(),
-                        minimum_trust: RequestTrustLevel::Verified,
-                        cel_allow_if: None,
-                        required_scopes: Vec::new(),
-                    },
-                ],
-                vec![],
-            )
-            .expect("compile federated rules"),
-        ));
-        let anon = |tool: &str| {
-            ToolPolicyContext::from_request_context(
-                &sample_context(RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                }),
-                tool,
-            )
-        };
+        gate.store_federations([
+            federation_governance("notion", RequestTrustLevel::Unauthenticated, None, &[]),
+            federation_governance("admin", RequestTrustLevel::Verified, None, &[]),
+        ]);
         // Federated rule lowers the bar below the default → allowed.
-        assert!(matches!(
-            gate.evaluate_tool_call(&anon("notion.search")),
-            PreDispatchPolicyOutcome::Allow
-        ));
+        assert!(allows(gate.evaluate(
+            &anonymous_context("notion.search"),
+            PolicyRoute::served_by(Some("notion"))
+        )));
         // Federated rule raises the bar → denied (governance enforced).
-        assert!(matches!(
-            gate.evaluate_tool_call(&anon("notion.admin")),
-            PreDispatchPolicyOutcome::Deny(_)
+        assert!(!allows(gate.evaluate(
+            &anonymous_context("admin.purge"),
+            PolicyRoute::served_by(Some("admin"))
+        )));
+    }
+
+    fn federation_governance(
+        federation: &str,
+        minimum_trust: RequestTrustLevel,
+        allow_if: Option<&str>,
+        required_scopes: &[&str],
+    ) -> FederationGovernance {
+        FederationGovernance {
+            federation: federation.to_owned(),
+            minimum_trust,
+            cel_allow_if: allow_if.map(str::to_owned),
+            required_scopes: required_scopes.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn gate_with_default_floor(default_minimum_trust: RequestTrustLevel) -> PreDispatchPolicyGate {
+        gate_with_rules(default_minimum_trust, Vec::new())
+    }
+
+    fn gate_with_rules(
+        default_minimum_trust: RequestTrustLevel,
+        rules: Vec<ToolTrustRule>,
+    ) -> PreDispatchPolicyGate {
+        PreDispatchPolicyGate::try_new(ToolAccessPolicyConfig {
+            default_minimum_trust,
+            cel_allow_if: None,
+            rules,
+        })
+        .expect("policy valid")
+    }
+
+    fn rule(
+        name: &str,
+        minimum_trust: RequestTrustLevel,
+        allow_if: Option<&str>,
+        required_scopes: &[&str],
+    ) -> ToolTrustRule {
+        ToolTrustRule {
+            tool_name: name.to_owned(),
+            minimum_trust,
+            cel_allow_if: allow_if.map(str::to_owned),
+            required_scopes: required_scopes.iter().map(|s| (*s).to_owned()).collect(),
+            surface: None,
+        }
+    }
+
+    /// A federated read routed as the read path routes it: `listed_as` is
+    /// the URI or template the federation lists the resource under.
+    fn federated_read(federation: &str, listed_as: &str) -> ResourceRoute {
+        ResourceRoute::Federated {
+            source: federation.to_owned(),
+            upstream_uri: String::new(),
+            listed_as: listed_as.to_owned(),
+        }
+    }
+
+    fn anonymous_context(tool: &str) -> ToolPolicyContext {
+        ToolPolicyContext::from_request_context(
+            &sample_context(RequestIdentity::Anonymous {
+                source: "test".to_owned(),
+            }),
+            tool,
+        )
+    }
+
+    fn verified_context_for(tool: &str, scopes: &[&str]) -> ToolPolicyContext {
+        let mut context = verified_context_with_claims(vec![], vec![], scopes.to_vec(), vec![]);
+        context.tool_name = tool.to_owned();
+        context
+    }
+
+    /// A federation whose `allow_if` does not compile has every capability
+    /// it serves refused, even for a caller who clears its trust floor,
+    /// while the other federations keep their own rules. The gateway-wide
+    /// default is never consulted for it.
+    #[test]
+    fn uncompiled_federation_governance_refuses_only_that_federation() {
+        let gate = gate_with_default_floor(RequestTrustLevel::Unauthenticated);
+        gate.store_federations([
+            federation_governance(
+                "broken",
+                RequestTrustLevel::Unauthenticated,
+                Some("tool_name == "),
+                &[],
+            ),
+            federation_governance(
+                "notion",
+                RequestTrustLevel::Verified,
+                Some(r#"tool_name == "notion.search""#),
+                &[],
+            ),
+        ]);
+        let broken = PolicyRoute::served_by(Some("broken"));
+        let notion = PolicyRoute::served_by(Some("notion"));
+
+        for context in [
+            anonymous_context("broken.search"),
+            verified_context_for("broken.search", &[]),
+            verified_context_for("mcp://broken/pages/{id}", &[]),
+        ] {
+            match gate.evaluate(&context, broken) {
+                PreDispatchPolicyOutcome::Deny(denial) => {
+                    assert_eq!(denial.http_status, 500);
+                    assert!(
+                        denial
+                            .audit_reason
+                            .starts_with("federation_governance_uncompiled:"),
+                        "{}",
+                        denial.audit_reason
+                    );
+                    assert!(denial.audit_reason.ends_with(":broken"));
+                }
+                PreDispatchPolicyOutcome::Allow => {
+                    panic!("{} must be refused", context.tool_name)
+                }
+            }
+            assert!(!gate.is_visible(&context, broken));
+        }
+        // A concrete template read the router sends to the broken federation.
+        let read = verified_context_for("mcp://broken/pages/1", &[]);
+        let route = federated_read("broken", "mcp://broken/pages/{id}");
+        match gate.evaluate(&read, PolicyRoute::for_resource(&route)) {
+            PreDispatchPolicyOutcome::Deny(denial) => assert_eq!(
+                denial.audit_reason,
+                "federation_governance_uncompiled:mcp://broken/pages/1:broken"
+            ),
+            PreDispatchPolicyOutcome::Allow => panic!("a read routed to it must be refused"),
+        }
+
+        // The healthy federation keeps its floor and its allow_if.
+        assert!(allows(
+            gate.evaluate(&verified_context_for("notion.search", &[]), notion)
         ));
+        assert!(!allows(
+            gate.evaluate(&anonymous_context("notion.search"), notion)
+        ));
+        assert!(!allows(
+            gate.evaluate(&verified_context_for("notion.delete", &[]), notion)
+        ));
+        // A name the gateway serves itself still follows the gateway default.
+        assert!(allows(
+            gate.evaluate_tool_call(&anonymous_context("native.echo"))
+        ));
+    }
+
+    /// A federation's `required_scopes` is enforced like a binding's: a
+    /// caller short of a scope is refused with the step-up flag naming it.
+    #[test]
+    fn federated_required_scopes_are_enforced() {
+        let gate = PreDispatchPolicyGate::try_new(ToolAccessPolicyConfig::default())
+            .expect("default policy valid");
+        gate.store_federations([federation_governance(
+            "notion",
+            RequestTrustLevel::Verified,
+            None,
+            &["notion.read"],
+        )]);
+        let notion = PolicyRoute::served_by(Some("notion"));
+
+        match gate.evaluate(&verified_context_for("notion.search", &["other"]), notion) {
+            PreDispatchPolicyOutcome::Deny(denial) => {
+                assert_eq!(denial.http_status, 403);
+                assert_eq!(
+                    denial.insufficient_scope.as_deref(),
+                    Some(["notion.read".to_owned()].as_slice()),
+                );
+            }
+            PreDispatchPolicyOutcome::Allow => panic!("a caller without the scope is refused"),
+        }
+        assert!(allows(gate.evaluate(
+            &verified_context_for("notion.search", &["notion.read"]),
+            notion
+        )));
+    }
+
+    /// A binding's rule governs its own kind of surface only. A native
+    /// prompt's rule never tightens a federated tool, or a native tool, of
+    /// the same name; a native tool's rule, which names the routed surface,
+    /// still tightens a federated tool of its name; a central rule governs
+    /// every surface of its name; and a request of unknown kind is held to
+    /// every rule of the name.
+    #[test]
+    fn a_binding_rule_governs_only_its_own_kind_of_surface() {
+        let crm = PolicyRoute::served_by(Some("crm"));
+        let gateway = PolicyRoute::gateway();
+        let lenient_crm =
+            federation_governance("crm", RequestTrustLevel::Unauthenticated, None, &[]);
+        let gate_with = |surface: Option<PolicySurface>| {
+            let gate = gate_with_rules(
+                RequestTrustLevel::Unauthenticated,
+                vec![ToolTrustRule {
+                    surface,
+                    ..rule("search", RequestTrustLevel::Verified, None, &[])
+                }],
+            );
+            gate.store_federations([lenient_crm.clone()]);
+            gate
+        };
+        let anonymous = anonymous_context("search");
+
+        let prompt_rule = gate_with(Some(PolicySurface::Prompt));
+        assert!(allows(
+            prompt_rule.evaluate(&anonymous, crm.on(PolicySurface::Tool))
+        ));
+        assert!(allows(
+            prompt_rule.evaluate(&anonymous, gateway.on(PolicySurface::Tool))
+        ));
+        assert!(!allows(
+            prompt_rule.evaluate(&anonymous, gateway.on(PolicySurface::Prompt))
+        ));
+        assert!(!allows(
+            prompt_rule.evaluate(&anonymous, crm.on(PolicySurface::Prompt))
+        ));
+        assert!(!allows(prompt_rule.evaluate(&anonymous, gateway)));
+
+        let tool_rule = gate_with(Some(PolicySurface::Tool));
+        assert!(!allows(
+            tool_rule.evaluate(&anonymous, crm.on(PolicySurface::Tool))
+        ));
+        assert!(allows(
+            tool_rule.evaluate(&anonymous, crm.on(PolicySurface::Prompt))
+        ));
+        assert!(allows(
+            tool_rule.evaluate(&anonymous, gateway.on(PolicySurface::Resource))
+        ));
+
+        let central_rule = gate_with(None);
+        for surface in [
+            PolicySurface::Tool,
+            PolicySurface::Prompt,
+            PolicySurface::Resource,
+        ] {
+            assert!(
+                !allows(central_rule.evaluate(&anonymous, crm.on(surface))),
+                "{surface:?}"
+            );
+        }
+    }
+
+    /// A cached decision for one kind of surface is never reused for another
+    /// of the same name.
+    #[test]
+    fn a_cached_decision_is_kept_per_kind_of_surface() {
+        let gate = PreDispatchPolicyGate::try_new_with_cache(
+            ToolAccessPolicyConfig {
+                default_minimum_trust: RequestTrustLevel::Unauthenticated,
+                cel_allow_if: None,
+                rules: vec![ToolTrustRule {
+                    surface: Some(PolicySurface::Prompt),
+                    ..rule("search", RequestTrustLevel::Verified, None, &[])
+                }],
+            },
+            &PolicyCacheConfig {
+                enabled: true,
+                ttl_ms: 60_000,
+                max_entries: 64,
+            },
+        )
+        .expect("policy valid");
+        let anonymous = anonymous_context("search");
+        let gateway = PolicyRoute::gateway();
+        assert!(allows(
+            gate.evaluate(&anonymous, gateway.on(PolicySurface::Tool))
+        ));
+        assert!(!allows(
+            gate.evaluate(&anonymous, gateway.on(PolicySurface::Prompt))
+        ));
+    }
+
+    /// A central or native rule that names what the router sends to a
+    /// federation is applied on top of the federation's rule: it can raise
+    /// the floor, add scopes and add an `allow_if`, but a lower floor, fewer
+    /// scopes or a more permissive condition never loosen the federation's.
+    #[test]
+    fn a_native_or_central_rule_tightens_a_federation_but_never_loosens_it() {
+        let crm = PolicyRoute::served_by(Some("crm"));
+        let strict_crm = federation_governance(
+            "crm",
+            RequestTrustLevel::Verified,
+            Some(r#""sales" in identity.groups"#),
+            &["crm.read"],
+        );
+        let mut sales = verified_context_for("search", &["crm.read"]);
+        sales.groups = vec!["sales".to_owned()];
+
+        // A lenient rule of the same name: the federation's rule still holds.
+        let gate = gate_with_rules(
+            RequestTrustLevel::Unauthenticated,
+            vec![rule(
+                "search",
+                RequestTrustLevel::Unauthenticated,
+                Some("true"),
+                &[],
+            )],
+        );
+        gate.store_federations([strict_crm.clone()]);
+        assert!(!allows(gate.evaluate(&anonymous_context("search"), crm)));
+        match gate.evaluate(&verified_context_for("search", &[]), crm) {
+            PreDispatchPolicyOutcome::Deny(denial) => assert_eq!(
+                denial.insufficient_scope.as_deref(),
+                Some(["crm.read".to_owned()].as_slice()),
+            ),
+            PreDispatchPolicyOutcome::Allow => panic!("the federation's scope still applies"),
+        }
+        assert!(!allows(
+            gate.evaluate(&verified_context_for("search", &["crm.read"]), crm)
+        ));
+        assert!(allows(gate.evaluate(&sales, crm)));
+
+        // A strict rule of the same name tightens a lenient federation.
+        let gate = gate_with_rules(
+            RequestTrustLevel::Unauthenticated,
+            vec![rule(
+                "search",
+                RequestTrustLevel::HeaderAsserted,
+                Some(r#""sales" in identity.groups"#),
+                &["crm.audit"],
+            )],
+        );
+        gate.store_federations([federation_governance(
+            "crm",
+            RequestTrustLevel::Unauthenticated,
+            None,
+            &[],
+        )]);
+        assert!(!allows(gate.evaluate(&anonymous_context("search"), crm)));
+        assert!(!allows(gate.evaluate(&sales, crm)));
+        sales.scopes.push("crm.audit".to_owned());
+        assert!(allows(gate.evaluate(&sales, crm)));
+        sales.groups.clear();
+        assert!(!allows(gate.evaluate(&sales, crm)));
+    }
+
+    /// A federated read answers to a rule filed under the URI or template
+    /// the federation lists it as, whichever spelling or concrete URI the
+    /// client read it by.
+    #[test]
+    fn a_rule_naming_a_listed_federated_uri_holds_for_every_read_of_it() {
+        let gate = gate_with_rules(
+            RequestTrustLevel::Unauthenticated,
+            vec![
+                rule(
+                    "https://docs.example/readme",
+                    RequestTrustLevel::Verified,
+                    None,
+                    &[],
+                ),
+                rule(
+                    "notion://pages/{id}",
+                    RequestTrustLevel::Verified,
+                    None,
+                    &[],
+                ),
+            ],
+        );
+        gate.store_federations([federation_governance(
+            "docs",
+            RequestTrustLevel::Unauthenticated,
+            None,
+            &[],
+        )]);
+        let readme = federated_read("docs", "https://docs.example/readme");
+        let page = federated_read("docs", "notion://pages/{id}");
+        for (uri, route) in [
+            ("HTTPS://Docs.Example:443/readme", &readme),
+            ("notion://pages/42", &page),
+        ] {
+            let route = PolicyRoute::for_resource(route);
+            assert!(
+                !allows(gate.evaluate(&anonymous_context(uri), route)),
+                "{uri}"
+            );
+            assert!(
+                allows(gate.evaluate(&verified_context_for(uri, &[]), route)),
+                "{uri}"
+            );
+        }
+    }
+
+    /// A read the router sends to a federation answers to that federation's
+    /// rule however it is spelled: a URI in another case or with a default
+    /// port, and a concrete URI one of its templates matches when the
+    /// federation has no `resource_uri_prefix`.
+    #[test]
+    fn a_read_routed_to_a_federation_answers_to_its_rule_by_any_spelling() {
+        let gate = gate_with_default_floor(RequestTrustLevel::Unauthenticated);
+        gate.store_federations([federation_governance(
+            "docs",
+            RequestTrustLevel::Verified,
+            None,
+            &["docs.read"],
+        )]);
+
+        let readme = federated_read("docs", "https://docs.example/readme");
+        let page = federated_read("docs", "notion://pages/{id}");
+        let routed = [
+            ("https://docs.example/readme", &readme),
+            ("HTTPS://Docs.Example:443/readme", &readme),
+            (" https://docs.example/readme ", &readme),
+            ("notion://pages/42", &page),
+            ("notion://pages/{id}", &page),
+        ];
+        for (uri, route) in routed {
+            let decide = |context: &ToolPolicyContext| {
+                gate.evaluate(context, PolicyRoute::for_resource(route))
+            };
+            assert!(
+                matches!(
+                    decide(&anonymous_context(uri)),
+                    PreDispatchPolicyOutcome::Deny(_)
+                ),
+                "{uri} must answer to the federation's floor"
+            );
+            match decide(&verified_context_for(uri, &[])) {
+                PreDispatchPolicyOutcome::Deny(denial) => assert_eq!(
+                    denial.insufficient_scope.as_deref(),
+                    Some(["docs.read".to_owned()].as_slice()),
+                    "{uri}"
+                ),
+                PreDispatchPolicyOutcome::Allow => panic!("{uri} must require docs.read"),
+            }
+            assert!(matches!(
+                decide(&verified_context_for(uri, &["docs.read"])),
+                PreDispatchPolicyOutcome::Allow
+            ));
+        }
+    }
+
+    /// A federation governs only what the router sends to it. A name it
+    /// lists, or one of its URIs or templates would match, but that the
+    /// router serves natively (a gateway-internal tool, a native template's
+    /// concrete URI, another spelling of a native resource) keeps the
+    /// gateway's own policy even when the federation's floor is lower —
+    /// otherwise an upstream could lower it by advertising a prompt or a
+    /// template under that name.
+    #[test]
+    fn a_federation_does_not_govern_what_the_router_sends_elsewhere() {
+        let gate = gate_with_default_floor(RequestTrustLevel::HeaderAsserted);
+        gate.store_federations([federation_governance(
+            "open",
+            RequestTrustLevel::Unauthenticated,
+            None,
+            &[],
+        )]);
+
+        for name in [
+            "mcpg.debug.command_probe",
+            "file:///secrets",
+            "HTTPS://docs.example/readme",
+        ] {
+            assert!(
+                !allows(gate.evaluate(&anonymous_context(name), PolicyRoute::gateway())),
+                "{name} is not the federation's to open"
+            );
+            assert!(
+                allows(gate.evaluate(
+                    &anonymous_context(name),
+                    PolicyRoute::served_by(Some("open"))
+                )),
+                "{name} routed to the federation takes its floor"
+            );
+        }
+    }
+
+    /// A native read answers to the rule of the binding it routes to, which
+    /// is filed under the binding's name: a concrete URI a template matches
+    /// and another spelling of a resource's URI get the binding's floor, not
+    /// the gateway default.
+    #[test]
+    fn a_native_read_answers_to_the_binding_it_routes_to() {
+        let gate = gate_with_rules(
+            RequestTrustLevel::Unauthenticated,
+            vec![
+                rule("page", RequestTrustLevel::Verified, None, &["wiki.read"]),
+                rule("wiki://pages/{id}", RequestTrustLevel::Verified, None, &[]),
+                rule("readme", RequestTrustLevel::Verified, None, &[]),
+                rule(
+                    "https://docs.example/readme",
+                    RequestTrustLevel::Verified,
+                    None,
+                    &[],
+                ),
+            ],
+        );
+        let page = ResourceRoute::Template {
+            profile: "page".to_owned(),
+            template_vars: std::collections::BTreeMap::new(),
+        };
+        let readme = ResourceRoute::Binding {
+            profile: "readme".to_owned(),
+        };
+        for (uri, route) in [
+            ("wiki://pages/7", &page),
+            ("HTTPS://Docs.Example:443/readme", &readme),
+        ] {
+            let route = PolicyRoute::for_resource(route);
+            assert!(
+                !allows(gate.evaluate(&anonymous_context(uri), route)),
+                "{uri} must answer to its binding's floor"
+            );
+        }
+        match gate.evaluate(
+            &verified_context_for("wiki://pages/7", &[]),
+            PolicyRoute::for_resource(&page),
+        ) {
+            PreDispatchPolicyOutcome::Deny(denial) => assert_eq!(
+                denial.insufficient_scope.as_deref(),
+                Some(["wiki.read".to_owned()].as_slice())
+            ),
+            PreDispatchPolicyOutcome::Allow => panic!("the template binding's scope applies"),
+        }
+        assert!(allows(gate.evaluate(
+            &verified_context_for("wiki://pages/7", &["wiki.read"]),
+            PolicyRoute::for_resource(&page)
+        )));
+        assert!(allows(gate.evaluate(
+            &verified_context_for("HTTPS://Docs.Example:443/readme", &[]),
+            PolicyRoute::for_resource(&readme)
+        )));
+    }
+
+    /// A read routed to a federation that published no governance is
+    /// refused rather than decided by the gateway-wide policy.
+    #[test]
+    fn a_read_routed_to_an_ungoverned_federation_is_refused() {
+        let gate = gate_with_default_floor(RequestTrustLevel::Unauthenticated);
+        let route = federated_read("ghost", "notes/{id}");
+        match gate.evaluate(
+            &anonymous_context("notes/1"),
+            PolicyRoute::for_resource(&route),
+        ) {
+            PreDispatchPolicyOutcome::Deny(denial) => {
+                assert_eq!(denial.http_status, 500);
+                assert_eq!(
+                    denial.audit_reason,
+                    "federation_governance_missing:notes/1:ghost"
+                );
+            }
+            PreDispatchPolicyOutcome::Allow => panic!("an ungoverned route must be refused"),
+        }
+    }
+
+    /// Federated governance changes under a running gate as imports land, so
+    /// a cached decision is only reused under the set it was made under.
+    #[test]
+    fn a_cached_decision_does_not_outlive_its_federated_policy_set() {
+        let gate = PreDispatchPolicyGate::try_new_with_cache(
+            ToolAccessPolicyConfig {
+                default_minimum_trust: RequestTrustLevel::Unauthenticated,
+                cel_allow_if: None,
+                rules: Vec::new(),
+            },
+            &crate::config::PolicyCacheConfig {
+                enabled: true,
+                ttl_ms: 600_000,
+                max_entries: 100,
+            },
+        )
+        .expect("policy valid");
+        let caller = anonymous_context("late.search");
+        let late = PolicyRoute::served_by(Some("late"));
+        gate.store_federations([federation_governance(
+            "late",
+            RequestTrustLevel::Unauthenticated,
+            None,
+            &[],
+        )]);
+        assert!(allows(gate.evaluate(&caller, late)));
+
+        gate.store_federations([federation_governance(
+            "late",
+            RequestTrustLevel::Verified,
+            None,
+            &[],
+        )]);
+        assert!(!allows(gate.evaluate(&caller, late)));
+
+        // The same name decided for a native route and for a route to the
+        // federation are two decisions, not one cached answer; so are two
+        // reads of one URI listed under different names.
+        let reader = anonymous_context("late://notes/1");
+        assert!(allows(gate.evaluate(&reader, PolicyRoute::gateway())));
+        assert!(!allows(gate.evaluate(&reader, late)));
+        let gate = PreDispatchPolicyGate::try_new_with_cache(
+            ToolAccessPolicyConfig {
+                default_minimum_trust: RequestTrustLevel::Unauthenticated,
+                cel_allow_if: None,
+                rules: vec![rule(
+                    "late://notes/{id}",
+                    RequestTrustLevel::Verified,
+                    None,
+                    &[],
+                )],
+            },
+            &crate::config::PolicyCacheConfig {
+                enabled: true,
+                ttl_ms: 600_000,
+                max_entries: 100,
+            },
+        )
+        .expect("policy valid");
+        gate.store_federations([federation_governance(
+            "late",
+            RequestTrustLevel::Unauthenticated,
+            None,
+            &[],
+        )]);
+        let other = federated_read("late", "late://notes/1");
+        let template = federated_read("late", "late://notes/{id}");
+        assert!(allows(
+            gate.evaluate(&reader, PolicyRoute::for_resource(&other))
+        ));
+        assert!(!allows(
+            gate.evaluate(&reader, PolicyRoute::for_resource(&template))
+        ));
+    }
+
+    fn cached_gate(max_entries: usize) -> PreDispatchPolicyGate {
+        PreDispatchPolicyGate::try_new_with_cache(
+            ToolAccessPolicyConfig {
+                default_minimum_trust: RequestTrustLevel::Unauthenticated,
+                cel_allow_if: None,
+                rules: Vec::new(),
+            },
+            &crate::config::PolicyCacheConfig {
+                enabled: true,
+                ttl_ms: 600_000,
+                max_entries,
+            },
+        )
+        .expect("policy valid")
+    }
+
+    /// An event rule's CEL reads `surface` and the subscription
+    /// `arguments`, and a cached decision for one argument set never
+    /// answers for another.
+    #[test]
+    fn event_rules_read_the_surface_and_arguments_and_cache_per_argument_set() {
+        let gate = PreDispatchPolicyGate::try_new_with_cache(
+            ToolAccessPolicyConfig {
+                default_minimum_trust: RequestTrustLevel::Unauthenticated,
+                cel_allow_if: None,
+                rules: vec![ToolTrustRule {
+                    tool_name: "event:orders.created".to_owned(),
+                    minimum_trust: RequestTrustLevel::Unauthenticated,
+                    cel_allow_if: Some(
+                        r#"surface == "event" && (!has(arguments.region) || arguments.region == "eu")"#
+                            .to_owned(),
+                    ),
+                    required_scopes: Vec::new(),
+                    surface: Some(PolicySurface::Event),
+                }],
+            },
+            &crate::config::PolicyCacheConfig {
+                enabled: true,
+                ttl_ms: 600_000,
+                max_entries: 100,
+            },
+        )
+        .expect("policy valid");
+        let caller = anonymous_context("event:orders.created");
+        let eu = serde_json::json!({ "region": "eu" });
+        let us = serde_json::json!({ "region": "us" });
+        assert!(allows(
+            gate.evaluate(&caller, PolicyRoute::event(Some(&eu)))
+        ));
+        assert!(!allows(
+            gate.evaluate(&caller, PolicyRoute::event(Some(&us)))
+        ));
+        assert!(allows(
+            gate.evaluate(&caller, PolicyRoute::event(Some(&eu)))
+        ));
+        assert!(
+            allows(gate.evaluate(&caller, PolicyRoute::event(None))),
+            "a listing has no arguments"
+        );
+        // A tool of the same bare name is not governed by the event rule.
+        let tool = anonymous_context("orders.created");
+        assert!(allows(gate.evaluate(&tool, PolicyRoute::gateway())));
+    }
+
+    #[test]
+    fn a_republish_keeps_the_decisions_its_rules_still_make() {
+        let gate = cached_gate(100);
+        let notion = federation_governance("notion", RequestTrustLevel::Unauthenticated, None, &[]);
+        let crm = federation_governance("crm", RequestTrustLevel::Unauthenticated, None, &[]);
+        gate.store_federations([notion.clone(), crm.clone()]);
+        let search = anonymous_context("notion.search");
+        let contacts = anonymous_context("crm.contacts");
+        let native = anonymous_context("mcpg.runtime.snapshot");
+        assert!(allows(
+            gate.evaluate(&search, PolicyRoute::served_by(Some("notion")))
+        ));
+        assert!(allows(
+            gate.evaluate(&contacts, PolicyRoute::served_by(Some("crm")))
+        ));
+        assert!(allows(gate.evaluate(&native, PolicyRoute::gateway())));
+        assert_eq!(gate.cached_decisions(), 3);
+
+        // A refresh that publishes the same governance decides nothing anew.
+        gate.store_federations([notion.clone(), crm.clone()]);
+        assert!(allows(
+            gate.evaluate(&search, PolicyRoute::served_by(Some("notion")))
+        ));
+        assert!(allows(
+            gate.evaluate(&contacts, PolicyRoute::served_by(Some("crm")))
+        ));
+        assert!(allows(gate.evaluate(&native, PolicyRoute::gateway())));
+        assert_eq!(gate.cached_decisions(), 3);
+
+        // A changed rule is decided anew for its own federation only.
+        let crm_verified = federation_governance("crm", RequestTrustLevel::Verified, None, &[]);
+        gate.store_federations([notion, crm_verified]);
+        assert!(allows(
+            gate.evaluate(&search, PolicyRoute::served_by(Some("notion")))
+        ));
+        assert!(allows(gate.evaluate(&native, PolicyRoute::gateway())));
+        assert_eq!(gate.cached_decisions(), 3);
+        assert!(!allows(
+            gate.evaluate(&contacts, PolicyRoute::served_by(Some("crm")))
+        ));
+        assert_eq!(gate.cached_decisions(), 4);
+    }
+
+    #[test]
+    fn a_cache_full_of_decisions_under_a_replaced_rule_still_caches() {
+        let gate = cached_gate(2);
+        let open = federation_governance("crm", RequestTrustLevel::Unauthenticated, None, &[]);
+        gate.store_federations([open]);
+        let route = PolicyRoute::served_by(Some("crm"));
+        assert!(allows(gate.evaluate(&anonymous_context("crm.a"), route)));
+        assert!(allows(gate.evaluate(&anonymous_context("crm.b"), route)));
+        assert_eq!(gate.cached_decisions(), 2);
+
+        // Both cached decisions were made under a rule that no longer holds,
+        // so no lookup can reach them: the next decision takes their place.
+        let closed = federation_governance("crm", RequestTrustLevel::Verified, None, &[]);
+        gate.store_federations([closed]);
+        let caller = anonymous_context("crm.a");
+        assert!(!allows(gate.evaluate(&caller, route)));
+        assert_eq!(gate.cached_decisions(), 1);
+        let cache = gate.cache.as_ref().expect("cache enabled");
+        let federated = gate.tool_access_policy.federated.load();
+        let key = format!(
+            "{}|{:?}|{:?}|{:?}",
+            caller.cache_key(),
+            Some(("crm".to_owned(), federated.version("crm"))),
+            None::<&str>,
+            None::<PolicySurface>,
+        );
+        assert!(
+            cache.get(&key).is_some(),
+            "the new decision is cached under the rule in force"
+        );
+    }
+
+    /// A rule names one exact capability, never a pattern, so a name prefix
+    /// is governed in the global `cel_allow_if`, as the multi-tenant docs
+    /// show; a caller without the tenant claim is denied, not errored.
+    #[test]
+    fn a_name_prefix_is_governed_in_the_global_cel_allow_if() {
+        let gate = PreDispatchPolicyGate::try_new(ToolAccessPolicyConfig {
+            default_minimum_trust: RequestTrustLevel::Unauthenticated,
+            cel_allow_if: Some(
+                r#"(!tool_name.startsWith("acme.")
+                     || ("tenant" in identity.attributes && identity.attributes["tenant"] == "acme")
+                     || "platform" in identity.groups)
+                   && (!tool_name.startsWith("partner.")
+                     || ("tenant" in identity.attributes && identity.attributes["tenant"] == "partner"))"#
+                    .to_owned(),
+            ),
+            rules: Vec::new(),
+        })
+        .expect("policy valid");
+        let caller = |tool: &str, tenant: Option<&str>, groups: &[&str]| ToolPolicyContext {
+            tool_name: tool.to_owned(),
+            trust_level: RequestTrustLevel::Verified,
+            principal_id: Some("user-1".to_owned()),
+            auth_provider: None,
+            issuer: None,
+            identity_kind: "verified".to_owned(),
+            roles: Vec::new(),
+            groups: groups.iter().map(|g| (*g).to_owned()).collect(),
+            scopes: Vec::new(),
+            attributes: tenant
+                .map(|t| [("tenant".to_owned(), t.to_owned())].into())
+                .unwrap_or_default(),
+        };
+        let decide = |context: ToolPolicyContext| gate.evaluate_tool_call(&context);
+
+        assert!(allows(decide(caller("acme.search", Some("acme"), &[]))));
+        assert!(allows(decide(caller("acme.search", None, &["platform"]))));
+        assert!(allows(decide(caller(
+            "shared.search",
+            Some("partner"),
+            &[]
+        ))));
+        assert!(allows(decide(caller("shared.search", None, &[]))));
+        assert!(!allows(decide(caller("acme.search", Some("partner"), &[]))));
+        assert!(!allows(decide(caller("partner.search", Some("acme"), &[]))));
+        match decide(caller("acme.search", None, &[])) {
+            PreDispatchPolicyOutcome::Deny(denial) => assert_eq!(denial.code, -32022),
+            PreDispatchPolicyOutcome::Allow => panic!("a caller without the claim is denied"),
+        }
+        // `acme.*` is the name of one capability, not a pattern.
+        let exact = gate_with_rules(
+            RequestTrustLevel::Unauthenticated,
+            vec![rule("acme.*", RequestTrustLevel::Verified, None, &[])],
+        );
+        assert!(allows(
+            exact.evaluate_tool_call(&anonymous_context("acme.search"))
+        ));
+        assert!(!allows(
+            exact.evaluate_tool_call(&anonymous_context("acme.*"))
+        ));
+    }
+
+    /// Config validation checks a governance `allow_if` with the shared
+    /// validator and the gate compiles it itself, so the two must accept
+    /// exactly the same expressions.
+    #[test]
+    fn governance_validation_and_the_gate_agree_on_allow_if() {
+        use mcpg_expr::governance::validate_allow_if;
+        for source in [
+            r#""ops" in identity.groups"#,
+            r#"tool_name.startsWith("acme.")"#,
+            r#"trust_level == "verified" && "#,
+            "tool_name == ",
+            "size(",
+        ] {
+            assert_eq!(
+                validate_allow_if(source, "x").is_ok(),
+                CelToolAccessPolicy::compile(source.to_owned(), "x".to_owned()).is_ok(),
+                "{source}"
+            );
+        }
+        let error = validate_allow_if(
+            "tool_name == ",
+            "mcp.federations[notion].governance.allow_if",
+        )
+        .expect_err("invalid CEL");
+        assert!(
+            error
+                .to_string()
+                .contains("mcp.federations[notion].governance.allow_if"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -925,6 +2103,7 @@ mod tests {
                 minimum_trust: RequestTrustLevel::Unauthenticated,
                 cel_allow_if: None,
                 required_scopes: Vec::new(),
+                surface: None,
             }],
         })
         .expect("policy valid");
@@ -1010,6 +2189,7 @@ mod tests {
                 minimum_trust: RequestTrustLevel::Verified,
                 cel_allow_if: None,
                 required_scopes: vec!["admin.write".to_owned(), "audit.read".to_owned()],
+                surface: None,
             }],
         })
         .expect("policy valid");
@@ -1067,6 +2247,7 @@ mod tests {
                 minimum_trust: RequestTrustLevel::HeaderAsserted,
                 cel_allow_if: Some("principal_id == \"user-1\"".to_owned()),
                 required_scopes: Vec::new(),
+                surface: None,
             }],
         })
         .expect("policy valid");
@@ -1094,6 +2275,7 @@ mod tests {
                 minimum_trust: RequestTrustLevel::HeaderAsserted,
                 cel_allow_if: Some("principal_id == \"admin\"".to_owned()),
                 required_scopes: Vec::new(),
+                surface: None,
             }],
         })
         .expect("policy valid");
@@ -1131,6 +2313,7 @@ mod tests {
                 minimum_trust: RequestTrustLevel::HeaderAsserted,
                 cel_allow_if: Some("principal_id == ".to_owned()),
                 required_scopes: Vec::new(),
+                surface: None,
             }],
         })
         .expect_err("invalid per-tool CEL should fail");
@@ -1147,11 +2330,17 @@ mod tests {
     #[test]
     fn policy_cache_returns_cached_outcome() {
         let cache = PolicyCache::new(60, 100);
+        let no_federations = FederatedToolPolicies::default();
         let key = "user-1:my_tool:verified".to_owned();
 
         assert!(cache.get(&key).is_none());
 
-        cache.put(key.clone(), PreDispatchPolicyOutcome::Allow);
+        cache.put(
+            key.clone(),
+            PreDispatchPolicyOutcome::Allow,
+            None,
+            &no_federations,
+        );
 
         let cached = cache.get(&key).expect("should be cached");
         assert!(matches!(cached, PreDispatchPolicyOutcome::Allow));
@@ -1160,9 +2349,15 @@ mod tests {
     #[test]
     fn policy_cache_expires_after_ttl() {
         let cache = PolicyCache::new(0, 100); // 0-second TTL = immediately expired
+        let no_federations = FederatedToolPolicies::default();
         let key = "user-1:my_tool:verified".to_owned();
 
-        cache.put(key.clone(), PreDispatchPolicyOutcome::Allow);
+        cache.put(
+            key.clone(),
+            PreDispatchPolicyOutcome::Allow,
+            None,
+            &no_federations,
+        );
 
         // With 0-second TTL, entry should be expired
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -1172,15 +2367,31 @@ mod tests {
     #[test]
     fn policy_cache_evicts_expired_entries_when_full() {
         let cache = PolicyCache::new(0, 2); // 0-second TTL, max 2 entries
+        let no_federations = FederatedToolPolicies::default();
 
-        cache.put("a:tool:v".to_owned(), PreDispatchPolicyOutcome::Allow);
-        cache.put("b:tool:v".to_owned(), PreDispatchPolicyOutcome::Allow);
+        cache.put(
+            "a:tool:v".to_owned(),
+            PreDispatchPolicyOutcome::Allow,
+            None,
+            &no_federations,
+        );
+        cache.put(
+            "b:tool:v".to_owned(),
+            PreDispatchPolicyOutcome::Allow,
+            None,
+            &no_federations,
+        );
 
         // Wait for entries to expire
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         // This should evict expired entries and succeed
-        cache.put("c:tool:v".to_owned(), PreDispatchPolicyOutcome::Allow);
+        cache.put(
+            "c:tool:v".to_owned(),
+            PreDispatchPolicyOutcome::Allow,
+            None,
+            &no_federations,
+        );
 
         // Only the new entry should survive (others expired)
         // Note: the new entry was just inserted so it's not expired yet

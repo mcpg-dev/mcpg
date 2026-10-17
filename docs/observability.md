@@ -175,9 +175,18 @@ Always returns HTTP 200. Used by load balancers for liveness.
 { "status": "ok" }
 ```
 
+The status is `degraded` while the licence holds the gateway: it refuses every
+tool call, prompt, resource read and completion until a licence covers an item
+it cannot run without (or a withheld tool gate), or, on a gateway attached to a
+control plane, the delivered licence keeps failing to reach the running
+gateway. It stays HTTP 200: a restart would bring no licence.
+
 ### `GET /ready`
 
-Returns HTTP 200 when all subsystems are ready. Used for readiness probes.
+Returns HTTP 200 when all subsystems are ready. Used for readiness probes. The
+body's `status` is `ready`, `not_ready`, or `degraded` with a `license` check
+naming the hold, as above; `degraded` keeps the gateway in rotation, since it
+still serves its listings and answers every refused call with the reason.
 
 ### `GET /runtime`
 
@@ -247,3 +256,20 @@ Highlights for SRE alerting:
 | `mcpg_native_plugin_timeout_total{plugin_id} > 0` | Native plugin hung for >30s. **Investigate**. |
 | `mcpg_sse_stream_limit_rejected_total{session_id}` | Client hitting SSE cap (3). Likely reconnect loop. |
 | `mcpg_infra_no_auth_warning_total{backend} > 0` | Plaintext NATS/Redis on non-loopback. **Investigate deployment**. |
+| `mcpg_events_egress_blocked_total` rising | MCP Events callbacks refused by the egress policy: someone may be probing for internal addresses through `events/subscribe`. **Investigate**. |
+| `mcpg_events_verification_failures_total{category}` rising against `mcpg_events_verifications_total` | Many subscribes name callbacks that do not answer the challenge. |
+
+## MCP Events metrics
+
+Labels are the event name, an outcome or a category: never a principal, a
+URL or a host. The full table and the troubleshooting guide are in
+[MCP Events](https://mcpg.dev/docs/gateway/mcp-events).
+
+| Metric | Alert trigger |
+|---|---|
+| `mcpg_events_subscriptions{state="suspended"}` rising | Receivers are failing; their clients' next refresh resumes them. |
+| `mcpg_events_abandoned_total{reason="exhausted"}` rising | Events given up after every retry. |
+| `mcpg_events_terminated_total{reason}` | Subscriptions ended by revocation, policy, schema change or an operator. |
+| `mcpg_events_delivery_latency_seconds` p99 high | Receivers are slow or retrying. |
+| `mcpg_events_inbound_total{outcome="inbox_full"} > 0` | No replica is draining inbound events: check the events owner. |
+| `mcpg_plugin_watch_events_dropped_total{reason="overflow"} > 0` | A watch plugin emits faster than its consumer takes events. |

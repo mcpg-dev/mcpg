@@ -75,7 +75,11 @@ mcp:
 
       governance:                   # Inherited by EVERY synthetic capability (like a native binding).
         minimum_trust: verified     #   unauthenticated | header_asserted | verified  (default: header_asserted)
-        allow_if: '"notion-users" in identity.groups'   # optional CEL; same engine as native per-tool rules
+        allow_if: '"notion-users" in identity.groups'   # optional CEL; same engine as native per-tool rules.
+                                     #   Compiled by `config check`, at boot and on reload: a syntax
+                                     #   error refuses the config.
+        required_scopes: [notion.read]   # optional; the caller's credential must carry every scope
+                                     #   (403 + insufficient_scope step-up challenge otherwise)
 
       retry:                        # optional; upstream call retry
         max_attempts: 2
@@ -118,15 +122,28 @@ mcp:
         resources: false
         resource_templates: false
         prompts: false
+        events: false               # MCP Events types; needs the 2026-07-28 wire over
+                                    #   streamable_http (§5a)
 
       naming:                       # prefixes applied to imported names/URIs (collision-avoidance)
         tool_prefix: "notion."
         resource_uri_prefix: "mcp://notion/"
         prompt_prefix: "notion."
+        event_prefix: "notion."     # must keep event names valid: letters, digits, . _ -
 
-      filter:                       # glob filter on imported TOOL names
+      filter:                       # glob filters on imported names
         include_tools: ["*"]        #   default ["*"]
         exclude_tools: ["internal_*"]
+        include_events: ["*"]       #   the same, for event type names
+        exclude_events: []
+
+      events:                       # how imported event types are read from the upstream
+        delivery: auto              #   auto (default; webhook when offered and this gateway has a
+                                    #   public address, else push when offered, else poll)
+                                    #   | webhook | push | poll
+        sharing: fan_in             #   fan_in (default; one upstream subscription per set of
+                                    #   arguments, as the gateway) | per_principal (one per
+                                    #   subscriber, with their stored sign-in)
 
       cache:
         capability_ttl_secs: 300    # poll-refresh interval (re-list even without a push); default 300
@@ -191,6 +208,18 @@ name, e.g. `com.acme.crm.`); operator-authored federations win on any
 name/prefix collision; and the registry cannot relax transport security
 — stdio, insecure HTTP, and `tunnel://` stay denied regardless of what
 it lists, with `allow_private_backends` an explicit per-registry opt-in.
+Every synthesized federation is governed by its registry's
+`defaults.governance` as the config in force declares it: a reload that
+tightens it applies at once, a snapshot adopted from the cluster leader
+brings no governance of its own, and a synthesized federation whose registry
+is no longer configured is dropped. The overlay records the registry that
+synthesized each federation, so the claim never rests on the federation's
+name (a registry `a-` synthesizes `a---srv`, which also starts with registry
+`a`'s `a--`). A snapshot published by a leader that predates this record
+(during a rolling upgrade) is claimed by name instead, as that leader's own
+followers claim it: each federation goes to the one configured registry
+whose `<registry>--` prefix it starts with, and one that two registries'
+prefixes match, or none, is dropped.
 Servers whose remote declares required URL variables or secret headers
 you have not supplied are skipped and reported
 (`mcpg_registry_server_skipped_total{reason}`), as are packages-only
@@ -403,6 +432,7 @@ from colliding with native ones (or with each other):
 | Resources | `resources` | `resource_uri_prefix` | `resources/read` |
 | Resource templates | `resource_templates` | `resource_uri_prefix` | `resources/read` (URI matched, de-prefixed) |
 | Prompts | `prompts` | `prompt_prefix` | `prompts/get` |
+| MCP Events types | `events` | `event_prefix` | the gateway's own event log (§5a) |
 
 Every federated capability carries `_meta.mcpg.source.federatedFrom: "<name>"`
 so clients (and your audit) can see where it came from. The original upstream
@@ -435,6 +465,83 @@ mcp:
 
 Use it to expose a safe subset of a powerful upstream.
 
+`include_events` and `exclude_events` filter imported event type names the
+same way, on their own: the tool filter never applies to events.
+
+---
+
+## 5a. Importing MCP Events
+
+With `import.events: true`, MCPG lists the upstream's MCP Events types
+(`events/list`) and serves each one as its own type, named `event_prefix` +
+the upstream name, in every delivery mode `mcp.configurations.events`
+enables, whatever modes the upstream offers.
+
+- **One upstream subscription per key of demand.** A type has demand while a
+  webhook subscription, a poll lease or a push stream of it is live. The
+  events owner opens one upstream subscription per distinct set of
+  `arguments` (`sharing: fan_in`), or per subscriber and set of arguments
+  (`sharing: per_principal`), and closes it `sources.linger_ms` after the
+  last of them ends. Webhook demand comes from the subscription records;
+  poll and stream demand from a record each lease renews
+  (`ev:poll:a:{h(type)}:{key}`, with the subscriber's identity under
+  `per_principal`).
+- **Served from the gateway's own log.** Each occurrence is stored tagged
+  with the keyed hash of its arguments, and under `per_principal` of its
+  subscriber, so only those readers receive it; one upstream event read for
+  two keys is kept once for each.
+- **Read in the federation's mode.** `events.delivery: auto` takes a webhook
+  subscription when the upstream offers webhooks and the gateway has a
+  public address (`gateway.server.canonical_url`, or a public tunnel's URL
+  while it is up), else streams when the upstream offers push, else polls;
+  `webhook`, `push` and `poll` insist on one.
+- **Webhook mode.** Each upstream subscription has an id
+  (`fsub_` + keyed hash of federation, type, subscriber and arguments) and a
+  route (`ev:fed:r:{id}`) the owner writes before it subscribes, because the
+  upstream challenges the callback while it subscribes. The callback is
+  `{address}/webhooks/mcp-events/{federation}/{id}`; its `whsec_` secret is
+  derived from the cluster key and the id, so every replica verifies it and
+  nothing stores it. Any replica takes a delivery into the type's inbox and
+  answers `200` once that is durable: `503` for an unknown id, `410` for a
+  stopped one, `401` for a bad signature, the echo for a verification
+  challenge. An upstream `gap` envelope writes a gap marker; a `terminated`
+  one with `-32012`, `-32011` or `-32602` writes an end row (below), any
+  other marks the route so the owner subscribes again later. The owner
+  refreshes the subscription at 80% of its grant and unsubscribes when its
+  demand ends, not when ownership moves to another replica.
+- **Held with the catalogue credential, or the subscriber's own.** Under
+  `fan_in` with `auth.import` (or `auth` when it needs no caller): an
+  upstream subscription serves every subscriber of its arguments, so it is
+  made as the gateway. Under `per_principal` with the credential the
+  federation mints from the subscriber's stored sign-in
+  (`oauth_impersonation` + `subject_token: idp_refresh_token` or
+  `idp_id_token`, enforced at validation); a subscriber with no stored
+  sign-in is retried every five minutes and gets nothing meanwhile.
+- **Namespaced ids.** An upstream event id `e1` of federation `gh` is served
+  as `gh:e1` (hashed to `evt_…` when that is not header-safe).
+- **Resumes, and says when it cannot.** Each upstream subscription keeps the
+  upstream cursor (slot `{id}` of the type's resume position, kept seven
+  days). An upstream `truncated`, a schema change upstream, or a restart
+  with no cursor writes a gap marker for its readers only.
+- **Ends when the upstream ends it.** An upstream `-32012`, `-32011` or
+  `-32602` (on the stream's `terminated` frame or as the answer to a poll or
+  a stream request) writes an end row for those arguments: webhook
+  subscriptions end once every row before it is done (deleted, not
+  tombstoned, so a refresh subscribes anew), a poll from before it gets the
+  events before it and then the error, a stream sends them and then
+  `terminated`. The errors are the gateway's own (`upstream_forbidden`,
+  `upstream_not_found`, `upstream_refused_arguments`); no upstream text
+  passes. Any other upstream error is retried and ends nothing.
+- **Follows the upstream's list.** The listener asks for
+  `notifications/events/list_changed`; that or the TTL refresh re-imports,
+  and the events core announces the change to MCPG's clients. A dropped type
+  ends its subscriptions as a removed type does — except while a federation
+  that imports events has not completed its first import.
+
+An upstream on the legacy wire, or one that does not advertise events,
+imports no event types, with a warning. `import.events` on `stdio`, or on an
+upstream pinned to `2025-11-25`, fails validation.
+
 ---
 
 ## 6. Governance inheritance
@@ -452,6 +559,10 @@ exactly as if you'd written it on a native binding:
   `identity.attributes`) and `tool_name`, the prefixed name the client called.
   Same engine and semantics as native per-tool `allow_if`; an expression that
   fails to evaluate denies the call.
+- **`required_scopes`** — OAuth scopes the caller's credential must carry,
+  enforced exactly as on a native binding. A caller missing any of them is
+  refused with `403` and the `insufficient_scope` step-up challenge naming the
+  missing scopes, and does not see the capability in its lists.
 
 ```yaml
 mcp:
@@ -463,11 +574,77 @@ mcp:
         tool_prefix: "notion."
       governance:
         minimum_trust: verified
+        required_scopes: [notion.read]
         allow_if: '"notion-users" in identity.groups && !tool_name.endsWith(".delete_page")'
 ```
 
 This is enforced at dispatch by the same `PreDispatchPolicyGate` that guards
-native tools — federation is not a governance bypass.
+native tools — federation is not a governance bypass. The rule covers every
+surface the federation serves: tools and prompts by prefixed name, resources
+by URI, and resource templates both by `uriTemplate` and by each concrete URI
+a template matches that the router sends to this federation (a native binding,
+or a federation declared earlier, that serves the URI takes it instead), with
+or without a `resource_uri_prefix`. The gate applies
+it to whatever the router sends to the federation, so a resource read answers
+to the rule of the federation the read path routes it to, however the client
+spells the URI (scheme or host case, a default port). The rule governs only
+what is routed to the federation: a name or URI that the gateway serves itself
+(native bindings are matched first, and the gateway's own tools, prompts and
+resources are native) is never decided by a federation's rule, even where the
+federation lists the same name on another surface or one of its URIs or
+templates also matches it. Lists apply the same decision as calls and reads:
+a caller sees a federated capability exactly when a call or read of it would
+be allowed.
+
+**Other rules can tighten a federation's rule, never loosen it.** A call or
+read routed to a federation must pass the federation's rule **and** every
+other rule that names it:
+
+- a central `governance.policy.tool_access.rules[]` entry whose `tool_name` is
+  the federated tool or prompt name, the URI a client reads, or the URI or
+  `uriTemplate` the federation lists the resource under;
+- a native binding's rule filed under the same name, for the same kind of
+  surface — a binding's rule governs only its own kind, so a native tool
+  binding named `search` tightens a federated tool `search`, while a native
+  prompt, resource or template binding named `search` does not.
+
+All of them apply together: the highest `minimum_trust`, every
+`required_scopes` entry and every `allow_if`. A central rule with a lower floor
+or a more permissive `allow_if` than the federation's therefore has no effect
+on the federation's capabilities; use one to add a requirement, and set the
+federation's own `governance` to relax it.
+
+```yaml
+governance:
+  policy:
+    tool_access:
+      rules:
+        # crm.delete_record already needs `verified` from its federation;
+        # this adds a scope and a group on top.
+        - tool_name: crm.delete_record
+          minimum_trust: verified
+          required_scopes: [crm.admin]
+          cel_allow_if: '"crm-admins" in identity.groups'
+```
+
+**An invalid rule fails closed.** `allow_if` is compiled with the gate's own
+CEL compiler when the config is validated, so `mcpg config check`, boot, and
+every reload (file, SIGHUP, control-plane push) refuse an expression that
+does not compile, or a key the block does not know (for example the central
+rules' `cel_allow_if`), and the error names its path — for example
+`mcp.federations[notion].governance.allow_if` or
+`mcp.registries[acme].defaults.governance.allow_if`. A reload that fails this
+way keeps the running config. If a federation's rule still cannot be compiled
+at runtime, every capability that federation serves is refused: hidden from
+every list and denied on call with an internal error (audit reason
+`federation_governance_uncompiled`). It never falls back to the gateway-wide
+policy, and every other federation keeps its own rules.
+
+A name that two federations both list (for example the same resource URI from
+two upstreams without a `resource_uri_prefix`) is served by the federation
+declared first; the other federation's entry is withheld from lists and never
+dispatched, so only the serving federation's rule applies. Give each
+federation a `naming` prefix to serve both.
 
 ---
 
@@ -987,10 +1164,13 @@ fingerprint of the caller's bearer joins the key, so two tokens of the
 same principal (scope change, rotation) never share an upstream
 session. The upstream credential is re-resolved on every dispatch: a
 rotated token replaces the satellite's connection instead of riding the
-stale one into an upstream 401. On a config reload, capabilities +
-governance carry across with no flicker, and satellites (and detected
-wires) for **unchanged** federations are reused (no reconnect, no
-re-probe); changed/removed ones re-establish.
+stale one into an upstream 401. On a config reload, capabilities carry
+across with no flicker and are governed by the **reloaded** config from the
+first request: a tightened `minimum_trust`, `required_scopes` or `allow_if`,
+a newly excluded tool (`filter.exclude_tools`) or an `import` switched off
+applies before the re-import finishes. Satellites (and detected wires) for
+**unchanged** federations are reused (no reconnect, no re-probe);
+changed/removed ones re-establish.
 
 ---
 

@@ -123,7 +123,10 @@ impl MessageDispatcher for GatewayMessageDispatcher {
             GatewayResponsePayload::Protocol(protocol_response) => {
                 match protocol_response.response {
                     ProtocolResponse::JsonRpcSuccess(success) => serialise_json_reply(&success),
-                    ProtocolResponse::JsonRpcError(error) => serialise_json_reply(&error),
+                    ProtocolResponse::JsonRpcError(mut error) => {
+                        crate::transports::http::strip_internal_markers(&mut error);
+                        serialise_json_reply(&error)
+                    }
                     ProtocolResponse::NotificationAccepted => {
                         // Notifications don't get a response — ack
                         // with an empty DispatchResponse.

@@ -25,7 +25,9 @@ pub struct ControlPlaneAttachConfig {
     /// LKG cache. Defaults to `./mcpg-cp-state`.
     #[serde(default = "default_cp_state_dir")]
     pub state_dir: String,
-    /// Seconds between heartbeats. Default 30s.
+    /// Milliseconds between heartbeats. Default 30000 (30 s); held to
+    /// 5000–60000, since each heartbeat reply carries the CP's quota status.
+    /// A platform-provisioned gateway always runs the default.
     #[serde(default)]
     pub heartbeat_interval_ms: Option<u64>,
     /// PEM-encoded CA bundle to trust on the very first connect

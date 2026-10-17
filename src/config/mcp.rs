@@ -118,6 +118,14 @@ pub struct McpCapabilitiesConfig {
     #[serde(default)]
     pub resource_templates: Vec<BackendConfig>,
 
+    /// MCP Events (experimental) event types — what `events/list` offers
+    /// and the delivery modes deliver. Each type binds one source: a
+    /// plugin watch strategy, a signed inbound webhook route, a resource
+    /// binding's watch, or an event the gateway raises itself. Served only
+    /// while `mcp.configurations.events.enabled` is `true`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<crate::config::events::EventTypeConfig>,
+
     /// MCP Tasks — task-augmented tool-call semantics. Carries the task
     /// store override, TTL/reaper tuning, and the task-supported tools
     /// list.
@@ -354,6 +362,12 @@ pub struct McpConfigurationsConfig {
     /// tighten-only CSP/permission egress policy.
     #[serde(default)]
     pub apps: AppsConfig,
+    /// `io.modelcontextprotocol/events` (MCP Events, experimental)
+    /// extension config. Off by default; `enabled: true` serves the
+    /// `events/*` methods on the `2026-07-28` wire and advertises them in
+    /// `server/discover`.
+    #[serde(default)]
+    pub events: crate::config::events::EventsConfig,
 }
 
 impl McpConfigurationsConfig {
@@ -382,6 +396,9 @@ impl McpConfigurationsConfig {
         self.apps
             .validate()
             .map_err(|e| anyhow::anyhow!("mcp.configurations.apps: {e}"))?;
+        self.events
+            .validate()
+            .map_err(|e| anyhow::anyhow!("mcp.configurations.events: {e}"))?;
         Ok(())
     }
 }

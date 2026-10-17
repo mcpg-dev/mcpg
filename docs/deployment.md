@@ -298,6 +298,29 @@ MCPG exposes three probe endpoints:
 
 The Helm chart configures all three probes with sensible defaults. The startup probe allows up to 60 seconds (12 attempts × 5s) for initial bootstrap.
 
+Outside Kubernetes, the image `HEALTHCHECK` runs `mcpg --health-check`. It
+maps a `0.0.0.0` or `[::]` bind to loopback and sends one `GET` to
+`health_path` with a 2 s timeout. It exits 0 on a 2xx and 1 otherwise, with
+the reason on one stderr line. It loads no plugins and starts no second
+gateway.
+
+The `HEALTHCHECK` runs with no arguments and does not see the container's
+own arguments. It reads only `MCPG_CONFIG` and the `MCPG_*` overrides. If you
+start the container with `--config <source>`, mount the config at the
+`MCPG_CONFIG` path (`/etc/mcpg/config.yaml`) instead, or give the check the
+same source: `docker run --health-cmd 'mcpg --health-check --config <source>' …`.
+The check then fetches a remote `https://` source on every run. Run by hand,
+`mcpg --health-check` reads `--config` first, then `MCPG_CONFIG`, as the
+gateway does.
+
+The probe covers a plain-HTTP listener only. It exits 1 with the reason when
+`gateway.server.tls` is set, when a tunnel is enabled
+(`gateway.server.tunnel.enabled`), or when the transport is stdio. A gateway
+started with `--tunnel` or `--stdio` as container arguments has no
+plain-HTTP listener either, and the check reports a refused connection.
+Disable the `HEALTHCHECK` for these gateways (`docker run --no-healthcheck`),
+or replace it with a check that fits.
+
 ---
 
 ## Monitoring

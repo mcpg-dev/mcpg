@@ -467,6 +467,43 @@ async fn a_stored_refresh_token_is_exchanged_for_a_gateway_minted_caller() {
 }
 
 #[tokio::test]
+async fn an_event_read_for_a_subscriber_presents_their_stored_sign_in() {
+    let (url, seen) = spawn_auth_gated_mock().await;
+    let h = harness(
+        vault_fed(&url, SubjectToken::IdpRefreshToken),
+        FakeVault::new(Stored::Token("idp-rt-1")),
+    );
+    let subscriber = signed_in_caller();
+    let upstream = h
+        .engine
+        .events_upstream("notion", Some(&subscriber))
+        .await
+        .expect("connects as the subscriber");
+    upstream.list_tools().await.expect("tools/list");
+    upstream.close().await;
+    assert_eq!(
+        seen_for(&seen, "tools/list"),
+        vec!["Bearer exchanged-idp-rt-1".to_owned()],
+        "the upstream sees the subscriber's own credential"
+    );
+
+    h.vault.store(Stored::Missing);
+    let calls = seen.lock().expect("seen lock").len();
+    assert!(
+        matches!(
+            h.engine.events_upstream("notion", Some(&subscriber)).await,
+            Err(UpstreamError::NotLinked { .. })
+        ),
+        "no stored sign-in: no upstream subscription"
+    );
+    assert_eq!(
+        seen.lock().expect("seen lock").len(),
+        calls,
+        "refused before any request"
+    );
+}
+
+#[tokio::test]
 async fn an_id_token_federation_presents_the_stored_id_token() {
     let (url, seen) = spawn_auth_gated_mock().await;
     let h = harness(

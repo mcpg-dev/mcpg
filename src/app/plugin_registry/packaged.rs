@@ -149,6 +149,18 @@ pub(crate) fn load_packaged_plugin(
                 signature_verified = loaded.meta.signature_verified,
                 "packaged native plugin loaded"
             );
+            // The descriptor is the packager's claim, and the registry accepts
+            // it when any registered plugin matches it; the library itself
+            // must be the plugin the license gate judged by `ref` (or `id`).
+            if loaded.meta.manifest.id != expected_ref {
+                return Err(anyhow::anyhow!(
+                    "plugin alias '{}': packaged cdylib declares manifest id {:?} \
+                     but entry expects ref '{}'",
+                    entry.id,
+                    loaded.meta.manifest.id,
+                    expected_ref,
+                ));
+            }
             // Run plugin.lifecycle.register policy chain. Use
             // block_in_place + block_on so the surrounding sync
             // function doesn't have to plumb async; the only

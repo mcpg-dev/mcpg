@@ -6,9 +6,13 @@
 //!   (`META_KEY_REQUEST`, `META_KEY_REPLAYED`,
 //!   `META_KEY_ORIGINAL_COMPLETED_AT`).
 //! - JSON-RPC error codes for the four idempotency-specific failure
-//!   modes (`-32010`..`-32013`; `-32012 IdempotencyKeyRequired` is
+//!   modes (`-33010`..`-33013`; `-33012 IdempotencyKeyRequired` is
 //!   reserved for a future per-binding "key required" policy and not
-//!   emitted yet).
+//!   emitted yet). They sit in the application `-33xxx` band, clear of
+//!   the implementation-defined server range that MCP extensions draw
+//!   from: the Events extension's `-32011` and `-32013` mean NotFound and
+//!   ResourceExhausted, and the `Idempotency-Key` header lift answers on
+//!   every POST, `events/*` included.
 //! - Format validation for the request-side key
 //!   ([`validate_request_key`]): ASCII, ≤255 chars, non-empty after
 //!   trim. Rejection surfaces as `IdempotencyKeyMalformed`.
@@ -54,15 +58,15 @@ pub const META_KEY_ORIGINAL_COMPLETED_AT: &str = "dev.mcpg/idempotency-original-
 ///
 /// HTTP transport maps this to 422 Unprocessable Entity, matching
 /// RFC `draft-ietf-httpapi-idempotency-key-header-07`.
-pub const ERROR_CODE_CONFLICT: i32 = -32010;
+pub const ERROR_CODE_CONFLICT: i32 = -33010;
 
 /// JSON-RPC error code for "another request with this key is in
 /// flight". HTTP transport maps to 409 Conflict + `Retry-After: 1`.
-pub const ERROR_CODE_IN_FLIGHT: i32 = -32011;
+pub const ERROR_CODE_IN_FLIGHT: i32 = -33011;
 
 /// JSON-RPC error code for "key violates format constraints" —
 /// non-ASCII byte, length > 255, or empty after trim.
-pub const ERROR_CODE_KEY_MALFORMED: i32 = -32013;
+pub const ERROR_CODE_KEY_MALFORMED: i32 = -33013;
 
 /// Maximum permitted length of a caller-supplied idempotency key
 /// (in bytes). RFC `draft-ietf-httpapi-idempotency-key-header-07`
@@ -82,7 +86,7 @@ pub enum KeyValidation {
     /// is the trimmed canonical form used as the storage lookup key.
     Valid(String),
     /// Caller supplied a key that violates the format constraints.
-    /// Rejected with `-32013 IdempotencyKeyMalformed`.
+    /// Rejected with `-33013 IdempotencyKeyMalformed`.
     Invalid(KeyMalformedReason),
 }
 
@@ -286,6 +290,24 @@ pub fn stamp_replay_marker(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The codes live in the application band, outside the
+    /// implementation-defined server range MCP extensions draw from, so a
+    /// client that branches on the code alone cannot read an idempotency
+    /// failure as an extension's error.
+    #[test]
+    fn error_codes_sit_in_the_application_band() {
+        assert_eq!(ERROR_CODE_CONFLICT, -33010);
+        assert_eq!(ERROR_CODE_IN_FLIGHT, -33011);
+        assert_eq!(ERROR_CODE_KEY_MALFORMED, -33013);
+        for code in [
+            ERROR_CODE_CONFLICT,
+            ERROR_CODE_IN_FLIGHT,
+            ERROR_CODE_KEY_MALFORMED,
+        ] {
+            assert!(!(-32099..=-32000).contains(&code), "{code}");
+        }
+    }
 
     #[test]
     fn validate_accepts_valid_ascii_key() {

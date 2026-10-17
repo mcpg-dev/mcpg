@@ -294,7 +294,7 @@ fn test_http_binding(name: &str, allow_if: Option<&str>) -> BackendConfig {
             },
         ),
         governance: BackendGovernanceConfig {
-            minimum_trust: TrustLevelConfig::HeaderAsserted,
+            minimum_trust: None,
             allow_if: allow_if.map(|s| s.to_owned()),
             required_scopes: Vec::new(),
         },
@@ -387,6 +387,7 @@ async fn build_from_config_rejects_invalid_per_tool_cel_policy() {
                     cel_allow_if: None,
                     rules: vec![crate::config::ToolTrustRuleConfig {
                         tool_name: "mcpg.runtime.snapshot".to_owned(),
+                        event_name: None,
                         minimum_trust: TrustLevelConfig::HeaderAsserted,
                         cel_allow_if: Some("principal_id == ".to_owned()),
                         required_scopes: Vec::new(),
@@ -478,7 +479,7 @@ fn build_tool_access_policy_config_injects_binding_governance_rules() {
                             }),
                         ),
                         governance: BackendGovernanceConfig {
-                            minimum_trust: TrustLevelConfig::HeaderAsserted,
+                            minimum_trust: Some(TrustLevelConfig::HeaderAsserted),
                             allow_if: Some("principal_id == \"user-2\"".to_owned()),
                             required_scopes: Vec::new(),
                         },
@@ -528,6 +529,7 @@ fn build_tool_access_policy_config_injects_binding_governance_rules() {
         RequestTrustLevel::Unauthenticated
     );
 
+    // A binding that names no floor is gated at `default_minimum_trust`.
     let weather_rule = policy
         .rules
         .iter()
@@ -535,7 +537,7 @@ fn build_tool_access_policy_config_injects_binding_governance_rules() {
         .expect("binding governance rule");
     assert_eq!(
         weather_rule.minimum_trust,
-        RequestTrustLevel::HeaderAsserted
+        RequestTrustLevel::Unauthenticated
     );
     assert_eq!(
         weather_rule.cel_allow_if.as_deref(),
@@ -557,6 +559,130 @@ fn build_tool_access_policy_config_injects_binding_governance_rules() {
     );
 }
 
+/// A binding's rule names the kind of surface it governs; a central rule
+/// governs every kind.
+#[test]
+fn binding_rules_name_their_kind_of_surface() {
+    use crate::runtime::PolicySurface;
+    let mut prompt = test_http_binding("search", None);
+    prompt.governance.minimum_trust = Some(TrustLevelConfig::Verified);
+    let mut resource = test_http_binding("doc", None);
+    resource.uri = Some("docs://search".to_owned());
+    let mut config = AppConfig::default();
+    config.mcp.capabilities.tools = vec![test_http_binding("lookup", None)];
+    config.mcp.capabilities.prompts = vec![prompt];
+    config.mcp.capabilities.resources = vec![resource];
+    config.governance.policy.tool_access.rules = vec![crate::config::ToolTrustRuleConfig {
+        tool_name: "search".to_owned(),
+        event_name: None,
+        minimum_trust: TrustLevelConfig::Verified,
+        cel_allow_if: None,
+        required_scopes: Vec::new(),
+    }];
+
+    let policy = build_tool_access_policy_config(&config);
+    let surfaces = |name: &str| -> Vec<Option<PolicySurface>> {
+        policy
+            .rules
+            .iter()
+            .filter(|rule| rule.tool_name == name)
+            .map(|rule| rule.surface)
+            .collect()
+    };
+    assert_eq!(surfaces("lookup"), [Some(PolicySurface::Tool)]);
+    assert_eq!(surfaces("search"), [None, Some(PolicySurface::Prompt)]);
+    assert_eq!(surfaces("doc"), [Some(PolicySurface::Resource)]);
+    assert_eq!(surfaces("docs://search"), [Some(PolicySurface::Resource)]);
+}
+
+/// A binding that names no floor follows `default_minimum_trust` in both
+/// directions, on every surface it is filed under; a binding that names one
+/// keeps it.
+#[test]
+fn a_binding_without_a_floor_is_gated_at_the_default_floor() {
+    let mut tool = test_http_binding("crm.search", None);
+    tool.governance.required_scopes = vec!["crm.read".to_owned()];
+    let mut template = test_http_binding("crm.record", None);
+    template.uri_template = Some("crm://records/{id}".to_owned());
+    let mut pinned = test_http_binding("crm.pinned", None);
+    pinned.governance.minimum_trust = Some(TrustLevelConfig::HeaderAsserted);
+
+    let gate_at = |default_minimum_trust| {
+        let config = AppConfig {
+            mcp: crate::config::McpConfig {
+                capabilities: McpCapabilitiesConfig {
+                    tools: vec![tool.clone(), pinned.clone()],
+                    resource_templates: vec![template.clone()],
+                    ..McpCapabilitiesConfig::default()
+                },
+                ..crate::config::McpConfig::default()
+            },
+            governance: GovernanceConfig {
+                policy: PolicyConfig {
+                    tool_access: ToolAccessPolicyConfigYaml {
+                        default_minimum_trust,
+                        cel_allow_if: None,
+                        rules: Vec::new(),
+                    },
+                    cache: PolicyCacheConfig::default(),
+                    engine: Vec::new(),
+                },
+                ..Default::default()
+            },
+            ..AppConfig::default()
+        };
+        crate::runtime::policy::PreDispatchPolicyGate::try_new(build_tool_access_policy_config(
+            &config,
+        ))
+        .expect("policy compiles")
+    };
+    let allows = |gate: &crate::runtime::policy::PreDispatchPolicyGate, name: &str, trust_level| {
+        let context = crate::runtime::policy::ToolPolicyContext {
+            tool_name: name.to_owned(),
+            trust_level,
+            principal_id: Some("user-1".to_owned()),
+            auth_provider: None,
+            identity_kind: "verified".to_owned(),
+            roles: Vec::new(),
+            groups: Vec::new(),
+            scopes: vec!["crm.read".to_owned()],
+            attributes: std::collections::BTreeMap::new(),
+            issuer: None,
+        };
+        matches!(
+            gate.evaluate(&context, crate::runtime::policy::PolicyRoute::gateway()),
+            crate::runtime::policy::PreDispatchPolicyOutcome::Allow
+        )
+    };
+
+    let raised = gate_at(TrustLevelConfig::Verified);
+    for name in ["crm.search", "crm.record", "crm://records/{id}"] {
+        assert!(
+            !allows(&raised, name, RequestTrustLevel::HeaderAsserted),
+            "{name}"
+        );
+        assert!(allows(&raised, name, RequestTrustLevel::Verified), "{name}");
+    }
+    assert!(allows(
+        &raised,
+        "crm.pinned",
+        RequestTrustLevel::HeaderAsserted
+    ));
+
+    let lowered = gate_at(TrustLevelConfig::Unauthenticated);
+    for name in ["crm.search", "crm.record", "crm://records/{id}"] {
+        assert!(
+            allows(&lowered, name, RequestTrustLevel::Unauthenticated),
+            "{name}"
+        );
+    }
+    assert!(!allows(
+        &lowered,
+        "crm.pinned",
+        RequestTrustLevel::Unauthenticated
+    ));
+}
+
 /// A resource's `governance.minimum_trust` has to reach policy under the key
 /// the resource surfaces are gated by — the URI. Both `resources/list` and
 /// the read path ask policy about the URI the client sent, so a name-only
@@ -567,11 +693,11 @@ fn build_tool_access_policy_config_injects_binding_governance_rules() {
 fn build_tool_access_policy_config_keys_resource_rules_by_uri() {
     let mut resource = test_http_binding("secret.resource", None);
     resource.uri = Some("secret://vault/credentials".to_owned());
-    resource.governance.minimum_trust = TrustLevelConfig::Verified;
+    resource.governance.minimum_trust = Some(TrustLevelConfig::Verified);
 
     let mut template = test_http_binding("secret.template", None);
     template.uri_template = Some("secret://vault/{id}".to_owned());
-    template.governance.minimum_trust = TrustLevelConfig::Verified;
+    template.governance.minimum_trust = Some(TrustLevelConfig::Verified);
 
     let config = AppConfig {
         mcp: crate::config::McpConfig {
@@ -617,6 +743,226 @@ fn build_tool_access_policy_config_keys_resource_rules_by_uri() {
             .any(|rule| rule.tool_name == "secret.resource"),
         "the name-keyed rule is still registered"
     );
+}
+
+/// A resource's `governance` holds for every read the router sends to its
+/// binding, not only a read that spells the key its rule is filed under: a
+/// concrete URI one of its templates matches, another spelling of its URI,
+/// and the URI a binding without `uri` is served under.
+#[test]
+fn a_native_resource_read_answers_to_its_binding_under_any_uri() {
+    let mut resource = test_http_binding("secret.resource", None);
+    resource.uri = Some("secret://vault/credentials".to_owned());
+    resource.governance.minimum_trust = Some(TrustLevelConfig::Verified);
+
+    let mut note = test_http_binding("plain.note", None);
+    note.governance.minimum_trust = Some(TrustLevelConfig::Verified);
+
+    let mut template = test_http_binding("secret.template", None);
+    template.uri_template = Some("secret://vault/{id}".to_owned());
+    template.governance.minimum_trust = Some(TrustLevelConfig::Verified);
+
+    let resources = vec![resource, note];
+    let templates = vec![template];
+    let config = AppConfig {
+        mcp: crate::config::McpConfig {
+            capabilities: McpCapabilitiesConfig {
+                resources: resources.clone(),
+                resource_templates: templates.clone(),
+                ..McpCapabilitiesConfig::default()
+            },
+            ..crate::config::McpConfig::default()
+        },
+        governance: GovernanceConfig {
+            policy: PolicyConfig {
+                tool_access: ToolAccessPolicyConfigYaml {
+                    default_minimum_trust: TrustLevelConfig::Unauthenticated,
+                    cel_allow_if: None,
+                    rules: Vec::new(),
+                },
+                cache: PolicyCacheConfig::default(),
+                engine: Vec::new(),
+            },
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    let gate = crate::runtime::policy::PreDispatchPolicyGate::try_new(
+        build_tool_access_policy_config(&config),
+    )
+    .expect("policy compiles");
+    let registry = crate::backends::CapabilityRegistry::new(
+        false,
+        crate::backends::DebugToolBackends::default(),
+        crate::backends::DebugToolExposure::default(),
+        &[],
+        &[],
+        &resources,
+        &templates,
+        None,
+    );
+
+    for uri in [
+        "secret://vault/42",
+        "SECRET://vault/credentials",
+        "mcpg://resources/plain.note",
+    ] {
+        let route = registry.resource_route(uri).expect("a routed URI");
+        for (trust_level, allowed) in [
+            (RequestTrustLevel::Unauthenticated, false),
+            (RequestTrustLevel::Verified, true),
+        ] {
+            let context = crate::runtime::policy::ToolPolicyContext {
+                tool_name: uri.to_owned(),
+                trust_level,
+                principal_id: Some("user-1".to_owned()),
+                auth_provider: None,
+                identity_kind: "verified".to_owned(),
+                roles: Vec::new(),
+                groups: Vec::new(),
+                scopes: Vec::new(),
+                attributes: std::collections::BTreeMap::new(),
+                issuer: None,
+            };
+            assert_eq!(
+                matches!(
+                    gate.evaluate(
+                        &context,
+                        crate::runtime::policy::PolicyRoute::for_resource(&route)
+                    ),
+                    crate::runtime::policy::PreDispatchPolicyOutcome::Allow
+                ),
+                allowed,
+                "a read of {uri} at {trust_level:?}"
+            );
+        }
+    }
+}
+
+/// A central rule may name a resource's URI or a template, which is also
+/// the key the binding's own rule is filed under. Both rules govern the
+/// read: the higher floor, every scope and every `allow_if`, so neither can
+/// loosen the other.
+#[test]
+fn a_central_rule_on_a_binding_uri_applies_with_the_binding_rule() {
+    let mut resource = test_http_binding("vault.credentials", Some("principal_id != \"blocked\""));
+    resource.uri = Some("secret://vault/credentials".to_owned());
+    resource.governance.minimum_trust = Some(TrustLevelConfig::Unauthenticated);
+
+    let mut template = test_http_binding("vault.entry", None);
+    template.uri_template = Some("secret://vault/{id}".to_owned());
+    template.governance.minimum_trust = Some(TrustLevelConfig::Verified);
+
+    let central = |key: &str, minimum_trust, scopes: &[&str]| crate::config::ToolTrustRuleConfig {
+        tool_name: key.to_owned(),
+        event_name: None,
+        minimum_trust,
+        cel_allow_if: Some("principal_id != \"revoked\"".to_owned()),
+        required_scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+    };
+    let config = AppConfig {
+        mcp: crate::config::McpConfig {
+            capabilities: McpCapabilitiesConfig {
+                resources: vec![resource],
+                resource_templates: vec![template],
+                ..McpCapabilitiesConfig::default()
+            },
+            ..crate::config::McpConfig::default()
+        },
+        governance: GovernanceConfig {
+            policy: PolicyConfig {
+                tool_access: ToolAccessPolicyConfigYaml {
+                    default_minimum_trust: TrustLevelConfig::Unauthenticated,
+                    cel_allow_if: None,
+                    rules: vec![
+                        central(
+                            "secret://vault/credentials",
+                            TrustLevelConfig::Verified,
+                            &["vault.read"],
+                        ),
+                        central(
+                            "secret://vault/{id}",
+                            TrustLevelConfig::Unauthenticated,
+                            &[],
+                        ),
+                    ],
+                },
+                cache: PolicyCacheConfig::default(),
+                engine: Vec::new(),
+            },
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    config
+        .validate()
+        .expect("a central rule may name a binding's URI");
+    let gate = crate::runtime::policy::PreDispatchPolicyGate::try_new(
+        build_tool_access_policy_config(&config),
+    )
+    .expect("policy compiles");
+    let decide = |uri: &str, trust_level, principal: &str, scopes: &[&str]| {
+        let context = crate::runtime::policy::ToolPolicyContext {
+            tool_name: uri.to_owned(),
+            trust_level,
+            principal_id: Some(principal.to_owned()),
+            auth_provider: None,
+            identity_kind: "verified".to_owned(),
+            roles: Vec::new(),
+            groups: Vec::new(),
+            scopes: scopes.iter().map(|s| (*s).to_owned()).collect(),
+            attributes: std::collections::BTreeMap::new(),
+            issuer: None,
+        };
+        matches!(
+            gate.evaluate(&context, crate::runtime::policy::PolicyRoute::gateway()),
+            crate::runtime::policy::PreDispatchPolicyOutcome::Allow
+        )
+    };
+
+    let credentials = "secret://vault/credentials";
+    // The central rule's floor and scope hold over the binding's lower floor.
+    assert!(!decide(
+        credentials,
+        RequestTrustLevel::Unauthenticated,
+        "user-1",
+        &[]
+    ));
+    assert!(!decide(
+        credentials,
+        RequestTrustLevel::Verified,
+        "user-1",
+        &[]
+    ));
+    assert!(decide(
+        credentials,
+        RequestTrustLevel::Verified,
+        "user-1",
+        &["vault.read"]
+    ));
+    // Both `allow_if` expressions run.
+    assert!(!decide(
+        credentials,
+        RequestTrustLevel::Verified,
+        "revoked",
+        &["vault.read"]
+    ));
+    assert!(!decide(
+        credentials,
+        RequestTrustLevel::Verified,
+        "blocked",
+        &["vault.read"]
+    ));
+    // A central rule with a lower floor does not lower the binding's.
+    let entry = "secret://vault/{id}";
+    assert!(!decide(
+        entry,
+        RequestTrustLevel::Unauthenticated,
+        "user-1",
+        &[]
+    ));
+    assert!(decide(entry, RequestTrustLevel::Verified, "user-1", &[]));
+    assert!(!decide(entry, RequestTrustLevel::Verified, "revoked", &[]));
 }
 
 // `resolve_store_kind` / `resolve_pipeline_store_kind`
@@ -1618,7 +1964,10 @@ fn synthetic_openapi_binding_reconstructs_backend_config() {
         Some("getPetById")
     );
     // Relayed governance deserialized into the typed struct.
-    assert_eq!(binding.governance.minimum_trust, TrustLevelConfig::Verified);
+    assert_eq!(
+        binding.governance.minimum_trust,
+        Some(TrustLevelConfig::Verified)
+    );
 }
 
 #[test]
@@ -1651,6 +2000,116 @@ fn synthetic_resource_template_binding_reconstructs_backend_config() {
             .and_then(|v| v.as_str()),
         Some("getPetById")
     );
+}
+
+/// A capability an openapi source auto-exposes comes from the upstream's
+/// spec, so one whose relayed governance names no floor is gated like a
+/// federation's (`header_asserted`); lowering `default_minimum_trust` does
+/// not open it. A floor the source names still applies.
+#[test]
+fn an_auto_exposed_openapi_capability_without_a_floor_keeps_the_federated_floor() {
+    let tool = |name: &str, governance: Option<serde_json::Value>| {
+        synthetic_tool_binding(mcpg_plugin_protocol::ExpandedTool {
+            name: name.to_owned(),
+            title: None,
+            description: "An operation".to_owned(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            output_schema: None,
+            annotations: None,
+            meta: None,
+            backend_kind: "openapi".to_owned(),
+            backend_spec: serde_json::json!({ "source": "petstore", "operation": name }),
+            governance,
+            retry: None,
+        })
+        .expect("synthesize tool")
+    };
+    let template =
+        synthetic_resource_template_binding(mcpg_plugin_protocol::ExpandedResourceTemplate {
+            name: "petstore.getPet".to_owned(),
+            uri_template: "petstore://pets/{petId}".to_owned(),
+            description: "A pet".to_owned(),
+            mime_type: None,
+            meta: None,
+            backend_kind: "openapi".to_owned(),
+            backend_spec: serde_json::json!({ "source": "petstore", "operation": "getPet" }),
+            governance: None,
+            retry: None,
+        })
+        .expect("synthesize template");
+
+    let config = AppConfig {
+        mcp: crate::config::McpConfig {
+            capabilities: McpCapabilitiesConfig {
+                tools: vec![
+                    tool("petstore.deletePet", None),
+                    tool(
+                        "petstore.updatePet",
+                        Some(serde_json::json!({ "allow_if": "true" })),
+                    ),
+                    tool(
+                        "petstore.listPets",
+                        Some(serde_json::json!({ "minimum_trust": "unauthenticated" })),
+                    ),
+                ],
+                resource_templates: vec![template],
+                ..McpCapabilitiesConfig::default()
+            },
+            ..crate::config::McpConfig::default()
+        },
+        governance: GovernanceConfig {
+            policy: PolicyConfig {
+                tool_access: ToolAccessPolicyConfigYaml {
+                    default_minimum_trust: TrustLevelConfig::Unauthenticated,
+                    cel_allow_if: None,
+                    rules: Vec::new(),
+                },
+                cache: PolicyCacheConfig::default(),
+                engine: Vec::new(),
+            },
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    let gate = crate::runtime::policy::PreDispatchPolicyGate::try_new(
+        build_tool_access_policy_config(&config),
+    )
+    .expect("policy compiles");
+    let allows = |name: &str, trust_level| {
+        let context = crate::runtime::policy::ToolPolicyContext {
+            tool_name: name.to_owned(),
+            trust_level,
+            principal_id: None,
+            auth_provider: None,
+            identity_kind: "anonymous".to_owned(),
+            roles: Vec::new(),
+            groups: Vec::new(),
+            scopes: Vec::new(),
+            attributes: std::collections::BTreeMap::new(),
+            issuer: None,
+        };
+        matches!(
+            gate.evaluate(&context, crate::runtime::policy::PolicyRoute::gateway()),
+            crate::runtime::policy::PreDispatchPolicyOutcome::Allow
+        )
+    };
+
+    for name in [
+        "petstore.deletePet",
+        "petstore.updatePet",
+        "petstore.getPet",
+        "petstore://pets/{petId}",
+    ] {
+        assert!(
+            !allows(name, RequestTrustLevel::Unauthenticated),
+            "{name} admitted an anonymous caller"
+        );
+        assert!(allows(name, RequestTrustLevel::HeaderAsserted), "{name}");
+    }
+    assert!(allows(
+        "petstore.listPets",
+        RequestTrustLevel::Unauthenticated
+    ));
 }
 
 #[tokio::test]
@@ -2131,7 +2590,7 @@ mcp:
     )
     .expect("config parses");
 
-    let bundle = super::build_plugin_registry(&mut config, None, None)
+    let bundle = super::build_plugin_registry(&mut config, None, None, &Default::default())
         .await
         .expect("plugin registry builds");
 
@@ -2180,11 +2639,17 @@ fn test_oidc_resolver() -> std::sync::Arc<crate::runtime::oidc::OidcOAuthResolve
 #[tokio::test]
 async fn oidc_configured_without_any_provider_refuses_boot() {
     let mut config = crate::config::AppConfig::default();
-    let err =
-        match super::build_plugin_registry(&mut config, None, Some(test_oidc_resolver())).await {
-            Ok(_) => panic!("a configured OIDC resolver with no provider must refuse boot"),
-            Err(e) => e,
-        };
+    let err = match super::build_plugin_registry(
+        &mut config,
+        None,
+        Some(test_oidc_resolver()),
+        &Default::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("a configured OIDC resolver with no provider must refuse boot"),
+        Err(e) => e,
+    };
     let msg = format!("{err:#}");
     assert!(
         msg.contains("no identity plugin is registered under"),
@@ -2224,11 +2689,17 @@ plugins:
     )
     .expect("config parses");
 
-    let err =
-        match super::build_plugin_registry(&mut config, None, Some(test_oidc_resolver())).await {
-            Ok(_) => panic!("an absent cdylib artifact must fail the load"),
-            Err(e) => e,
-        };
+    let err = match super::build_plugin_registry(
+        &mut config,
+        None,
+        Some(test_oidc_resolver()),
+        &Default::default(),
+    )
+    .await
+    {
+        Ok(_) => panic!("an absent cdylib artifact must fail the load"),
+        Err(e) => e,
+    };
     let msg = format!("{err:#}");
     assert!(
         msg.contains("artifact not found") && msg.contains("dev.mcpg.identity.oidc"),
@@ -2292,7 +2763,7 @@ fn built_in_official_key_bundle_decodes_and_flows_into_inherit_path() {
 #[tokio::test]
 async fn plugin_registry_publishes_an_empty_secrets_digest_without_references() {
     let mut config = AppConfig::default();
-    let bundle = super::build_plugin_registry(&mut config, None, None)
+    let bundle = super::build_plugin_registry(&mut config, None, None, &Default::default())
         .await
         .expect("plugin registry builds");
     assert_eq!(bundle.secrets_digest, "");
@@ -2323,7 +2794,8 @@ plugins:
     ))
     .expect("config parses");
 
-    let err = match super::build_plugin_registry(&mut config, None, None).await {
+    let err = match super::build_plugin_registry(&mut config, None, None, &Default::default()).await
+    {
         Ok(_) => panic!("a missing secret must refuse the build"),
         Err(e) => format!("{e:#}"),
     };
@@ -2334,6 +2806,307 @@ plugins:
     assert!(err.contains("${secret.MISSING}"), "{err}");
     assert!(!err.contains("s3cret-value"), "{err}");
     assert!(!err.contains("libconsumer.so"), "{err}");
+}
+
+// ── which plugins a `plugins[]` entry loads ──────────────────────────
+
+/// The license gate skips a `disabled: true` entry because a disabled entry
+/// is not loaded: its artefact is never opened, its config never resolved,
+/// and nothing of it is registered.
+#[tokio::test]
+async fn a_disabled_plugin_entry_is_never_loaded() {
+    let mut config: AppConfig = serde_yaml::from_str(
+        r#"
+plugins:
+  - id: dev.mcpg.payment.ucp
+    class: tool_gate
+    kind: native
+    source:
+      path: /nonexistent/libmcpg_plugin_payment_ucp.so
+    config:
+      api_key: "${secret.NEVER_MOUNTED}"
+    disabled: true
+"#,
+    )
+    .expect("config parses");
+    crate::license_gate::enforce_license_gate(&config)
+        .expect("the license gate skips a disabled entry");
+
+    let bundle =
+        match super::build_plugin_registry(&mut config, None, None, &Default::default()).await {
+            Ok(bundle) => bundle,
+            Err(e) => panic!("a disabled entry must not be opened: {e:#}"),
+        };
+    assert!(
+        bundle
+            .registry
+            .loaded_plugins()
+            .iter()
+            .all(|p| p.id != "dev.mcpg.payment.ucp"),
+        "a disabled entry registers nothing"
+    );
+}
+
+/// A gateway whose licence lapsed withholds its gated backend, and the boot
+/// goes on: the bindings of that backend's kind are refused at call time, and
+/// everything free keeps serving.
+#[tokio::test]
+async fn a_withheld_backend_does_not_stop_the_boot() {
+    use mcpg_control_plane_license::license::{
+        AUDIENCE_GATEWAY, IssuerRole, KeyEnvironment, LicenseClaims, features_for, plan_envelope,
+    };
+    use mcpg_control_plane_license::trust::test_override;
+
+    const DAY: i64 = 86_400;
+    let now = chrono::Utc::now().timestamp();
+    let mut claims = LicenseClaims::community(AUDIENCE_GATEWAY);
+    let (entitlements, quotas) = plan_envelope("enterprise");
+    claims.plan = "enterprise".into();
+    claims.plugin_entitlements = entitlements;
+    claims.quotas = quotas;
+    claims.features = features_for("enterprise");
+    claims.exp = now - 20 * DAY;
+    claims.nbf = now - 400 * DAY;
+    claims.iat = claims.nbf;
+    let token = test_override::issue(IssuerRole::SelfHost, KeyEnvironment::Production, &claims);
+
+    let config: AppConfig = serde_yaml::from_str(&format!(
+        r#"
+license:
+  token: {token}
+plugins:
+  - id: dev.mcpg.backend.grpc
+    class: backend
+    kind: native
+    source:
+      path: /nonexistent/libmcpg_plugin_backend_grpc.so
+mcp:
+  capabilities:
+    tools:
+      - name: users.get
+        description: Look up a user over gRPC.
+        backend:
+          kind: grpc
+          url: "https://grpc.example.com"
+          service: example.UserService
+          method: GetUser
+"#
+    ))
+    .expect("config parses");
+
+    let state = match build_from_config(config, Vec::new()).await {
+        Ok(state) => state,
+        Err(e) => panic!("a withheld backend must not stop the boot: {e:#}"),
+    };
+    let runtime = state.runtime.load_full();
+    assert_eq!(
+        runtime.license_state().withheld,
+        vec!["dev.mcpg.backend.grpc".to_owned()]
+    );
+}
+
+/// Only the license gate's withholding excuses a binding without its backend:
+/// a backend the operator disabled still refuses the build.
+#[tokio::test]
+async fn a_binding_of_a_disabled_backend_still_refuses_the_build() {
+    let mut config: AppConfig = serde_yaml::from_str(
+        r#"
+plugins:
+  - id: dev.mcpg.backend.grpc
+    class: backend
+    kind: native
+    source:
+      path: /nonexistent/libmcpg_plugin_backend_grpc.so
+    disabled: true
+mcp:
+  capabilities:
+    tools:
+      - name: users.get
+        description: Look up a user over gRPC.
+        backend:
+          kind: grpc
+          url: "https://grpc.example.com"
+          service: example.UserService
+          method: GetUser
+"#,
+    )
+    .expect("config parses");
+    let err = match super::build_plugin_registry(&mut config, None, None, &Default::default()).await
+    {
+        Ok(_) => panic!("a binding without its backend must refuse the build"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("no backend plugin is registered"), "{err}");
+}
+
+/// The in-tree `dev.mcpg.testing.hello-native` cdylib, staged as runfiles by
+/// a sandboxed runner. `None` under `cargo test`, which stages no cdylib.
+fn hello_native_cdylib() -> Option<std::path::PathBuf> {
+    let rel = std::env::var("MCPG_TEST_HELLO_NATIVE_CDYLIB").ok()?;
+    let root = std::env::var("TEST_SRCDIR").ok()?;
+    let path = std::path::PathBuf::from(root).join(rel);
+    assert!(path.is_file(), "staged cdylib missing: {}", path.display());
+    Some(path)
+}
+
+fn raw_native_entry_config(so: &std::path::Path, id: &str, reference: Option<&str>) -> AppConfig {
+    let reference = reference
+        .map(|r| format!("    ref: {r}\n"))
+        .unwrap_or_default();
+    serde_yaml::from_str(&format!(
+        "plugins:\n  - id: {id}\n{reference}    class: tool_gate\n    kind: native\n    \
+         source:\n      path: {}\n    signature:\n      policy: disabled\n",
+        so.display()
+    ))
+    .expect("config parses")
+}
+
+/// The license gate judges an entry by its `ref` (or `id`), so a raw cdylib
+/// loads only when it is the plugin the entry names: an alias or a borrowed
+/// free `ref` in front of another plugin's `.so` refuses the load.
+#[tokio::test]
+async fn a_raw_native_cdylib_loads_only_as_the_plugin_its_entry_names() {
+    let Some(so) = hello_native_cdylib() else {
+        eprintln!("skipped: this runner stages no hello-native cdylib");
+        return;
+    };
+    const MANIFEST_ID: &str = "dev.mcpg.testing.hello-native";
+
+    for (id, reference) in [
+        ("some-alias", None),
+        ("my-gate", Some("dev.mcpg.backend.http")),
+    ] {
+        let mut config = raw_native_entry_config(&so, id, reference);
+        let err = match super::build_plugin_registry(&mut config, None, None, &Default::default())
+            .await
+        {
+            Ok(_) => panic!("{id}: a cdylib that is not the named plugin must not load"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains(&format!("plugin alias '{id}'"))
+                && err.contains(&format!("declares manifest id \"{MANIFEST_ID}\""))
+                && err.contains(&format!("entry expects ref '{}'", reference.unwrap_or(id))),
+            "{err}"
+        );
+    }
+
+    for (id, reference) in [(MANIFEST_ID, None), ("gate-a", Some(MANIFEST_ID))] {
+        let mut config = raw_native_entry_config(&so, id, reference);
+        let bundle = match super::build_plugin_registry(
+            &mut config,
+            None,
+            None,
+            &Default::default(),
+        )
+        .await
+        {
+            Ok(bundle) => bundle,
+            Err(e) => panic!("{id}: the named plugin loads: {e:#}"),
+        };
+        assert!(
+            bundle
+                .registry
+                .loaded_plugins()
+                .iter()
+                .any(|p| p.id == MANIFEST_ID),
+            "{id}: the cdylib is registered"
+        );
+    }
+}
+
+/// A file a sandboxed runner staged for this test under the runfiles path in
+/// `var`; `None` under `cargo test`.
+fn staged_test_file(var: &str) -> Option<std::path::PathBuf> {
+    let rel = std::env::var(var).ok()?;
+    let root = std::env::var("TEST_SRCDIR").ok()?;
+    let path = std::path::PathBuf::from(root).join(rel);
+    assert!(path.is_file(), "staged file missing: {}", path.display());
+    Some(path)
+}
+
+/// Packs `cdylib` with `descriptor_yaml` as its `plugin.yaml`, and a config
+/// that loads the package as alias `id` of `reference`.
+fn packaged_entry_config(
+    dir: &std::path::Path,
+    cdylib: &std::path::Path,
+    descriptor_yaml: &str,
+    id: &str,
+    reference: &str,
+) -> AppConfig {
+    let descriptor = dir.join(format!("{id}.plugin.yaml"));
+    std::fs::write(&descriptor, descriptor_yaml).unwrap();
+    let package = dir.join(format!("{id}.zip"));
+    mcpg_plugin_host::Package::pack(
+        &mcpg_plugin_host::PackInputs {
+            descriptor_path: &descriptor,
+            artifact_path: cdylib,
+            artifact_kind: mcpg_plugin_host::ArtifactKind::Native,
+            signature_path: None,
+            license_path: None,
+        },
+        &package,
+    )
+    .unwrap();
+    serde_yaml::from_str(&format!(
+        "gateway:\n  plugin_registry:\n    cache_dir: {}\nplugins:\n  - id: {id}\n    \
+         ref: {reference}\n    class: cache\n    kind: native\n    source:\n      path: {}\n    \
+         config: {{}}\n    signature:\n      policy: disabled\n",
+        dir.join("unpack-cache").display(),
+        package.display(),
+    ))
+    .expect("config parses")
+}
+
+/// A package's `plugin.yaml` is the packager's claim, and the registry accepts
+/// it when any registered plugin matches it. A package that borrows the
+/// always-registered built-in cache's identity for another cdylib therefore
+/// passed every descriptor check; it loads only when the cdylib inside is the
+/// plugin the entry names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_packaged_cdylib_loads_only_as_the_plugin_its_entry_names() {
+    let (Some(so), Some(own_descriptor)) = (
+        staged_test_file("MCPG_TEST_CACHE_MEMORY_CDYLIB"),
+        staged_test_file("MCPG_TEST_CACHE_MEMORY_DESCRIPTOR"),
+    ) else {
+        eprintln!("skipped: this runner stages no cache-memory cdylib");
+        return;
+    };
+    const MANIFEST_ID: &str = "dev.mcpg.cache.memory";
+    const BORROWED_ID: &str = "dev.mcpg.builtin.cache.memory";
+    let dir = tempfile::tempdir().unwrap();
+
+    let borrowed = crate::builtins::cache_memory::DESCRIPTOR_YAML
+        .replace("runtime: static-firstparty-v1", "runtime: native-cdylib-v1");
+    assert!(borrowed.contains(&format!("id: {BORROWED_ID}\n")));
+    let mut config = packaged_entry_config(dir.path(), &so, &borrowed, "my-cache", BORROWED_ID);
+    let err = match super::build_plugin_registry(&mut config, None, None, &Default::default()).await
+    {
+        Ok(_) => panic!("a package that borrows another plugin's identity must not load"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("plugin alias 'my-cache'")
+            && err.contains(&format!("declares manifest id \"{MANIFEST_ID}\""))
+            && err.contains(&format!("entry expects ref '{BORROWED_ID}'")),
+        "{err}"
+    );
+
+    let own = std::fs::read_to_string(own_descriptor).unwrap();
+    let mut config = packaged_entry_config(dir.path(), &so, &own, "cache-a", MANIFEST_ID);
+    let bundle =
+        match super::build_plugin_registry(&mut config, None, None, &Default::default()).await {
+            Ok(bundle) => bundle,
+            Err(e) => panic!("the package of the named plugin loads: {e:#}"),
+        };
+    assert!(
+        bundle
+            .registry
+            .loaded_plugins()
+            .iter()
+            .any(|p| p.id == MANIFEST_ID),
+        "the packaged cdylib is registered"
+    );
 }
 
 // ── where the EMA authorization server records redeemed ID-JAGs ──────
@@ -2486,7 +3259,7 @@ async fn the_ema_server_is_built_from_resolved_env_and_mounted_secrets() {
 
     let mut config = ema_config_with_placeholders("${env.MCPGTEST_EMA_SIGNING_SECRET}", dir.path());
     config.validate().expect("the placeholders pass validation");
-    let bundle = build_plugin_registry(&mut config, None, None)
+    let bundle = build_plugin_registry(&mut config, None, None, &Default::default())
         .await
         .unwrap_or_else(|e| panic!("registry builds: {e:#}"));
     let resolved = bundle.authorization_server.expect("configured");
@@ -2550,7 +3323,7 @@ async fn a_resolved_ema_signing_secret_is_held_to_the_hs256_floor() {
     config
         .validate()
         .expect("a placeholder is not judged by its length");
-    let error = match build_plugin_registry(&mut config, None, None).await {
+    let error = match build_plugin_registry(&mut config, None, None, &Default::default()).await {
         Ok(_) => panic!("an 11-byte HS256 secret must refuse the boot"),
         Err(error) => format!("{error:#}"),
     };
@@ -2572,7 +3345,7 @@ async fn an_unset_ema_env_var_refuses_the_boot_and_names_it() {
     .expect("write secret");
     let mut config =
         ema_config_with_placeholders("${env.MCPGTEST_EMA_SIGNING_SECRET_NEVER_SET}", dir.path());
-    let error = match build_plugin_registry(&mut config, None, None).await {
+    let error = match build_plugin_registry(&mut config, None, None, &Default::default()).await {
         Ok(_) => panic!("an unset variable must refuse the boot"),
         Err(error) => format!("{error:#}"),
     };

@@ -125,6 +125,7 @@ impl GatewayRuntime {
                                     "prompt",
                                     "prompt.get.pre",
                                     &params.name,
+                                    PolicyRoute::for_prompt(&route),
                                     &args_value,
                                     request_context,
                                     &request_id,
@@ -326,6 +327,7 @@ impl GatewayRuntime {
                                     "resource",
                                     "resource.read.pre",
                                     &params.uri,
+                                    PolicyRoute::gateway().on(PolicySurface::Resource),
                                     &args_value,
                                     request_context,
                                     &request_id,
@@ -350,13 +352,12 @@ impl GatewayRuntime {
                                     ResourceRoute::Template { .. } => "resource_template",
                                     _ => "resource",
                                 };
-                                let args_value = serde_json::json!({ "uri": params.uri });
                                 if let Err(gate_response) = self
-                                    .evaluate_surface_gate(
+                                    .evaluate_resource_gate(
                                         surface_label,
                                         "resource.read.pre",
                                         &params.uri,
-                                        &args_value,
+                                        &route,
                                         request_context,
                                         &request_id,
                                     )
@@ -503,7 +504,7 @@ impl GatewayRuntime {
                     Ok(_) => {
                         let session_id = request_context.session_id.as_deref().unwrap_or("");
                         // Verify the resource exists
-                        if self.resolve_resource_route(&params.uri).is_none() {
+                        let Some(route) = self.resolve_resource_route(&params.uri) else {
                             return protocol_http_error(
                                 200,
                                 Some(request_id),
@@ -514,20 +515,19 @@ impl GatewayRuntime {
                                     "Use resources/list to discover available resource URIs.",
                                 ),
                             );
-                        }
+                        };
                         // A subscription is a read that keeps arriving, and the
                         // first holder starts a backend poll watcher, so it runs
                         // the same authz stack `resources/read` does. Without
                         // this the trust floor, CEL `allow_if`, the policy chain
                         // and the per-resource governance a federated import
                         // attaches were all skipped for the streaming surface.
-                        let args_value = serde_json::json!({ "uri": params.uri });
                         if let Err(gate_response) = self
-                            .evaluate_surface_gate(
+                            .evaluate_resource_gate(
                                 "resource",
                                 "resource.subscribe.pre",
                                 &params.uri,
-                                &args_value,
+                                &route,
                                 request_context,
                                 &request_id,
                             )
@@ -936,6 +936,7 @@ impl GatewayRuntime {
             ResourceRoute::Federated {
                 ref source,
                 ref upstream_uri,
+                ..
             } => {
                 let Some(engine) = self.execution_dispatcher.federation_engine() else {
                     return Err(invocation::SurfaceDecodeError::BackendError {

@@ -79,7 +79,10 @@ before the code:
    server answered with an error.** The check runs before dispatch, so a
    failed attempt consumes its id; a reused id (number or string) is
    refused with `-32600 duplicate request id on this session` before
-   anything else happens. Count up, or use UUIDs.
+   anything else happens. Count up, or use UUIDs. This rule is the
+   `2025-11-25` wire's; on `2026-07-28` an id need only differ from the
+   client's other requests still in flight, and the gateway keeps no id
+   history there.
 3. **A notification carries no `id`.** `notifications/initialized` sent with
    an `id` is a *request* for a method that does not exist, and is answered
    with `-32601 Method not found: notifications/initialized` — the session

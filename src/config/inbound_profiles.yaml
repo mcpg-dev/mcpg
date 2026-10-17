@@ -1,0 +1,38 @@
+# The signing profiles every inbound event route can name in
+# `verify.profile`. Each entry has the shape of an entry of
+# `mcp.configurations.events.inbound_profiles`, where an operator declares
+# more.
+
+# https://www.standardwebhooks.com
+- name: standard_webhooks
+  secret: { prefix: whsec_, encoding: base64, min_bytes: 24, max_bytes: 64 }
+  signature: { header: webhook-signature, separator: " ", prefix: "v1,", encoding: base64 }
+  signed_payload: "{header:webhook-id}.{timestamp}.{body}"
+  signed_timestamp: { header: webhook-timestamp }
+  event_id: { header: webhook-id }
+
+# GitHub webhooks. The event kind is the X-GitHub-Event header.
+- name: github
+  signature: { header: X-Hub-Signature-256, prefix: "sha256=" }
+  event_id: { header: X-GitHub-Delivery }
+  handshakes:
+    - when: { header: { X-GitHub-Event: ping } }
+
+# Stripe webhook endpoints. The event kind is the body's /type.
+- name: stripe
+  signature: { header: Stripe-Signature, separator: ",", key: v1 }
+  signed_payload: "{timestamp}.{body}"
+  signed_timestamp: { key: t }
+  event_id: { pointer: /id }
+  event_time: /created
+
+# The Slack Events API. The event kind is the body's /event/type.
+- name: slack
+  signature: { header: X-Slack-Signature, prefix: "v0=" }
+  signed_payload: "v0:{timestamp}:{body}"
+  signed_timestamp: { header: X-Slack-Request-Timestamp }
+  event_id: { pointer: /event_id }
+  event_time: /event_time
+  handshakes:
+    - when: { body: { /type: url_verification } }
+      reply: { challenge: /challenge }

@@ -62,7 +62,6 @@ cluster:
 
 license:
   token_file: "/etc/mcpg/license/license.jwt"
-  pubkey_pem: "${env.MCPG_LICENSE_PUBKEY}"
 
 governance:
   access:

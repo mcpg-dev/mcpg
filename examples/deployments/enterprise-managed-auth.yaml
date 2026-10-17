@@ -35,7 +35,6 @@
 #   MCPG_AS_SIGNING_KEY    — P-256 PKCS#8 PEM that signs the gateway's
 #                            access tokens, same on every replica
 #   CLAUDE_EMA_SECRET      — client secret of the MCP client registered below
-#   MCPG_LICENSE_PUBKEY    — public key (SPKI PEM) that verifies the license
 #   HOSTNAME              — `cluster.node.id`, unique per replica; exported
 #                            by a container runtime, not by a shell
 #
@@ -72,12 +71,11 @@ cluster:
   state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
 
 # The NATS coordinator is a licensed plugin: the gateway refuses to load
-# it without a license that entitles `cluster.*` plugins (Team,
-# Enterprise). Outside production, `non_production_use: true` in place of
-# the token loads it under the non-production grant.
+# it without a license that entitles `cluster.*` plugins (Enterprise).
+# Outside production, `non_production_use: true` in place of the token
+# loads it under the non-production grant.
 license:
   token_file: "/etc/mcpg/license/license.jwt"
-  pubkey_pem: "${env.MCPG_LICENSE_PUBKEY}"
 
 governance:
   access:

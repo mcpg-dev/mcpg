@@ -604,7 +604,13 @@ pub struct TunnelConfig {
     /// Relay endpoint to dial (e.g. `wss://relay.tunnels.mcpg.cloud`).
     #[serde(default = "default_tunnel_relay_url")]
     pub relay_url: String,
-    /// Optional stable tunnel name; the relay allocates one when unset.
+    /// Optional stable tunnel name, held by one gateway at a time within the
+    /// org. When unset, the tunnel is named after this gateway's instance
+    /// uid, which changes on every restart. A `public` tunnel's name is its
+    /// host label (`<name>.tunnels.mcpg.cloud`), so it must be one DNS label:
+    /// 1 to 63 letters, digits and `-`, neither starting nor ending with `-`,
+    /// compared lowercase. The relay refuses any other public name with
+    /// `tunnel_name_invalid`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// `public` allocates a `<id>.tunnels.mcpg.cloud` URL (dev preview,

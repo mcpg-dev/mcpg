@@ -64,12 +64,15 @@ pub(crate) fn watch_config_for(
             spec: serde_json::json!({ "subject": subject }),
         },
         WatchStrategyConfig::KafkaTopic { topic, group_id } => {
+            // An absent group lets the plugin pick: shared for a resource
+            // watch, its own for an event source.
+            let mut spec = serde_json::json!({ "topic": topic });
+            if let Some(group_id) = group_id {
+                spec["group_id"] = serde_json::json!(group_id);
+            }
             watch_engine::WatchStrategy::Plugin {
                 kind: "kafka_topic".into(),
-                spec: serde_json::json!({
-                    "topic": topic,
-                    "group_id": group_id,
-                }),
+                spec,
             }
         }
         WatchStrategyConfig::SqlPolling { spec } => {
@@ -219,6 +222,7 @@ pub(crate) fn build_watch_resource_fetcher(
             ResourceRoute::Federated {
                 source,
                 upstream_uri,
+                ..
             } => {
                 let engine = execution_dispatcher.federation_engine()?;
                 let outcome = tokio::task::block_in_place(|| {

@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use axum::Router;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::TlsConnector;
@@ -59,13 +60,15 @@ fn to_spec(cfg: &TunnelConfig) -> TunnelSpec {
 /// Establish a tunnel over an already-connected `transport` (a TLS WebSocket
 /// in production, an in-memory duplex in tests), complete the handshake
 /// (presenting `bearer` as the dial-in credential the relay authenticates),
-/// and serve `router` through it until the relay hangs up.
+/// and serve `router` through it until the relay hangs up. `public_url`
+/// holds the URL the relay assigned while the tunnel is up.
 pub async fn serve_over<T>(
     transport: T,
     router: Router,
     cfg: &TunnelConfig,
     instance_uid: impl Into<String>,
     bearer: Option<String>,
+    public_url: &ArcSwapOption<String>,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -81,7 +84,10 @@ where
             tracing::info!(tunnel_id = %resp.tunnel_id, "tunnel established (private)");
         }
     }
-    mcpg_tunnel_agent::serve(session, router, gateway_decorator()).await?;
+    public_url.store(resp.public_url.clone().map(Arc::new));
+    let served = mcpg_tunnel_agent::serve(session, router, gateway_decorator()).await;
+    public_url.store(None);
+    served?;
     Ok(())
 }
 
@@ -108,9 +114,60 @@ pub async fn run(
     } else {
         None
     };
+    let public_url = state
+        .runtime
+        .load()
+        .shared_services
+        .load_full()
+        .map(|services| Arc::clone(&services.tunnel_public_url))
+        .unwrap_or_default();
     let make_router =
         move || crate::transports::http::router(state.clone(), &health_path, &mcp_path);
-    run_loop(cfg, make_router, bearer, tls, shutdown).await
+    run_loop(
+        cfg,
+        make_router,
+        bearer,
+        tls,
+        shutdown,
+        Redial::DEFAULT,
+        public_url,
+    )
+    .await
+}
+
+/// How long the dial loop waits before it dials again.
+#[derive(Clone, Copy, Debug)]
+struct Redial {
+    /// The wait after the first failed dial; it doubles with every failure.
+    base: std::time::Duration,
+    /// The longest wait.
+    cap: std::time::Duration,
+    /// The longest wait while another gateway of the org holds the tunnel's
+    /// name. That gateway is usually the one this one replaces, so the name
+    /// frees soon after it leaves; the doubled wait would keep the tunnel down
+    /// for up to `cap` after that.
+    name_in_use: std::time::Duration,
+}
+
+impl Redial {
+    const DEFAULT: Self = Self {
+        base: std::time::Duration::from_millis(500),
+        cap: std::time::Duration::from_secs(30),
+        name_in_use: std::time::Duration::from_secs(5),
+    };
+}
+
+/// The relay's refusal of a name that another gateway of the org holds on a
+/// live tunnel.
+const NAME_IN_USE: &str = "tunnel_name_in_use";
+
+/// Whether `e` is the relay refusing the dial because another gateway of the
+/// org holds the tunnel's name.
+fn name_held_elsewhere(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<mcpg_tunnel_proto::ProtoError>(),
+        Some(mcpg_tunnel_proto::ProtoError::Rejected(reason)) if reason.ends_with(NAME_IN_USE)
+    )
 }
 
 /// The bearer credential the gateway presents to the relay, read from
@@ -133,6 +190,8 @@ async fn run_loop<F>(
     bearer: Option<String>,
     tls: Option<TlsConnector>,
     mut shutdown: tokio::sync::watch::Receiver<()>,
+    redial: Redial,
+    public_url: Arc<ArcSwapOption<String>>,
 ) -> anyhow::Result<()>
 where
     F: FnMut() -> Router,
@@ -151,9 +210,7 @@ where
         "tunnel transport: dialing relay (no public bind)"
     );
 
-    let base_backoff = std::time::Duration::from_millis(500);
-    let backoff_cap = std::time::Duration::from_secs(30);
-    let mut backoff = base_backoff;
+    let mut backoff = redial.base;
     loop {
         // Rebuild per dial so a config reload lands on the next reconnect.
         let router = make_router();
@@ -165,12 +222,30 @@ where
             match (&tls, &server_name) {
                 (Some(connector), Some(name)) => {
                     let stream = connector.connect(name.clone(), tcp).await?;
-                    serve_over(stream, router, &cfg, instance_uid.clone(), bearer.clone()).await
+                    serve_over(
+                        stream,
+                        router,
+                        &cfg,
+                        instance_uid.clone(),
+                        bearer.clone(),
+                        &public_url,
+                    )
+                    .await
                 }
-                _ => serve_over(tcp, router, &cfg, instance_uid.clone(), bearer.clone()).await,
+                _ => {
+                    serve_over(
+                        tcp,
+                        router,
+                        &cfg,
+                        instance_uid.clone(),
+                        bearer.clone(),
+                        &public_url,
+                    )
+                    .await
+                }
             }
         };
-        tokio::select! {
+        let pause = tokio::select! {
             _ = shutdown.changed() => {
                 tracing::info!("tunnel transport: shutdown signal received");
                 return Ok(());
@@ -178,21 +253,34 @@ where
             res = attempt => match res {
                 Ok(()) => {
                     tracing::info!("tunnel closed by relay; reconnecting");
-                    backoff = base_backoff;
+                    backoff = redial.base;
+                    backoff
                 }
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    backoff_ms = backoff.as_millis() as u64,
-                    "tunnel dial/serve failed; retrying"
-                ),
+                Err(e) if name_held_elsewhere(&e) => {
+                    let pause = backoff.min(redial.name_in_use);
+                    tracing::warn!(
+                        error = %e,
+                        backoff_ms = pause.as_millis() as u64,
+                        "tunnel name held by another gateway of the org; retrying"
+                    );
+                    pause
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "tunnel dial/serve failed; retrying"
+                    );
+                    backoff
+                }
             }
-        }
+        };
         // Pause before redial, but wake immediately on shutdown.
         tokio::select! {
             _ = shutdown.changed() => return Ok(()),
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(pause) => {}
         }
-        backoff = (backoff * 2).min(backoff_cap);
+        backoff = (backoff * 2).min(redial.cap);
     }
 }
 
@@ -279,6 +367,8 @@ fn instance_uid() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use axum::routing::get;
     use mcpg_tunnel_proto::{
@@ -335,7 +425,15 @@ mod tests {
             },
             async {
                 tokio::spawn(async move {
-                    let _ = serve_over(client_io, tls_router(), &config, "inst-1", None).await;
+                    let _ = serve_over(
+                        client_io,
+                        tls_router(),
+                        &config,
+                        "inst-1",
+                        None,
+                        &ArcSwapOption::empty(),
+                    )
+                    .await;
                 });
             },
         );
@@ -414,6 +512,7 @@ mod tests {
                         &config,
                         "inst-1",
                         Some("s3cret".to_owned()),
+                        &ArcSwapOption::empty(),
                     )
                     .await;
                 });
@@ -448,7 +547,16 @@ mod tests {
                     post(|body: String| async move { format!("echo:{body}") }),
                 )
             };
-            run_loop(config, make, None, None, rx).await
+            run_loop(
+                config,
+                make,
+                None,
+                None,
+                rx,
+                Redial::DEFAULT,
+                Arc::default(),
+            )
+            .await
         });
 
         // Relay side: accept the dialed agent and answer a single request.
@@ -493,6 +601,62 @@ mod tests {
         // Stop the reconnect loop and confirm it exits cleanly.
         tx.send(()).unwrap();
         loop_task.await.unwrap().unwrap();
+    }
+
+    /// Dial `run_loop` against a relay that refuses every handshake with
+    /// `reason`, and return the time between each dial and the next.
+    async fn gaps_between_refused_dials(reason: &'static str, redial: Redial) -> Vec<Duration> {
+        use mcpg_tunnel_proto::ProtoError;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = cfg();
+        config.relay_url = format!("tcp://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::watch::channel(());
+        let loop_task = tokio::spawn(run_loop(
+            config,
+            Router::new,
+            None,
+            None,
+            rx,
+            redial,
+            Arc::default(),
+        ));
+
+        let mut dials = Vec::new();
+        for _ in 0..8 {
+            let (sock, _) = listener.accept().await.unwrap();
+            dials.push(tokio::time::Instant::now());
+            let refused = RelaySession::accept(sock, async |_| {
+                Err::<HandshakeResponse, _>(ProtoError::Rejected(reason.to_owned()))
+            })
+            .await;
+            assert!(refused.is_err());
+        }
+        tx.send(()).unwrap();
+        loop_task.await.unwrap().unwrap();
+        dials.windows(2).map(|w| w[1] - w[0]).collect()
+    }
+
+    /// While another gateway of the org holds the tunnel's name, the loop asks
+    /// again at a short interval instead of doubling its wait, so a gateway
+    /// that replaces another takes the name soon after the old one leaves.
+    /// Any other refusal still backs off.
+    #[tokio::test]
+    async fn a_name_another_gateway_holds_is_asked_for_again_soon() {
+        let redial = Redial {
+            base: Duration::from_millis(10),
+            cap: Duration::from_secs(10),
+            name_in_use: Duration::from_millis(40),
+        };
+        let held = gaps_between_refused_dials("tunnel_name_in_use", redial).await;
+        let longest = held.iter().max().unwrap();
+        assert!(*longest < Duration::from_millis(400), "{held:?}");
+
+        let taken = gaps_between_refused_dials("tunnel_hostname_taken", redial).await;
+        assert!(
+            *taken.last().unwrap() >= Duration::from_millis(640),
+            "{taken:?}"
+        );
     }
 
     #[test]
@@ -591,7 +755,16 @@ mod tests {
                     post(|body: String| async move { format!("echo:{body}") }),
                 )
             };
-            run_loop(config, make, None, Some(connector), rx).await
+            run_loop(
+                config,
+                make,
+                None,
+                Some(connector),
+                rx,
+                Redial::DEFAULT,
+                Arc::default(),
+            )
+            .await
         });
 
         let (sock, _) = listener.accept().await.unwrap();

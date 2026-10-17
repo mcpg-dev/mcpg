@@ -294,12 +294,12 @@ The guardrail hooks fit into `runtime/mod.rs` at the `ToolsCall` handler between
 
 ```
 Current flow:
-  policy_gate.evaluate_tool_call()        → Allow/Deny
+  pre_dispatch_policy.evaluate(ctx, route) → Allow/Deny
   capability_registry.validate_tool_arguments()
   execution_dispatcher.dispatch_tool_call()
 
 Proposed flow:
-  policy_gate.evaluate_tool_call()        → Allow/Deny
+  pre_dispatch_policy.evaluate(ctx, route) → Allow/Deny
   capability_registry.validate_tool_arguments()
   guardrail_chain.evaluate_pre_execution() → Allow/Deny/RequireApproval
   execution_dispatcher.dispatch_tool_call()

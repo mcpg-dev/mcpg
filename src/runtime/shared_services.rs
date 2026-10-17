@@ -19,6 +19,7 @@ use std::sync::{Arc, Weak};
 use arc_swap::ArcSwap;
 
 use crate::config::AppConfig;
+use crate::protocol::v_2026_07_28::dispatch::events::EventsHandlerSlot;
 #[cfg(test)]
 use crate::protocol::v_2026_07_28::dispatch::request_state::InMemoryRequestStateStore;
 use crate::protocol::v_2026_07_28::dispatch::request_state::RequestStateCodec;
@@ -70,6 +71,18 @@ pub struct SharedServices {
     /// Encoded when the modern `tools/call` path suspends awaiting
     /// input, and decoded again when the pipeline resumes.
     pub request_state_codec: Arc<RequestStateCodec>,
+
+    /// The MCP Events core, once installed. The bundle outlives config
+    /// reloads, so a core installed at boot keeps serving across them.
+    pub events: Arc<EventsHandlerSlot>,
+
+    /// The same events core, typed, for the reload path and the inbound
+    /// event routes.
+    pub events_core: Arc<crate::runtime::events::EventsCoreSlot>,
+
+    /// The URL the relay of a public tunnel assigned this gateway, while
+    /// the tunnel is up.
+    pub tunnel_public_url: Arc<arc_swap::ArcSwapOption<String>>,
 }
 
 impl SharedServices {
@@ -87,6 +100,9 @@ impl SharedServices {
             config_snapshot,
             runtime: Arc::downgrade(runtime),
             request_state_codec,
+            events: Arc::default(),
+            events_core: Arc::default(),
+            tunnel_public_url: Arc::default(),
         }
     }
 
@@ -116,6 +132,9 @@ impl SharedServices {
                 *b"0123456789abcdef0123456789abcdef",
                 Arc::new(InMemoryRequestStateStore::new()),
             )),
+            events: Arc::default(),
+            events_core: Arc::default(),
+            tunnel_public_url: Arc::default(),
         }
     }
 }

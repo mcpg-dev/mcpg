@@ -48,13 +48,18 @@ pub(crate) async fn reload_with_config(
         .resolve_schema_refs(config_dir.as_deref())
         .await?;
 
-    crate::license_gate::enforce_license_gate(&new_config)?;
+    let license =
+        crate::license_gate::gate_at_reload(&new_config, state.runtime.load().license_state())?;
 
     // Registry auto-federation composes here — the single point every
     // reload trigger passes through — so a CP push or file reload can
     // never wipe registry-synthesized federations, and the syncer can
     // never resurrect a superseded base config.
     state.base_config.store(Arc::new(new_config.clone()));
+    // The base keeps withheld plugins, so a reload once a licence covers
+    // them loads them.
+    crate::license_gate::withhold(&mut new_config, &license);
+    let withheld_backend_kinds = crate::license_gate::withheld_backend_kinds(&license);
     if let Some(merged) = crate::runtime::registry_sync::merged_with_overlay(
         &new_config,
         &state.registry_overlay.load(),
@@ -97,6 +102,7 @@ pub(crate) async fn reload_with_config(
         &mut new_config,
         jwt_verifier.as_ref(),
         oidc_resolver.clone(),
+        &withheld_backend_kinds,
     )
     .await?;
 
@@ -226,6 +232,8 @@ pub(crate) async fn reload_with_config(
         None
     };
 
+    let (watched_resources, watched_templates) =
+        super::boot::resolved_resource_watches(&new_config, &plugin_registry).await?;
     let mut new_runtime = GatewayRuntime::try_new_with_runtime_controls_and_cache(
         "mcpg",
         env!("CARGO_PKG_VERSION"),
@@ -318,8 +326,8 @@ pub(crate) async fn reload_with_config(
         },
         &new_config.mcp.capabilities.tools,
         &new_config.mcp.capabilities.prompts,
-        &new_config.mcp.capabilities.resources,
-        &new_config.mcp.capabilities.resource_templates,
+        &watched_resources,
+        &watched_templates,
         jwt_verifier,
         oidc_resolver,
         pipeline_store,
@@ -353,6 +361,7 @@ pub(crate) async fn reload_with_config(
     new_runtime.set_quota_gate(quota_gate.clone());
     new_runtime.set_idempotency_store(new_idempotency_store.clone());
     new_runtime.set_idempotency_capability(new_idempotency_capability.clone());
+    new_runtime.set_events_config(new_config.mcp.configurations.events.clone());
     new_runtime.set_idempotency_replay_revalidation(
         new_idempotency_cfg.enabled && new_idempotency_cfg.replay_revalidation,
     );
@@ -374,6 +383,7 @@ pub(crate) async fn reload_with_config(
         &new_apps_cfg.registry,
     );
     new_runtime.set_tunnel_federation(new_config.gateway.server.tunnel_federation.as_ref());
+    new_runtime.set_license_state((&license).into());
     // CP-attached hooks are installed once, at attach time; a fresh runtime
     // starts on the no-op defaults, so they must be carried across every
     // reload or the CP stops receiving its own telemetry.
@@ -382,11 +392,12 @@ pub(crate) async fn reload_with_config(
         new_runtime.adopt_cp_hooks(&old_runtime);
     }
 
-    // Re-wire federation, preserving imported capabilities + governance
-    // across the swap: seed the new overlays from the
-    // old runtime (no flicker / governance gap), carry the old engine's
-    // upstream sessions for unchanged federations, and skip the re-import
-    // when the federation config is unchanged (no upstream reconnect).
+    // Re-wire federation, preserving imported capabilities across the swap:
+    // the new engine republishes the old engine's imports under the new
+    // config's governance (no flicker, no stale rule), carries the old
+    // engine's upstream sessions for unchanged federations, and skips the
+    // re-import when the federation config is unchanged (no upstream
+    // reconnect).
     {
         let old_runtime = state.runtime.load();
         let federations_unchanged =
@@ -394,8 +405,6 @@ pub(crate) async fn reload_with_config(
         new_runtime.rewire_federations(
             new_config.mcp.federations.clone(),
             format!("mcpg/{}", env!("CARGO_PKG_VERSION")),
-            old_runtime.federated_capabilities(),
-            old_runtime.federated_policies(),
             old_runtime.federation_engine(),
             !federations_unchanged,
             tenant_seg.clone(),
@@ -492,6 +501,23 @@ pub(crate) async fn reload_with_config(
         new_runtime.set_shared_services(services);
     }
 
+    // MCP Events: compile the new config against the new registry before
+    // anything is swapped, so a declaration that does not compile keeps the
+    // previous config in force. Committed right after the swap, while the
+    // old registry's coordinator can still release the owner lease.
+    let events_core = new_runtime
+        .shared_services
+        .load_full()
+        .and_then(|services| services.events_core.get().cloned());
+    let prepared_events = match &events_core {
+        Some(core) => Some(
+            core.prepare(&new_config, &new_runtime)
+                .await
+                .context("mcp.configurations.events")?,
+        ),
+        None => None,
+    };
+
     // Build the reloaded health-prober config BEFORE `new_config` is
     // moved into the swap below. The prober itself is (re)started after the
     // swap so it targets the new registry.
@@ -509,6 +535,13 @@ pub(crate) async fn reload_with_config(
 
     // Atomically swap config, runtime, overlay, and policy chain
     state.runtime.store(Arc::new(new_runtime));
+    let mut events_listed_changed = false;
+    if let (Some(core), Some(prepared)) = (events_core.as_ref(), prepared_events) {
+        events_listed_changed = core.commit(prepared, &state.runtime).await;
+        // The task store is new with every reload; it reports to the core.
+        crate::runtime::events::builtin::observe_tasks(core, &state.runtime.load());
+    }
+    crate::license_gate::report(&license);
     state.config.store(Arc::new(new_config));
     state
         .config_overlay
@@ -565,6 +598,12 @@ pub(crate) async fn reload_with_config(
     // fresh watch_peers subscriber on the new registry. The prior
     // subscriber's stream will end when the old coordinator drops.
     spawn_cluster_audit_taps(&state.runtime.load());
+
+    // MCP Events types are served on the 2026-07-28 wire only, so only its
+    // sessions hear that they changed.
+    if events_listed_changed {
+        crate::runtime::events::builtin::announce_list_changed(&session_store, &new_delivery_bus);
+    }
 
     // Emit list_changed notifications for any inventory changes.
     // Only notify sessions that have completed initialization (Operational phase).

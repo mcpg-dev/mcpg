@@ -18,14 +18,19 @@ impl GatewayRuntime {
         request_context: &RequestContext,
         cursor: Option<&str>,
     ) -> (Vec<crate::backends::ToolDescriptor>, Option<String>) {
-        let all_tools = self.capability_registry.tools();
-        let visible_tools: Vec<_> = all_tools
+        // Each tool is gated as `tools/call` would route it.
+        let visible_tools: Vec<_> = self
+            .capability_registry
+            .tools_with_source()
             .into_iter()
-            .filter(|tool| {
-                let policy_context =
-                    ToolPolicyContext::from_request_context(request_context, &tool.name);
-                self.pre_dispatch_policy.is_tool_visible(&policy_context)
+            .filter(|(tool, federation)| {
+                self.surface_is_visible(
+                    request_context,
+                    &tool.name,
+                    PolicyRoute::served_by(federation.as_deref()).on(PolicySurface::Tool),
+                )
             })
+            .map(|(tool, _)| tool)
             .collect();
         // Walk the catalog provider chain on every
         // tools/list. Empty chain ⇒ no-op.
@@ -55,9 +60,16 @@ impl GatewayRuntime {
         // consistent with what they can actually see.
         let all_prompts: Vec<_> = self
             .capability_registry
-            .prompts()
+            .prompts_with_source()
             .into_iter()
-            .filter(|prompt| self.surface_is_visible(request_context, &prompt.name))
+            .filter(|(prompt, federation)| {
+                self.surface_is_visible(
+                    request_context,
+                    &prompt.name,
+                    PolicyRoute::served_by(federation.as_deref()).on(PolicySurface::Prompt),
+                )
+            })
+            .map(|(prompt, _)| prompt)
             .collect();
         paginate_list_bound(
             &all_prompts,
@@ -66,11 +78,28 @@ impl GatewayRuntime {
         )
     }
 
-    /// Per-caller visibility for a non-tool surface, keyed by the same
-    /// surface-scoped name the read path gates on.
-    pub(crate) fn surface_is_visible(&self, request_context: &RequestContext, name: &str) -> bool {
+    /// Per-caller visibility for a listed surface, keyed by the same
+    /// surface-scoped name, and decided under the same route, as the call
+    /// or read of it.
+    pub(crate) fn surface_is_visible(
+        &self,
+        request_context: &RequestContext,
+        name: &str,
+        route: PolicyRoute<'_>,
+    ) -> bool {
         let policy_context = ToolPolicyContext::from_request_context(request_context, name);
-        self.pre_dispatch_policy.is_tool_visible(&policy_context)
+        self.pre_dispatch_policy.is_visible(&policy_context, route)
+    }
+
+    /// Per-caller visibility for a listed resource: gated under the route a
+    /// `resources/read` of that exact URI takes.
+    fn resource_is_visible(&self, request_context: &RequestContext, uri: &str) -> bool {
+        let route = self.resolve_resource_route(uri);
+        let route = route
+            .as_ref()
+            .map(PolicyRoute::for_resource)
+            .unwrap_or_else(|| PolicyRoute::gateway().on(PolicySurface::Resource));
+        self.surface_is_visible(request_context, uri, route)
     }
 
     /// Enumerate the resource catalog page for a request,
@@ -106,7 +135,7 @@ impl GatewayRuntime {
         // Same per-caller gate `tools/list` applies, keyed on the URI the
         // read path gates on. Applied before pagination so cursors stay
         // consistent with what this caller can see.
-        all_resources.retain(|r| self.surface_is_visible(request_context, &r.uri));
+        all_resources.retain(|r| self.resource_is_visible(request_context, &r.uri));
         let composite = cursor.and_then(|c| decode_composite_cursor(c, Some(&bind_key)));
         let (mut page, outgoing_static, outgoing_dyn);
         match composite {
@@ -122,7 +151,7 @@ impl GatewayRuntime {
                     .map(|(b, k)| (b.clone(), k.clone(), None))
                     .collect();
                 let remaining = self.merge_dynamic_resources(&mut page, &targets).await;
-                page.retain(|r| self.surface_is_visible(request_context, &r.uri));
+                page.retain(|r| self.resource_is_visible(request_context, &r.uri));
                 outgoing_static = static_offset;
                 outgoing_dyn = remaining;
             }
@@ -159,7 +188,7 @@ impl GatewayRuntime {
                             })
                             .collect();
                     let remaining = self.merge_dynamic_resources(&mut page, &targets).await;
-                    page.retain(|r| self.surface_is_visible(request_context, &r.uri));
+                    page.retain(|r| self.resource_is_visible(request_context, &r.uri));
                     outgoing_static = None;
                     outgoing_dyn = remaining;
                 }
@@ -190,9 +219,16 @@ impl GatewayRuntime {
         // unfiltered list leaks the same shape `resources/read` gates.
         let all_templates: Vec<_> = self
             .capability_registry
-            .resource_templates()
+            .resource_templates_with_source()
             .into_iter()
-            .filter(|t| self.surface_is_visible(request_context, &t.uri_template))
+            .filter(|(t, federation)| {
+                self.surface_is_visible(
+                    request_context,
+                    &t.uri_template,
+                    PolicyRoute::served_by(federation.as_deref()).on(PolicySurface::Resource),
+                )
+            })
+            .map(|(t, _)| t)
             .collect();
         paginate_list_bound(
             &all_templates,

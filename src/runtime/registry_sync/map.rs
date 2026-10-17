@@ -145,6 +145,7 @@ pub(crate) fn federation_for_entry(
         import: registry.defaults.import.clone(),
         naming: naming_for(server_name),
         filter: FilterConfig::default(),
+        events: crate::config::federation::FederationEventsConfig::default(),
         cache: registry.defaults.cache.clone(),
         synthesize: registry.defaults.synthesize.clone(),
         session: SessionConfig::default(),
@@ -203,6 +204,7 @@ fn naming_for(server_name: &str) -> NamingConfig {
         tool_prefix: Some(format!("{dotted}.")),
         resource_uri_prefix: Some(format!("mcp://{dotted}/")),
         prompt_prefix: Some(format!("{dotted}.")),
+        event_prefix: Some(format!("{dotted}.")),
     }
 }
 

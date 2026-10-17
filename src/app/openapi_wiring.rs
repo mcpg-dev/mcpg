@@ -106,13 +106,22 @@ pub(crate) fn compose_synthetic_binding(
     obj
 }
 
+/// A synthesized binding whose relayed governance names no floor is gated at
+/// the federated default, never at `default_minimum_trust`: its catalog is
+/// the upstream spec's, so lowering that default must not open it.
 pub(crate) fn deserialize_binding(
     obj: serde_json::Map<String, serde_json::Value>,
     kind: &str,
     name: &str,
 ) -> Result<crate::config::BackendConfig> {
-    serde_json::from_value::<crate::config::BackendConfig>(serde_json::Value::Object(obj))
-        .map_err(|e| anyhow::anyhow!("synthesize openapi {kind} binding '{name}': {e}"))
+    let mut binding =
+        serde_json::from_value::<crate::config::BackendConfig>(serde_json::Value::Object(obj))
+            .map_err(|e| anyhow::anyhow!("synthesize openapi {kind} binding '{name}': {e}"))?;
+    binding
+        .governance
+        .minimum_trust
+        .get_or_insert(crate::config::FEDERATED_DEFAULT_MINIMUM_TRUST);
+    Ok(binding)
 }
 
 /// Synthesize a tool `BackendConfig` from one [`mcpg_plugin_protocol::ExpandedTool`].

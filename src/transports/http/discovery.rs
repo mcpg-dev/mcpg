@@ -499,6 +499,36 @@ pub(crate) fn derive_authorization_servers(auth: &crate::config::AccessConfig) -
     servers
 }
 
+/// Every endpoint of the embedded authorization server answers `503` while
+/// the licence holds one of its surfaces: the surface is part of the server,
+/// so a sign-in, a token or a registration it served would run the feature
+/// the licence does not cover. The protected-resource metadata is the
+/// resource's, not the server's, and keeps answering.
+pub(crate) async fn refuse_while_authorization_server_held(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let hold = state
+        .runtime
+        .load()
+        .license_state()
+        .authorization_server_hold
+        .clone();
+    let Some(hold) = hold else {
+        return next.run(request).await;
+    };
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "error": "temporarily_unavailable",
+            "error_description": hold,
+        })),
+    )
+        .into_response()
+}
+
 /// RFC 8414 authorization-server metadata for the embedded EMA
 /// authorization server. Answers 404 while
 /// `governance.access.authorization_server` is unset.

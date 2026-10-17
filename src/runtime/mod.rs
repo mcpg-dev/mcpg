@@ -9,6 +9,7 @@ pub(crate) mod cel_guard_plugin;
 pub mod cp;
 pub use cp::{cp_metrics, cp_quota};
 mod cursor;
+pub mod events;
 mod execution;
 pub(crate) mod expr;
 pub(crate) mod feature_flags;
@@ -104,8 +105,8 @@ use delivery_bus::DeliveryBus;
 use execution::{BackendInvocationRequest, ExecutionDispatcher};
 pub use execution::{CommandToolRuntimeConfig, NetworkToolRuntimeConfig, RuntimeDebugConfig};
 use handlers::modern_task_status_notification;
-use policy::{PreDispatchPolicyGate, PreDispatchPolicyOutcome, ToolPolicyContext};
-pub use policy::{ToolAccessPolicyConfig, ToolTrustRule};
+use policy::{PolicyRoute, PreDispatchPolicyGate, PreDispatchPolicyOutcome, ToolPolicyContext};
+pub use policy::{PolicySurface, ToolAccessPolicyConfig, ToolTrustRule};
 use seen_request_ids::{
     RegisteredCancellation, SeenRequestIds, cancellation_requester_is_owner, resumer_owns_pipeline,
     session_owner_matches,
@@ -801,10 +802,19 @@ pub struct GatewayRuntime {
     /// UI-enabled tools. Mirrors
     /// `apps.federate_upstream` (inherits `enabled`).
     apps_federate_upstream: bool,
+    /// `mcp.configurations.events` of the config this runtime was built
+    /// from. Read per request by `server/discover` and the `events/*`
+    /// arms, so a reload that turns events on or off takes effect at
+    /// once.
+    events_config: crate::config::EventsConfig,
     /// Reverse-federation ingress, resolved from
     /// `gateway.server.tunnel_federation`. `Some` lets `tunnel://<name>`
     /// federation upstreams resolve through the relay's federation ingress.
     tunnel_federation: Option<federation::engine::TunnelFederation>,
+    /// The MCP Events types this runtime's federations imported, as the
+    /// federation engine last published them; the events core serves them
+    /// beside the configured types.
+    federated_events: Arc<tokio::sync::watch::Sender<events::catalog::FederatedEvents>>,
     /// Compiled tighten-only CSP/permission egress policy. `Some` when
     /// Apps is enabled; applied to `_meta.ui` on resource list/read
     /// egress. `None` ⇒ pure passthrough.
@@ -914,11 +924,16 @@ pub struct GatewayRuntime {
     /// `ArcSwap<Option<QuotaStatus>>`. Consulted on every tool
     /// dispatch — when `current().exhausted == true`, dispatch
     /// returns 429 with `Retry-After` instead of invoking the
-    /// backend, gated behind the `governance-quotas` feature.
+    /// backend — and by MCP Events for the plan's event caps.
     pub(crate) cp_quota_status: cp_quota::QuotaStatusHandle,
     /// Enforces the licence's per-gateway RPS ceiling. Shared across the
-    /// process so every dispatch counts into the same window.
+    /// process and carried across reloads, so every counted request lands
+    /// in the same window ([`Self::admit_plan_rps`]).
     pub(crate) cp_rps_limiter: std::sync::Arc<cp_quota::RpsLimiter>,
+    /// What the license gate left running: the gated items this runtime
+    /// loaded, which a reload keeps, and the refusal every tool call gets
+    /// while a withheld tool gate waits for a licence.
+    pub(crate) license_state: std::sync::Arc<crate::license_gate::LicenseRuntimeState>,
     /// Multi-version protocol dispatcher. Installed at boot via
     /// [`Self::set_protocol_registry`] after the runtime is wrapped
     /// in `ArcSwap` (so we can downgrade the swap handle into
@@ -1056,7 +1071,14 @@ impl GatewayRuntime {
 
         metrics::counter!("mcpg_requests_total", "operation" => operation_label, "transport" => transport_label).increment(1);
 
-        let payload = if let Some(req_id) = message.jsonrpc_id.clone() {
+        // 2026-07-28 asks only that an id differ from the sender's other
+        // requests still in flight, and on HTTP every response rides its own
+        // request, so ids are remembered on the session-bound wire alone.
+        let remembers_ids =
+            message.negotiated_version != crate::protocol::version::ProtocolVersion::V_2026_07_28;
+        let payload = if let Some(req_id) = message.jsonrpc_id.clone()
+            && remembers_ids
+        {
             if self
                 .record_client_request_id(
                     context.session_id.as_deref(),

@@ -49,8 +49,11 @@ pub enum WatchStrategyConfig {
     /// Subscribe to a Kafka topic — any message means the resource changed.
     KafkaTopic {
         topic: String,
-        #[serde(default = "default_kafka_watch_group_id")]
-        group_id: String,
+        /// Consumer group. A resource watch defaults to the shared
+        /// `mcpg-resource-watcher`; an event source to its own
+        /// `mcpg-events-{name}`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_id: Option<String>,
     },
     /// Receive webhook POSTs from 3rd-party systems.
     /// MCPG exposes `/webhooks/resource-updated/{token}` and triggers
@@ -89,9 +92,8 @@ pub enum WatchStrategyConfig {
     /// dedicated connection per watch and re-emits NOTIFY payloads.
     /// Far lower overhead than polling for change-feed-style sources.
     PostgresListenNotify {
-        /// Postgres connection URL. Credential interpolation via the
-        /// gateway's `${env.VAR}` happens before the spec reaches the
-        /// plugin.
+        /// Postgres connection URL. `${env.X}`, `${secret.X}` and secret
+        /// provider URIs are resolved before the spec reaches the plugin.
         url: String,
         /// Channel name to LISTEN on (`NOTIFY <channel>, payload`).
         /// ASCII alphanumeric + underscore.
@@ -101,14 +103,16 @@ pub enum WatchStrategyConfig {
     /// plugin by its `kind()` discriminator. Use this for custom watch
     /// plugins that have no dedicated typed variant above (e.g. the
     /// Twilio plugin's `twilio_inbound` strategy). The remaining fields
-    /// flatten into the spec passed verbatim to the plugin's `watch()`,
-    /// so the plugin owns and validates its own spec schema.
+    /// flatten into the spec passed to the plugin's `watch()`, so the
+    /// plugin owns and validates its own spec schema. As in every
+    /// strategy, `${env.X}`, `${secret.X}` and secret provider URIs in
+    /// its strings are resolved first.
     ///
     /// `{ type: plugin, kind: twilio_inbound, kinds: [sms, voice] }`
     Plugin {
         /// The target plugin's `WatchStrategyPlugin::kind()` string.
         kind: String,
-        /// Spec forwarded verbatim to the plugin (it owns the schema).
+        /// Spec forwarded to the plugin, which owns its schema.
         #[serde(flatten)]
         #[schemars(with = "serde_json::Value")]
         spec: serde_json::Map<String, serde_json::Value>,
@@ -119,10 +123,6 @@ fn default_poll_interval_ms() -> u64 {
     60000
 }
 
-fn default_kafka_watch_group_id() -> String {
-    "mcpg-resource-watcher".to_owned()
-}
-
 impl Default for WatchStrategyConfig {
     fn default() -> Self {
         Self::Poll {
@@ -131,9 +131,43 @@ impl Default for WatchStrategyConfig {
     }
 }
 
+impl WatchStrategyConfig {
+    /// Refuse a spec, written at `at`, that carries the reserved resume key:
+    /// the gateway alone passes a resume position there. Only the
+    /// strategies whose spec the plugin owns can carry one.
+    pub fn validate(&self, at: &str) -> anyhow::Result<()> {
+        let spec = match self {
+            Self::SqlPolling { spec } | Self::Plugin { spec, .. } => spec,
+            _ => return Ok(()),
+        };
+        if spec.contains_key(mcpg_plugin_protocol::WATCH_RESUME_SPEC_KEY) {
+            anyhow::bail!(
+                "{at} must not set `{}`: the gateway passes the resume position there itself",
+                mcpg_plugin_protocol::WATCH_RESUME_SPEC_KEY
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spec_may_not_carry_the_resume_key() {
+        for yaml in [
+            "type: plugin\nkind: cron\nschedule: '* * * * *'\n_mcpg_resume: { fired: 1 }\n",
+            "type: sql_polling\ndriver: postgres\n_mcpg_resume: 1\n",
+        ] {
+            let cfg: WatchStrategyConfig = serde_yaml::from_str(yaml).expect("parses");
+            let error = cfg.validate("x.watch.strategy").unwrap_err().to_string();
+            assert!(error.contains("_mcpg_resume"), "{error}");
+        }
+        let cfg: WatchStrategyConfig =
+            serde_yaml::from_str("type: plugin\nkind: cron\nschedule: '* * * * *'\n").unwrap();
+        assert!(cfg.validate("x.watch.strategy").is_ok());
+    }
 
     #[test]
     fn plugin_strategy_parses_kind_and_flattens_spec() {

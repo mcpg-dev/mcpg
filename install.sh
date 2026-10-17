@@ -3,13 +3,14 @@
 # install.sh — curl-able installer for the mcpg CLIs.
 #
 #   curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh
-#   curl -fsSL .../install.sh | sh -s -- --bin mcpg-cloud --version 1.0.0-dev.3
+#   curl -fsSL .../install.sh | sh -s -- --bin mcpg-cloud --version <version>
 #
 # With no --bin it installs the public CLI suite: mcpg, mcpg-config,
-# mcpg-cloud, mcpg-plugin, mcpg-inspector — each from its own public
-# repository's latest release (`github.com/mcpg-dev/<project>`). The
-# BUSL control plane (`--bin mcpg-control-plane`) ships from a private
-# repository and needs authenticated access.
+# mcpg-cloud, mcpg-plugin and mcpg-inspector-tui (the inspector's terminal
+# UI) — each from its project's public repository, at that repository's
+# latest release (`github.com/mcpg-dev/<project>`). The BUSL control plane
+# (`--bin mcpg-control-plane`) ships from a private repository and needs
+# authenticated access.
 # Detects OS / arch / libc, picks the matching release tarball, verifies its
 # sha256 (and the cosign sign-blob bundle when `cosign` is present), and
 # installs the binaries to a PATH dir. POSIX sh (no bash-isms) so it runs
@@ -18,7 +19,7 @@
 # Options (flags or env):
 #   --bin NAME      / MCPG_BIN     one CLI instead of the suite:
 #                                  mcpg | mcpg-config | mcpg-cloud |
-#                                  mcpg-plugin | mcpg-inspector |
+#                                  mcpg-plugin | mcpg-inspector-tui |
 #                                  mcpg-control-plane (needs repo access)
 #   --version VER   / MCPG_VERSION pin a version (applies to every selected
 #                                  bin; default: each bin's latest release).
@@ -61,13 +62,14 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # The default suite: the CLIs whose repositories are public. The control
 # plane is installable with `--bin mcpg-control-plane` but ships from a
 # private (licensed) repository, so it is not in the anonymous default.
-SUITE="mcpg mcpg-config mcpg-cloud mcpg-plugin mcpg-inspector"
+SUITE="mcpg mcpg-config mcpg-cloud mcpg-plugin mcpg-inspector-tui"
 KNOWN_BINS="$SUITE mcpg-control-plane"
 
-# Release project (repo name + asset stem) that ships a given binary.
+# Release project (its repository name) that ships a given binary.
 project_for() {
   case "$1" in
     mcpg-control-plane) echo "mcpg-control-plane-server" ;;
+    mcpg-inspector-tui) echo "mcpg-inspector" ;;
     *) echo "$1" ;;
   esac
 }
@@ -79,6 +81,9 @@ repo_for() {
 }
 
 if [ -n "$BIN" ]; then
+  case "$BIN" in
+    mcpg-inspector) err "the inspector's release archives carry its terminal UI only: use --bin mcpg-inspector-tui (the full inspector ships as the image ghcr.io/mcpg-dev/mcpg-inspector)" ;;
+  esac
   case " $KNOWN_BINS " in
     *" $BIN "*) BINS="$BIN" ;;
     *) err "unknown --bin '$BIN' (one of: $KNOWN_BINS)" ;;
@@ -168,9 +173,9 @@ install_one() { # <bin> — resolves its own version unless VERSION pins one
     [ -n "$ver" ] || err "could not find a published release in ${repo} (pin one with --version)"
   fi
   tag="v${ver}"
-  # Assets are named after the PROJECT (pack-binary.sh), which differs from
-  # the binary inside for the control plane.
-  stem="${project}-${ver}-${TRIPLE}"
+  # A project's release names each archive after the binary it carries,
+  # which differs from the project for the control plane and the inspector.
+  stem="${bin}-${ver}-${TRIPLE}"
   asset="${stem}.${EXT}"
   base="https://github.com/${repo}/releases/download/${tag}"
 

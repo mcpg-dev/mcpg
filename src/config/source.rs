@@ -96,6 +96,44 @@ pub async fn resolve(spec: &str) -> Result<ConfigSource> {
     Ok(ConfigSource::File(PathBuf::from(trimmed)))
 }
 
+/// The config layers a gateway process loads: the `--config` specs when any
+/// are given, else the files `MCPG_CONFIG` lists. A named file that does not
+/// exist is an error naming what pointed at it, so the gateway and
+/// `--health-check` agree on the layers and on the reason a layer is missing.
+pub async fn gateway_sources(specs: &[String]) -> Result<Vec<ConfigSource>> {
+    let origin = if specs.is_empty() {
+        "MCPG_CONFIG"
+    } else {
+        "--config"
+    };
+    let mut sources = Vec::with_capacity(specs.len());
+    if specs.is_empty()
+        && let Some(paths) = std::env::var_os("MCPG_CONFIG").filter(|v| !v.is_empty())
+    {
+        sources.extend(std::env::split_paths(&paths).map(ConfigSource::File));
+    }
+    for spec in specs {
+        // The spec is echoed back on failure, and a pasted share link carries
+        // its key in the fragment — mask it before it reaches stderr.
+        sources.push(
+            resolve(spec)
+                .await
+                .with_context(|| format!("--config {}", encrypted::redacted_spec(spec)))?,
+        );
+    }
+    for source in &sources {
+        if let ConfigSource::File(path) = source
+            && !path.is_file()
+        {
+            bail!(
+                "config file not found: {} (named by {origin})",
+                path.display()
+            );
+        }
+    }
+    Ok(sources)
+}
+
 fn decode_base64(scheme: &str, b64: &str) -> Result<ConfigSource> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.trim())
@@ -894,5 +932,34 @@ mod tests {
     #[tokio::test]
     async fn empty_source_is_rejected() {
         assert!(resolve("   ").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn config_flags_are_the_layers_in_the_order_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("base.yaml");
+        std::fs::write(&file, SAMPLE_YAML).unwrap();
+        let inline = format!("base64:{}", B64.encode(SAMPLE_YAML));
+        let sources = gateway_sources(&[file.display().to_string(), inline])
+            .await
+            .unwrap();
+        assert!(matches!(&sources[..], [
+            ConfigSource::File(p),
+            ConfigSource::Inline { .. },
+        ] if *p == file));
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_names_the_flag_that_pointed_at_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.yaml");
+        let err = gateway_sources(&[missing.display().to_string()])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("config file not found") && err.contains("(named by --config)"),
+            "{err}"
+        );
     }
 }

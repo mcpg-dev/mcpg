@@ -186,7 +186,7 @@ fn decide(config: &AppConfig) -> Decision {
 
     // 4. The license envelope. A failure to resolve is treated as "do not
     //    report" — never as "community, go ahead".
-    match crate::license_gate::resolve_claims(&config.license) {
+    match crate::license_gate::resolve_claims(config) {
         Ok(claims) if claims.airgap => Decision::Disabled("license marks this install air-gapped"),
         Ok(claims) if claims.sovereign => {
             Decision::Disabled("license marks this install sovereign")

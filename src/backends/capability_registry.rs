@@ -434,8 +434,8 @@ impl CapabilityRegistry {
                         .as_ref()
                         .filter(|u| u.contains("${"))
                         .cloned();
-                    resources.push(RegisteredResource {
-                        descriptor: ResourceDescriptor {
+                    resources.push(RegisteredResource::new(
+                        ResourceDescriptor {
                             uri,
                             name: binding.name.clone(),
                             title: binding.title.clone(),
@@ -449,11 +449,11 @@ impl CapabilityRegistry {
                                 .map(|a| a.to_protocol()),
                             meta,
                         },
-                        app_url_pattern,
-                        route: ResourceRoute::Binding {
+                        ResourceRoute::Binding {
                             profile: binding.name.clone(),
                         },
-                    });
+                        app_url_pattern,
+                    ));
                 }
             }
         }
@@ -480,8 +480,8 @@ impl CapabilityRegistry {
 
         // Add debug resources
         if debug_enabled && debug_tool_exposure.runtime_overview_resource {
-            resources.push(RegisteredResource {
-                descriptor: ResourceDescriptor {
+            resources.push(RegisteredResource::new(
+                ResourceDescriptor {
                     uri: "mcpg://runtime/overview".to_owned(),
                     name: "runtime-overview".to_owned(),
                     title: Some("MCPG Runtime Overview".to_owned()),
@@ -494,9 +494,9 @@ impl CapabilityRegistry {
                     icons: None,
                     meta: None,
                 },
-                route: ResourceRoute::RuntimeOverview,
-                app_url_pattern: None,
-            });
+                ResourceRoute::RuntimeOverview,
+                None,
+            ));
         }
 
         // Build route map for ALL bindings (used for prompt/resource dispatch)
@@ -709,13 +709,11 @@ impl CapabilityRegistry {
     ///
     /// A federated catalog's names come from the upstream server, and
     /// `naming.tool_prefix` defaults to empty, so an upstream can name a tool
-    /// whatever a native binding is called. Dispatch already resolves
-    /// native-first, so the duplicate was never reachable; it was still
-    /// *listed*, with its own description and input schema, and clients feed
-    /// both to a model. Authorization made it worse: `per_tool_rules` is
-    /// consulted before the overlay, so the shadowing entry was governed by
-    /// the native tool's rule and the federation's own `minimum_trust` never
-    /// applied. Listing what dispatch would actually run removes both.
+    /// whatever a native binding is called. Dispatch resolves native-first
+    /// (and, between federations, first-declared), so a duplicate is never
+    /// reachable; listing it would still hand clients a description and input
+    /// schema for something that never runs, and gate its visibility under a
+    /// route its calls never take.
     fn native_first<T>(&self, items: Vec<T>, surface: &str, key: impl Fn(&T) -> String) -> Vec<T> {
         let mut seen: std::collections::HashSet<String> =
             std::collections::HashSet::with_capacity(items.len());
@@ -751,15 +749,30 @@ impl CapabilityRegistry {
     }
 
     pub fn tools(&self) -> Vec<ToolDescriptor> {
+        self.tools_with_source()
+            .into_iter()
+            .map(|(tool, _)| tool)
+            .collect()
+    }
+
+    /// [`Self::tools`], each with the federation that serves it (`None` for
+    /// a tool the gateway serves itself): the federation `tools/call`
+    /// dispatches that name to.
+    pub fn tools_with_source(&self) -> Vec<(ToolDescriptor, Option<String>)> {
         let overlay = self.federated.load();
-        let merged: Vec<ToolDescriptor> = self
+        let merged: Vec<(ToolDescriptor, Option<String>)> = self
             .tools
             .iter()
             .chain(overlay.tools.iter())
-            .map(|binding| binding.descriptor.clone())
+            .map(|binding| {
+                (
+                    binding.descriptor.clone(),
+                    binding.route.federation().map(str::to_owned),
+                )
+            })
             .collect();
-        let mut out = self.native_first(merged, "tool", |d| d.name.clone());
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut out = self.native_first(merged, "tool", |(d, _)| d.name.clone());
+        out.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
         out
     }
 
@@ -773,15 +786,29 @@ impl CapabilityRegistry {
     }
 
     pub fn prompts(&self) -> Vec<PromptDescriptor> {
+        self.prompts_with_source()
+            .into_iter()
+            .map(|(prompt, _)| prompt)
+            .collect()
+    }
+
+    /// [`Self::prompts`], each with the federation `prompts/get` fetches it
+    /// from (`None` for a prompt the gateway serves itself).
+    pub fn prompts_with_source(&self) -> Vec<(PromptDescriptor, Option<String>)> {
         let overlay = self.federated.load();
-        let merged: Vec<PromptDescriptor> = self
+        let merged: Vec<(PromptDescriptor, Option<String>)> = self
             .prompts
             .iter()
             .chain(overlay.prompts.iter())
-            .map(|binding| binding.descriptor.clone())
+            .map(|binding| {
+                (
+                    binding.descriptor.clone(),
+                    binding.route.federation().map(str::to_owned),
+                )
+            })
             .collect();
-        let mut out = self.native_first(merged, "prompt", |d| d.name.clone());
-        out.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut out = self.native_first(merged, "prompt", |(d, _)| d.name.clone());
+        out.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
         out
     }
 
@@ -800,10 +827,32 @@ impl CapabilityRegistry {
 
     /// Returns registered resource templates from binding config.
     pub fn resource_templates(&self) -> Vec<crate::protocol::ResourceTemplate> {
-        let mut merged = self.resource_templates.clone();
-        merged.extend(self.federated.load().resource_templates.iter().cloned());
-        let mut out = self.native_first(merged, "resource_template", |t| t.uri_template.clone());
-        out.sort_by(|a, b| a.uri_template.cmp(&b.uri_template));
+        self.resource_templates_with_source()
+            .into_iter()
+            .map(|(template, _)| template)
+            .collect()
+    }
+
+    /// [`Self::resource_templates`], each with the federation that serves
+    /// it (`None` for a template the gateway serves itself).
+    pub fn resource_templates_with_source(
+        &self,
+    ) -> Vec<(crate::protocol::ResourceTemplate, Option<String>)> {
+        let overlay = self.federated.load();
+        let merged: Vec<(crate::protocol::ResourceTemplate, Option<String>)> = self
+            .resource_templates
+            .iter()
+            .map(|template| (template.clone(), None))
+            .chain(
+                overlay
+                    .resource_templates
+                    .iter()
+                    .map(|(template, source)| (template.clone(), Some(source.clone()))),
+            )
+            .collect();
+        let mut out =
+            self.native_first(merged, "resource_template", |(t, _)| t.uri_template.clone());
+        out.sort_by(|(a, _), (b, _)| a.uri_template.cmp(&b.uri_template));
         out
     }
 
@@ -877,7 +926,7 @@ impl CapabilityRegistry {
         if let Some(binding) = self
             .resources
             .iter()
-            .find(|binding| normalize_resource_uri(&binding.descriptor.uri) == normalized)
+            .find(|binding| binding.normalized_uri == normalized)
         {
             return Some(binding.route.clone());
         }
@@ -901,11 +950,7 @@ impl CapabilityRegistry {
         }
         // Federated resources (exact, prefixed URIs) match next.
         let federated = self.federated.load();
-        if let Some(binding) = federated
-            .resources
-            .iter()
-            .find(|binding| normalize_resource_uri(&binding.descriptor.uri) == normalized)
-        {
+        if let Some(binding) = federated.resource(&normalized) {
             return Some(binding.route.clone());
         }
         // Federated *templates* match last: on a hit, de-prefix the URI back
@@ -919,6 +964,7 @@ impl CapabilityRegistry {
                 return Some(ResourceRoute::Federated {
                     source: tmpl.source.clone(),
                     upstream_uri,
+                    listed_as: tmpl.uri_template.clone(),
                 });
             }
         }
@@ -930,15 +976,13 @@ impl CapabilityRegistry {
         if let Some(binding) = self
             .resources
             .iter()
-            .find(|binding| normalize_resource_uri(&binding.descriptor.uri) == normalized)
+            .find(|binding| binding.normalized_uri == normalized)
         {
             return Some(binding.descriptor.clone());
         }
         self.federated
             .load()
-            .resources
-            .iter()
-            .find(|binding| normalize_resource_uri(&binding.descriptor.uri) == normalized)
+            .resource(&normalized)
             .map(|binding| binding.descriptor.clone())
     }
 
@@ -949,7 +993,7 @@ impl CapabilityRegistry {
         let normalized = normalize_resource_uri(uri);
         self.resources
             .iter()
-            .find(|b| normalize_resource_uri(&b.descriptor.uri) == normalized)
+            .find(|b| b.normalized_uri == normalized)
             .and_then(|b| b.app_url_pattern.clone())
     }
 
@@ -1122,6 +1166,28 @@ pub(crate) struct RegisteredResource {
     /// stored when the URL contains `${...}` expressions that need
     /// per-read resolution.
     pub(crate) app_url_pattern: Option<String>,
+    /// `descriptor.uri` normalized once, so routing a URI normalizes only
+    /// that URI; `resources/list` routes every listed URI.
+    normalized_uri: String,
+}
+
+impl RegisteredResource {
+    pub(crate) fn new(
+        descriptor: ResourceDescriptor,
+        route: ResourceRoute,
+        app_url_pattern: Option<String>,
+    ) -> Self {
+        Self {
+            normalized_uri: normalize_resource_uri(&descriptor.uri),
+            descriptor,
+            route,
+            app_url_pattern,
+        }
+    }
+
+    pub(crate) fn normalized_uri(&self) -> &str {
+        &self.normalized_uri
+    }
 }
 
 /// MCP 2025-11-25 `completion/complete` caps the returned `values`

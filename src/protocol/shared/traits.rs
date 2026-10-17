@@ -15,11 +15,11 @@
 //! 2. `ProtocolRegistry::select` picks a handler.
 //! 3. `handler.validate_transport_headers(&headers, &body)` rejects on
 //!    mismatch — short-circuit response.
-//! 4. `handler.parse(body)` → `ProtocolMessage`.
-//! 5. `handler.long_lived_stream_plan(&ctx, &msg)` — if `Some`, the
-//!    transport switches to SSE streaming and the dispatcher writes
-//!    events into the stream's channel. If `None`, dispatch produces
-//!    a single response.
+//! 4. `handler.long_lived_stream_plan(&body)` — if `Some`, the request is
+//!    a long-lived stream, not a finite parse → dispatch: the transport
+//!    runs the plan, which answers with an SSE response it writes until
+//!    the stream ends.
+//! 5. `handler.parse(body)` → `ProtocolMessage`.
 //! 6. `handler.dispatch(&ctx, msg, &services)` → `ProtocolHttpResponse`.
 //! 7. Transport serializes and writes.
 //!
@@ -37,6 +37,30 @@ use crate::protocol::version::ProtocolVersion;
 use crate::protocol::{ProtocolError, ProtocolHttpResponse};
 use crate::runtime::RequestContext;
 use crate::runtime::shared_services::SharedServices;
+
+/// A request the transport answers with a long-lived stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPlan {
+    /// `subscriptions/listen`: the server-initiated notifications the
+    /// request names.
+    SubscriptionsListen,
+    /// `events/stream`: one MCP Events push subscription.
+    EventsStream,
+}
+
+impl StreamPlan {
+    /// The JSON-RPC method of the plan, for metrics and logs.
+    pub fn method(self) -> &'static str {
+        match self {
+            Self::SubscriptionsListen => {
+                crate::protocol::v_2026_07_28::wire::subscriptions::METHOD_SUBSCRIPTIONS_LISTEN
+            }
+            Self::EventsStream => {
+                crate::protocol::v_2026_07_28::extensions::events::wire::METHOD_STREAM_EVENTS
+            }
+        }
+    }
+}
 
 /// Per-version protocol adapter.
 ///
@@ -74,6 +98,12 @@ pub trait ProtocolHandler: Send + Sync + 'static {
         headers: &HeaderMap,
         body: &Value,
     ) -> Result<(), TransportRejection>;
+
+    /// Whether `body` asks for a long-lived stream, decided before
+    /// [`parse`](Self::parse). `None` (default) on a wire with none.
+    fn long_lived_stream_plan(&self, _body: &Value) -> Option<StreamPlan> {
+        None
+    }
 
     /// Parse a JSON body into this version's typed operation. The
     /// returned [`ProtocolMessage`] is opaque to callers; only this

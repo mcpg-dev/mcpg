@@ -6,6 +6,7 @@
 //! grow large enough to warrant their own file.
 
 pub mod completion;
+pub mod events;
 pub mod lifecycle;
 pub mod mrtr;
 pub mod prompts;

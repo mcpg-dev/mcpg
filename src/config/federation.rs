@@ -42,9 +42,13 @@ pub struct FederationConfig {
     #[serde(default)]
     pub naming: NamingConfig,
 
-    /// Allow/deny filtering of imported tool names.
+    /// Allow/deny filtering of imported tool and event type names.
     #[serde(default)]
     pub filter: FilterConfig,
+
+    /// How imported event types are read from the upstream.
+    #[serde(default)]
+    pub events: FederationEventsConfig,
 
     /// Capability-cache behaviour (TTL refresh).
     #[serde(default)]
@@ -75,8 +79,49 @@ impl FederationConfig {
         if self.name.trim().eq_ignore_ascii_case("mcpg") {
             bail!("{path}: federation name 'mcpg' is reserved for gateway-authored resources");
         }
+        self.governance.validate(&path)?;
         self.upstream.validate(&path)?;
         self.import.validate(&path)?;
+        if self.import.events {
+            let legacy = matches!(self.upstream.transport, UpstreamTransport::Stdio)
+                || self
+                    .upstream
+                    .protocol_version
+                    .pinned()
+                    .is_some_and(|_| !self.upstream.protocol_version.is_modern());
+            if legacy {
+                bail!(
+                    "{path}.import.events: MCP Events needs an upstream on the 2026-07-28 wire over streamable_http (protocol_version: 2026-07-28 or auto)"
+                );
+            }
+            if let Some(prefix) = &self.naming.event_prefix
+                && !crate::config::events::is_event_name(&format!("{prefix}x"))
+            {
+                bail!(
+                    "{path}.naming.event_prefix: `{prefix}` would not make valid event names (letters, digits, `.`, `_` and `-`)"
+                );
+            }
+            let auth = &self.upstream.auth;
+            let per_subscriber_credential =
+                auth.mode == AuthMode::OauthImpersonation && !auth.subject_token.is_caller_bearer();
+            if self.events.sharing == UpstreamEventSharing::PerPrincipal
+                && !per_subscriber_credential
+            {
+                bail!(
+                    "{path}.events.sharing: per_principal holds each upstream subscription with the subscriber's own credential, minted from their stored sign-in; set upstream.auth.mode: oauth_impersonation with subject_token: idp_refresh_token or idp_id_token"
+                );
+            }
+            self.events.retention.validate(&format!("{path}.events"))?;
+        } else if self.events != FederationEventsConfig::default()
+            || self.naming.event_prefix.is_some()
+            || self.filter.include_events != default_include_all()
+            || !self.filter.exclude_events.is_empty()
+        {
+            tracing::warn!(
+                "{path}: events, naming.event_prefix, filter.include_events and \
+                 filter.exclude_events take effect only with import.events: true"
+            );
+        }
         if let Some(retry) = &self.retry {
             retry.validate(&path)?;
         }
@@ -107,6 +152,12 @@ impl FederationConfig {
     #[must_use]
     pub fn tool_prefix(&self) -> &str {
         self.naming.tool_prefix.as_deref().unwrap_or("")
+    }
+
+    /// The effective event type name prefix (empty string when unset).
+    #[must_use]
+    pub fn event_prefix(&self) -> &str {
+        self.naming.event_prefix.as_deref().unwrap_or("")
     }
 }
 
@@ -505,6 +556,14 @@ pub struct ImportConfig {
     pub resource_templates: bool,
     #[serde(default)]
     pub prompts: bool,
+    /// Import the upstream's MCP Events types. Each serves downstream
+    /// from the gateway's own log, in every delivery mode the gateway
+    /// enables, and is fed by one upstream subscription per distinct set
+    /// of arguments in demand, held with this federation's catalogue
+    /// credential. Needs an upstream on the `2026-07-28` wire over
+    /// `streamable_http` that advertises events; any other imports none.
+    #[serde(default)]
+    pub events: bool,
 }
 
 impl Default for ImportConfig {
@@ -514,15 +573,21 @@ impl Default for ImportConfig {
             resources: false,
             resource_templates: false,
             prompts: false,
+            events: false,
         }
     }
 }
 
 impl ImportConfig {
     pub(crate) fn validate(&self, path: &str) -> Result<()> {
-        if !self.tools && !self.resources && !self.resource_templates && !self.prompts {
+        if !self.tools
+            && !self.resources
+            && !self.resource_templates
+            && !self.prompts
+            && !self.events
+        {
             bail!(
-                "{path}.import: nothing to import (set tools / resources / resource_templates / prompts: true)"
+                "{path}.import: nothing to import (set tools / resources / resource_templates / prompts / events: true)"
             );
         }
         Ok(())
@@ -542,9 +607,14 @@ pub struct NamingConfig {
     /// Prepended to every imported prompt name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_prefix: Option<String>,
+    /// Prepended to every imported event type name (e.g. `"github."`).
+    /// The result must still be a valid event name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_prefix: Option<String>,
 }
 
-/// Allow/deny filtering of imported tool names (glob `*` suffix).
+/// Allow/deny filtering of imported tool and event type names (glob `*`
+/// suffix).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct FilterConfig {
@@ -552,6 +622,10 @@ pub struct FilterConfig {
     pub include_tools: Vec<String>,
     #[serde(default)]
     pub exclude_tools: Vec<String>,
+    #[serde(default = "default_include_all")]
+    pub include_events: Vec<String>,
+    #[serde(default)]
+    pub exclude_events: Vec<String>,
 }
 
 impl Default for FilterConfig {
@@ -559,6 +633,8 @@ impl Default for FilterConfig {
         Self {
             include_tools: default_include_all(),
             exclude_tools: Vec::new(),
+            include_events: default_include_all(),
+            exclude_events: Vec::new(),
         }
     }
 }
@@ -574,6 +650,79 @@ impl FilterConfig {
         }
         self.include_tools.iter().any(|p| glob_match(p, tool_name))
     }
+
+    /// Whether an upstream event type name passes the event filter, as
+    /// [`Self::admits`] does for tools.
+    #[must_use]
+    pub fn admits_event(&self, event_name: &str) -> bool {
+        if self
+            .exclude_events
+            .iter()
+            .any(|p| glob_match(p, event_name))
+        {
+            return false;
+        }
+        self.include_events
+            .iter()
+            .any(|p| glob_match(p, event_name))
+    }
+}
+
+/// How imported MCP Events types are read from the upstream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct FederationEventsConfig {
+    /// The upstream delivery mode each upstream subscription uses.
+    #[serde(default)]
+    pub delivery: UpstreamEventDelivery,
+    /// Whose upstream subscriptions serve the subscribers.
+    #[serde(default)]
+    pub sharing: UpstreamEventSharing,
+    /// What the gateway keeps of each imported type's events, as
+    /// `retention` does for a configured type. Imported types count
+    /// against the event-log store's byte budget after the configured
+    /// ones; a type that does not fit is not served.
+    #[serde(default)]
+    pub retention: crate::config::events::EventRetentionConfig,
+}
+
+/// The upstream delivery mode of an imported event type.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamEventDelivery {
+    /// `webhook` when the type offers it and the gateway has a public
+    /// address (`gateway.server.canonical_url`, or a public tunnel), else
+    /// `push` when offered, else `poll`.
+    #[default]
+    Auto,
+    /// An upstream webhook subscription per upstream subscription,
+    /// delivering to `/webhooks/mcp-events/{federation}/{id}` on this
+    /// gateway.
+    Webhook,
+    /// One `events/stream` per upstream subscription.
+    Push,
+    /// An `events/poll` loop per upstream subscription.
+    Poll,
+}
+
+/// Whose upstream subscriptions serve the subscribers of an imported type.
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamEventSharing {
+    /// One upstream subscription per set of arguments, held with the
+    /// federation's catalogue credential, shared by every subscriber of
+    /// those arguments.
+    #[default]
+    FanIn,
+    /// One upstream subscription per subscriber and set of arguments, held
+    /// with that subscriber's own upstream credential, minted from their
+    /// stored sign-in. Needs `auth.mode: oauth_impersonation` with
+    /// `subject_token: idp_refresh_token` or `idp_id_token`.
+    PerPrincipal,
 }
 
 /// Minimal glob: exact match, or `*` (all), or `prefix*` (prefix glob).
@@ -732,6 +881,64 @@ naming:
             UpstreamTransport::StreamableHttp
         ));
         assert!(matches!(c.upstream.auth.mode, AuthMode::None));
+    }
+
+    fn with_governance(governance: &str) -> FederationConfig {
+        cfg(&format!("{}governance: {governance}\n", minimal()))
+    }
+
+    /// `allow_if` is compiled by the policy gate's own compiler at
+    /// validation, so `config check`, boot and every reload refuse an
+    /// expression the gate could not enforce, naming where it is.
+    #[test]
+    fn governance_allow_if_is_compiled_at_validation() {
+        with_governance(r#"{ allow_if: '"ops" in identity.groups' }"#)
+            .validate()
+            .expect("valid CEL");
+
+        let err = with_governance("{ allow_if: 'tool_name == ' }")
+            .validate()
+            .expect_err("a syntax error must not validate");
+        assert!(
+            format!("{err:#}").contains("mcp.federations[notion].governance.allow_if"),
+            "{err:#}"
+        );
+
+        let err = with_governance("{ allow_if: '  ' }")
+            .validate()
+            .expect_err("an empty expression must not validate");
+        assert!(
+            err.to_string()
+                .contains("mcp.federations[notion].governance.allow_if must not be empty"),
+            "{err}"
+        );
+    }
+
+    /// A misspelled governance key is refused rather than parsed as "no
+    /// condition".
+    #[test]
+    fn governance_rejects_unknown_keys() {
+        let err = serde_yaml::from_str::<FederationConfig>(&format!(
+            "{}governance: {{ cel_allow_if: '\"ops\" in identity.groups' }}\n",
+            minimal()
+        ))
+        .expect_err("an unknown governance key must not parse");
+        assert!(err.to_string().contains("cel_allow_if"), "{err}");
+    }
+
+    #[test]
+    fn governance_required_scopes_are_validated() {
+        with_governance("{ required_scopes: [notion.read] }")
+            .validate()
+            .expect("valid scope");
+        let err = with_governance("{ required_scopes: ['notion read'] }")
+            .validate()
+            .expect_err("a scope with whitespace must not validate");
+        assert!(
+            err.to_string()
+                .contains("mcp.federations[notion].governance.required_scopes"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1205,6 +1412,7 @@ upstream:
         let f = FilterConfig {
             include_tools: vec!["*".to_owned()],
             exclude_tools: vec!["internal_*".to_owned(), "debug".to_owned()],
+            ..FilterConfig::default()
         };
         assert!(f.admits("search"));
         assert!(!f.admits("internal_reset"));
@@ -1213,9 +1421,81 @@ upstream:
         let only = FilterConfig {
             include_tools: vec!["search".to_owned(), "create_*".to_owned()],
             exclude_tools: vec![],
+            ..FilterConfig::default()
         };
         assert!(only.admits("search"));
         assert!(only.admits("create_page"));
         assert!(!only.admits("delete_page"));
+    }
+
+    #[test]
+    fn the_event_filter_is_its_own() {
+        let f = FilterConfig {
+            include_tools: vec!["search".to_owned()],
+            include_events: vec!["issues.*".to_owned()],
+            exclude_events: vec!["issues.deleted".to_owned()],
+            ..FilterConfig::default()
+        };
+        assert!(f.admits_event("issues.opened"));
+        assert!(!f.admits_event("issues.deleted"));
+        assert!(!f.admits_event("search"));
+        assert!(FilterConfig::default().admits_event("anything"));
+    }
+
+    #[test]
+    fn importing_events_needs_the_modern_wire_over_http() {
+        let with = |upstream: &str, naming: &str| {
+            cfg(&format!(
+                "name: gh\nupstream: {upstream}\nimport: {{ events: true }}\nnaming: {naming}"
+            ))
+            .validate()
+        };
+        let http = r#"{ url: "https://gh.example/mcp" }"#;
+        with(http, "{}").expect("auto may find the modern wire");
+        with(
+            r#"{ url: "https://gh.example/mcp", protocol_version: "2026-07-28" }"#,
+            r#"{ event_prefix: "gh." }"#,
+        )
+        .expect("a pinned modern wire");
+        let legacy = with(
+            r#"{ url: "https://gh.example/mcp", protocol_version: "2025-11-25" }"#,
+            "{}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(legacy.contains("import.events"), "{legacy}");
+        let stdio = with(
+            r#"{ transport: stdio, command: gh-mcp, upstream_safety: { allow_stdio: true } }"#,
+            "{}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(stdio.contains("import.events"), "{stdio}");
+        let prefix = with(http, r#"{ event_prefix: "gh/" }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(prefix.contains("event_prefix"), "{prefix}");
+    }
+
+    #[test]
+    fn per_principal_sharing_needs_a_stored_sign_in_credential() {
+        let with = |auth: &str| {
+            cfg(&format!(
+                "name: gh\nupstream: {{ url: \"https://gh.example/mcp\", auth: {auth} }}\nimport: {{ events: true }}\nevents: {{ sharing: per_principal }}"
+            ))
+            .validate()
+        };
+        let error = with(r#"{ mode: service_token, token: "t" }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("events.sharing"), "{error}");
+        let error = with(r#"{ mode: oauth_impersonation, credential: "cred://p/x" }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("events.sharing"), "{error}");
+        with(
+            r#"{ mode: oauth_impersonation, credential: "cred://p/x", subject_token: idp_refresh_token }"#,
+        )
+        .expect("the subscriber's stored sign-in mints their credential");
     }
 }

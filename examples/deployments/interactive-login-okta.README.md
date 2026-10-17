@@ -6,7 +6,7 @@ One gateway whose embedded authorization server serves both ways into it through
 - **Interactive clients** (Claude Code, VS Code, `mcpg inspector`, a registered CLI) sign their user in through the browser: `authorization_code` with PKCE at `/oauth/authorize`, the consent page where it applies, then Okta. The user is the same principal whichever way they came in.
 - **The `vendor` federation** presents the user's stored Okta refresh token as the RFC 8693 subject token, through `dev.mcpg.credential.oauth-id-jag`.
 
-Interactive sign-in needs a license with the `sso.interactive_login` feature (enterprise). A gateway refuses to boot with a `login` or `interactive` block unless its `license:` block grants it or the deployment declares `license.non_production_use: true`. This holds for a gateway attached to a self-hosted control plane too, which never sees the gateway's local config. On mcpg.cloud, the control plane refuses to publish such a config for an org whose plan lacks it.
+Interactive sign-in needs a license with the `sso.interactive_login` feature (enterprise). A standalone gateway refuses to boot with a `login` or `interactive` block unless its `license:` block grants it or the deployment declares `license.non_production_use: true`. A gateway attached to your own control plane does the same, and without a `license:` block of its own runs on the licence that control plane relays. A gateway mcpg.cloud delivers a licence to ignores its `license:` block (`non_production_use` included) and gates on that licence. On mcpg.cloud, the control plane refuses to publish such a config for an org whose plan lacks it.
 
 ## Set up Okta
 

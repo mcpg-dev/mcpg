@@ -174,6 +174,8 @@ pub fn parse(args: &[String]) -> anyhow::Result<CompositionArgs> {
                     }
                 }
             }
+            // The probe passes its whole argv through here to read `--config`.
+            "--health-check" => {}
             _ => {}
         }
         i += 1;
@@ -338,7 +340,7 @@ pub fn apply(config: &mut AppConfig, comp: &CompositionArgs) -> anyhow::Result<(
 /// a `server.tunnel` block already in the config file: `--tunnel` alone
 /// enables the file's tunnel settings (keeping a file-set relay/name/mode),
 /// and each explicit flag overrides only its own field.
-fn apply_tunnel(config: &mut AppConfig, comp: &CompositionArgs) -> anyhow::Result<()> {
+pub(crate) fn apply_tunnel(config: &mut AppConfig, comp: &CompositionArgs) -> anyhow::Result<()> {
     if !comp.tunnel {
         return Ok(());
     }
@@ -398,8 +400,7 @@ pub async fn box_status() -> anyhow::Result<()> {
     match AppConfig::load_many(&path_refs) {
         Ok(cfg) => {
             let bind = &cfg.gateway.server.bind_address;
-            let health = &cfg.gateway.server.health_path;
-            let probe = format!("http://{bind}{health}");
+            let probe = crate::health_probe::local_health_url(&cfg.gateway.server);
             let up = matches!(
                 http.get(&probe).send().await,
                 Ok(r) if r.status().is_success()
@@ -933,29 +934,30 @@ mod tests {
             "an open listener should be seen immediately"
         );
 
-        // Bind a second port, then drop it: nothing is listening there now.
-        let closed = {
-            let doomed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            doomed.local_addr().unwrap().to_string()
-        };
+        // A port held by a socket that never listens: nothing accepts there,
+        // and no other process can bind it meanwhile.
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let closed = held.local_addr().unwrap().to_string();
         assert!(
             !wait_for_listener(&closed, std::time::Duration::from_millis(300)).await,
             "a closed port must time out rather than report ready"
         );
+        drop(held);
     }
 
     /// The real ordering: the sidecar is up first and the gateway's listener
     /// opens later, which is exactly when announcing early misleads.
     #[tokio::test]
     async fn wait_for_listener_waits_for_a_late_bind() {
-        // Reserve a port, release it, and rebind after a delay.
-        let addr = {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            probe.local_addr().unwrap()
-        };
+        // Hold a port with a socket that listens only after a delay, so no
+        // other process can take it in between.
+        let held = tokio::net::TcpSocket::new_v4().unwrap();
+        held.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = held.local_addr().unwrap();
         let late = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            tokio::net::TcpListener::bind(addr).await
+            held.listen(16)
         });
 
         let seen = wait_for_listener(&addr.to_string(), std::time::Duration::from_secs(10)).await;

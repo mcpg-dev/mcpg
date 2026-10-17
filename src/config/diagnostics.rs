@@ -36,14 +36,15 @@ pub fn reachable_trust_ceiling(config: &AppConfig) -> TrustLevelConfig {
     }
 }
 
-/// Bindings whose `governance.minimum_trust` sits above the trust ceiling
-/// the identity posture can produce — each one hidden from every list and
-/// rejected on call.
+/// Bindings whose trust floor (their own `governance.minimum_trust`, or
+/// `default_minimum_trust`) sits above the trust ceiling the identity
+/// posture can produce — each one hidden from every list and rejected on
+/// call.
 pub fn unreachable_trust_bindings(config: &AppConfig) -> Vec<&str> {
     let ceiling = reachable_trust_ceiling(config);
     config
         .all_bindings()
-        .filter(|(_, binding)| binding.governance.minimum_trust > ceiling)
+        .filter(|(_, binding)| config.binding_minimum_trust(binding) > ceiling)
         .map(|(_, binding)| binding.name.as_str())
         .collect()
 }
@@ -55,23 +56,26 @@ pub fn trust_ceiling_remedy(ceiling: TrustLevelConfig) -> &'static str {
         "configure an identity source (governance.access.oidc_oauth / .jwks / \
          .authorization_server, or an identity_provider plugin), set \
          gateway.server.trust_subject_header to accept header-asserted identity, or lower the \
-         binding's governance.minimum_trust"
+         binding's governance.minimum_trust (or default_minimum_trust, for a binding that \
+         names no floor)"
     } else {
         "configure an identity source (governance.access.oidc_oauth / .jwks / \
          .authorization_server, or an identity_provider plugin), or lower the binding's \
-         governance.minimum_trust"
+         governance.minimum_trust (or default_minimum_trust, for a binding that names no floor)"
     }
 }
 
-/// Settings that validate but leave the embedded EMA authorization server
+/// Access settings that validate but do not do what they say: an
+/// `event_name` rule for an event type nobody declared, and settings that
+/// leave the embedded EMA authorization server
 /// (`governance.access.authorization_server`) unreachable for some clients.
-/// One operator-facing message per finding; empty without the server.
+/// One operator-facing message per finding.
 pub fn access_posture_warnings(config: &AppConfig) -> Vec<String> {
+    let mut warnings = event_rule_warnings(config);
     let access = &config.governance.access;
     let Some(ref authz) = access.authorization_server else {
-        return Vec::new();
+        return warnings;
     };
-    let mut warnings = Vec::new();
     // RFC 8414 §3.3: a client refuses metadata whose `issuer` differs from
     // the URL it was listed under, so only an exact entry is discoverable.
     let issuer = authz.issuer.as_str();
@@ -372,6 +376,43 @@ fn url_origin(url: &str) -> Option<String> {
     })
 }
 
+/// `event_name` rules that govern nothing, because no event type of that
+/// name is declared and no federation imports one under its prefix: such a
+/// rule is silently inert otherwise.
+fn event_rule_warnings(config: &AppConfig) -> Vec<String> {
+    let declared: std::collections::HashSet<&str> = config
+        .mcp
+        .capabilities
+        .events
+        .iter()
+        .map(|ty| ty.name.as_str())
+        .collect();
+    let may_be_imported = |name: &str| {
+        config
+            .mcp
+            .federations
+            .iter()
+            .filter(|fed| fed.import.events)
+            .any(|fed| name.starts_with(fed.event_prefix()))
+    };
+    config
+        .governance
+        .policy
+        .tool_access
+        .rules
+        .iter()
+        .filter_map(|rule| rule.event_name.as_deref())
+        .filter(|name| !declared.contains(name) && !may_be_imported(name))
+        .map(|name| {
+            format!(
+                "governance.policy.tool_access.rules names event_name `{name}`, but no event \
+                 type of that name is declared under mcp.capabilities.events or imported by a \
+                 federation, so the rule governs nothing"
+            )
+        })
+        .collect()
+}
+
 /// Boot-side counterpart to [`access_posture_warnings`].
 pub fn warn_access_posture(config: &AppConfig) {
     for warning in access_posture_warnings(config) {
@@ -407,12 +448,7 @@ mod tests {
     }
 
     fn unreachable(config: &AppConfig) -> Vec<&str> {
-        let ceiling = reachable_trust_ceiling(config);
-        config
-            .all_bindings()
-            .filter(|(_, b)| b.governance.minimum_trust > ceiling)
-            .map(|(_, b)| b.name.as_str())
-            .collect()
+        unreachable_trust_bindings(config)
     }
 
     const ANONYMOUS_QUICKSTART: &str = r#"
@@ -511,6 +547,27 @@ mcp:
         );
     }
 
+    /// A binding that names no floor is gated at `default_minimum_trust`,
+    /// so the diagnosis follows that default in both directions.
+    #[test]
+    fn a_binding_without_a_floor_is_diagnosed_at_the_default_floor() {
+        let lowered = config(&format!(
+            "governance:\n  policy:\n    tool_access:\n      default_minimum_trust: \
+             unauthenticated\n{ANONYMOUS_QUICKSTART}"
+        ));
+        assert!(
+            unreachable(&lowered).is_empty(),
+            "{:?}",
+            unreachable(&lowered)
+        );
+
+        let raised = config(&format!(
+            "gateway:\n  server:\n    trust_subject_header: true\ngovernance:\n  policy:\n    \
+             tool_access:\n      default_minimum_trust: verified\n{ANONYMOUS_QUICKSTART}"
+        ));
+        assert_eq!(unreachable(&raised), vec!["dev.mock.echo"]);
+    }
+
     const EMA_ACCESS: &str = r#"
 governance:
   access:
@@ -528,6 +585,31 @@ governance:
     #[test]
     fn no_access_posture_warning_without_an_authorization_server() {
         assert!(access_posture_warnings(&config(ANONYMOUS_QUICKSTART)).is_empty());
+    }
+
+    /// A rule keyed on an event type nobody declared governs nothing, which
+    /// would otherwise go unnoticed.
+    #[test]
+    fn an_event_rule_for_an_undeclared_type_warns() {
+        let rules = "governance:\n  policy:\n    tool_access:\n      rules:\n        - event_name: \
+                     orders.created\n          minimum_trust: verified\n";
+        let warnings = access_posture_warnings(&config(&format!("{rules}{ANONYMOUS_QUICKSTART}")));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("orders.created"));
+
+        let declared = format!(
+            "{rules}mcp:\n  capabilities:\n    events:\n      - name: orders.created\n        \
+             source: {{ inbound: {{ source_id: orders, allow_unsigned: true }} }}\n"
+        );
+        assert!(access_posture_warnings(&config(&declared)).is_empty());
+
+        // A type a federation imports under its prefix is governed too.
+        let imported = format!(
+            "{rules}mcp:\n  federations:\n    - name: shop\n      upstream: {{ url: \
+             \"https://shop.example/mcp\" }}\n      import: {{ events: true }}\n      naming: {{ \
+             event_prefix: \"orders.\" }}\n"
+        );
+        assert!(access_posture_warnings(&config(&imported)).is_empty());
     }
 
     /// An EMA gateway that serves anonymous `initialize` never hands a

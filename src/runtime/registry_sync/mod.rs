@@ -36,12 +36,26 @@ const TICK: Duration = Duration::from_secs(15);
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct RegistryOverlay {
     pub federations: Vec<FederationConfig>,
+    /// The registry each federation was synthesized from, by federation
+    /// name. A federation's name alone cannot say: registry names may
+    /// contain `-`, so `a---srv` starts with both `a--` and `a---`.
+    pub owners: BTreeMap<String, String>,
+}
+
+impl RegistryOverlay {
+    /// Add `federation`, synthesized from the registry named `registry`.
+    pub(crate) fn push(&mut self, registry: &str, federation: FederationConfig) {
+        self.owners
+            .insert(federation.name.clone(), registry.to_owned());
+        self.federations.push(federation);
+    }
 }
 
 /// Compose the registry overlay onto a base config: append synthesized
-/// federations that collide with nothing, then re-validate the merged
-/// whole. `None` = nothing to change (empty overlay, everything
-/// collided, or the merge failed validation — the base applies alone).
+/// federations that collide with nothing, each under the governance its
+/// registry declares in `base`, then re-validate the merged whole. `None`
+/// = nothing to change (empty overlay, everything collided or unclaimed,
+/// or the merge failed validation — the base applies alone).
 pub(crate) fn merged_with_overlay(
     base: &AppConfig,
     overlay: &RegistryOverlay,
@@ -65,6 +79,14 @@ pub(crate) fn merged_with_overlay(
         .collect();
     let mut appended = 0usize;
     for fed in &overlay.federations {
+        let Some(governance) = synthesized_federation_governance(base, overlay, &fed.name) else {
+            tracing::warn!(
+                federation = %fed.name,
+                registry = overlay.owners.get(&fed.name).map(String::as_str).unwrap_or(""),
+                "registry overlay entry names no registry this config declares; not federated"
+            );
+            continue;
+        };
         let prefix = fed.tool_prefix().to_owned();
         if names.contains(&fed.name) || prefixes.contains(&prefix) {
             tracing::warn!(
@@ -75,7 +97,9 @@ pub(crate) fn merged_with_overlay(
         }
         names.insert(fed.name.clone());
         prefixes.insert(prefix);
-        merged.mcp.federations.push(fed.clone());
+        let mut fed = fed.clone();
+        fed.governance = governance.clone();
+        merged.mcp.federations.push(fed);
         appended += 1;
     }
     if appended == 0 {
@@ -91,6 +115,25 @@ pub(crate) fn merged_with_overlay(
             None
         }
     }
+}
+
+/// The governance a registry-synthesized federation named `federation`
+/// answers to: the `defaults.governance` that `base` declares for the
+/// registry `overlay` records as its owner. The overlay was built under the
+/// config in force when it was crawled, or on the cluster leader, so the
+/// governance it carries may be looser than `base` asks for. `None` when the
+/// overlay records no owner, or `base` declares no registry of that name.
+pub(crate) fn synthesized_federation_governance<'a>(
+    base: &'a AppConfig,
+    overlay: &RegistryOverlay,
+    federation: &str,
+) -> Option<&'a crate::config::BackendGovernanceConfig> {
+    let owner = overlay.owners.get(federation)?;
+    base.mcp
+        .registries
+        .iter()
+        .find(|registry| registry.name == *owner)
+        .map(|registry| &registry.defaults.governance)
 }
 
 /// Cluster leadership role: in a clustered deployment exactly one
@@ -116,6 +159,9 @@ struct OverlaySnapshot {
     #[serde(default)]
     fence: u64,
     federations: Vec<FederationConfig>,
+    /// `None` on an envelope from a leader that records no owners.
+    #[serde(default)]
+    owners: Option<BTreeMap<String, String>>,
 }
 
 const OVERLAY_SNAPSHOT_V: u32 = 1;
@@ -125,27 +171,64 @@ fn encode_overlay_snapshot(overlay: &RegistryOverlay, fence: u64) -> Option<Vec<
         v: OVERLAY_SNAPSHOT_V,
         fence,
         federations: overlay.federations.clone(),
+        owners: Some(overlay.owners.clone()),
     })
     .ok()
 }
 
-/// Decode → `(overlay, publisher's fencing token)`.
-fn decode_overlay_snapshot(bytes: &[u8]) -> Option<(RegistryOverlay, u64)> {
+/// Decode → `(overlay, publisher's fencing token)`. `registries` are the ones
+/// this replica declares; they name the owners of an envelope that records
+/// none.
+fn decode_overlay_snapshot(
+    bytes: &[u8],
+    registries: &[McpRegistryConfig],
+) -> Option<(RegistryOverlay, u64)> {
     let snap: OverlaySnapshot = serde_json::from_slice(bytes).ok()?;
     if snap.v != OVERLAY_SNAPSHOT_V {
         return None;
     }
-    let overlay = RegistryOverlay {
-        federations: snap
-            .federations
-            .into_iter()
-            // `tunnel://` needs no safety opt-in, so clamping the flags is not
-            // enough — the scheme itself has to go.
-            .filter(|f| !f.upstream.url.starts_with("tunnel://"))
-            .map(clamp_adopted)
+    let federations: Vec<FederationConfig> = snap
+        .federations
+        .into_iter()
+        // `tunnel://` needs no safety opt-in, so clamping the flags is not
+        // enough — the scheme itself has to go.
+        .filter(|f| !f.upstream.url.starts_with("tunnel://"))
+        .map(clamp_adopted)
+        .collect();
+    let mut owners = match snap.owners {
+        Some(owners) => owners,
+        // A leader that predates the record still publishes during a rolling
+        // upgrade; its followers claim by name, and so does this one, so the
+        // registry's federations keep serving until a newer leader republishes.
+        None => federations
+            .iter()
+            .filter_map(|f| {
+                registry_named_by(registries, &f.name).map(|owner| (f.name.clone(), owner))
+            })
             .collect(),
     };
-    Some((overlay, snap.fence))
+    owners.retain(|name, _| federations.iter().any(|f| f.name == *name));
+    Some((
+        RegistryOverlay {
+            federations,
+            owners,
+        },
+        snap.fence,
+    ))
+}
+
+/// The one registry in `registries` whose `<registry>--` prefix `federation`
+/// starts with. `None` when none does, or more than one: registry names may
+/// contain `-`, so `a---srv` starts with both `a--` and `a---`.
+fn registry_named_by(registries: &[McpRegistryConfig], federation: &str) -> Option<String> {
+    let mut claimants = registries
+        .iter()
+        .filter(|registry| federation.starts_with(&map::federation_name(&registry.name, "")));
+    let registry = claimants.next()?;
+    if claimants.next().is_some() {
+        return None;
+    }
+    Some(registry.name.clone())
 }
 
 /// Re-assert the synthesis rails on a federation adopted from the
@@ -261,7 +344,8 @@ impl RegistrySyncer {
         // feature; adopting a snapshot there would federate servers the
         // operator never asked for. The syncer itself is spawned
         // unconditionally, so the check belongs here rather than at spawn.
-        if self.state.config.load().mcp.registries.is_empty() {
+        let config = self.state.config.load_full();
+        if config.mcp.registries.is_empty() {
             return;
         }
         let Some(kv) = self.overlay_kv(backend) else {
@@ -269,7 +353,9 @@ impl RegistrySyncer {
         };
         match kv.get(OVERLAY_KV_KEY).await {
             Ok(Some(entry)) => {
-                let Some((overlay, fence)) = decode_overlay_snapshot(&entry.bytes) else {
+                let Some((overlay, fence)) =
+                    decode_overlay_snapshot(&entry.bytes, &config.mcp.registries)
+                else {
                     tracing::warn!("registry overlay KV snapshot is undecodable; keeping current");
                     return;
                 };
@@ -333,7 +419,7 @@ impl RegistrySyncer {
         // inert.)
         match kv.get(OVERLAY_KV_KEY).await {
             Ok(Some(entry)) => {
-                if let Some((_, stored_fence)) = decode_overlay_snapshot(&entry.bytes)
+                if let Some((_, stored_fence)) = decode_overlay_snapshot(&entry.bytes, &[])
                     && stored_fence > fence
                 {
                     tracing::warn!(
@@ -908,7 +994,7 @@ fn assemble_overlay(
     registries: &[McpRegistryConfig],
     runs: &BTreeMap<String, RegistryRun>,
 ) -> RegistryOverlay {
-    let mut federations: Vec<FederationConfig> = Vec::new();
+    let mut overlay = RegistryOverlay::default();
     let mut names: HashSet<String> = HashSet::new();
     let mut prefixes: HashSet<String> = HashSet::new();
     for registry in registries {
@@ -926,10 +1012,10 @@ fn assemble_overlay(
             }
             names.insert(fed.name.clone());
             prefixes.insert(prefix);
-            federations.push(fed.clone());
+            overlay.push(&registry.name, fed.clone());
         }
     }
-    RegistryOverlay { federations }
+    overlay
 }
 
 #[cfg(test)]
@@ -1133,8 +1219,14 @@ mod tests {
         assert_eq!(fed.upstream.auth.credential_config, Some(explicit));
     }
 
+    /// A base config with the `acme` registry, which claims every
+    /// `acme--…` overlay federation, and one operator-written federation.
     fn base_with_federation(name: &str, prefix: &str) -> AppConfig {
         let mut config = AppConfig::default();
+        config.mcp.registries.push(
+            serde_yaml::from_str("name: acme\nurl: \"https://registry.example\"\n")
+                .expect("parse registry"),
+        );
         config.mcp.federations.push(
             serde_yaml::from_str(&format!(
                 "name: {name}\nupstream:\n  url: \"https://up.example/mcp\"\nnaming: {{ tool_prefix: \"{prefix}\" }}\n"
@@ -1151,18 +1243,26 @@ mod tests {
         .expect("parse federation")
     }
 
+    /// An overlay of `(registry, federation)` entries, each owned by its
+    /// registry.
+    fn overlay_of<const N: usize>(entries: [(&str, FederationConfig); N]) -> RegistryOverlay {
+        let mut overlay = RegistryOverlay::default();
+        for (registry, federation) in entries {
+            overlay.push(registry, federation);
+        }
+        overlay
+    }
+
     #[test]
     fn overlay_appends_and_operator_wins_on_collision() {
-        let base = base_with_federation("crm", "crm.");
-        let overlay = RegistryOverlay {
-            federations: vec![
-                overlay_fed("acme--com.acme--crm", "com.acme.crm."),
-                // Name collision with the operator entry: dropped.
-                overlay_fed("crm", "other."),
-                // Prefix collision with the operator entry: dropped.
-                overlay_fed("acme--com.acme--crm2", "crm."),
-            ],
-        };
+        let base = base_with_federation("acme--legacy", "crm.");
+        let overlay = overlay_of([
+            ("acme", overlay_fed("acme--com.acme--crm", "com.acme.crm.")),
+            // Name collision with the operator entry: dropped.
+            ("acme", overlay_fed("acme--legacy", "other.")),
+            // Prefix collision with the operator entry: dropped.
+            ("acme", overlay_fed("acme--com.acme--crm2", "crm.")),
+        ]);
         let merged = merged_with_overlay(&base, &overlay).expect("merged");
         let names: Vec<_> = merged
             .mcp
@@ -1170,7 +1270,41 @@ mod tests {
             .iter()
             .map(|f| f.name.as_str())
             .collect();
-        assert_eq!(names, vec!["crm", "acme--com.acme--crm"]);
+        assert_eq!(names, vec!["acme--legacy", "acme--com.acme--crm"]);
+    }
+
+    /// A synthesized federation answers to the governance its registry
+    /// declares in the config being applied, not the governance it was
+    /// crawled (or adopted from the cluster leader) with. One that no
+    /// configured registry claims is not federated.
+    #[test]
+    fn overlay_federations_take_their_registrys_current_governance() {
+        let mut base = AppConfig::default();
+        base.mcp.registries.push(
+            serde_yaml::from_str(
+                "name: acme\nurl: \"https://registry.example\"\ndefaults:\n  governance:\n    minimum_trust: verified\n    allow_if: '\"crm\" in identity.groups'\n    required_scopes: [crm.read]\n",
+            )
+            .expect("parse registry"),
+        );
+        let mut crawled = overlay_fed("acme--com.acme--crm", "com.acme.crm.");
+        crawled.governance.minimum_trust = Some(crate::config::TrustLevelConfig::Unauthenticated);
+        let overlay = overlay_of([
+            ("acme", crawled),
+            ("gone", overlay_fed("gone--com.acme--hr", "com.acme.hr.")),
+        ]);
+
+        let merged = merged_with_overlay(&base, &overlay).expect("merged");
+        let names: Vec<_> = merged
+            .mcp
+            .federations
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["acme--com.acme--crm"]);
+        assert_eq!(
+            merged.mcp.federations[0].governance,
+            base.mcp.registries[0].defaults.governance
+        );
     }
 
     /// A registry-synced federation that presents the caller's stored IdP
@@ -1199,17 +1333,20 @@ governance:
             client_secret: login-client-secret-0123
       clients:
         - client_id: mcp-client
+mcp:
+  registries:
+    - name: acme
+      url: https://registry.example
 ";
         let mut fed = overlay_fed("acme--com.acme--crm", "com.acme.crm.");
         fed.upstream.auth = serde_yaml::from_str(
             "mode: oauth_impersonation\ncredential: cred://dev.mcpg.credential.oauth-id-jag/com.acme/crm\nsubject_token: idp_refresh_token\n",
         )
         .expect("parse auth");
-        let overlay = RegistryOverlay {
-            federations: vec![fed],
-        };
+        let overlay = overlay_of([("acme", fed)]);
         let (adopted, _) = decode_overlay_snapshot(
             &encode_overlay_snapshot(&overlay, 3).expect("snapshot encodes"),
+            &[],
         )
         .expect("snapshot decodes");
         assert_eq!(
@@ -1243,12 +1380,129 @@ governance:
 
     #[test]
     fn empty_or_fully_colliding_overlay_is_a_no_op() {
-        let base = base_with_federation("crm", "crm.");
+        let base = base_with_federation("acme--crm", "crm.");
         assert!(merged_with_overlay(&base, &RegistryOverlay::default()).is_none());
-        let overlay = RegistryOverlay {
-            federations: vec![overlay_fed("crm", "whatever.")],
-        };
+        let overlay = overlay_of([("acme", overlay_fed("acme--crm", "whatever."))]);
         assert!(merged_with_overlay(&base, &overlay).is_none());
+    }
+
+    /// A synthesized federation answers to the registry that synthesized
+    /// it, not to whichever registry's name its own name starts with.
+    #[test]
+    fn an_overlay_entry_answers_to_the_registry_that_synthesized_it() {
+        let mut base = AppConfig::default();
+        let registries = [
+            ("a", "verified"),
+            ("a-", "unauthenticated"),
+            ("acme", "verified"),
+        ];
+        for (i, (name, trust)) in registries.into_iter().enumerate() {
+            base.mcp.registries.push(
+                serde_yaml::from_str(&format!(
+                    "name: \"{name}\"\nurl: \"https://r{i}.example\"\ndefaults:\n  governance:\n    \
+                     minimum_trust: {trust}\n"
+                ))
+                .expect("parse registry"),
+            );
+        }
+        let overlay = overlay_of([
+            // `a---srv` starts with both `a--` and `a---`.
+            (
+                "a-",
+                overlay_fed(&map::federation_name("a-", "srv"), "srv."),
+            ),
+            // Synthesized by a registry this config no longer declares.
+            (
+                "acme--eu",
+                overlay_fed(&map::federation_name("acme--eu", "hr"), "hr."),
+            ),
+        ]);
+
+        let merged = merged_with_overlay(&base, &overlay).expect("merged");
+        let federations: Vec<_> = merged
+            .mcp
+            .federations
+            .iter()
+            .map(|f| (f.name.as_str(), f.governance.minimum_trust))
+            .collect();
+        assert_eq!(
+            federations,
+            vec![(
+                "a---srv",
+                Some(crate::config::TrustLevelConfig::Unauthenticated)
+            )]
+        );
+    }
+
+    /// A leader that predates the owner record keeps publishing during a
+    /// rolling upgrade. Its envelope is claimed the way its own followers
+    /// claim it, by the one registry whose name prefixes each federation, so
+    /// an upgraded follower keeps serving the registry's federations; a name
+    /// two registries could both prefix, or none, is still dropped. An
+    /// envelope that records owners is never claimed by name.
+    #[test]
+    fn an_envelope_without_owners_is_claimed_by_name() {
+        let mut base = AppConfig::default();
+        let registries = [
+            ("acme", "verified"),
+            ("a", "verified"),
+            ("a-", "unauthenticated"),
+        ];
+        for (i, (name, trust)) in registries.into_iter().enumerate() {
+            base.mcp.registries.push(
+                serde_yaml::from_str(&format!(
+                    "name: \"{name}\"\nurl: \"https://r{i}.example\"\ndefaults:\n  governance:\n    \
+                     minimum_trust: {trust}\n"
+                ))
+                .expect("parse registry"),
+            );
+        }
+        let federations = vec![
+            overlay_fed("acme--com.acme--crm", "com.acme.crm."),
+            overlay_fed(&map::federation_name("a-", "srv"), "srv."),
+            overlay_fed("gone--com.acme--hr", "com.acme.hr."),
+        ];
+        let legacy = |federations: Vec<FederationConfig>| {
+            let overlay = RegistryOverlay {
+                federations,
+                owners: BTreeMap::new(),
+            };
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&encode_overlay_snapshot(&overlay, 7).unwrap()).unwrap();
+            v.as_object_mut().unwrap().remove("owners");
+            serde_json::to_vec(&v).unwrap()
+        };
+
+        let (adopted, _) =
+            decode_overlay_snapshot(&legacy(federations.clone()), &base.mcp.registries)
+                .expect("an envelope without owners decodes");
+        assert_eq!(adopted.federations.len(), 3);
+        let merged = merged_with_overlay(&base, &adopted).expect("merged");
+        let federated: Vec<_> = merged
+            .mcp
+            .federations
+            .iter()
+            .map(|f| (f.name.as_str(), f.governance.minimum_trust))
+            .collect();
+        assert_eq!(
+            federated,
+            vec![(
+                "acme--com.acme--crm",
+                Some(crate::config::TrustLevelConfig::Verified)
+            )]
+        );
+
+        let recorded = RegistryOverlay {
+            federations,
+            owners: BTreeMap::new(),
+        };
+        let (adopted, _) = decode_overlay_snapshot(
+            &encode_overlay_snapshot(&recorded, 7).unwrap(),
+            &base.mcp.registries,
+        )
+        .expect("an envelope with owners decodes");
+        assert!(adopted.owners.is_empty());
+        assert!(merged_with_overlay(&base, &adopted).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1325,11 +1579,9 @@ governance:
 
     #[test]
     fn overlay_snapshot_round_trips() {
-        let overlay = RegistryOverlay {
-            federations: vec![overlay_fed("acme--com.acme--crm", "com.acme.crm.")],
-        };
+        let overlay = overlay_of([("acme", overlay_fed("acme--com.acme--crm", "com.acme.crm."))]);
         let bytes = encode_overlay_snapshot(&overlay, 42).expect("encode");
-        let (decoded, fence) = decode_overlay_snapshot(&bytes).expect("decode");
+        let (decoded, fence) = decode_overlay_snapshot(&bytes, &[]).expect("decode");
         assert_eq!(decoded, overlay);
         assert_eq!(
             fence, 42,
@@ -1339,8 +1591,8 @@ governance:
         // A different snapshot version is refused, not misapplied.
         let mut v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         v["v"] = serde_json::json!(999);
-        assert!(decode_overlay_snapshot(&serde_json::to_vec(&v).unwrap()).is_none());
-        assert!(decode_overlay_snapshot(b"not-json").is_none());
+        assert!(decode_overlay_snapshot(&serde_json::to_vec(&v).unwrap(), &[]).is_none());
+        assert!(decode_overlay_snapshot(b"not-json", &[]).is_none());
     }
 
     /// An adopted snapshot carries its own safety flags, so `validate()`
@@ -1367,7 +1619,7 @@ governance:
                 }
             }]
         });
-        let (decoded, _) = decode_overlay_snapshot(&serde_json::to_vec(&hostile).unwrap())
+        let (decoded, _) = decode_overlay_snapshot(&serde_json::to_vec(&hostile).unwrap(), &[])
             .expect("snapshot still decodes");
         let fed = &decoded.federations[0];
         assert_eq!(
@@ -1510,14 +1762,12 @@ governance:
         // An envelope written before tokens were stamped carries no
         // `fence` field; it must decode (as 0) rather than be dropped,
         // and 0 never outranks any stamped snapshot.
-        let overlay = RegistryOverlay {
-            federations: vec![overlay_fed("reg--com.acme--crm", "com.acme.crm.")],
-        };
+        let overlay = overlay_of([("reg", overlay_fed("reg--com.acme--crm", "com.acme.crm."))]);
         let mut v: serde_json::Value =
             serde_json::from_slice(&encode_overlay_snapshot(&overlay, 7).unwrap()).unwrap();
         v.as_object_mut().unwrap().remove("fence");
         let bytes = serde_json::to_vec(&v).unwrap();
-        let (_, fence) = decode_overlay_snapshot(&bytes).expect("legacy envelope decodes");
+        let (_, fence) = decode_overlay_snapshot(&bytes, &[]).expect("legacy envelope decodes");
         assert_eq!(fence, 0);
     }
 }

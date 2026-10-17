@@ -58,8 +58,14 @@ pub(crate) async fn health_handler(
         None
     };
 
+    // A licence hold degrades the gateway but never fails it: it stays up.
+    let status = if runtime.license_state().degradation().is_some() {
+        "degraded"
+    } else {
+        "ok"
+    };
     let response = Json(HealthResponse {
-        status: "ok",
+        status,
         service: runtime.service_name.clone(),
         version: runtime.service_version.clone(),
         bindings,

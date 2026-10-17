@@ -975,10 +975,13 @@ governance:
 #   - id: dev.mcpg.webhook
 #     class: tool_gate
 #     source: { path: ./plugins/libmcpg_plugin_integration_webhook.so }
+#     granted_capabilities: ["network_outbound"]
 #     config:
 #       endpoints:
 #         - url: https://hooks.internal/mcp
-#           events: ["tool.call.completed"]
+#           events: ["completed"]          # completed | error | slow_response | all
+#           # Standard Webhooks secrets (whsec_, 24–64 byte key); the first signs, the rest join during a rotation
+#           signing_secrets: ["${secret.HOOK_WHSEC}"]
 #           headers: { Authorization: "${cred://webhook-token}" }
 #       max_retries: 3
 #       retry_backoff_ms: 1000

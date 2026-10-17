@@ -175,7 +175,8 @@ pub async fn serve(state: AppState, mut shutdown: tokio::sync::watch::Receiver<(
                         let json = serde_json::to_value(&success).expect("serialize success");
                         write_json_line(&mut writer, &json).await?;
                     }
-                    ProtocolResponse::JsonRpcError(error) => {
+                    ProtocolResponse::JsonRpcError(mut error) => {
+                        crate::transports::http::strip_internal_markers(&mut error);
                         let json = serde_json::to_value(&error).expect("serialize error");
                         write_json_line(&mut writer, &json).await?;
                     }

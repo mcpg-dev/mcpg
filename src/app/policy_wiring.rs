@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::backend::BackendKind;
+use crate::runtime::policy::PolicySurface;
 
 /// Build the runtime quota gate from `governance.quotas:` plus
 /// the per-binding `quotas:` references collected from every
@@ -193,16 +194,19 @@ pub(crate) fn build_tool_access_policy_config(config: &AppConfig) -> ToolAccessP
         .rules
         .iter()
         .map(|rule| ToolTrustRule {
-            tool_name: rule.tool_name.clone(),
+            tool_name: rule.policy_key(),
             minimum_trust: map_trust_level(rule.minimum_trust),
             cel_allow_if: rule.cel_allow_if.clone(),
             required_scopes: rule.required_scopes.clone(),
+            surface: rule.event_name.as_ref().map(|_| PolicySurface::Event),
         })
         .collect::<Vec<_>>();
 
     // Inject binding governance rules — trust floor, CEL guard, and the
     // binding's own scope requirement (a central rule cannot name a bound
-    // surface, so this is where a bound tool's scopes are declared).
+    // surface, so this is where a bound tool's scopes are declared). A
+    // binding's rule replaces the default floor, so a binding that names no
+    // floor carries the default in its rule.
     for (kind, binding) in config.all_bindings() {
         // Every surface is gated under the key that surface names it by, and
         // for resources that key is the URI, not the binding name — both
@@ -215,12 +219,20 @@ pub(crate) fn build_tool_access_policy_config(config: &AppConfig) -> ToolAccessP
             BackendKind::ResourceTemplate => binding.uri_template.clone(),
             BackendKind::Tool | BackendKind::Prompt => None,
         };
+        // A binding's rule governs its own kind only, so a prompt named like
+        // a tool (native or federated) never tightens that tool.
+        let surface = match kind {
+            BackendKind::Tool => PolicySurface::Tool,
+            BackendKind::Prompt => PolicySurface::Prompt,
+            BackendKind::Resource | BackendKind::ResourceTemplate => PolicySurface::Resource,
+        };
         for key in std::iter::once(binding.name.clone()).chain(surface_key) {
             rules.push(ToolTrustRule {
                 tool_name: key,
-                minimum_trust: map_trust_level(binding.governance.minimum_trust),
+                minimum_trust: map_trust_level(config.binding_minimum_trust(binding)),
                 cel_allow_if: binding.governance.allow_if.clone(),
                 required_scopes: binding.governance.required_scopes.clone(),
+                surface: Some(surface),
             });
         }
     }

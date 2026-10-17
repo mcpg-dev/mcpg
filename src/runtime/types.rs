@@ -49,4 +49,6 @@ pub struct ReadinessCheck {
 pub enum ReadinessStatus {
     Ready,
     NotReady,
+    /// Serving, but less than its config: the gateway stays in rotation.
+    Degraded,
 }

@@ -36,7 +36,7 @@ pub(crate) fn map_protocol_http_response(response: ProtocolHttpResponse) -> Resp
     // / Chargebee convention) so clients that prefer header-side
     // signalling don't have to peek inside `_meta`.
     let mut idempotent_replayed: Option<String> = None;
-    let mut retry_after: Option<&'static str> = None;
+    let mut retry_after: Option<u64> = None;
     if let ProtocolResponse::JsonRpcSuccess(success) = &response.response {
         let meta = success
             .result
@@ -59,7 +59,19 @@ pub(crate) fn map_protocol_http_response(response: ProtocolHttpResponse) -> Resp
         && let ProtocolResponse::JsonRpcError(err) = &response.response
         && err.error.code == crate::runtime::idempotency::ERROR_CODE_IN_FLIGHT
     {
-        retry_after = Some("1");
+        retry_after = Some(1);
+    }
+    let mut response = response;
+    // A refusal that names when to come back carries the seconds under
+    // `RETRY_AFTER_DATA_KEY`: they become `Retry-After` and leave the body.
+    if let ProtocolResponse::JsonRpcError(err) = &mut response.response
+        && let Some(data) = err.error.data.as_mut().and_then(Value::as_object_mut)
+        && let Some(secs) = data.remove(RETRY_AFTER_DATA_KEY)
+    {
+        retry_after = secs.as_u64().map(|secs| secs.max(1)).or(retry_after);
+        if data.is_empty() {
+            err.error.data = None;
+        }
     }
     // SEP-2350 step-up: a policy scope denial tags the JSON-RPC error
     // `data` with the missing-scope list. Lift it into the internal
@@ -67,7 +79,6 @@ pub(crate) fn map_protocol_http_response(response: ProtocolHttpResponse) -> Resp
     // `insufficient_scope` 403 challenge, and strip the marker from the
     // wire body (the challenge carries it).
     let mut insufficient_scope: Option<String> = None;
-    let mut response = response;
     if response.http_status == 403
         && let ProtocolResponse::JsonRpcError(err) = &mut response.response
         && let Some(data) = err.error.data.as_mut().and_then(Value::as_object_mut)
@@ -118,7 +129,7 @@ pub(crate) fn map_protocol_http_response(response: ProtocolHttpResponse) -> Resp
     if let Some(secs) = retry_after {
         http_response
             .headers_mut()
-            .insert("retry-after", HeaderValue::from_static(secs));
+            .insert("retry-after", HeaderValue::from(secs));
     }
     if let Some(scope) = insufficient_scope
         && let Ok(value) = HeaderValue::from_str(&scope)
@@ -185,6 +196,36 @@ pub const INSUFFICIENT_SCOPE_HEADER: &str = "x-mcpg-insufficient-scope";
 /// into [`INSUFFICIENT_SCOPE_HEADER`] so the transport-level challenge
 /// builder can mint the SEP-2350 `insufficient_scope` step-up challenge.
 pub const INSUFFICIENT_SCOPE_DATA_KEY: &str = "mcpg_insufficient_scope";
+
+/// JSON-RPC error `data` marker carrying the whole seconds a refused caller
+/// should wait. `map_protocol_http_response` turns it into `Retry-After`
+/// and strips it from the wire body.
+pub const RETRY_AFTER_DATA_KEY: &str = "mcpg_retry_after_secs";
+
+/// Remove the gateway's internal `data` markers from an error that leaves
+/// on a transport without HTTP headers, where nothing would lift them.
+pub(crate) fn strip_internal_markers(error: &mut crate::protocol::shared::jsonrpc::JsonRpcError) {
+    if let Some(data) = error.error.data.as_mut().and_then(Value::as_object_mut) {
+        data.remove(RETRY_AFTER_DATA_KEY);
+        data.remove(INSUFFICIENT_SCOPE_DATA_KEY);
+        if data.is_empty() {
+            error.error.data = None;
+        }
+    }
+}
+
+/// JSON-RPC error `data` that asks for `Retry-After: secs`, keeping the
+/// entries `data` already has. A `data` that is not an object has nowhere to
+/// carry the marker and stays as it is.
+pub(crate) fn retry_after_data(data: Option<Value>, secs: u64) -> Option<Value> {
+    let mut object = match data {
+        Some(Value::Object(object)) => object,
+        None => serde_json::Map::new(),
+        other => return other,
+    };
+    object.insert(RETRY_AFTER_DATA_KEY.to_owned(), Value::from(secs));
+    Some(Value::Object(object))
+}
 
 /// Fallback relative well-known path used when no canonical PRM `resource`
 /// is configured.

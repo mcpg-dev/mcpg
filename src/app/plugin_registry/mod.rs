@@ -110,10 +110,14 @@ pub(crate) struct PluginBundle {
     pub authorization_server: Option<crate::config::AuthorizationServerConfig>,
 }
 
+/// `withheld_backend_kinds` are the binding kinds whose backend plugin the
+/// license gate withheld: their bindings stay configured and fail at call time
+/// instead of refusing the build.
 pub(crate) async fn build_plugin_registry(
     config: &mut AppConfig,
     jwt_verifier: Option<&crate::runtime::identity::JwtVerifier>,
     oidc_resolver: Option<std::sync::Arc<crate::runtime::oidc::OidcOAuthResolver>>,
+    withheld_backend_kinds: &std::collections::BTreeSet<String>,
 ) -> Result<PluginBundle> {
     let mut registry = mcpg_plugin_host::PluginRegistry::new();
 
@@ -667,7 +671,15 @@ pub(crate) async fn build_plugin_registry(
         // untouched (can't mutate `&AppConfig`), which also makes
         // it easy to log "what the operator wrote" separately
         // from "what we expanded it into".
-        let mut resolved_entries = config.plugins.clone();
+        //
+        // A `disabled: true` entry is never loaded; the license gate skips
+        // such entries on exactly that promise.
+        let mut resolved_entries: Vec<_> = config
+            .plugins
+            .iter()
+            .filter(|entry| !entry.disabled)
+            .cloned()
+            .collect();
         // Inline-config override for the cluster coordinator: when
         // the operator writes `cluster: { kind: redis,
         // url: ... }` at the top level, that block IS the source of
@@ -1021,6 +1033,20 @@ pub(crate) async fn build_plugin_registry(
                             native_library_cache.insert(fingerprint.clone(), fresh.clone());
                             fresh
                         };
+                        // The license gate judged this entry by its `ref` (or
+                        // `id`), so the cdylib must be that plugin whatever
+                        // file the path names.
+                        let expected_ref = entry.ref_or_id();
+                        if loaded.meta.manifest.id != expected_ref {
+                            return Err(anyhow::anyhow!(
+                                "plugin alias '{}': native artifact '{}' declares manifest id {:?} \
+                                 but entry expects ref '{}'",
+                                entry.id,
+                                path,
+                                loaded.meta.manifest.id,
+                                expected_ref,
+                            ));
+                        }
                         let plugin_cfg = entry.config.clone();
                         // Capability cross-check: if the cdylib
                         // ships a sidecar `<artifact>.plugin.yaml`, hard-fail at
@@ -1357,6 +1383,17 @@ pub(crate) async fn build_plugin_registry(
             // dispatch does so a valid LLM binding is not falsely rejected.
             let lookup_kind = crate::backends::registry_lookup_kind(&binding.backend)
                 .unwrap_or_else(|| kind.to_owned());
+            if registry.backend(&lookup_kind).is_none()
+                && withheld_backend_kinds.contains(&lookup_kind)
+            {
+                tracing::warn!(
+                    binding = %binding.name,
+                    kind = %kind,
+                    "license: the binding's backend plugin is withheld until a licence covers \
+                     it; its calls fail until then"
+                );
+                continue;
+            }
             if registry.backend(&lookup_kind).is_none() {
                 return Err(anyhow::anyhow!(
                     "binding '{}' names backend kind '{}', but no backend plugin is \

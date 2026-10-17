@@ -67,6 +67,9 @@ use tracing_subscriber::{
 use crate::config::{LogsConfig, ObservabilityConfig, SinkConfig};
 
 static LOGGING_INITIALIZED: OnceLock<()> = OnceLock::new();
+/// Held from the check of [`LOGGING_INITIALIZED`] to its set, so two boots
+/// in one process never both install the global subscriber.
+static LOGGING_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Built-in sink kinds dispatched in-gateway. The set is limited
 /// to OS-stream emitters only (`stderr` / `stdout` / `file`) —
@@ -258,6 +261,9 @@ pub fn init(observability: &ObservabilityConfig) -> Result<ObservabilityHandle> 
         });
     }
 
+    let _init = LOGGING_INIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if LOGGING_INITIALIZED.get().is_some() {
         return Ok(ObservabilityHandle {
             log_bridge: None,
@@ -325,8 +331,8 @@ fn build_os_stream_layers(
         let format = sink_format(&sink.config);
 
         let layer: Box<dyn Layer<Registry> + Send + Sync + 'static> = match sink.kind.as_str() {
-            "stderr" => build_fmt_layer(io::stderr, format),
-            "stdout" => build_fmt_layer(io::stdout, format),
+            "stderr" => build_fmt_layer(stderr_writer(), format),
+            "stdout" => build_fmt_layer(stdout_writer(), format),
             "file" => {
                 let path = sink
                     .config
@@ -358,6 +364,33 @@ fn build_os_stream_layers(
         layers.push(layer.with_filter(env_filter).boxed());
     }
     Ok(layers)
+}
+
+/// Writer for a `stderr` sink. Unit tests write through `eprint!`, which
+/// libtest captures per test thread; a raw process-stream write is not
+/// captured and floods the shared test log.
+fn stderr_writer() -> impl for<'a> MakeWriter<'a> + Send + Sync + 'static {
+    #[cfg(test)]
+    {
+        fmt::TestWriter::with_stderr
+    }
+    #[cfg(not(test))]
+    {
+        io::stderr
+    }
+}
+
+/// Writer for a `stdout` sink; unit tests write through `print!`, as in
+/// [`stderr_writer`].
+fn stdout_writer() -> impl for<'a> MakeWriter<'a> + Send + Sync + 'static {
+    #[cfg(test)]
+    {
+        fmt::TestWriter::new
+    }
+    #[cfg(not(test))]
+    {
+        io::stdout
+    }
 }
 
 /// Build a single `fmt::Layer` for the given writer + format. The
@@ -556,6 +589,20 @@ mod tests {
         let layers = build_os_stream_layers(&config).expect("build succeeds");
         // Two OS-stream sinks → two layers; plugin-kind sink skipped.
         assert_eq!(layers.len(), 2);
+    }
+
+    #[test]
+    fn os_stream_writers_go_through_libtest_capture_on_their_own_stream() {
+        let stderr = std::any::type_name_of_val(&stderr_writer());
+        let stdout = std::any::type_name_of_val(&stdout_writer());
+        assert!(
+            stderr.ends_with("TestWriter::with_stderr"),
+            "stderr sink writer: {stderr}"
+        );
+        assert!(
+            stdout.ends_with("TestWriter::new"),
+            "stdout sink writer: {stdout}"
+        );
     }
 
     #[test]

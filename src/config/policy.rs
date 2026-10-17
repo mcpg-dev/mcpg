@@ -123,10 +123,26 @@ impl ToolAccessPolicyConfig {
         }
         let mut seen = std::collections::HashSet::new();
         for rule in &self.rules {
-            if rule.tool_name.trim().is_empty() {
-                return Err(anyhow::anyhow!(
-                    "policy.tool_access.rules[].tool_name must not be empty"
-                ));
+            match &rule.event_name {
+                Some(_) if !rule.tool_name.is_empty() => {
+                    return Err(anyhow::anyhow!(
+                        "policy.tool_access.rules[] names `{}` both as a tool_name and as an \
+                         event_name; a rule governs one of them",
+                        rule.tool_name
+                    ));
+                }
+                Some(name) if !crate::config::events::is_event_name(name) => {
+                    return Err(anyhow::anyhow!(
+                        "policy.tool_access.rules[].event_name `{name}` is not an event type name"
+                    ));
+                }
+                Some(_) => {}
+                None if rule.tool_name.trim().is_empty() => {
+                    return Err(anyhow::anyhow!(
+                        "policy.tool_access.rules[].tool_name must not be empty"
+                    ));
+                }
+                None => {}
             }
             if rule
                 .cel_allow_if
@@ -146,9 +162,10 @@ impl ToolAccessPolicyConfig {
                     "policy.tool_access.rules[].required_scopes must not contain empty entries"
                 ));
             }
-            if !seen.insert(rule.tool_name.as_str()) {
+            if !seen.insert(rule.policy_key()) {
                 return Err(anyhow::anyhow!(
-                    "policy.tool_access.rules must not contain duplicate tool_name entries"
+                    "policy.tool_access.rules must not contain duplicate tool_name or \
+                     event_name entries"
                 ));
             }
         }
@@ -159,7 +176,15 @@ impl ToolAccessPolicyConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ToolTrustRuleConfig {
+    /// The tool, prompt or resource the rule governs. Set this or
+    /// `event_name`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tool_name: String,
+    /// The MCP Events type the rule governs: who may see it in
+    /// `events/list` and subscribe to it. A rule here never governs a tool
+    /// of the same name. Set this or `tool_name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_name: Option<String>,
     pub minimum_trust: TrustLevelConfig,
     #[serde(default)]
     pub cel_allow_if: Option<String>,
@@ -174,27 +199,65 @@ pub struct ToolTrustRuleConfig {
     pub required_scopes: Vec<String>,
 }
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Serialize,
-    Deserialize,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum TrustLevelConfig {
-    Unauthenticated,
-    #[default]
-    HeaderAsserted,
-    Verified,
+impl ToolTrustRuleConfig {
+    /// The name the rule is filed under: the tool name, or `event:<name>`
+    /// for an event type, so the two never meet.
+    pub fn policy_key(&self) -> String {
+        match &self.event_name {
+            Some(name) => format!("event:{name}"),
+            None => self.tool_name.clone(),
+        }
+    }
 }
+
+pub use mcpg_expr::governance::TrustLevelConfig;
 
 fn default_minimum_tool_trust() -> TrustLevelConfig {
     TrustLevelConfig::HeaderAsserted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(rules: &str) -> Result<()> {
+        let config: ToolAccessPolicyConfig =
+            serde_yaml::from_str(&format!("rules:\n{rules}")).expect("parses");
+        config.validate()
+    }
+
+    #[test]
+    fn an_event_rule_is_filed_apart_from_a_tool_of_the_same_name() {
+        let config: ToolAccessPolicyConfig = serde_yaml::from_str(
+            "rules:\n  - event_name: orders.created\n    minimum_trust: verified\n  - tool_name: \
+             orders.created\n    minimum_trust: verified\n",
+        )
+        .unwrap();
+        config
+            .validate()
+            .expect("a tool and an event may share a name");
+        assert_eq!(config.rules[0].policy_key(), "event:orders.created");
+        assert_eq!(config.rules[1].policy_key(), "orders.created");
+    }
+
+    #[test]
+    fn an_event_rule_names_one_valid_event_type() {
+        assert!(
+            policy("  - event_name: a.b\n    tool_name: a.b\n    minimum_trust: verified\n")
+                .is_err()
+        );
+        assert!(policy("  - event_name: 'has space'\n    minimum_trust: verified\n").is_err());
+        assert!(
+            policy(
+                "  - event_name: a.b\n    minimum_trust: verified\n  - event_name: a.b\n    \
+                 minimum_trust: unauthenticated\n"
+            )
+            .is_err(),
+            "duplicates"
+        );
+        assert!(
+            policy("  - minimum_trust: verified\n").is_err(),
+            "names nothing"
+        );
+    }
 }

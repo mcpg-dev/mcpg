@@ -39,6 +39,8 @@ pub(crate) use crate::{
 pub use auth_wiring::{
     build_aauth_resource, build_ema_authorization_server, build_ema_authorization_server_with_state,
 };
+#[cfg(test)]
+pub(crate) use boot::build_from_config_adjusted;
 pub use boot::{
     build, build_from_config, build_from_sources, install_protocol_handlers_in_process,
 };

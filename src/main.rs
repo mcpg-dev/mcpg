@@ -13,8 +13,7 @@ use anyhow::Context as _;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // Install the process-level rustls CryptoProvider before any TLS client
     // can be built. The dependency graph compiles in both providers (aws_lc_rs
     // directly, ring transitively via tonic's tls feature), so rustls cannot
@@ -26,15 +25,32 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
 
-    // `--version` / `-V` must print and exit BEFORE any boot work: without
-    // this the flag fell through to the normal boot path and started a full
-    // gateway (plugins registered, port bound, blocked on signals) — hanging
-    // any script that shells out for a version string.
+    // `--version` / `-V` and `--health-check` answer and exit before any boot
+    // work and before the multi-threaded runtime exists. Either one reaching
+    // the boot path below would start a full gateway and never return, and a
+    // script or a container runtime waits on both.
     if args.iter().skip(1).any(|a| a == "--version" || a == "-V") {
         println!("mcpg {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // A bare word in first place is a subcommand that owns the rest of argv,
+    // so `--health-check` after it belongs to the sibling binary.
+    if args
+        .get(1)
+        .is_some_and(|a| !mcpg::cli::is_subcommand_word(a))
+        && args.iter().skip(1).any(|a| a == "--health-check")
+    {
+        std::process::exit(mcpg::health_probe::run(&args[1..]));
+    }
 
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("cannot build the async runtime")?
+        .block_on(run(args))
+}
+
+async fn run(args: Vec<String>) -> anyhow::Result<()> {
     // CLI extension dispatch: `mcpg plugin <subcommand> [args...]`
     // Delegates to `mcpg-plugin <subcommand> [args...]` if found on PATH,
     // passing through MCPG_CONFIG and other environment variables.
@@ -64,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         // Fall through into the normal boot path — `prepare_dev_mode`
         // has populated `MCPG_CONFIG` (or layered onto it) so the
         // generated dev-config materialises like any other YAML.
-        // Drop happens at end-of-main; tempfiles outlive the run.
+        // Drop happens at the end of `run`; tempfiles outlive the gateway.
         let config_paths: Vec<PathBuf> = std::env::var_os("MCPG_CONFIG")
             .map(|v| std::env::split_paths(&v).collect())
             .unwrap_or_default();
@@ -137,50 +153,15 @@ async fn main() -> anyhow::Result<()> {
     // default; a flag on the command line is never beaten by that default.
     // Layers within one list merge later-wins. `MCPG_*` setting overrides
     // apply over the loaded layers.
-    let env_config = std::env::var_os("MCPG_CONFIG").filter(|v| !v.is_empty());
-    let (mut config_sources, config_origin): (Vec<mcpg::config::ConfigSource>, &str) = if comp
-        .config
-        .is_empty()
+    if !comp.config.is_empty()
+        && let Some(v) = std::env::var_os("MCPG_CONFIG").filter(|v| !v.is_empty())
     {
-        (
-            env_config
-                .as_ref()
-                .map(|v| {
-                    std::env::split_paths(v)
-                        .map(mcpg::config::ConfigSource::File)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            "MCPG_CONFIG",
-        )
-    } else {
-        if let Some(v) = &env_config {
-            eprintln!(
-                "mcpg: --config given; MCPG_CONFIG={} is not loaded (a flag outranks the environment)",
-                v.to_string_lossy()
-            );
-        }
-        (Vec::new(), "--config")
-    };
-    for spec in &comp.config {
-        // The spec is echoed back on failure, and a pasted share link carries
-        // its key in the fragment — mask it before it reaches stderr.
-        config_sources.push(mcpg::config::source::resolve(spec).await.with_context(|| {
-            format!("--config {}", mcpg::config::encrypted::redacted_spec(spec))
-        })?);
+        eprintln!(
+            "mcpg: --config given; MCPG_CONFIG={} is not loaded (a flag outranks the environment)",
+            v.to_string_lossy()
+        );
     }
-    // A missing file is reported with the thing that named it: the error
-    // otherwise says where the gateway noticed, not what was wrong.
-    for source in &config_sources {
-        if let mcpg::config::ConfigSource::File(path) = source
-            && !path.is_file()
-        {
-            anyhow::bail!(
-                "config file not found: {} (named by {config_origin})",
-                path.display()
-            );
-        }
-    }
+    let config_sources = mcpg::config::source::gateway_sources(&comp.config).await?;
     // Load the config here (rather than via `app::build`) so the
     // composition flags can fold their control-plane attachment in before
     // the runtime is built.

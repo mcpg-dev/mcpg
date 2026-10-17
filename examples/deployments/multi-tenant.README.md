@@ -16,7 +16,7 @@ This is *application-layer* multi-tenancy. Subdomain-based routing (different ho
 - One `dev.mcpg.rate-limit` plugin entry; its default `per_principal` scope buckets by tenant id.
 - Metrics through the `dev.mcpg.observability.prometheus` plugin at `/metrics` on the gateway listener.
 - The gateway image carries no plugins: the gateway pulls each signed artifact in `plugins` at boot. Without the Redis or the OIDC entry the gateway refuses to boot; without the Prometheus entry it boots and exports no metrics.
-- A `license` block. The Redis coordinator is a licensed plugin: the gateway refuses to load it without a license that entitles `cluster.*` plugins (Team, Enterprise). Outside production, `license.non_production_use: true` in place of the token loads it under the non-production grant.
+- A `license` block. The Redis coordinator is a licensed plugin: the gateway refuses to load it without a license that entitles `cluster.*` plugins (Enterprise). Outside production, `license.non_production_use: true` in place of the token loads it under the non-production grant.
 - Two bindings illustrating governance:
   - `api.tenant.lookup` — any authenticated tenant.
   - `api.admin.tenant.delete` — only `tenant_admins` group members.
@@ -36,7 +36,6 @@ This is *application-layer* multi-tenancy. Subdomain-based routing (different ho
 - `MCPG_REDIS_URL` — Redis cluster.
 - `MCPG_REDIS_PASSWORD` — Redis password, passed out of the URL.
 - `MCPG_CLUSTER_STATE_KEY` — URL-safe-base64 32-byte state-encryption key, identical on every replica (`openssl rand -base64 32 | tr '+/' '-_'`). Required whenever `cluster.kind` is not `single_node`.
-- `MCPG_LICENSE_PUBKEY` — the public key (SPKI PEM) that verifies the license token.
 
 The IdP needs no credentials here: issuer and audience are inline in the YAML, and the verification keys come from the IdP's JWKS.
 

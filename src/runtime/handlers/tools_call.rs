@@ -119,7 +119,7 @@ impl GatewayRuntime {
                     // the caller-supplied idempotency key
                     // out of `_meta` and validate format
                     // up-front. Malformed values short-
-                    // circuit with `-32013 IdempotencyKeyMalformed`
+                    // circuit with `-33013 IdempotencyKeyMalformed`
                     // before any further work.
                     let idempotency_key: Option<String> =
                         match idempotency::extract_request_key(params.meta.as_ref()) {
@@ -280,6 +280,7 @@ impl GatewayRuntime {
                                             "tool",
                                             "tool.call.pre",
                                             &params.name,
+                                            PolicyRoute::for_tool(&route),
                                             params
                                                 .arguments
                                                 .as_ref()
@@ -294,11 +295,12 @@ impl GatewayRuntime {
                                     }
                                 } else {
                                     matches!(
-                                        self.pre_dispatch_policy.evaluate_tool_call(
+                                        self.pre_dispatch_policy.evaluate(
                                             &ToolPolicyContext::from_request_context(
                                                 request_context,
                                                 &params.name,
                                             ),
+                                            PolicyRoute::for_tool(&route),
                                         ),
                                         PreDispatchPolicyOutcome::Allow
                                     )
@@ -618,7 +620,10 @@ impl GatewayRuntime {
                     }
                     let policy_context =
                         ToolPolicyContext::from_request_context(request_context, &params.name);
-                    match self.pre_dispatch_policy.evaluate_tool_call(&policy_context) {
+                    match self
+                        .pre_dispatch_policy
+                        .evaluate(&policy_context, PolicyRoute::for_tool(&route))
+                    {
                         PreDispatchPolicyOutcome::Allow => {
                             metrics::counter!("mcpg_policy_evaluations_total", "decision" => "allow").increment(1);
                         }
@@ -704,6 +709,26 @@ impl GatewayRuntime {
                         }
                     }
 
+                    // A tool gate the license gate withheld cannot judge this
+                    // call, and an item it holds is one the gateway cannot
+                    // serve without, so the call does not run without either.
+                    if let Some(hold) = self.license_state.tool_hold.as_deref() {
+                        metrics::counter!("mcpg_license_tool_call_refusals_total", "surface" => "tool")
+                            .increment(1);
+                        return protocol_http_error(
+                            503,
+                            Some(request_id),
+                            -33003,
+                            hold.to_owned(),
+                            self.debug_error_data(
+                                request_context,
+                                "A licence-gated tool gate is withheld, or an item the gateway \
+                                 cannot run without is held, because no licence covers it. Tool \
+                                 calls resume once one does.",
+                            ),
+                        );
+                    }
+
                     // License quota refusal. The CP
                     // pushes a `QuotaStatus` on each heartbeat;
                     // when `exhausted: true`, refuse the call
@@ -718,21 +743,7 @@ impl GatewayRuntime {
                     // refuses like the quota gate does, and the refusal is
                     // recorded as `QuotaExceeded` — a call we declined to run
                     // is never billable.
-                    if let Some(qs) = self.cp_quota_status.current()
-                        && let Some(rps) = qs.rps_limit
-                        && !self.cp_rps_limiter.allow(
-                            rps,
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0),
-                        )
-                    {
-                        metrics::counter!(
-                            "mcpg_cp_rps_refusals_total",
-                            "tool" => params.name.clone(),
-                        )
-                        .increment(1);
+                    if let Err(rps) = self.admit_plan_rps("tools") {
                         let reason = format!("per-gateway rate limit exceeded (limit={rps}/s)");
                         let event = mcpg_plugin_host::audit_events::quota_exceeded_event(
                             plugin_identity_from_request(request_context),
@@ -770,13 +781,16 @@ impl GatewayRuntime {
                                 "Per-gateway rate limit of {rps} requests/second exceeded. \
                                  Retry shortly."
                             ),
-                            self.debug_error_data(
-                                request_context,
-                                &format!(
-                                    "The license caps this gateway at {rps} requests/second. \
-                                     Requests above it are shed before dispatch and are not \
-                                     billed. Add replicas or raise the plan to lift it."
+                            crate::transports::http::retry_after_data(
+                                self.debug_error_data(
+                                    request_context,
+                                    &format!(
+                                        "The license caps this gateway at {rps} requests/second. \
+                                         Requests above it are shed before dispatch and are not \
+                                         billed. Add replicas or raise the plan to lift it."
+                                    ),
                                 ),
+                                1,
                             ),
                         );
                     }
@@ -832,11 +846,14 @@ impl GatewayRuntime {
                                     format!(
                                         "Tool-call quota exhausted for this organization. Resets at {until_str}.",
                                     ),
-                                    self.debug_error_data(
-                                        request_context,
-                                        &format!(
-                                            "Control-plane reported tool-call quota exhausted; new calls will be refused until {until_str}. Contact your billing admin to raise the limit."
+                                    crate::transports::http::retry_after_data(
+                                        self.debug_error_data(
+                                            request_context,
+                                            &format!(
+                                                "Control-plane reported tool-call quota exhausted; new calls will be refused until {until_str}. Contact your billing admin to raise the limit."
+                                            ),
                                         ),
+                                        crate::runtime::cp::cp_quota::secs_until(qs.until),
                                     ),
                                 );
                     }

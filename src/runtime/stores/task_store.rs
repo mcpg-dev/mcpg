@@ -177,6 +177,9 @@ pub trait TaskStore: Send + Sync + std::fmt::Debug {
     /// Active retention / quota policy for this store.
     fn retention_policy(&self) -> TaskRetentionPolicy;
 
+    /// Tell `observer` of every status this store writes from now on.
+    fn set_observer(&self, _observer: std::sync::Arc<dyn TaskObserver>) {}
+
     /// Create a new task record. Returns the full `TaskRecord` or
     /// `QuotaExceeded` when the session is already at the configured cap.
     fn create_task(
@@ -320,9 +323,16 @@ pub trait TaskStore: Send + Sync + std::fmt::Debug {
 /// Key scheme: `task:{task_id}` → JSON-encoded [`TaskRecord`].
 /// Per-key TTL is the originally-supplied `task.ttl`; backends auto-expire
 /// stale entries so [`gc_expired_tasks`] is a no-op for KV-backed stores.
+/// Told of every status a task store writes, after it is stored. Called
+/// on the writing thread, so an implementation hands slow work off.
+pub trait TaskObserver: Send + Sync {
+    fn task_changed(&self, record: &TaskRecord);
+}
+
 pub struct KvBackedTaskStore {
     state: std::sync::Arc<dyn mcpg_cluster_api::KeyValueStore>,
     policy: TaskRetentionPolicy,
+    observer: parking_lot::RwLock<Option<std::sync::Arc<dyn TaskObserver>>>,
 }
 
 impl std::fmt::Debug for KvBackedTaskStore {
@@ -338,7 +348,17 @@ impl KvBackedTaskStore {
         state: std::sync::Arc<dyn mcpg_cluster_api::KeyValueStore>,
         policy: TaskRetentionPolicy,
     ) -> Self {
-        Self { state, policy }
+        Self {
+            state,
+            policy,
+            observer: parking_lot::RwLock::new(None),
+        }
+    }
+
+    fn notify(&self, record: &TaskRecord) {
+        if let Some(observer) = self.observer.read().as_ref() {
+            observer.task_changed(record);
+        }
     }
 
     /// Convenience: in-process `MemoryKv` backing.
@@ -392,6 +412,10 @@ impl KvBackedTaskStore {
 impl TaskStore for KvBackedTaskStore {
     fn retention_policy(&self) -> TaskRetentionPolicy {
         self.policy
+    }
+
+    fn set_observer(&self, observer: std::sync::Arc<dyn TaskObserver>) {
+        *self.observer.write() = Some(observer);
     }
 
     fn create_task(
@@ -453,6 +477,7 @@ impl TaskStore for KvBackedTaskStore {
                 )
                 .await
                 .map_err(|e| TaskStoreError::Internal(format!("kv put: {e}")))?;
+            self.notify(&record);
             Ok(record)
         })
     }
@@ -510,6 +535,7 @@ impl TaskStore for KvBackedTaskStore {
                 .put(&key, bytes::Bytes::from(bytes), Some(ttl))
                 .await
                 .map_err(|e| TaskStoreError::Internal(format!("kv put: {e}")))?;
+            self.notify(&record);
             Ok(())
         })
     }
@@ -585,6 +611,7 @@ impl TaskStore for KvBackedTaskStore {
                 .put(&key, bytes::Bytes::from(bytes), Some(ttl))
                 .await
                 .map_err(|e| TaskStoreError::Internal(format!("kv put: {e}")))?;
+            self.notify(&record);
             Ok(())
         })
     }
@@ -635,6 +662,7 @@ impl TaskStore for KvBackedTaskStore {
                 .put(&key, bytes::Bytes::from(bytes), Some(ttl))
                 .await
                 .map_err(|e| TaskStoreError::Internal(format!("kv put: {e}")))?;
+            self.notify(&record);
             Ok(())
         })
     }
@@ -678,6 +706,7 @@ impl TaskStore for KvBackedTaskStore {
                 .put(&key, bytes::Bytes::from(bytes), Some(ttl))
                 .await
                 .map_err(|e| TaskStoreError::Internal(format!("kv put: {e}")))?;
+            self.notify(&record);
             Ok(record)
         })
     }

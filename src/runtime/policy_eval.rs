@@ -1,36 +1,44 @@
 use super::*;
+use crate::protocol::v_2026_07_28::extensions::events::errors::{FORBIDDEN_CODE, ForbiddenReason};
+
+/// The code of a gate refusal that needs an approval the request cannot
+/// wait for. Its `data.reason` is `approval_required`.
+pub(crate) const APPROVAL_REQUIRED_CODE: i32 = FORBIDDEN_CODE;
+
+/// What a surface gate does with a gate plugin that asks for an approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingApprovals {
+    /// Wait for the decision, as `tools/call` does.
+    Await,
+    /// Refuse the request at once.
+    Refuse,
+}
 
 impl GatewayRuntime {
-    /// Evaluate policy for a tool+identity pair (used by admin policy:preview).
-    pub fn evaluate_policy_for_preview(
-        &self,
-        tool_name: &str,
-        identity: &crate::admin::service::TestIdentity,
-    ) -> String {
-        let trust_level = match identity.trust_level.as_str() {
-            "unauthenticated" => RequestTrustLevel::Unauthenticated,
-            "header_asserted" => RequestTrustLevel::HeaderAsserted,
-            "verified" => RequestTrustLevel::Verified,
-            _ => RequestTrustLevel::Unauthenticated,
-        };
-
-        let policy_ctx = ToolPolicyContext {
-            tool_name: tool_name.to_owned(),
-            trust_level,
-            principal_id: identity.subject_id.clone(),
-            issuer: None,
-            auth_provider: None,
-            identity_kind: identity.kind.clone(),
-            roles: identity.roles.clone(),
-            groups: identity.groups.clone(),
-            scopes: vec![],
-            attributes: std::collections::BTreeMap::new(),
-        };
-
-        match self.pre_dispatch_policy.evaluate_tool_call(&policy_ctx) {
-            PreDispatchPolicyOutcome::Allow => "allow".to_owned(),
-            PreDispatchPolicyOutcome::Deny(_) => "deny".to_owned(),
+    /// Where the running catalog sends `name`, for the admin policy preview:
+    /// a tool call first, then a prompt, then a resource read.
+    pub(crate) fn preview_route(&self, name: &str) -> policy::PreviewRoute {
+        if let Some(route) = self.capability_registry.tool_route(name) {
+            return policy::PreviewRoute::Tool(route);
         }
+        if let Some(route) = self.capability_registry.prompt_route(name) {
+            return policy::PreviewRoute::Prompt(route);
+        }
+        match self.resolve_resource_route(name) {
+            Some(route) => policy::PreviewRoute::Resource(route),
+            None => policy::PreviewRoute::Unrouted,
+        }
+    }
+
+    /// The built-in gate's decision for the admin policy preview, made
+    /// exactly as a request routed as `route` gets it.
+    pub(crate) fn evaluate_policy_for_preview(
+        &self,
+        policy_context: &ToolPolicyContext,
+        route: &policy::PreviewRoute,
+    ) -> PreDispatchPolicyOutcome {
+        self.pre_dispatch_policy
+            .evaluate(policy_context, route.policy_route())
     }
 
     /// Evaluate the operator-bound `policy_engine` chain for a
@@ -89,6 +97,32 @@ impl GatewayRuntime {
             .await
     }
 
+    /// [`Self::evaluate_surface_gate`] for a resource read or subscription
+    /// the read path has already routed. The built-in gate decides it under
+    /// the rule of the federation `route` reads from, whatever URI spelling
+    /// or template brought it there, and a URI the gateway serves itself
+    /// never answers to a federation's rule.
+    pub(crate) async fn evaluate_resource_gate(
+        &self,
+        surface: &str,
+        decision_point: &str,
+        uri: &str,
+        route: &ResourceRoute,
+        request_context: &RequestContext,
+        request_id: &Value,
+    ) -> Result<(), ProtocolHttpResponse> {
+        self.evaluate_surface_gate(
+            surface,
+            decision_point,
+            uri,
+            PolicyRoute::for_resource(route),
+            &serde_json::json!({ "uri": uri }),
+            request_context,
+            request_id,
+        )
+        .await
+    }
+
     /// Authorize a non-tool surface (prompts, resources, completion, ...)
     /// before dispatch. Runs the SAME three pre-dispatch layers as
     /// `tools/call`, in order: first the operator-bound external policy_engine
@@ -101,14 +135,73 @@ impl GatewayRuntime {
     /// Layers 1 and 2 are built-in and run even when no tool_gate PLUGIN is
     /// loaded — a non-tool surface must never silently skip the operator's
     /// declarative authz (the historical short-circuit did exactly that).
+    ///
+    /// `route` is where the router sends the request; the built-in gate
+    /// applies the rule of the federation it names on top of the rules that
+    /// name `backend_name`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn evaluate_surface_gate(
         &self,
         surface: &str,
         decision_point: &str,
         backend_name: &str,
+        route: PolicyRoute<'_>,
         arguments: &Value,
         request_context: &RequestContext,
         request_id: &Value,
+    ) -> Result<(), ProtocolHttpResponse> {
+        self.evaluate_surface_gate_with(
+            surface,
+            decision_point,
+            backend_name,
+            route,
+            arguments,
+            request_context,
+            request_id,
+            PendingApprovals::Await,
+        )
+        .await
+    }
+
+    /// [`Self::evaluate_surface_gate`] for a request that must not wait on
+    /// a human: a gate that asks for an approval refuses it instead, with
+    /// [`APPROVAL_REQUIRED_CODE`]. A client that repeats the request, such
+    /// as a poll loop, would otherwise hold one approval per call.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn evaluate_surface_gate_without_waiting(
+        &self,
+        surface: &str,
+        decision_point: &str,
+        backend_name: &str,
+        route: PolicyRoute<'_>,
+        arguments: &Value,
+        request_context: &RequestContext,
+        request_id: &Value,
+    ) -> Result<(), ProtocolHttpResponse> {
+        self.evaluate_surface_gate_with(
+            surface,
+            decision_point,
+            backend_name,
+            route,
+            arguments,
+            request_context,
+            request_id,
+            PendingApprovals::Refuse,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate_surface_gate_with(
+        &self,
+        surface: &str,
+        decision_point: &str,
+        backend_name: &str,
+        route: PolicyRoute<'_>,
+        arguments: &Value,
+        request_context: &RequestContext,
+        request_id: &Value,
+        approvals: PendingApprovals,
     ) -> Result<(), ProtocolHttpResponse> {
         let plugin_ctx = mcpg_plugin_protocol::PluginContext {
             request_id: request_context.request_id.as_str().to_owned(),
@@ -158,7 +251,7 @@ impl GatewayRuntime {
         //    resource URI / completion ref.
         let policy_context = ToolPolicyContext::from_request_context(request_context, backend_name);
         if let PreDispatchPolicyOutcome::Deny(denial) =
-            self.pre_dispatch_policy.evaluate_tool_call(&policy_context)
+            self.pre_dispatch_policy.evaluate(&policy_context, route)
         {
             metrics::counter!(
                 "mcpg_policy_evaluations_total",
@@ -179,8 +272,26 @@ impl GatewayRuntime {
         }
 
         // 3. Surface-aware tool_gate plugin chain (DLP / approval / rate-limit).
-        //    Only this layer is plugin-backed, so it (and only it) is skipped
-        //    when no tool_gate plugin is loaded.
+        //    A gate the license gate withheld may judge this surface, and an
+        //    item it holds is one the gateway cannot serve without, so the
+        //    surface waits for either. Otherwise this layer, the only
+        //    plugin-backed one, is skipped when no tool_gate plugin is loaded.
+        if let Some(hold) = self.license_state.tool_hold.as_deref() {
+            metrics::counter!("mcpg_license_tool_call_refusals_total", "surface" => surface.to_owned())
+                .increment(1);
+            return Err(protocol_http_error(
+                503,
+                Some(request_id.clone()),
+                -33003,
+                hold.to_owned(),
+                self.debug_error_data(
+                    request_context,
+                    "A licence-gated tool gate is withheld, or an item the gateway cannot run \
+                     without is held, because no licence covers it. What it judges resumes once \
+                     one does.",
+                ),
+            ));
+        }
         if !self.plugin_registry.has_tool_gate_plugins() {
             return Ok(());
         }
@@ -219,6 +330,17 @@ impl GatewayRuntime {
                 message,
                 Some(challenge_data),
             )),
+            mcpg_plugin_protocol::GateDecision::PendingApproval { .. }
+                if approvals == PendingApprovals::Refuse =>
+            {
+                Err(protocol_http_error(
+                    403,
+                    Some(request_id.clone()),
+                    APPROVAL_REQUIRED_CODE,
+                    "this request needs an approval, which it cannot wait for".to_owned(),
+                    Some(serde_json::json!({ "reason": ForbiddenReason::ApprovalRequired })),
+                ))
+            }
             mcpg_plugin_protocol::GateDecision::PendingApproval {
                 approval_id,
                 deadline_at,
@@ -255,6 +377,44 @@ impl GatewayRuntime {
                     )),
                 }
             }
+        }
+    }
+
+    /// Decide again, from a stored identity, whether a standing grant on a
+    /// non-tool surface still holds: the external policy chain and the
+    /// built-in trust floor and CEL gate. The tool_gate chain does not run,
+    /// because its approval, rate-limit and DLP gates have side effects that
+    /// must not fire on a timer. `Err` names what refused the grant.
+    pub(crate) async fn recheck_surface(
+        &self,
+        surface: &str,
+        decision_point: &str,
+        backend_name: &str,
+        route: PolicyRoute<'_>,
+        arguments: &Value,
+        request_context: &RequestContext,
+    ) -> Result<(), ForbiddenReason> {
+        let plugin_ctx = mcpg_plugin_protocol::PluginContext {
+            request_id: request_context.request_id.as_str().to_owned(),
+            session_id: None,
+            tool_name: backend_name.to_owned(),
+            surface: surface.to_owned(),
+            identity: plugin_identity_from_request(request_context),
+            transport: transport_label(&request_context.transport).to_owned(),
+        };
+        if let mcpg_plugin_host::PolicyChainOutcome::Deny { .. } = self
+            .evaluate_pre_dispatch_policy_chain(decision_point, &plugin_ctx, arguments)
+            .await
+        {
+            return Err(ForbiddenReason::PolicyEngine);
+        }
+        let policy_context = ToolPolicyContext::from_request_context(request_context, backend_name);
+        match self.pre_dispatch_policy.evaluate(&policy_context, route) {
+            PreDispatchPolicyOutcome::Allow => Ok(()),
+            PreDispatchPolicyOutcome::Deny(denial) if denial.code == -32003 => {
+                Err(ForbiddenReason::Trust)
+            }
+            PreDispatchPolicyOutcome::Deny(_) => Err(ForbiddenReason::Policy),
         }
     }
 

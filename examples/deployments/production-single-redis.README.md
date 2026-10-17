@@ -11,7 +11,7 @@ Single-instance production gateway with Redis-backed cluster primitives. The "Re
 - One illustrative HTTP binding with retry + `governance.minimum_trust: verified`.
 - Logs to stderr (JSON), metrics through the `dev.mcpg.observability.prometheus` plugin at `/metrics` on the gateway listener.
 - A `plugins` list with those three plugins. The gateway image carries no plugins: the gateway pulls each signed artifact at boot. Without the Redis or the OIDC entry the gateway refuses to boot; without the Prometheus entry it boots and exports no metrics.
-- A `license` block. The Redis coordinator is a licensed plugin: the gateway refuses to load it without a license that entitles `cluster.*` plugins (Team, Enterprise). Outside production, `license.non_production_use: true` in place of the token loads it under the non-production grant.
+- A `license` block. The Redis coordinator is a licensed plugin: the gateway refuses to load it without a license that entitles `cluster.*` plugins (Enterprise). Outside production, `license.non_production_use: true` in place of the token loads it under the non-production grant.
 
 ## What to change
 
@@ -25,7 +25,7 @@ Single-instance production gateway with Redis-backed cluster primitives. The "Re
 | `config.providers` of the `dev.mcpg.identity.oidc` entry | Keep equal to `governance.access.oidc_oauth.providers`. |
 | `plugins[*].source.oci` | The plugin releases that match the gateway you run, or your mirror of them. |
 | `governance.audit.sinks[0].config.path` | Audit log file your filebeat / vector / fluentbit forwarder watches. |
-| `license.token_file` | Where your license token is mounted. |
+| `license.token_file` | Where your MCPG-issued license token is mounted. The gateway verifies it against the MCPG issuer keys built into the binary, so no key is configured. |
 | `mcp.capabilities.tools` | Replace the placeholder binding with your tools. |
 
 ## Required env vars
@@ -33,7 +33,6 @@ Single-instance production gateway with Redis-backed cluster primitives. The "Re
 - `MCPG_REDIS_URL` — Redis connection (`rediss://` recommended outside localhost).
 - `MCPG_REDIS_PASSWORD` — Redis password, passed out of the URL.
 - `MCPG_CLUSTER_STATE_KEY` — URL-safe-base64 32-byte state-encryption key (`openssl rand -base64 32 | tr '+/' '-_'`). Required whenever `cluster.kind` is not `single_node`; seals the Redis-held session/pipeline state.
-- `MCPG_LICENSE_PUBKEY` — the public key (SPKI PEM) that verifies the license token.
 - `ACCOUNTS_API_TOKEN` — bearer token the example HTTP binding sends to its upstream. Drop with the binding if you don't keep it.
 
 ## Verify before deploy

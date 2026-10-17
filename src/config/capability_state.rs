@@ -348,7 +348,7 @@ impl IdempotencyScopeKind {
 #[serde(rename_all = "snake_case")]
 pub enum ConflictPolicy {
     /// Same key + different body hash → JSON-RPC error
-    /// `-32010 IdempotencyConflict` (HTTP 422).
+    /// `-33010 IdempotencyConflict` (HTTP 422).
     #[default]
     Reject,
 }

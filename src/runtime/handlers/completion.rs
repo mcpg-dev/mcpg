@@ -30,19 +30,21 @@ impl GatewayRuntime {
                 // template catalog.
                 // run surface-aware gate plugins before serving
                 // completion values.
-                let backend_name = params
-                    .reference
-                    .name
-                    .clone()
-                    .or_else(|| params.reference.uri.clone())
-                    .unwrap_or_else(|| params.reference.ref_type.clone());
+                let (backend_name, federation) = self.completion_subject(&params.reference);
                 let args_value =
                     serde_json::to_value(&params.argument).unwrap_or(serde_json::json!({}));
+                let route = PolicyRoute::served_by(federation.as_deref());
+                let route = match params.reference.ref_type.as_str() {
+                    "ref/prompt" => route.on(PolicySurface::Prompt),
+                    "ref/resource" => route.on(PolicySurface::Resource),
+                    _ => route,
+                };
                 if let Err(gate_response) = self
                     .evaluate_surface_gate(
                         "completion",
                         "completion.complete.pre",
                         &backend_name,
+                        route,
                         &args_value,
                         request_context,
                         &request_id,
@@ -141,6 +143,49 @@ impl GatewayRuntime {
                 }
             }
             Err(error) => self.map_session_error_to_protocol_response(error, Some(request_id)),
+        }
+    }
+
+    /// The name a completion is gated under, and the federation that serves
+    /// it: the prompt a `ref/prompt` names or the URI template a
+    /// `ref/resource` names, the same field `complete_argument` completes
+    /// from. A reference may carry both fields, and gating the one it does
+    /// not complete from would let a lenient name unlock a strict template.
+    fn completion_subject(
+        &self,
+        reference: &crate::protocol::CompletionReference,
+    ) -> (String, Option<String>) {
+        match reference.ref_type.as_str() {
+            "ref/prompt" => match &reference.name {
+                Some(name) => {
+                    let federation = self
+                        .capability_registry
+                        .prompt_route(name)
+                        .and_then(|route| route.federation().map(str::to_owned));
+                    (name.clone(), federation)
+                }
+                None => (reference.ref_type.clone(), None),
+            },
+            "ref/resource" => match &reference.uri {
+                Some(uri) => {
+                    let federation = self
+                        .capability_registry
+                        .resource_templates_with_source()
+                        .into_iter()
+                        .find(|(template, _)| &template.uri_template == uri)
+                        .and_then(|(_, federation)| federation);
+                    (uri.clone(), federation)
+                }
+                None => (reference.ref_type.clone(), None),
+            },
+            _ => (
+                reference
+                    .name
+                    .clone()
+                    .or_else(|| reference.uri.clone())
+                    .unwrap_or_else(|| reference.ref_type.clone()),
+                None,
+            ),
         }
     }
 

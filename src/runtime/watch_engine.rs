@@ -835,11 +835,24 @@ struct ResourceUpdatedSink {
     compiled_filter_program: Option<Arc<cel::Program>>,
     plugin_kind: String,
     plugin_registry: Option<Arc<PluginRegistry>>,
+    /// Positions of handled events, for the watcher to acknowledge.
+    acks: mpsc::Sender<serde_json::Value>,
 }
 
 #[async_trait]
 impl WatchEventSink for ResourceUpdatedSink {
     async fn emit(&self, event: WatchEvent) {
+        // A notification is told once and never retried, so the event is
+        // handled as soon as it is fanned out. A full queue only delays the
+        // acknowledgement to the upstream's redelivery.
+        if let Some(position) = event.upstream_cursor {
+            let _ = self.acks.try_send(position);
+        }
+        // A notification keeps no history, so a gap alone says nothing to
+        // its subscribers.
+        if event.gap && event.event_type.is_none() && event.data.is_none() {
+            return;
+        }
         let ctx = EventContext {
             user_id: event.user_id,
             session_id: event.session_id,
@@ -913,6 +926,7 @@ async fn run_plugin_watcher(
         return;
     };
 
+    let (acks, mut handled) = mpsc::channel(PLUGIN_ACK_CAPACITY);
     let sink = Arc::new(ResourceUpdatedSink {
         uri: uri.clone(),
         subscription_store,
@@ -921,6 +935,7 @@ async fn run_plugin_watcher(
         compiled_filter_program,
         plugin_kind: kind.clone(),
         plugin_registry: Some(registry.clone()),
+        acks,
     });
 
     let handle = match plugin.watch(&uri, &spec, sink).await {
@@ -937,10 +952,20 @@ async fn run_plugin_watcher(
     };
 
     info!(uri = %uri, kind = %kind, "plugin watch: watcher started");
-    cancel.cancelled().await;
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            Some(position) = handled.recv() => handle.acknowledge(&position).await,
+        }
+    }
     handle.cancel().await;
     debug!(uri = %uri, kind = %kind, "plugin watch: watcher cancelled");
 }
+
+/// Positions a plugin watcher holds for acknowledgement; past it, an
+/// acknowledgement waits for the upstream's redelivery.
+const PLUGIN_ACK_CAPACITY: usize = 1024;
 
 // ─── Poll Watcher ────────────────────────────────────────────────────────────
 
@@ -1529,6 +1554,7 @@ mod tests {
     struct TestEmittingPlugin {
         manifest: mcpg_plugin_protocol::PluginManifest,
         event_count: usize,
+        acknowledged: Arc<Mutex<Vec<serde_json::Value>>>,
     }
 
     #[async_trait]
@@ -1546,17 +1572,24 @@ mod tests {
             sink: Arc<dyn WatchEventSink>,
         ) -> Result<Box<dyn mcpg_plugin_protocol::WatchHandle>, mcpg_plugin_protocol::WatchError>
         {
-            for _ in 0..self.event_count {
-                sink.emit(WatchEvent::default()).await;
+            for n in 0..self.event_count {
+                sink.emit(WatchEvent {
+                    upstream_cursor: Some(serde_json::json!({ "n": n })),
+                    ..WatchEvent::default()
+                })
+                .await;
             }
-            Ok(Box::new(NoopHandle))
+            Ok(Box::new(RecordingHandle(Arc::clone(&self.acknowledged))))
         }
     }
 
-    struct NoopHandle;
+    struct RecordingHandle(Arc<Mutex<Vec<serde_json::Value>>>);
     #[async_trait]
-    impl mcpg_plugin_protocol::WatchHandle for NoopHandle {
+    impl mcpg_plugin_protocol::WatchHandle for RecordingHandle {
         async fn cancel(&self) {}
+        async fn acknowledge(&self, position: &serde_json::Value) {
+            self.0.lock().unwrap().push(position.clone());
+        }
     }
 
     #[tokio::test]
@@ -1580,7 +1613,9 @@ mod tests {
 
         // Registry with one strategy plugin that will emit two events.
         let mut registry = mcpg_plugin_host::PluginRegistry::new();
+        let acknowledged = Arc::new(Mutex::new(Vec::new()));
         let plugin = Arc::new(TestEmittingPlugin {
+            acknowledged: Arc::clone(&acknowledged),
             manifest: PluginManifest {
                 id: "test.emit".into(),
                 version: "0.1.0".into(),
@@ -1647,6 +1682,11 @@ mod tests {
                 assert_eq!(msg.jsonrpc_message["params"]["uri"], "mem://pluginwatch");
             }
         }
+        assert_eq!(
+            *acknowledged.lock().unwrap(),
+            [serde_json::json!({ "n": 0 }), serde_json::json!({ "n": 1 })],
+            "a notified change is acknowledged, in order"
+        );
 
         engine.shutdown().await;
     }

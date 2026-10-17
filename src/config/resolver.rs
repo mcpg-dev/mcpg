@@ -121,6 +121,49 @@ pub async fn resolve_authorization_server(
     Ok(Some(resolved))
 }
 
+/// `strategy` with every string leaf resolved through
+/// [`resolve_config_value`]: a watch plugin receives its spec as values,
+/// never as `${env.…}` or `${secret.…}` placeholders. `at` names the
+/// strategy in errors.
+pub async fn resolve_watch_strategy(
+    strategy: &super::WatchStrategyConfig,
+    registry: &PluginRegistry,
+    secrets: &SecretsSource,
+    at: &str,
+) -> Result<super::WatchStrategyConfig> {
+    let mut value = serde_json::to_value(strategy).with_context(|| format!("{at}: serialise"))?;
+    // One message with the whole chain: callers wrap it with `{e}`, and the
+    // chain names the reference that failed (never a value).
+    resolve_config_value(&mut value, registry, secrets)
+        .await
+        .map_err(|e| anyhow::anyhow!("{at}: {e:#}"))?;
+    serde_json::from_value(value).with_context(|| format!("{at}: resolved values"))
+}
+
+/// `bindings` with the strategy of every `watch:` block resolved by
+/// [`resolve_watch_strategy`]. The config the gateway keeps, serves and
+/// hashes still carries the placeholders; this copy is for the runtime.
+pub async fn resolve_binding_watches(
+    bindings: &[super::BackendConfig],
+    registry: &PluginRegistry,
+    secrets: &SecretsSource,
+    at: &str,
+) -> Result<Vec<super::BackendConfig>> {
+    let mut resolved = bindings.to_vec();
+    for (index, binding) in resolved.iter_mut().enumerate() {
+        if let Some(watch) = binding.watch.as_mut() {
+            watch.strategy = resolve_watch_strategy(
+                &watch.strategy,
+                registry,
+                secrets,
+                &format!("{at}[{index}].watch.strategy"),
+            )
+            .await?;
+        }
+    }
+    Ok(resolved)
+}
+
 /// Collect the env-var names referenced by `${env.NAME}` (CEL interpolation)
 /// and `env://NAME` (secret-ref) string forms anywhere in `value`. The opt-in
 /// post-boot env scrub (`server.scrub_process_env_after_boot`) uses this on the
@@ -329,6 +372,97 @@ mod tests {
         );
         assert!(err.contains("${secret.MISSING}"), "{err}");
         assert!(!err.contains("s3cret-value"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn every_watch_strategy_reaches_its_plugin_resolved() {
+        use crate::config::WatchStrategyConfig;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("DB_PASS"), "pw-1").unwrap();
+        std::fs::write(dir.path().join("HOOK"), "tok-1").unwrap();
+        let secrets = secrets_in(dir.path());
+        let registry = PluginRegistry::new();
+        let parse = |yaml: &str| serde_yaml::from_str::<WatchStrategyConfig>(yaml).unwrap();
+        let cases = [
+            (
+                "{ type: sql_polling, driver: postgres, url: 'postgres://app:${secret.DB_PASS}@db/x', query: { sql: 'SELECT 1', row_mode: scalar } }",
+                "{ type: sql_polling, driver: postgres, url: 'postgres://app:pw-1@db/x', query: { sql: 'SELECT 1', row_mode: scalar } }",
+            ),
+            (
+                "{ type: postgres_listen_notify, url: 'postgres://app:${secret.DB_PASS}@db/x', channel: orders }",
+                "{ type: postgres_listen_notify, url: 'postgres://app:pw-1@db/x', channel: orders }",
+            ),
+            (
+                "{ type: plugin, kind: mqtt, password: '${secret.DB_PASS}', topics: [a/#] }",
+                "{ type: plugin, kind: mqtt, password: pw-1, topics: [a/#] }",
+            ),
+            (
+                "{ type: webhook, token: '${secret.HOOK}' }",
+                "{ type: webhook, token: tok-1 }",
+            ),
+            (
+                "{ type: poll, interval_ms: 5000 }",
+                "{ type: poll, interval_ms: 5000 }",
+            ),
+        ];
+        for (declared, want) in cases {
+            let resolved = resolve_watch_strategy(&parse(declared), &registry, &secrets, "w")
+                .await
+                .unwrap();
+            assert_eq!(resolved, parse(want), "{declared}");
+        }
+
+        let error = format!(
+            "{:#}",
+            resolve_watch_strategy(
+                &parse("{ type: plugin, kind: x, password: '${secret.MISSING}' }"),
+                &registry,
+                &secrets,
+                "mcp.capabilities.resources[2].watch.strategy",
+            )
+            .await
+            .unwrap_err()
+        );
+        assert!(error.contains("resources[2].watch.strategy"), "{error}");
+        assert!(error.contains("${secret.MISSING}"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn binding_watches_resolve_in_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("DB_PASS"), "pw-1").unwrap();
+        let bindings: Vec<crate::config::BackendConfig> = serde_yaml::from_str(
+            r#"
+- name: orders
+  description: Orders.
+  uri: "db://orders"
+  backend: { kind: mock, response: "x" }
+  watch: { strategy: { type: plugin, kind: scripted, url: "db://app:${secret.DB_PASS}@db" } }
+- name: plain
+  description: Plain.
+  uri: "db://plain"
+  backend: { kind: mock, response: "x" }
+"#,
+        )
+        .unwrap();
+        let resolved = resolve_binding_watches(
+            &bindings,
+            &PluginRegistry::new(),
+            &secrets_in(dir.path()),
+            "mcp.capabilities.resources",
+        )
+        .await
+        .unwrap();
+        let strategy = |b: &crate::config::BackendConfig| {
+            serde_json::to_value(&b.watch.as_ref().unwrap().strategy).unwrap()
+        };
+        assert_eq!(strategy(&resolved[0])["url"], "db://app:pw-1@db");
+        assert_eq!(
+            strategy(&bindings[0])["url"],
+            "db://app:${secret.DB_PASS}@db",
+            "the kept config keeps its placeholder"
+        );
+        assert!(resolved[1].watch.is_none());
     }
 
     #[test]

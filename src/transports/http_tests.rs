@@ -395,6 +395,68 @@ async fn readiness_route_returns_explicit_checks() {
     assert_eq!(body["checks"][0]["name"], "config_valid");
 }
 
+/// A gateway that holds items for a licence, or whose delivered licence keeps
+/// failing to reach it, reports itself degraded on its readiness and health
+/// endpoints, never failed: both still answer 200, so the pod stays up.
+#[tokio::test]
+async fn a_licence_hold_or_a_failing_regate_degrades_readiness_and_health() {
+    use crate::license_gate::{LicenseRuntimeState, platform, record_regate};
+
+    async fn probe(state: &AppState, path: &str) -> Value {
+        let response = router(state.clone(), "/health", "/mcp")
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        response_json(response).await
+    }
+    let with_license = |license: LicenseRuntimeState| {
+        build_test_state_with_all_runtime_controls_mut(
+            false,
+            RuntimeDebugConfig::default(),
+            Vec::new(),
+            ToolAccessPolicyConfig::default(),
+            move |runtime| runtime.set_license_state(license),
+        )
+    };
+    let _platform = platform::test_lock().await;
+
+    let held = with_license(LicenseRuntimeState {
+        tool_hold: Some(
+            "tool calls, prompts, resource reads and completions are refused until a licence \
+             covers dev.mcpg.cluster.redis"
+                .to_owned(),
+        ),
+        attached: Some(true),
+        ..Default::default()
+    });
+    let ready = probe(&held, "/ready").await;
+    assert_eq!(ready["status"], "degraded", "{ready}");
+    let check = ready["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "license")
+        .expect("a license check");
+    assert_eq!(check["status"], "degraded");
+    assert!(check["detail"].as_str().unwrap().contains("cluster.redis"));
+    assert_eq!(probe(&held, "/health").await["status"], "degraded");
+
+    let attached = with_license(LicenseRuntimeState {
+        attached: Some(true),
+        ..Default::default()
+    });
+    assert_eq!(probe(&attached, "/ready").await["status"], "ready");
+    record_regate(false);
+    record_regate(false);
+    let ready = probe(&attached, "/ready").await;
+    assert_eq!(ready["status"], "degraded", "{ready}");
+    assert_eq!(probe(&attached, "/health").await["status"], "degraded");
+    record_regate(true);
+    assert_eq!(probe(&attached, "/ready").await["status"], "ready");
+    assert_eq!(probe(&attached, "/health").await["status"], "ok");
+}
+
 #[tokio::test]
 async fn runtime_route_returns_runtime_and_logging_facts() {
     let app = router(build_test_state(), "/health", "/mcp");
@@ -1561,6 +1623,7 @@ async fn promoted_command_json_call_can_require_stricter_trust_than_global_defau
                     minimum_trust: RequestTrustLevel::HeaderAsserted,
                     cel_allow_if: None,
                     required_scopes: Vec::new(),
+                    surface: None,
                 }],
             },
         ),
@@ -1676,6 +1739,7 @@ async fn anonymous_trust_floor_refusal_is_a_401_challenge_when_auth_is_configure
                 minimum_trust: RequestTrustLevel::Verified,
                 cel_allow_if: None,
                 required_scopes: Vec::new(),
+                surface: None,
             }],
         },
     );
@@ -1774,6 +1838,7 @@ async fn promoted_command_json_call_can_use_allow_if_for_caller_specific_gating(
                     minimum_trust: RequestTrustLevel::HeaderAsserted,
                     cel_allow_if: Some("principal_id == \"user-1\"".to_owned()),
                     required_scopes: Vec::new(),
+                    surface: None,
                 }],
             },
         ),
@@ -2955,8 +3020,19 @@ async fn extract_jsonrpc_response(
 }
 
 fn build_conformance_state_with_mock() -> AppState {
+    build_test_state_with_runtime_controls(
+        true,
+        RuntimeDebugConfig {
+            enabled: true,
+            ..RuntimeDebugConfig::default()
+        },
+        vec![conformance_mock_binding()],
+    )
+}
+
+fn conformance_mock_binding() -> BackendConfig {
     use crate::config::MockBackendConfig;
-    let mock_binding = BackendConfig {
+    BackendConfig {
         name: "conformance.mock".to_owned(),
         title: Some("Conformance Mock".to_owned()),
         description: "Mock binding for conformance testing".to_owned(),
@@ -2995,15 +3071,7 @@ fn build_conformance_state_with_mock() -> AppState {
         resource_size: None,
         resource_annotations: None,
         mcp_app_url: None,
-    };
-    build_test_state_with_runtime_controls(
-        true,
-        RuntimeDebugConfig {
-            enabled: true,
-            ..RuntimeDebugConfig::default()
-        },
-        vec![mock_binding],
-    )
+    }
 }
 
 async fn mcp_request(
@@ -3200,6 +3268,322 @@ async fn conformance_tools_call_mock_returns_fixture_response() {
     assert_eq!(parsed["data"], serde_json::json!([1, 2, 3]));
     // is_error should be false for success
     assert_ne!(result.get("isError"), Some(&serde_json::json!(true)));
+}
+
+/// While a licence-gated tool gate is withheld for want of a licence, no
+/// tool call runs without it: every call is refused before dispatch.
+#[tokio::test]
+async fn a_withheld_tool_gate_refuses_every_tool_call() {
+    let state = build_test_state_with_all_runtime_controls_mut(
+        true,
+        RuntimeDebugConfig {
+            enabled: true,
+            ..RuntimeDebugConfig::default()
+        },
+        vec![conformance_mock_binding()],
+        ToolAccessPolicyConfig::default(),
+        |runtime| {
+            runtime.set_license_state(crate::license_gate::LicenseRuntimeState {
+                tool_hold: Some(
+                    "tool calls are refused until a licence covers the tool gate(s) \
+                     dev.mcpg.payment.ucp"
+                        .to_owned(),
+                ),
+                ..Default::default()
+            })
+        },
+    );
+    let app = router(state, "/health", "/mcp");
+    let (app, session_id) = initialize_session(app).await;
+    let (_, response) = mcp_request(
+        app,
+        &session_id,
+        22,
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "conformance.mock",
+            "arguments": { "query": "test" }
+        })),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = extract_jsonrpc_response(response, 22).await;
+    assert_eq!(body["error"]["code"], -33003);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("dev.mcpg.payment.ucp"),
+        "{body}"
+    );
+}
+
+/// A withheld tool gate may judge prompts, resources and completions too
+/// (a DLP gate with `apply_to_non_tool_surfaces`), so none of them is served
+/// without it either.
+#[tokio::test]
+async fn a_withheld_tool_gate_refuses_every_gated_surface() {
+    let state = build_test_state_with_all_runtime_controls_mut(
+        true,
+        RuntimeDebugConfig {
+            enabled: true,
+            ..RuntimeDebugConfig::default()
+        },
+        vec![conformance_mock_binding()],
+        ToolAccessPolicyConfig::default(),
+        |runtime| {
+            runtime.set_license_state(crate::license_gate::LicenseRuntimeState {
+                tool_hold: Some(
+                    "tool calls, prompts, resource reads and completions are refused until a \
+                     licence covers the tool gate(s) dev.mcpg.tool-gate.dlp"
+                        .to_owned(),
+                ),
+                ..Default::default()
+            })
+        },
+    );
+    let app = router(state, "/health", "/mcp");
+    let (app, session_id) = initialize_session(app).await;
+    let requests = [
+        (
+            "prompts/get",
+            serde_json::json!({ "name": "mcpg_operational_overview" }),
+        ),
+        (
+            "resources/read",
+            serde_json::json!({ "uri": "mcpg://runtime/overview" }),
+        ),
+    ];
+    for (id, (method, params)) in (60u64..).zip(requests) {
+        let (_, response) = mcp_request(app.clone(), &session_id, id, method, Some(params)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{method}"
+        );
+        let body = extract_jsonrpc_response(response, id).await;
+        assert_eq!(body["error"]["code"], -33003, "{method}: {body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("dev.mcpg.tool-gate.dlp"),
+            "{method}: {body}"
+        );
+    }
+}
+
+/// The gated tool gate the attached-licence tests below load.
+#[cfg(feature = "cp-attached")]
+const ATTACHED_GATE: &str = "dev.mcpg.tool-gate.dlp";
+
+/// An attached gateway's config with [`ATTACHED_GATE`], under `state_dir`.
+#[cfg(feature = "cp-attached")]
+fn attached_gate_config(state_dir: &std::path::Path) -> AppConfig {
+    let config: AppConfig = serde_yaml::from_str(&format!(
+        "feature_flags:\n  debug_tools_enabled: true\n\
+         governance:\n  policy:\n    tool_access:\n      default_minimum_trust: unauthenticated\n\
+         gateway:\n  control_plane:\n    url: http://127.0.0.1:9\n    \
+         enrollment_url: http://127.0.0.1:9\n    state_dir: {}\n\
+         plugins:\n  - id: {ATTACHED_GATE}\n    class: tool_gate\n    kind: native\n    \
+         source: {{}}\n",
+        state_dir.display()
+    ))
+    .expect("config parses");
+    assert!(crate::license_gate::platform::attached(&config));
+    config
+}
+
+/// The enterprise mcpg.cloud licence of org `acme`, expiring at `exp`, as
+/// the control plane delivers it.
+#[cfg(feature = "cp-attached")]
+fn enterprise_delivery(exp: i64) -> crate::license_gate::Delivery {
+    use mcpg_control_plane_license::license::{IssuerRole, KeyEnvironment};
+    use mcpg_control_plane_license::trust::test_override;
+
+    acme_delivery(test_override::issue(
+        IssuerRole::Cloud,
+        KeyEnvironment::Production,
+        &enterprise_claims(exp),
+    ))
+}
+
+/// `license_jwt` delivered by mcpg.cloud to a gateway enrolled into org
+/// `acme`.
+#[cfg(feature = "cp-attached")]
+fn acme_delivery(license_jwt: String) -> crate::license_gate::Delivery {
+    crate::license_gate::Delivery::received(
+        license_jwt,
+        "acme".into(),
+        crate::license_gate::Origin::Proven,
+    )
+}
+
+/// The claims of org `acme`'s enterprise mcpg.cloud licence, expiring at
+/// `exp`.
+#[cfg(feature = "cp-attached")]
+fn enterprise_claims(exp: i64) -> mcpg_control_plane_license::license::LicenseClaims {
+    use mcpg_control_plane_license::license::{
+        AUDIENCE_GATEWAY_MANAGED, LicenseClaims, features_for, plan_envelope,
+    };
+
+    let mut claims = LicenseClaims::community("mcpg-cp");
+    claims.aud.push(AUDIENCE_GATEWAY_MANAGED.into());
+    claims.iss = "https://license.test".into();
+    claims.tenant_slug = "acme".into();
+    claims.exp = exp;
+    claims.nbf = exp - 30 * 86_400;
+    claims.iat = claims.nbf;
+    let (entitlements, quotas) = plan_envelope("enterprise");
+    claims.plugin_entitlements = entitlements;
+    claims.quotas = quotas;
+    claims.features = features_for("enterprise");
+    claims.plan = "enterprise".into();
+    claims
+}
+
+/// `resources/read` of the runtime overview on `state`: its HTTP status and
+/// JSON-RPC response.
+#[cfg(feature = "cp-attached")]
+async fn read_overview(state: AppState, id: u64) -> (StatusCode, serde_json::Value) {
+    let app = router(state, "/health", "/mcp");
+    let (app, session_id) = initialize_session(app).await;
+    let (_, response) = mcp_request(
+        app,
+        &session_id,
+        id,
+        "resources/read",
+        Some(serde_json::json!({ "uri": "mcpg://runtime/overview" })),
+    )
+    .await;
+    let status = response.status();
+    (status, extract_jsonrpc_response(response, id).await)
+}
+
+/// An attached gateway follows the licence the control plane delivers, with
+/// no restart: under a paid licence its gated tool gate is admitted and calls
+/// are served; a community delivery withholds the gate and refuses every call
+/// in its place; the paid licence delivered again serves them again.
+#[cfg(feature = "cp-attached")]
+#[tokio::test]
+async fn a_running_gateway_follows_the_delivered_licence_down_and_back() {
+    use crate::license_gate::{Delivery, platform};
+
+    const GATE: &str = ATTACHED_GATE;
+    let state_dir = tempfile::tempdir().unwrap();
+    let config = attached_gate_config(state_dir.path());
+    let _platform = platform::test_lock().await;
+
+    let paid = enterprise_delivery(chrono::Utc::now().timestamp() + 3600);
+    let community = acme_delivery(String::new());
+
+    platform::set_delivery(paid.clone());
+    let state = match crate::app::build_from_config(config, Vec::new()).await {
+        Ok(state) => state,
+        Err(e) => panic!("boots under the paid licence: {e:#}"),
+    };
+    let withheld = |state: &AppState| state.runtime.load().license_state().withheld.clone();
+
+    assert!(withheld(&state).is_empty());
+    let (status, body) = read_overview(state.clone(), 70).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("error").is_none(), "{body}");
+
+    platform::set_delivery(community);
+    crate::runtime::cp::attach::regate_running(&state).await;
+    assert_eq!(withheld(&state), [GATE]);
+    let (status, body) = read_overview(state.clone(), 71).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"]["code"], -33003, "{body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains(GATE),
+        "{body}"
+    );
+
+    platform::set_delivery(paid);
+    crate::runtime::cp::attach::regate_running(&state).await;
+    assert!(withheld(&state).is_empty());
+    let (status, body) = read_overview(state.clone(), 72).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("error").is_none(), "{body}");
+
+    platform::set_delivery(Delivery::Pending);
+}
+
+/// A running attached gateway stops on a positive word about its plan, and
+/// only on one. A delivered licence that does not verify (signed with a key
+/// this release does not embed) leaves it serving on the last one that did.
+/// When that licence's grace ends, no delivery need come, and a control plane
+/// that cannot be reached sends none: the gateway's own watch gates it again
+/// and withholds what the lapsed licence covered. A delivery the running
+/// gateway was never gated on is caught up the same way.
+#[cfg(feature = "cp-attached")]
+#[tokio::test]
+async fn a_running_gateway_lapses_on_its_own_clock_and_never_on_an_unverifiable_delivery() {
+    use crate::license_gate::{Delivery, platform};
+    use crate::runtime::cp::attach::{LicenceWatch, check_running_licence, regate_running};
+    use mcpg_control_plane_license::trust::test_override;
+
+    let state_dir = tempfile::tempdir().unwrap();
+    let config = attached_gate_config(state_dir.path());
+    let _platform = platform::test_lock().await;
+    let withheld = |state: &AppState| state.runtime.load().license_state().withheld.clone();
+    let serves = |state: &AppState, id: u64| {
+        let state = state.clone();
+        async move {
+            let (status, body) = read_overview(state, id).await;
+            (status == StatusCode::OK && body.get("error").is_none())
+                .then_some(())
+                .ok_or(body)
+        }
+    };
+
+    // Expired, seconds before the end of its 7-day grace.
+    let grace_ends = chrono::Utc::now().timestamp() + 4;
+    platform::set_delivery(enterprise_delivery(grace_ends - 7 * 86_400));
+    let state = match crate::app::build_from_config(config, Vec::new()).await {
+        Ok(state) => state,
+        Err(e) => panic!("boots in the licence's grace: {e:#}"),
+    };
+    assert_eq!(
+        state.runtime.load().license_state().lapses_at,
+        Some(grace_ends)
+    );
+    let mut watch = LicenceWatch::default();
+
+    let unknown_key = ed25519_dalek::SigningKey::generate(&mut rand::rng());
+    let unverifiable = test_override::sign(
+        &enterprise_claims(chrono::Utc::now().timestamp() + 3600),
+        &unknown_key,
+    );
+    assert!(!platform::receive_delivery(acme_delivery(unverifiable)));
+    regate_running(&state).await;
+    check_running_licence(&state, &mut watch).await;
+    assert!(withheld(&state).is_empty());
+    serves(&state, 80).await.expect("served in the grace");
+
+    let past_grace = grace_ends + 1 - chrono::Utc::now().timestamp();
+    tokio::time::sleep(std::time::Duration::from_secs(past_grace.max(0) as u64)).await;
+    check_running_licence(&state, &mut watch).await;
+    assert_eq!(withheld(&state), [ATTACHED_GATE]);
+    let refusal = serves(&state, 81).await.expect_err("refused once lapsed");
+    assert_eq!(refusal["error"]["code"], -33003, "{refusal}");
+
+    // A delivery the running gateway was not gated on.
+    let state_dir = tempfile::tempdir().unwrap();
+    let config = attached_gate_config(state_dir.path());
+    platform::set_delivery(enterprise_delivery(chrono::Utc::now().timestamp() + 3600));
+    let state = match crate::app::build_from_config(config, Vec::new()).await {
+        Ok(state) => state,
+        Err(e) => panic!("boots under the paid licence: {e:#}"),
+    };
+    platform::set_delivery(acme_delivery(String::new()));
+    let mut watch = LicenceWatch::default();
+    check_running_licence(&state, &mut watch).await;
+    assert_eq!(withheld(&state), [ATTACHED_GATE]);
+
+    platform::set_delivery(Delivery::Pending);
 }
 
 #[tokio::test]
@@ -7232,6 +7616,7 @@ fn build_ema_state_with(
                 minimum_trust: RequestTrustLevel::Verified,
                 cel_allow_if: None,
                 required_scopes: vec!["mcp:admin".to_owned()],
+                surface: None,
             }],
         },
         move |runtime| runtime.set_ema_authorization_server(Some(installed)),
@@ -9488,11 +9873,10 @@ async fn modern_subscriptions_listen_returns_sse_with_confirmation_event() {
         "expected SSE stream, got Content-Type {content_type:?}"
     );
 
-    // Read the first chunks of the streaming response. M4.C changed
-    // the priming sequence so the FIRST frame is now the SEP-2575
-    // `notifications/subscriptions/acknowledged` notification and
-    // the second frame is the JSON-RPC response (id-correlated to
-    // the original request). Verify both.
+    // The first frame is the acknowledgement with the request id, as
+    // sent, for the subscription id. This test's delivery bus has nothing
+    // behind it, so the server ends the subscription and the last frame
+    // is the request's result.
     let bytes = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
     let text = std::str::from_utf8(&bytes).unwrap();
     let data_payloads: Vec<Value> = text
@@ -9500,22 +9884,27 @@ async fn modern_subscriptions_listen_returns_sse_with_confirmation_event() {
         .filter(|l| l.starts_with("data:"))
         .filter_map(|l| serde_json::from_str(l.trim_start_matches("data:").trim()).ok())
         .collect();
-    assert!(
-        data_payloads.len() >= 2,
-        "subscriptions/listen primes ack + response (got {})",
-        data_payloads.len()
-    );
-    // First frame: ack notification.
+    assert_eq!(data_payloads.len(), 2, "ack, then the closing result");
     assert_eq!(data_payloads[0]["jsonrpc"], "2.0");
     assert_eq!(
         data_payloads[0]["method"],
         "notifications/subscriptions/acknowledged"
     );
-    assert!(data_payloads[0]["params"]["subscriptionId"].is_string());
-    // Second frame: JSON-RPC response correlated to the call's id.
-    assert_eq!(data_payloads[1]["jsonrpc"], "2.0");
+    assert_eq!(
+        data_payloads[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        401
+    );
+    assert!(data_payloads[0]["params"].get("subscriptionId").is_none());
+    assert_eq!(
+        data_payloads[0]["params"]["notifications"],
+        serde_json::json!({ "toolsListChanged": true })
+    );
     assert_eq!(data_payloads[1]["id"], 401);
-    assert!(data_payloads[1]["result"]["subscriptionId"].is_string());
+    assert_eq!(data_payloads[1]["result"]["resultType"], "complete");
+    assert_eq!(
+        data_payloads[1]["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        401
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9568,18 +9957,15 @@ async fn modern_subscriptions_listen_works_without_session_header() {
 
     let bytes = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
     let text = std::str::from_utf8(&bytes).unwrap();
-    // M4.C priming: frame 1 = ack notification, frame 2 = JSON-RPC
-    // response. Locate the response frame by `id == 402`.
-    let response_frame = text
+    let ack = text
         .lines()
         .filter(|l| l.starts_with("data:"))
         .filter_map(|l| serde_json::from_str::<Value>(l.trim_start_matches("data:").trim()).ok())
-        .find(|v| v["id"] == 402)
-        .expect("JSON-RPC response frame correlated to request id 402");
-    assert_eq!(response_frame["jsonrpc"], "2.0");
-    assert!(
-        response_frame["result"]["subscriptionId"].is_string(),
-        "confirmation must carry a server-minted subscriptionId"
+        .find(|v| v["method"] == "notifications/subscriptions/acknowledged")
+        .expect("the acknowledgement");
+    assert_eq!(
+        ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 402,
+        "the subscription id is the request id as sent"
     );
 }
 
@@ -9847,12 +10233,15 @@ async fn modern_subscriptions_listen_subscription_id_equals_request_id() {
         .filter_map(|l| serde_json::from_str(l.trim_start_matches("data:").trim()).ok())
         .collect();
     assert!(data_payloads.len() >= 2);
-    // Ack frame: subscriptionId == "4099" (the request id rendered).
+    // The subscription id is the request id as sent: the number 4099.
     assert_eq!(
         data_payloads[0]["method"],
         "notifications/subscriptions/acknowledged"
     );
-    assert_eq!(data_payloads[0]["params"]["subscriptionId"], "4099");
+    assert_eq!(
+        data_payloads[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        4099
+    );
     // Honored-subset notifications object reflects the accepted targets.
     assert_eq!(
         data_payloads[0]["params"]["notifications"]["toolsListChanged"],
@@ -9868,10 +10257,13 @@ async fn modern_subscriptions_listen_subscription_id_equals_request_id() {
         "ack must not report a resource target that was skipped, got {}",
         data_payloads[0]["params"]["notifications"]
     );
-    // Response frame: id-correlated, subscriptionId == "4099",
-    // resultType:"complete".
+    // The bus behind this test ends at once, so the server closes the
+    // subscription with the request's result.
     assert_eq!(data_payloads[1]["id"], 4099);
-    assert_eq!(data_payloads[1]["result"]["subscriptionId"], "4099");
+    assert_eq!(
+        data_payloads[1]["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        4099
+    );
     assert_eq!(data_payloads[1]["result"]["resultType"], "complete");
 }
 
@@ -12223,6 +12615,10 @@ fn cp_hooks_survive_a_runtime_swap() {
         1,
         "the CP recorder must still be wired after a reload builds a new runtime"
     );
+    assert!(
+        Arc::ptr_eq(&reloaded.cp_rps_limiter, &attached.cp_rps_limiter),
+        "the request ceiling counts on in the same window after a reload"
+    );
 }
 
 /// A POST answers inline JSON to a client that advertised only
@@ -12314,4 +12710,644 @@ async fn post_continuation_sse_respects_the_per_session_stream_cap() {
     drop(held);
     let response = open_post_continuation_sse(&state, &session_id, &GatewayRequestId::new()).await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ── MCP Events: protocol surface ─────────────────────────────────────
+
+/// A stand-in events core: one type, deterministic answers.
+struct FixedEventsCore;
+
+#[async_trait::async_trait]
+impl crate::protocol::v_2026_07_28::dispatch::events::EventsHandler for FixedEventsCore {
+    async fn list(
+        &self,
+        _ctx: &crate::runtime::RequestContext,
+        _params: crate::protocol::v_2026_07_28::extensions::events::wire::ListEventsParams,
+    ) -> Result<
+        crate::protocol::v_2026_07_28::extensions::events::wire::ListEventsResult,
+        crate::protocol::v_2026_07_28::extensions::events::errors::EventsError,
+    > {
+        use crate::protocol::v_2026_07_28::extensions::events::wire::{
+            DeliveryMode, EventDescriptor, ListEventsResult,
+        };
+        Ok(ListEventsResult::new(
+            vec![EventDescriptor {
+                name: "orders.created".to_owned(),
+                description: Some("A new order row was committed.".to_owned()),
+                delivery: vec![DeliveryMode::Webhook],
+                input_schema: serde_json::json!({ "type": "object" }),
+                payload_schema: serde_json::json!({ "type": "object" }),
+                meta: None,
+            }],
+            None,
+        ))
+    }
+
+    async fn subscribe(
+        &self,
+        _ctx: &crate::runtime::RequestContext,
+        params: crate::protocol::v_2026_07_28::extensions::events::wire::SubscribeEventsParams,
+    ) -> Result<
+        crate::protocol::v_2026_07_28::extensions::events::wire::SubscribeEventsResult,
+        crate::protocol::v_2026_07_28::extensions::events::errors::EventsError,
+    > {
+        Ok(
+            crate::protocol::v_2026_07_28::extensions::events::wire::SubscribeEventsResult::new(
+                format!("sub_{}", params.name),
+                Some("2026-10-03T13:00:00Z".to_owned()),
+                None,
+                false,
+            ),
+        )
+    }
+
+    async fn unsubscribe(
+        &self,
+        _ctx: &crate::runtime::RequestContext,
+        _params: crate::protocol::v_2026_07_28::extensions::events::wire::UnsubscribeEventsParams,
+    ) -> Result<
+        crate::protocol::v_2026_07_28::extensions::events::wire::UnsubscribeEventsResult,
+        crate::protocol::v_2026_07_28::extensions::events::errors::EventsError,
+    > {
+        Ok(Default::default())
+    }
+
+    async fn poll(
+        &self,
+        _ctx: &crate::runtime::RequestContext,
+        _params: crate::protocol::v_2026_07_28::extensions::events::wire::PollEventsParams,
+    ) -> Result<
+        crate::protocol::v_2026_07_28::extensions::events::wire::PollEventsResult,
+        crate::protocol::v_2026_07_28::extensions::events::errors::EventsError,
+    > {
+        Err(
+            crate::protocol::v_2026_07_28::extensions::events::errors::EventsError::unsupported_delivery_mode(
+                "poll",
+            ),
+        )
+    }
+}
+
+/// The modern harness with `mcp.configurations.events.enabled` set as
+/// given and [`FixedEventsCore`] installed.
+fn build_events_state(enabled: bool) -> AppState {
+    let state = build_task_materialization_app_state(Vec::new(), |runtime| {
+        runtime.set_events_config(crate::config::EventsConfig {
+            enabled,
+            ..Default::default()
+        });
+    });
+    state
+        .runtime
+        .load()
+        .shared_services
+        .load_full()
+        .expect("protocol handlers installed")
+        .events
+        .install(Arc::new(FixedEventsCore))
+        .unwrap_or_else(|_| panic!("first install"));
+    state
+}
+
+/// POST one modern request as the header-asserted `user-1`, whose
+/// requests share one stored synthetic session — so the per-session
+/// request-id tracker is live for it.
+async fn modern_post(
+    app: &Router,
+    method: &str,
+    id: u64,
+    params: Value,
+    extra_headers: &[(&str, &str)],
+) -> (StatusCode, Value) {
+    let response = modern_post_response(app, method, id, params, extra_headers).await;
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    (status, body)
+}
+
+/// [`modern_post`]'s whole response, headers included.
+async fn modern_post_response(
+    app: &Router,
+    method: &str,
+    id: u64,
+    params: Value,
+    extra_headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut params = params;
+    params["_meta"] = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { "name": "t", "version": "0" },
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+        .header("mcp-protocol-version", "2026-07-28")
+        .header("mcp-method", method)
+        .header(header::HeaderName::from_static(SUBJECT_ID_HEADER), "user-1");
+    for (name, value) in extra_headers {
+        request = request.header(*name, *value);
+    }
+    app.clone()
+        .oneshot(
+            request
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": method,
+                        "params": params,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+fn events_subscribe_params() -> Value {
+    serde_json::json!({
+        "name": "orders.created",
+        "arguments": {},
+        "delivery": {
+            "mode": "webhook",
+            "url": "https://receiver.example/hooks/1",
+            "secret": "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
+        },
+        "cursor": null,
+        "ttlMs": 3600000
+    })
+}
+
+/// Send `method` with `params` up to three times, each admitted one answered
+/// `admitted`, and return the first refusal, a 429: three requests in under
+/// three seconds pass a ceiling of one a second.
+async fn first_refusal(
+    app: &Router,
+    method: &str,
+    params: Value,
+    extra_headers: &[(&str, &str)],
+    admitted: StatusCode,
+) -> axum::response::Response {
+    for id in 1..=3_u64 {
+        let response = modern_post_response(app, method, id, params.clone(), extra_headers).await;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            return response;
+        }
+        assert_eq!(response.status(), admitted);
+    }
+    panic!("no request past the ceiling was refused");
+}
+
+/// A mock tool `quota.mock` behind the modern harness, told about the plan
+/// `quota` sets.
+fn build_quota_state(quota: crate::runtime::cp_quota::TestQuota) -> AppState {
+    let mock = BackendConfig {
+        name: "quota.mock".to_owned(),
+        title: None,
+        description: "mock that answers at once".to_owned(),
+        input_schema: Some(serde_json::json!({ "type": "object" })),
+        backend: BackendImpl::from_typed(
+            "mock",
+            crate::config::MockBackendConfig {
+                response: serde_json::json!({ "status": "done" }),
+                delay_ms: 0,
+                error: false,
+                error_message: None,
+                passthrough: false,
+            },
+        ),
+        governance: BackendGovernanceConfig::default(),
+        retry: None,
+        content_storage: None,
+        cache: None,
+        quotas: None,
+        prompt_arguments: None,
+        uri: None,
+        mime_type: None,
+        watch: None,
+        uri_template: None,
+        variable_completions: None,
+        annotations: None,
+        output_schema: None,
+        task_support: None,
+        icons: None,
+        descriptor_meta: None,
+        resource_size: None,
+        resource_annotations: None,
+        mcp_app_url: None,
+    };
+    build_task_materialization_app_state(vec![mock], move |runtime| {
+        runtime.set_cp_quota_status_provider(Arc::new(quota));
+    })
+}
+
+fn quota_status(
+    rps_limit: Option<u32>,
+    exhausted_until: Option<chrono::DateTime<chrono::Utc>>,
+) -> crate::runtime::cp_quota::QuotaStatusInfo {
+    crate::runtime::cp_quota::QuotaStatusInfo {
+        exhausted: exhausted_until.is_some(),
+        until: exhausted_until,
+        remaining: exhausted_until.map(|_| 0),
+        limit: exhausted_until.map(|_| 100),
+        rps_limit,
+        events: Default::default(),
+    }
+}
+
+/// `tools/call` past the per-gateway request ceiling: 429, `-33002`,
+/// `Retry-After: 1`, and no transport marker in the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tools_call_past_the_request_ceiling_gets_429_with_retry_after_one() {
+    let quota = crate::runtime::cp_quota::TestQuota::default();
+    quota.set(quota_status(Some(1), None));
+    let app = router(build_quota_state(quota), "/health", "/mcp");
+    let response = first_refusal(
+        &app,
+        "tools/call",
+        serde_json::json!({ "name": "quota.mock", "arguments": {} }),
+        &[("mcp-name", "quota.mock")],
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response.headers()["retry-after"], "1");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], -33002, "{body}");
+    assert!(
+        body["error"].get("data").is_none(),
+        "the marker was the only entry, and it became the header: {body}"
+    );
+}
+
+/// `tools/call` once the month's calls are used: 429 with `Retry-After` up
+/// to the reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tools_call_past_the_monthly_quota_waits_until_the_reset() {
+    let quota = crate::runtime::cp_quota::TestQuota::default();
+    quota.set(quota_status(
+        None,
+        Some(chrono::Utc::now() + chrono::Duration::seconds(3_600)),
+    ));
+    let app = router(build_quota_state(quota), "/health", "/mcp");
+    let response = modern_post_response(
+        &app,
+        "tools/call",
+        1,
+        serde_json::json!({ "name": "quota.mock", "arguments": {} }),
+        &[("mcp-name", "quota.mock")],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let secs: u64 = response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!((3_590..=3_600).contains(&secs), "{secs}");
+}
+
+/// `events/*` share the licence's per-gateway request ceiling with
+/// `tools/call`: past it the answer is `-32013 {limit:
+/// "plan.rps_per_gateway"}` on 429, with `Retry-After` and no transport
+/// marker left in the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modern_events_past_the_request_ceiling_get_429_with_retry_after() {
+    let quota = crate::runtime::cp_quota::TestQuota::default();
+    quota.set(crate::runtime::cp_quota::QuotaStatusInfo {
+        exhausted: false,
+        until: None,
+        remaining: None,
+        limit: None,
+        rps_limit: Some(1),
+        events: Default::default(),
+    });
+    let wired = quota.clone();
+    let state = build_task_materialization_app_state(Vec::new(), move |runtime| {
+        runtime.set_events_config(crate::config::EventsConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        runtime.set_cp_quota_status_provider(Arc::new(wired));
+    });
+    state
+        .runtime
+        .load()
+        .shared_services
+        .load_full()
+        .expect("protocol handlers installed")
+        .events
+        .install(Arc::new(FixedEventsCore))
+        .unwrap_or_else(|_| panic!("first install"));
+    let app = router(state, "/health", "/mcp");
+    let response = first_refusal(
+        &app,
+        "events/list",
+        serde_json::json!({}),
+        &[],
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(response.headers()["retry-after"], "1");
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], -32013, "{body}");
+    assert_eq!(body["error"]["data"]["limit"], "plan.rps_per_gateway");
+    assert_eq!(body["error"]["data"]["max"], 1);
+    assert!(
+        body["error"]["data"]
+            .get(crate::transports::http::RETRY_AFTER_DATA_KEY)
+            .is_none(),
+        "the marker became the header: {body}"
+    );
+}
+
+/// Served end to end over HTTP: discover advertises both locations, and
+/// `events/*` reach the installed core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modern_events_are_discoverable_and_served_over_http() {
+    let app = router(build_events_state(true), "/health", "/mcp");
+
+    let (status, discover) =
+        modern_post(&app, "server/discover", 1, serde_json::json!({}), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{discover}");
+    let caps = &discover["result"]["capabilities"];
+    assert_eq!(
+        caps["events"],
+        serde_json::json!({"listChanged": true}),
+        "{caps}"
+    );
+    assert_eq!(
+        caps["extensions"]["io.modelcontextprotocol/events"],
+        serde_json::json!({"listChanged": true}),
+        "{caps}"
+    );
+
+    let (status, listed) = modern_post(&app, "events/list", 2, serde_json::json!({}), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["result"]["events"][0]["name"], "orders.created");
+
+    let (status, subscribed) = modern_post(
+        &app,
+        "events/subscribe",
+        3,
+        events_subscribe_params(),
+        &[("mcp-name", "orders.created")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{subscribed}");
+    assert_eq!(subscribed["result"]["id"], "sub_orders.created");
+    assert_eq!(
+        subscribed["result"]["refreshBefore"],
+        "2026-10-03T13:00:00Z"
+    );
+    assert_eq!(subscribed["result"]["cursor"], Value::Null);
+    assert!(
+        !subscribed.to_string().contains("MfKQ9r8"),
+        "the secret never comes back: {subscribed}"
+    );
+
+    let (status, unsubscribed) = modern_post(
+        &app,
+        "events/unsubscribe",
+        4,
+        serde_json::json!({ "name": "orders.created", "delivery": { "url": "https://receiver.example/hooks/1" } }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{unsubscribed}");
+    assert_eq!(
+        unsubscribed["result"],
+        serde_json::json!({ "resultType": "complete" })
+    );
+}
+
+/// The session-bound wire keeps its rule: a session uses an id once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_legacy_wire_refuses_a_reused_request_id() {
+    let state = build_test_state();
+    let (app, session_id) = initialize_session(router(state, "/health", "/mcp")).await;
+    let list = |app: Router, session_id: String| async move {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json")
+                    .header("mcp-protocol-version", "2025-11-25")
+                    .header(SESSION_ID_HEADER, session_id)
+                    .body(Body::from(
+                        serde_json::json!({ "jsonrpc": "2.0", "id": 5, "method": "tools/list" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        (status, body)
+    };
+    let (status, body) = list(app.clone(), session_id.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = list(app, session_id).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], -32600);
+}
+
+/// 2026-07-28 asks only that an id differ from the client's requests still
+/// in flight, so a finished request's id may come again on any method: a
+/// client that opens each connection with `server/discover` as id 0, a
+/// refreshed subscription, a repeated list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_modern_wire_keeps_no_request_id_history() {
+    let app = router(build_events_state(true), "/health", "/mcp");
+
+    for _ in 0..2 {
+        let (status, body) =
+            modern_post(&app, "server/discover", 0, serde_json::json!({}), &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) =
+            modern_post(&app, "events/subscribe", 40, events_subscribe_params(), &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = modern_post(&app, "events/list", 41, serde_json::json!({}), &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = modern_post(&app, "tools/list", 42, serde_json::json!({}), &[]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+}
+
+/// With events off the methods do not exist and discover does not name
+/// them, even with a core installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modern_events_off_is_method_not_found() {
+    let app = router(build_events_state(false), "/health", "/mcp");
+    let (_, discover) = modern_post(&app, "server/discover", 1, serde_json::json!({}), &[]).await;
+    assert!(
+        !discover["result"]["capabilities"]
+            .to_string()
+            .contains("events"),
+        "{discover}"
+    );
+    for (method, params) in [
+        ("events/list", serde_json::json!({})),
+        ("events/subscribe", events_subscribe_params()),
+    ] {
+        let (status, body) = modern_post(&app, method, 2, params, &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}: {body}");
+        assert_eq!(body["error"]["code"], -32601, "{method}");
+    }
+}
+
+/// Params with a too-short `whsec_` secret.
+fn events_subscribe_params_with_a_bad_secret() -> Value {
+    let mut params = events_subscribe_params();
+    params["delivery"]["secret"] = serde_json::json!("whsec_c2hvcnQ=");
+    params
+}
+
+/// With events off, a malformed `events/*` request is as unknown as a
+/// well-formed one: `-32601` on 404, never a `-32602` that names a field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modern_events_off_answers_malformed_requests_as_method_not_found() {
+    let app = router(build_events_state(false), "/health", "/mcp");
+    for (method, params) in [
+        (
+            "events/subscribe",
+            events_subscribe_params_with_a_bad_secret(),
+        ),
+        (
+            "events/unsubscribe",
+            serde_json::json!({ "name": "orders.created" }),
+        ),
+        ("events/poll", serde_json::json!({})),
+        ("events/list", serde_json::json!({ "cursor": 5 })),
+    ] {
+        let (status, body) = modern_post(&app, method, 7, params, &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}: {body}");
+        assert_eq!(body["error"]["code"], -32601, "{method}: {body}");
+        assert_eq!(
+            body["error"]["message"],
+            format!("Method not found: {method}")
+        );
+    }
+}
+
+/// Served, a malformed `events/*` request is `-32602` on HTTP 400 — the
+/// status every events `-32602` takes — and the rejected secret is not
+/// quoted back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modern_events_malformed_params_are_400_without_the_secret() {
+    let app = router(build_events_state(true), "/health", "/mcp");
+    let (status, body) = modern_post(
+        &app,
+        "events/subscribe",
+        8,
+        events_subscribe_params_with_a_bad_secret(),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], -32602, "{body}");
+    assert_eq!(body["id"], 8);
+    assert!(!body.to_string().contains("c2hvcnQ"), "{body}");
+
+    let (status, body) = modern_post(&app, "events/poll", 9, serde_json::json!({}), &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], -32602, "{body}");
+}
+
+/// `events/*` never exist on the legacy wire, enabled or not.
+#[tokio::test]
+async fn legacy_wire_has_no_events_methods() {
+    let state = build_events_state(true);
+    let (app, session_id) = initialize_session(router(state, "/health", "/mcp")).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+                .header(
+                    PROTOCOL_VERSION_HEADER,
+                    crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                )
+                .header(SESSION_ID_HEADER, &session_id)
+                .body(Body::from(
+                    serde_json::json!({ "jsonrpc": "2.0", "id": 5, "method": "events/list" })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], -32601, "{body}");
+}
+
+/// A malformed `Idempotency-Key` on an `events/*` request answers with
+/// the idempotency extension's own code, apart from the events `-32013`
+/// ResourceExhausted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_idempotency_key_on_events_is_not_an_events_code() {
+    let app = router(build_events_state(true), "/health", "/mcp");
+    let too_long = "k".repeat(crate::runtime::idempotency::MAX_KEY_LEN + 1);
+    let (status, body) = modern_post(
+        &app,
+        "events/list",
+        6,
+        serde_json::json!({}),
+        &[("idempotency-key", too_long.as_str())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["code"],
+        crate::runtime::idempotency::ERROR_CODE_KEY_MALFORMED
+    );
+    assert_eq!(body["error"]["code"], -33013);
+    assert_ne!(
+        body["error"]["code"],
+        crate::protocol::v_2026_07_28::extensions::events::errors::RESOURCE_EXHAUSTED_CODE
+    );
+}
+
+/// Modern discover advertises `dev.mcpg/idempotency` exactly as legacy
+/// `initialize` does: the same value, only while the extension is on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modern_discover_advertises_idempotency_like_initialize() {
+    let state = build_task_materialization_state_with_idempotency();
+    let expected = state
+        .runtime
+        .load()
+        .idempotency_capability()
+        .cloned()
+        .expect("fixture enables idempotency");
+    let app = router(state, "/health", "/mcp");
+    let (status, discover) =
+        modern_post(&app, "server/discover", 1, serde_json::json!({}), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{discover}");
+    assert_eq!(
+        discover["result"]["capabilities"]["extensions"]["dev.mcpg/idempotency"],
+        expected
+    );
+
+    let off = router(build_events_state(false), "/health", "/mcp");
+    let (_, discover) = modern_post(&off, "server/discover", 1, serde_json::json!({}), &[]).await;
+    assert!(
+        discover["result"]["capabilities"]["extensions"]
+            .get("dev.mcpg/idempotency")
+            .is_none(),
+        "{discover}"
+    );
 }

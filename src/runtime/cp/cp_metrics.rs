@@ -192,6 +192,91 @@ pub trait ToolCallRecorder: Send + Sync {
     fn payload_capture_enabled(&self) -> bool {
         false
     }
+
+    /// Count MCP Events deliveries of `event_name` in `mode` for the usage
+    /// report: first deliveries acknowledged, events given up, and the bytes
+    /// of the delivered bodies.
+    fn record_event_usage(
+        &self,
+        _event_name: &str,
+        _mode: &str,
+        _delivered: u64,
+        _abandoned: u64,
+        _bytes: u64,
+    ) {
+    }
+
+    /// Count MCP Events occurrences of `event_name` taken into its log from
+    /// a `source` (its kind) for the usage report, with their bytes.
+    fn record_event_ingest(&self, _event_name: &str, _source: &str, _ingested: u64, _bytes: u64) {}
+}
+
+/// One MCP Events usage report a [`TestRecorder`] took.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EventUsageCall {
+    pub event_name: String,
+    pub mode: String,
+    pub delivered: u64,
+    pub abandoned: u64,
+    pub ingested: u64,
+    pub bytes: u64,
+}
+
+/// A recorder that keeps the MCP Events usage it is told, for tests.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestRecorder(Arc<parking_lot::Mutex<Vec<EventUsageCall>>>);
+
+#[cfg(test)]
+impl TestRecorder {
+    pub(crate) fn event_usage(&self) -> Vec<EventUsageCall> {
+        self.0.lock().clone()
+    }
+
+    /// The occurrences of `event_name` metered as ingested.
+    pub(crate) fn ingested(&self, event_name: &str) -> u64 {
+        self.0
+            .lock()
+            .iter()
+            .filter(|call| call.event_name == event_name)
+            .map(|call| call.ingested)
+            .sum()
+    }
+}
+
+#[cfg(test)]
+impl ToolCallRecorder for TestRecorder {
+    fn record(&self, _sample: ToolCallSample) {}
+
+    fn record_event_usage(
+        &self,
+        event_name: &str,
+        mode: &str,
+        delivered: u64,
+        abandoned: u64,
+        bytes: u64,
+    ) {
+        self.0.lock().push(EventUsageCall {
+            event_name: event_name.to_owned(),
+            mode: mode.to_owned(),
+            delivered,
+            abandoned,
+            ingested: 0,
+            bytes,
+        });
+    }
+
+    fn record_event_ingest(&self, event_name: &str, source: &str, ingested: u64, bytes: u64) {
+        self.0.lock().push(EventUsageCall {
+            event_name: event_name.to_owned(),
+            mode: source.to_owned(),
+            delivered: 0,
+            abandoned: 0,
+            ingested,
+            bytes,
+        });
+    }
 }
 
 /// No-op recorder used when nothing is wired. Cheap: a method
@@ -232,6 +317,21 @@ impl ToolCallRecorderHandle {
     }
     pub fn payload_capture_enabled(&self) -> bool {
         self.0.payload_capture_enabled()
+    }
+    pub fn record_event_usage(
+        &self,
+        event_name: &str,
+        mode: &str,
+        delivered: u64,
+        abandoned: u64,
+        bytes: u64,
+    ) {
+        self.0
+            .record_event_usage(event_name, mode, delivered, abandoned, bytes);
+    }
+    pub fn record_event_ingest(&self, event_name: &str, source: &str, ingested: u64, bytes: u64) {
+        self.0
+            .record_event_ingest(event_name, source, ingested, bytes);
     }
 }
 

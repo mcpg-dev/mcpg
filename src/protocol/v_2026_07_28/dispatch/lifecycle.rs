@@ -5,10 +5,11 @@ use serde_json::{Value, json};
 use crate::protocol::shared::deprecation::{
     DEPRECATIONS_META_KEY, FEATURE_LOGGING, FEATURE_ROOTS, FEATURE_SAMPLING,
 };
+use crate::protocol::v_2026_07_28::extensions::events::wire::EXTENSION_ID as EVENTS_EXTENSION_ID;
 use crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION;
 use crate::protocol::v_2026_07_28::wire::lifecycle::{
-    CacheCapability, CompletionCapability, DiscoverResult, ImplementationInfo, PromptsCapability,
-    ResourcesCapability, ServerCapabilities, ToolsCapability,
+    CacheCapability, CompletionCapability, DiscoverResult, EventsCapability, ImplementationInfo,
+    PromptsCapability, ResourcesCapability, ServerCapabilities, ToolsCapability,
 };
 use crate::protocol::v_2026_07_28::wire::tools::CacheScope;
 use crate::runtime::TransportKind;
@@ -102,6 +103,36 @@ pub(crate) fn build_discover_result(
         );
     }
 
+    // `dev.mcpg/idempotency`, advertised exactly as legacy `initialize`
+    // advertises it: only while the operator enabled the extension.
+    if let Some(idempotency) = live.and_then(|rt| rt.idempotency_capability()) {
+        extensions.insert(
+            crate::runtime::idempotency::EXTENSION_ID.to_owned(),
+            idempotency.clone(),
+        );
+    }
+
+    // MCP Events, in each location the operator chose. Config and the
+    // installed core decide it, never the caller, because this result is
+    // publicly cacheable.
+    let events_config =
+        crate::protocol::v_2026_07_28::dispatch::events::live_events_config(services);
+    let events_served = crate::protocol::v_2026_07_28::dispatch::events::events_served(
+        &events_config,
+        services,
+        transport,
+    );
+    // A reload that changes the event types sends
+    // `notifications/events/list_changed` to `subscriptions/listen`.
+    let served_capability = EventsCapability {
+        list_changed: Some(true),
+    };
+    let events_capability =
+        (events_served && events_config.advertises_capability()).then(|| served_capability.clone());
+    if events_served && events_config.advertises_extension() {
+        extensions.insert(EVENTS_EXTENSION_ID.to_owned(), served_capability.to_value());
+    }
+
     // Same supported-versions surface as the unsupported-version
     // error response — keep the two correlated so the conformance
     // suite's `ServerUnsupportedVersionError` check sees a strict
@@ -149,6 +180,7 @@ pub(crate) fn build_discover_result(
             // argument-completion source, matching the legacy
             // `initialize` gate.
             completions: has_completions.then_some(CompletionCapability {}),
+            events: events_capability,
             extensions: if extensions.is_empty() {
                 None
             } else {
@@ -202,6 +234,145 @@ pub(crate) fn discover_meta_advisory() -> Value {
             ],
         }
     })
+}
+
+#[cfg(test)]
+mod events_advertisement_tests {
+    use super::*;
+    use crate::config::{AppConfig, EventsAdvertiseLocation};
+    use crate::protocol::v_2026_07_28::dispatch::events::EventsHandler;
+    use crate::protocol::v_2026_07_28::extensions::events::errors::EventsError;
+    use crate::protocol::v_2026_07_28::extensions::events::wire::{
+        ListEventsParams, ListEventsResult, PollEventsParams, PollEventsResult,
+        SubscribeEventsParams, SubscribeEventsResult, UnsubscribeEventsParams,
+        UnsubscribeEventsResult,
+    };
+    use crate::runtime::RequestContext;
+    use std::sync::Arc;
+
+    struct NoCore;
+
+    #[async_trait::async_trait]
+    impl EventsHandler for NoCore {
+        async fn list(
+            &self,
+            _: &RequestContext,
+            _: ListEventsParams,
+        ) -> Result<ListEventsResult, EventsError> {
+            Ok(ListEventsResult::new(Vec::new(), None))
+        }
+        async fn subscribe(
+            &self,
+            _: &RequestContext,
+            _: SubscribeEventsParams,
+        ) -> Result<SubscribeEventsResult, EventsError> {
+            Err(EventsError::internal("unused"))
+        }
+        async fn unsubscribe(
+            &self,
+            _: &RequestContext,
+            _: UnsubscribeEventsParams,
+        ) -> Result<UnsubscribeEventsResult, EventsError> {
+            Ok(UnsubscribeEventsResult::default())
+        }
+        async fn poll(
+            &self,
+            _: &RequestContext,
+            _: PollEventsParams,
+        ) -> Result<PollEventsResult, EventsError> {
+            Err(EventsError::internal("unused"))
+        }
+    }
+
+    fn services(
+        enabled: bool,
+        advertise: Vec<EventsAdvertiseLocation>,
+        installed: bool,
+    ) -> SharedServices {
+        let mut config = AppConfig::default();
+        config.mcp.configurations.events.enabled = enabled;
+        config.mcp.configurations.events.advertise = advertise;
+        let services = SharedServices::with_no_runtime(Arc::new(config));
+        if installed {
+            services
+                .events
+                .install(Arc::new(NoCore))
+                .unwrap_or_else(|_| panic!("first install"));
+        }
+        services
+    }
+
+    fn capabilities(services: &SharedServices, transport: TransportKind) -> Value {
+        let result = build_discover_result(services, &transport);
+        serde_json::to_value(&result).unwrap()["capabilities"].clone()
+    }
+
+    fn both() -> Vec<EventsAdvertiseLocation> {
+        vec![
+            EventsAdvertiseLocation::Capability,
+            EventsAdvertiseLocation::Extension,
+        ]
+    }
+
+    #[test]
+    fn enabled_events_are_advertised_in_both_locations() {
+        let caps = capabilities(&services(true, both(), true), TransportKind::Http);
+        assert_eq!(caps["events"], json!({"listChanged": true}));
+        assert_eq!(
+            caps["extensions"]["io.modelcontextprotocol/events"],
+            json!({"listChanged": true})
+        );
+    }
+
+    #[test]
+    fn each_location_is_switchable() {
+        let capability_only = capabilities(
+            &services(true, vec![EventsAdvertiseLocation::Capability], true),
+            TransportKind::Http,
+        );
+        assert_eq!(capability_only["events"], json!({"listChanged": true}));
+        assert!(capability_only.get("extensions").is_none());
+
+        let extension_only = capabilities(
+            &services(true, vec![EventsAdvertiseLocation::Extension], true),
+            TransportKind::Http,
+        );
+        assert!(extension_only.get("events").is_none());
+        assert_eq!(
+            extension_only["extensions"]["io.modelcontextprotocol/events"],
+            json!({"listChanged": true})
+        );
+    }
+
+    /// With events off, discover carries no `events` key and no extensions
+    /// entry.
+    #[test]
+    fn disabled_events_leave_discover_unchanged() {
+        let off = build_discover_result(&services(false, both(), true), &TransportKind::Http);
+        let baseline = build_discover_result(
+            &SharedServices::with_no_runtime(Arc::new(AppConfig::default())),
+            &TransportKind::Http,
+        );
+        let off = serde_json::to_string(&off).unwrap();
+        assert_eq!(off, serde_json::to_string(&baseline).unwrap());
+        assert!(!off.contains("events"), "{off}");
+    }
+
+    /// Advertising a capability promises a handler behind it, so nothing
+    /// is advertised until the events core is installed.
+    #[test]
+    fn nothing_is_advertised_without_a_core() {
+        let caps = capabilities(&services(true, both(), false), TransportKind::Http);
+        assert!(caps.get("events").is_none());
+        assert!(caps.get("extensions").is_none());
+    }
+
+    #[test]
+    fn stdio_never_advertises_events() {
+        let caps = capabilities(&services(true, both(), true), TransportKind::Stdio);
+        assert!(caps.get("events").is_none());
+        assert!(caps.get("extensions").is_none());
+    }
 }
 
 #[cfg(test)]

@@ -260,27 +260,26 @@ pub(crate) async fn register_modern_resource_subscriptions(
     let subscriptions = runtime.subscriptions();
     let mut leases = Vec::with_capacity(uris.len());
     for uri in uris {
-        if runtime.resolve_resource_route(uri).is_none() {
+        let Some(route) = runtime.resolve_resource_route(uri) else {
             tracing::debug!(
                 uri = %uri,
                 "subscriptions/listen: skipping resources/updated target for an unknown resource"
             );
             continue;
-        }
+        };
         // Same authz stack `resources/read` and the legacy subscribe arm
         // run. The audit record below already recognises a subscription as
         // "the same grant of ongoing access"; the authorization for that
         // grant was the part still missing on this wire. A denied URI is
         // skipped rather than failing the whole listen, mirroring how an
         // unknown resource is handled above.
-        let args_value = serde_json::json!({ "uri": uri });
         let request_id = serde_json::json!(request_context.request_id.as_str());
         if runtime
-            .evaluate_surface_gate(
+            .evaluate_resource_gate(
                 "resource",
                 "resource.subscribe.pre",
                 uri,
-                &args_value,
+                &route,
                 request_context,
                 &request_id,
             )

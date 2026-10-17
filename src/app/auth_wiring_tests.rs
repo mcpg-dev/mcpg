@@ -85,7 +85,7 @@ fn wire(
 /// Wire `config` as a fresh process would, once the tasks of the state
 /// that last held its file store have let the store go.
 async fn wire_after_restart(config: &AppConfig) -> Arc<AuthorizationServer> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         match wire(config, Some(&single_node()), None) {
             Ok(server) => return server,
