@@ -3340,6 +3340,7 @@ mod tests {
     /// The control plane's own word replaces the cached licence a restart
     /// counts on its proof: one that cannot prove the delivery drops it at
     /// once, even for the same licence, and a proven one takes over.
+    #[cfg(feature = "cp-attached")]
     #[tokio::test]
     async fn an_unproven_live_delivery_drops_a_cached_proven_licence_at_once() {
         use mcpg_control_plane_license::delivery::LAST_KNOWN_GOOD_SECS;
@@ -3378,6 +3379,7 @@ mod tests {
     /// with a cloud key it does not embed yet, or damaged — leaves a restart
     /// on the cached licence it counts, as a running gateway keeps the one it
     /// holds, until the day that cached proof holds ends.
+    #[cfg(feature = "cp-attached")]
     #[tokio::test]
     async fn a_proven_licence_that_does_not_verify_leaves_the_cached_one() {
         use mcpg_control_plane_license::delivery::LAST_KNOWN_GOOD_SECS;
@@ -3446,6 +3448,7 @@ mod tests {
 
     /// A gateway mcpg.cloud delivered to keeps gating on that delivery when
     /// a later one arrives with a cloud licence and no proof.
+    #[cfg(feature = "cp-attached")]
     #[tokio::test]
     async fn an_unproven_cloud_licence_never_replaces_a_proven_delivery() {
         let _platform = platform::test_lock().await;
@@ -3475,6 +3478,7 @@ mod tests {
     /// failing, leaves the licence proven, so the gateway warns instead of
     /// dropping the word, and the org holding none stays mcpg.cloud's word,
     /// with the block ignored.
+    #[cfg(feature = "cp-attached")]
     #[tokio::test]
     async fn a_proven_licence_sent_again_without_a_proof_stays_proven() {
         let _platform = platform::test_lock().await;
