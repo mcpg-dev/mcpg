@@ -32,6 +32,11 @@ pub struct CapabilityManifest {
     pub gateway_version: &'static str,
     /// FFI ABI generation the plugin loader refuses mismatches on.
     pub plugin_abi_version: u32,
+    /// Fingerprint of the plugin ABI's type layout
+    /// (`mcpg_plugin_protocol::abi_fingerprint`). The ABI version stays fixed
+    /// while layouts change in place, so this is what tells two builds apart:
+    /// a plugin packaged with another fingerprint is refused at load.
+    pub plugin_abi_layout: String,
     /// Plugin wire-protocol version (semver-of-`major.minor`).
     pub plugin_protocol_version: &'static str,
     /// MCP spec revisions this build serves.
@@ -115,6 +120,7 @@ pub fn manifest(baked_dir: &Path) -> CapabilityManifest {
         manifest_version: MANIFEST_VERSION,
         gateway_version: env!("CARGO_PKG_VERSION"),
         plugin_abi_version: mcpg_plugin_protocol::abi::MCPG_PLUGIN_ABI_VERSION,
+        plugin_abi_layout: mcpg_plugin_protocol::abi_fingerprint::plugin_abi_layout_fingerprint(),
         plugin_protocol_version: mcpg_plugin_protocol::PROTOCOL_VERSION,
         mcp_protocol_versions: mcp_versions(),
         config_schema_sha256,
@@ -207,6 +213,10 @@ mod tests {
         assert_eq!(
             m.plugin_abi_version,
             mcpg_plugin_protocol::abi::MCPG_PLUGIN_ABI_VERSION
+        );
+        assert_eq!(
+            m.plugin_abi_layout,
+            mcpg_plugin_protocol::abi_fingerprint::plugin_abi_layout_fingerprint()
         );
         assert!(m.mcp_protocol_versions.contains(&"2025-11-25"));
         assert!(m.mcp_protocol_versions.contains(&"2026-07-28"));

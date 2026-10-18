@@ -766,6 +766,7 @@ mod attached {
             backoff_initial: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             bootstrap_ca_pem: cp.bootstrap_ca_pem.clone(),
+            metrics_flush_interval: None,
         };
 
         seed_from_state_dir(std::path::Path::new(&cp.state_dir));
