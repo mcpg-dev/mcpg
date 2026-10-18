@@ -33,6 +33,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -153,7 +154,7 @@ def render_crate(version: str, sums: dict[str, str]) -> dict[str, str]:
         'homepage = "https://mcpg.dev"',
         f'repository = "https://github.com/{ORG}/{REPO}"',
         'readme = "README.md"',
-        'keywords = ["mcp", "model-context-protocol", "mcp-gateway", "gateway", "mcpg"]',
+        'keywords = ["mcp", "mcp-gateway", "gateway", "mcpg", "agents"]',
         'categories = ["command-line-utilities", "network-programming"]',
         "",
         "[dependencies]",
@@ -191,12 +192,15 @@ def render_crate(version: str, sums: dict[str, str]) -> dict[str, str]:
             f'    model_context_protocol_gateway::run("{name}")\n'
             "}\n"
         )
+    # cargo considers only stable versions unless one is named, so a
+    # prerelease crate is installed with its version.
+    pin = f" --version {version}" if "-" in version else ""
     files["README.md"] = (
         "# Model Context Protocol Gateway\n\n"
         f"Installs the [mcpg](https://mcpg.dev) CLI suite: {', '.join(f'`{n}`' for n in SUITE)}.\n\n"
         "```sh\n"
-        f"cargo install {NAME}      # a launcher; the first run downloads the release binaries\n"
-        f"cargo binstall {NAME}     # the release binaries directly\n"
+        f"cargo install {NAME}{pin}      # a launcher; the first run downloads the release binaries\n"
+        f"cargo binstall {NAME}{pin}     # the release binaries directly\n"
         "mcpg --version\n"
         "```\n\n"
         "The launcher checks each download against the SHA-256 sum published in this crate.\n"
@@ -296,11 +300,20 @@ def selftest() -> int:
         bad.append("checksums.rs")
     if 'run("mcpg-cloud")' not in files["src/bin/mcpg-cloud.rs"]:
         bad.append("bin entry")
+    if f"{NAME} --version" in files["README.md"]:
+        bad.append("stable README pins a version")
+    if f"cargo install {NAME} --version 1.0.0-beta.2" not in render_crate("1.0.0-beta.2", sums)["README.md"]:
+        bad.append("prerelease README lacks --version")
     lib = (Path(__file__).resolve().parents[1] / "crates" / "launcher" / "src" / "lib.rs").read_text()
     if "checksums::ARCHIVES" not in lib or "pub fn run(" not in lib:
         bad.append("launcher template")
     if len(manifest["package"]["description"]) > 1000:
         bad.append("description too long for crates.io")
+    # crates.io refuses the upload otherwise: at most five keywords, each
+    # under 20 ASCII characters, starting with a letter.
+    keywords = manifest["package"]["keywords"]
+    if len(keywords) > 5 or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_+-]{0,19}", k) for k in keywords):
+        bad.append(f"keywords crates.io refuses: {keywords}")
     print(" ".join(bad) if bad else "selftest ok")
     return 1 if bad else 0
 
