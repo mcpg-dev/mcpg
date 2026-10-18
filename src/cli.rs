@@ -298,6 +298,9 @@ fn print_plugin_help() {
 
 /// Explain that the `mcpg-plugin` delegate binary is missing and how to get it.
 fn print_plugins_not_installed() {
+    // The suite package carries this gateway's version; cargo installs a
+    // prerelease only when it is named.
+    let version = env!("CARGO_PKG_VERSION");
     eprintln!(
         "error: '{PLUGIN_CLI_BINARY}' is not installed or not on PATH.\n\n\
          The mcpg plugin CLI extension is a separate tool for packing,\n\
@@ -305,7 +308,7 @@ fn print_plugins_not_installed() {
          with mcpg in the model-context-protocol-gateway package:\n\
          \n  npm install -g model-context-protocol-gateway\
          \n  pipx install model-context-protocol-gateway\
-         \n  cargo install model-context-protocol-gateway\n\n\
+         \n  cargo install model-context-protocol-gateway --version {version}\n\n\
          Or install it alone:\n\
          \n  curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh -s -- --bin mcpg-plugin\n",
     );

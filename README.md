@@ -69,8 +69,8 @@ The `model-context-protocol-gateway` package installs `mcpg` together with
 npx model-context-protocol-gateway --help       # npm, one-shot
 npm install -g model-context-protocol-gateway   # npm
 pipx install model-context-protocol-gateway     # PyPI (or: uvx model-context-protocol-gateway)
-cargo install model-context-protocol-gateway    # crates.io: a launcher that runs the release binaries
-cargo binstall model-context-protocol-gateway   # the release binaries directly
+cargo install model-context-protocol-gateway --version <version>    # crates.io: a launcher that runs the release binaries
+cargo binstall model-context-protocol-gateway --version <version>   # the release binaries directly
 curl -fsSL https://raw.githubusercontent.com/mcpg-dev/mcpg/main/install.sh | sh
 ```
 
