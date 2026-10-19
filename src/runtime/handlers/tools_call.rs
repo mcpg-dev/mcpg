@@ -8,7 +8,16 @@ impl GatewayRuntime {
         params: ToolCallParams,
         request_context: &RequestContext,
     ) -> ProtocolHttpResponse {
-        match request_context.load_session_cached(&*self.session_store, true) {
+        // A confirmed Personal Agent Protocol operation runs outside any MCP
+        // session: the Session that confirms it may never have opened one.
+        let session = if request_context.pap_operation.is_some() {
+            Ok(None)
+        } else {
+            request_context
+                .load_session_cached(&*self.session_store, true)
+                .map(Some)
+        };
+        match session {
             Ok(_) => match self.capability_registry.tool_route(&params.name) {
                 Some(route) => {
                     // Enforce per-tool taskSupport constraints.
@@ -707,6 +716,16 @@ impl GatewayRuntime {
                                 error_data,
                             );
                         }
+                    }
+
+                    // An operations tool proposes an operation instead of
+                    // acting, for a Personal Agent that lists the extension;
+                    // the gates and the backend run when it is confirmed.
+                    if let Some(proposed) = self
+                        .propose_pap_operation(&request_id, &params, request_context)
+                        .await
+                    {
+                        return proposed;
                     }
 
                     // A tool gate the license gate withheld cannot judge this

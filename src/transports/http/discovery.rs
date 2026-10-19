@@ -298,6 +298,36 @@ fn aauth_problem(
     resp
 }
 
+/// `GET /.well-known/poppy.json`: the Personal Agent Protocol document of
+/// `governance.access.personal_agent.discovery` (PAP §3), or 404 while it
+/// is unset.
+pub(crate) async fn poppy_document_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Response {
+    let config = state.config.load();
+    let Some(document) = config
+        .governance
+        .access
+        .personal_agent
+        .as_ref()
+        .and_then(|profile| profile.poppy_document())
+    else {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "poppy.json not configured",
+                "detail": "set governance.access.personal_agent.discovery.document",
+            })),
+        )
+            .into_response();
+    };
+    (
+        [(axum::http::header::CACHE_CONTROL, "max-age=300")],
+        Json(document),
+    )
+        .into_response()
+}
+
 /// OAuth 2.1 Protected Resource Metadata (RFC 9728).
 ///
 /// Returns JSON document at `GET /.well-known/oauth-protected-resource` that lets
@@ -341,22 +371,44 @@ pub(crate) async fn oauth_protected_resource_handler(
         "bearer_methods_supported": rm.bearer_methods_supported,
     });
     // RFC 9728 §2: while the embedded authorization server binds tokens,
-    // this resource takes them with the DPoP scheme.
-    if let Some(dpop) = config
-        .governance
-        .access
+    // or `governance.access.dpop` covers the other verifiers, this resource
+    // takes tokens with the DPoP scheme.
+    let access = &config.governance.access;
+    let embedded_dpop = access
         .authorization_server
         .as_ref()
         .map(|authz| &authz.dpop)
-        .filter(|dpop| dpop.enabled)
-    {
+        .filter(|dpop| dpop.enabled);
+    let external_dpop = access.dpop.as_ref().filter(|dpop| dpop.enabled);
+    if embedded_dpop.is_some() || external_dpop.is_some() {
         let runtime = state.runtime.load();
         let identity_plugins = runtime.plugin_registry().has_identity_plugins();
-        let embedded_only =
-            embedded_server_only(&config.governance.access, &auth_servers, identity_plugins);
-        document["dpop_signing_alg_values_supported"] = serde_json::json!(dpop.allowed_algs);
-        document["dpop_bound_access_tokens_required"] =
-            serde_json::json!(dpop.required && embedded_only);
+        let mut algs: Vec<&str> = Vec::new();
+        for alg in embedded_dpop
+            .into_iter()
+            .chain(external_dpop)
+            .flat_map(|dpop| dpop.allowed_algs.iter())
+        {
+            if !algs.contains(&alg.as_str()) {
+                algs.push(alg);
+            }
+        }
+        let required = match external_dpop {
+            None => {
+                embedded_dpop.is_some_and(|dpop| dpop.required)
+                    && embedded_server_only(access, &auth_servers, identity_plugins)
+            }
+            Some(external) => {
+                external.required
+                    && !identity_plugins
+                    && access
+                        .authorization_server
+                        .as_ref()
+                        .is_none_or(|authz| authz.dpop.enabled && authz.dpop.required)
+            }
+        };
+        document["dpop_signing_alg_values_supported"] = serde_json::json!(algs);
+        document["dpop_bound_access_tokens_required"] = serde_json::json!(required);
     }
     // RFC 9728 §2: the authorization details types this resource's own
     // tokens may be limited to.

@@ -37,11 +37,13 @@ impl GatewayRuntime {
         let curated_tools = self
             .apply_catalog_chain(visible_tools, request_context)
             .await;
-        paginate_list_bound(
+        let (mut page, next_cursor) = paginate_list_bound(
             &curated_tools,
             cursor,
             Some(&self.cursor_binding_key(request_context.session_id.as_deref())),
-        )
+        );
+        self.hide_pap_operation_output_schemas(request_context, &mut page);
+        (page, next_cursor)
     }
 
     /// Enumerate the prompt catalog page for a request. Mirror of

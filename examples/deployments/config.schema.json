@@ -117,6 +117,18 @@
           "default": null,
           "description": "Embedded Enterprise-Managed Authorization server (MCP `io.modelcontextprotocol/enterprise-managed-authorization`). When set, the gateway acts as the OAuth Resource Authorization Server for ID-JAG grants: it serves RFC 8414 metadata at `GET /.well-known/oauth-authorization-server` advertising the `urn:ietf:params:oauth:grant-profile:id-jag` grant profile, and redeems Identity Assertion JWT Authorization Grants issued by the configured trusted enterprise IdPs at `POST /oauth/token` (`urn:ietf:params:oauth:grant-type:jwt-bearer`), minting audience-restricted access tokens the gateway itself accepts. With a `trusted_idps[].login` block it also signs users in interactively: an authorization endpoint (`authorization_code` with PKCE) that sends the user to that IdP, rotating refresh tokens, and optional dynamic client registration (see `interactive`). Without one there is no authorization endpoint, no refresh token and no registration endpoint. Requires `resource_metadata`, which is how clients discover this server."
         },
+        "dpop": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/DpopConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "DPoP (RFC 9449) for the access tokens that `oidc_oauth` or `jwks` verifies, such as a Personal Agent Protocol Company's Session Tokens. With `enabled: true`, a token presented with `Authorization: DPoP` is verified like a Bearer token and must carry `cnf.jkt` (in the JWT, or in the introspection response); its one `DPoP` proof must pass every check of RFC 9449 §4.3 (`typ`, an allowed asymmetric `alg`, a public key only, the signature, `htm` and `htu` against the request under a `resource_metadata` resource, `iat` within `proof_max_age_secs`, and `ath`), be of that key, and be unspent; it is then recorded in the replay ledger every replica shares. A token with `cnf` presented with `Bearer` is refused, and a Bearer token without `cnf` keeps working unless `required` is set. The caller carries the key's thumbprint as the `dpop_jkt` attribute, and the protected resource metadata publishes `dpop_signing_alg_values_supported`. `nonce` must stay `off`: no key is there to derive nonces from. Tokens of `authorization_server` follow `authorization_server.dpop` instead. Requires `oidc_oauth` or `jwks`, and `resource_metadata`; `enabled: true` requires a licence with the `oauth.dpop` feature."
+        },
         "jwks": {
           "anyOf": [
             {
@@ -139,6 +151,18 @@
           ],
           "default": null,
           "description": "Inbound OIDC: verifies Bearer tokens against each provider. A provider's `claim_mappings.attribute_claim_mappings` may not map to an attribute that only a credential of this gateway sets (`token_issuer`, `grant_type`, `grant_id`, `dpop_jkt`, `authorization_details`, `authorization_details_types`) or to a name starting with `subject_token`: such a configuration is refused at load, whether DPoP and authorization details are on or not. An identity plugin's attributes of those six names are dropped."
+        },
+        "personal_agent": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PersonalAgentConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Serve as a Personal Agent Protocol Company's MCP server: read the Session Token's PAP values from identity attributes, answer a signed-out Personal Agent a tool's scopes refuse with `sign_in_required` (403) instead of `insufficient_scope`, read the extensions a Personal Agent lists, refuse one without `require_extensions`, serve `poppy.json`, and turn chosen tools into operations the Personal Agent confirms. Requires `oidc_oauth` or `jwks`; only `oidc_oauth` maps claims to identity attributes, so with `jwks` alone every caller is a plain MCP client."
         },
         "require_authentication": {
           "default": false,
@@ -252,6 +276,56 @@
         }
       },
       "type": "object"
+    },
+    "AgentExtensionsConfig": {
+      "additionalProperties": false,
+      "description": "Where a Personal Agent's extensions are read.",
+      "properties": {
+        "allow_private_network": {
+          "default": false,
+          "description": "Fetch client metadata documents from private addresses too. For a test network only.",
+          "type": "boolean"
+        },
+        "allowed_hosts": {
+          "default": [],
+          "description": "Hosts a client metadata document may be fetched from; empty allows any public host.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "attribute": {
+          "default": "agent_extensions",
+          "description": "The identity attribute read with `source: attribute`.",
+          "type": "string"
+        },
+        "cache_secs": {
+          "default": 3600,
+          "description": "How long a fetched document is used, in seconds (60–86400); its `Cache-Control: max-age` shortens it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AgentExtensionsSource"
+            }
+          ],
+          "default": "client_metadata",
+          "description": "`client_metadata`: from `extensions` of the client metadata document at the agent's `client_id` URL, fetched over https without redirects, private addresses refused, and cached. `attribute`: from the identity attribute `attribute`, a JSON object of name to `{ \"version\": … }` or a space-separated list of names. `none`: no agent lists any."
+        }
+      },
+      "type": "object"
+    },
+    "AgentExtensionsSource": {
+      "description": "See [`AgentExtensionsConfig::source`].",
+      "enum": [
+        "client_metadata",
+        "attribute",
+        "none"
+      ],
+      "type": "string"
     },
     "Align": {
       "description": "Horizontal cell alignment.",
@@ -1703,6 +1777,7 @@
             "type": "string"
           },
           "default": {},
+          "description": "Claim path (dotted, as `realm_access.roles`) to the identity attribute it fills. A string claim maps as it is, a number or boolean as its JSON text, an object or array as compact JSON.",
           "type": "object"
         },
         "group_claim_paths": {
@@ -4313,8 +4388,10 @@
           ],
           "default": {
             "authorization_server": null,
+            "dpop": null,
             "jwks": null,
             "oidc_oauth": null,
+            "personal_agent": null,
             "require_authentication": false,
             "resource_metadata": null
           },
@@ -6400,6 +6477,207 @@
         }
       ]
     },
+    "OperationToolConfig": {
+      "additionalProperties": false,
+      "description": "One tool that proposes an operation.",
+      "properties": {
+        "action_key": {
+          "default": null,
+          "description": "The same action proposed again with this key, while its operation is still `proposed`, revises that operation instead of proposing a new one: equal terms return it as it is, other terms make the next revision. A template over the arguments; unset, every call proposes a new operation.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expires_after_secs": {
+          "default": 900,
+          "description": "How long a revision can be confirmed, in seconds (60–86400).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "summary": {
+          "description": "The terms in plain language, so the User can decide from them alone: what will happen, to what, and any cost, date or condition. A template over the call's arguments (`${arguments.order_id}`). The operation's `terms` are the validated arguments.",
+          "type": "string"
+        },
+        "tool": {
+          "description": "The MCP tool name.",
+          "type": "string"
+        },
+        "url": {
+          "default": null,
+          "description": "A page of the Company's website that shows the operation, a template over the arguments.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_approval_required": {
+          "default": false,
+          "description": "Accept only the User's approval of each revision, not a standing permission.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "tool",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "OperationsConfig": {
+      "additionalProperties": false,
+      "description": "`governance.access.personal_agent.operations`.",
+      "properties": {
+        "confirm_wait_secs": {
+          "default": 5,
+          "description": "How long a confirm waits for the action to finish before it answers `in_progress` with `Retry-After`, in seconds (1–30).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "endpoint": {
+          "description": "The operations endpoint's public URL, published in `poppy.json` as `extensions.operations.endpoint`: an https URL on the origin of a `resource_metadata` resource, with the path `/poppy/operations`, where the gateway serves it. It takes DPoP Session Tokens only, so `governance.access.dpop` (or the embedded server's `dpop`) must be on.",
+          "type": "string"
+        },
+        "retain_final_secs": {
+          "default": 604800,
+          "description": "How long a final operation stays readable, in seconds (3600–2592000).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tools": {
+          "description": "The tools that propose an operation.",
+          "items": {
+            "$ref": "#/definitions/OperationToolConfig"
+          },
+          "type": "array"
+        },
+        "without_extension": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OperationsWithoutExtension"
+            }
+          ],
+          "default": "perform",
+          "description": "What a tool call by a Personal Agent that does not list the extension does: `perform` runs the tool as without the extension; `refuse_agent` refuses such a Personal Agent on every request with `extension_required`, as `require_extensions` does. Plain MCP clients always run the tool."
+        }
+      },
+      "required": [
+        "endpoint",
+        "tools"
+      ],
+      "type": "object"
+    },
+    "OperationsWithoutExtension": {
+      "description": "See [`OperationsConfig::without_extension`].",
+      "enum": [
+        "perform",
+        "refuse_agent"
+      ],
+      "type": "string"
+    },
+    "PersonalAgentAttributes": {
+      "additionalProperties": false,
+      "description": "Identity attribute names of the PAP values of a Session Token.",
+      "properties": {
+        "account": {
+          "default": "account",
+          "description": "The account the Session is signed in to, set only while it is.",
+          "type": "string"
+        },
+        "client_id": {
+          "default": "client_id",
+          "description": "The Personal Agent's `client_id`: the URL of its client metadata document.",
+          "type": "string"
+        },
+        "session_id": {
+          "default": "session_id",
+          "description": "The Session the token was issued for.",
+          "type": "string"
+        },
+        "signed_in": {
+          "default": "signed_in",
+          "description": "`true` while the Session is signed in. Without this attribute, a caller is signed in when it has the `account` attribute.",
+          "type": "string"
+        },
+        "user_id": {
+          "default": "user_id",
+          "description": "The User ID the Personal Agent gave the User at this Company. A plain MCP client's Session has none.",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "PersonalAgentConfig": {
+      "additionalProperties": false,
+      "description": "The Personal Agent Protocol profile of the resource.",
+      "properties": {
+        "agent_extensions": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AgentExtensionsConfig"
+            }
+          ],
+          "default": {
+            "allow_private_network": false,
+            "allowed_hosts": [],
+            "attribute": "agent_extensions",
+            "cache_secs": 3600,
+            "source": "client_metadata"
+          },
+          "description": "Where the gateway reads the extensions a Personal Agent supports."
+        },
+        "attributes": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/PersonalAgentAttributes"
+            }
+          ],
+          "default": {
+            "account": "account",
+            "client_id": "client_id",
+            "session_id": "session_id",
+            "signed_in": "signed_in",
+            "user_id": "user_id"
+          },
+          "description": "The identity attributes that carry the Session Token's PAP values, filled by the verifier's claim mappings (for `oidc_oauth`, `claim_mappings.attribute_claim_mappings`). A caller with a `client_id` attribute is a Personal Agent; one without is a plain MCP client, which signed in with MCP's own flow."
+        },
+        "discovery": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/PoppyDiscoveryConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The Company's `poppy.json`, served at `GET /.well-known/poppy.json`."
+        },
+        "operations": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OperationsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The operations extension, version 1: the listed tools propose an operation instead of acting, and the Personal Agent confirms it once at the operations endpoint."
+        },
+        "require_extensions": {
+          "default": [],
+          "description": "Extensions a Personal Agent must list to use this server at all: one that does not is refused on every request with 403 and `WWW-Authenticate: <scheme> error=\"extension_required\", extension=\"<name>\"`. Plain MCP clients are not refused. A plain name (`operations`) is one the protocol defines; any other starts with a domain (`example.com/gift-wrap`).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "PipelinesConfig": {
       "additionalProperties": false,
       "description": "`pipelines:` config — pipeline state store + per-capability `store:` override. When `store` is unset, the pipeline KV inherits from the cluster's `key_value_store()` primitive.",
@@ -6941,6 +7219,19 @@
           }
         }
       },
+      "type": "object"
+    },
+    "PoppyDiscoveryConfig": {
+      "additionalProperties": false,
+      "description": "The `poppy.json` document the gateway serves.",
+      "properties": {
+        "document": {
+          "description": "The document, served as it is with `Cache-Control: max-age=300`. It needs `protocol_version` `0.x`, `organization.name` and `organization.domain`, and https URLs for `auth.issuer` and every `apis[].url`. PAP binds the document to the host that serves it, so publish it on the Company's own domain only."
+        }
+      },
+      "required": [
+        "document"
+      ],
       "type": "object"
     },
     "PromptArgumentConfig": {
@@ -10280,8 +10571,10 @@
       "default": {
         "access": {
           "authorization_server": null,
+          "dpop": null,
           "jwks": null,
           "oidc_oauth": null,
+          "personal_agent": null,
           "require_authentication": false,
           "resource_metadata": null
         },

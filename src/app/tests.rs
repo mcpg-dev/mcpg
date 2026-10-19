@@ -3407,7 +3407,7 @@ fn a_per_replica_ledger_is_reported_once() {
         .expect("wires")
         .expect("configured");
     assert!(
-        !per_replica_ledger_is_news(Some(&at_boot)),
+        !per_replica_ledger_is_news(Some(at_boot.replay_ledger())),
         "not again on a reload that keeps it"
     );
 
@@ -3423,7 +3423,92 @@ fn a_per_replica_ledger_is_reported_once() {
     .expect("configured");
     assert!(!shared.replay_ledger().is_process_local());
     assert!(
-        per_replica_ledger_is_news(Some(&shared)),
+        per_replica_ledger_is_news(Some(shared.replay_ledger())),
         "a shared ledger lost on reload"
+    );
+}
+
+// ── where Personal Agent Protocol operations are kept ──────
+
+fn operations_app_config(cluster_kind: &str) -> AppConfig {
+    let mut config: AppConfig = serde_yaml::from_str(
+        r#"
+governance:
+  access:
+    personal_agent:
+      operations:
+        endpoint: https://mcp.example.com/poppy/operations
+        tools:
+          - tool: refund
+            summary: Refund order ${arguments.order_id}.
+"#,
+    )
+    .expect("config parses");
+    config.cluster.kind = cluster_kind.to_owned();
+    config
+}
+
+/// A reload rebuilds the single-node coordinator with an empty KV, so the
+/// in-process operations pass from the replaced runtime to its successor.
+#[test]
+fn single_node_operations_survive_a_reload() {
+    let config = operations_app_config("single_node");
+    let wire = |previous| {
+        wire_pap_operations(
+            &config,
+            Some(&single_node_coordinator()),
+            &plaintext_state(),
+            &None,
+            previous,
+        )
+        .expect("wires")
+        .expect("configured")
+    };
+    let at_boot = wire(None);
+    assert!(at_boot.is_process_local());
+    let after_reload = wire(Some(&at_boot));
+    assert!(after_reload.shares_store_with(&at_boot));
+}
+
+#[test]
+fn clustered_operations_live_in_the_coordinators_kv() {
+    let coordinator = single_node_coordinator();
+    let at_boot = wire_pap_operations(
+        &operations_app_config("redis"),
+        Some(&coordinator),
+        &plaintext_state(),
+        &None,
+        None,
+    )
+    .expect("wires")
+    .expect("configured");
+    assert!(!at_boot.is_process_local());
+
+    let in_process = wire_pap_operations(
+        &operations_app_config("single_node"),
+        Some(&coordinator),
+        &plaintext_state(),
+        &None,
+        Some(&at_boot),
+    )
+    .expect("wires")
+    .expect("configured");
+    assert!(in_process.is_process_local());
+    assert!(
+        !in_process.shares_store_with(&at_boot),
+        "a shared store is not carried into a single-node reload"
+    );
+
+    assert!(
+        wire_pap_operations(
+            &AppConfig::default(),
+            Some(&coordinator),
+            &plaintext_state(),
+            &None,
+            Some(&at_boot),
+        )
+        .expect("wires")
+        .is_none(),
+        "no operations without their config"
     );
 }

@@ -72,7 +72,9 @@ impl IdentityProviderPlugin for JwtIdentityPlugin {
         }
 
         match self.verifier.verify_from_headers(&header_map) {
-            JwtVerificationResult::Verified { subject, issuer } => IdentityResolution::Resolved {
+            JwtVerificationResult::Verified {
+                subject, issuer, ..
+            } => IdentityResolution::Resolved {
                 identity: PluginIdentity {
                     kind: "verified".into(),
                     trust_level: "verified".into(),

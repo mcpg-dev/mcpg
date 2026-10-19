@@ -79,12 +79,17 @@ pub(crate) fn map_protocol_http_response(response: ProtocolHttpResponse) -> Resp
     // `insufficient_scope` 403 challenge, and strip the marker from the
     // wire body (the challenge carries it).
     let mut insufficient_scope: Option<String> = None;
+    let mut sign_in_required = false;
     if response.http_status == 403
         && let ProtocolResponse::JsonRpcError(err) = &mut response.response
         && let Some(data) = err.error.data.as_mut().and_then(Value::as_object_mut)
-        && let Some(scope_value) = data.remove(INSUFFICIENT_SCOPE_DATA_KEY)
     {
-        insufficient_scope = scope_value.as_str().map(str::to_owned);
+        if let Some(scope_value) = data.remove(INSUFFICIENT_SCOPE_DATA_KEY) {
+            insufficient_scope = scope_value.as_str().map(str::to_owned);
+        }
+        sign_in_required = data
+            .remove(SIGN_IN_REQUIRED_DATA_KEY)
+            .is_some_and(|marker| marker == Value::Bool(true));
         // Drop a now-empty `data` object so the error body stays clean.
         if data.is_empty() {
             err.error.data = None;
@@ -137,6 +142,12 @@ pub(crate) fn map_protocol_http_response(response: ProtocolHttpResponse) -> Resp
         http_response
             .headers_mut()
             .insert(HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER), value);
+    }
+    if sign_in_required {
+        http_response.headers_mut().insert(
+            HeaderName::from_static(SIGN_IN_REQUIRED_HEADER),
+            HeaderValue::from_static("1"),
+        );
     }
     http_response
 }
@@ -197,6 +208,17 @@ pub const INSUFFICIENT_SCOPE_HEADER: &str = "x-mcpg-insufficient-scope";
 /// builder can mint the SEP-2350 `insufficient_scope` step-up challenge.
 pub const INSUFFICIENT_SCOPE_DATA_KEY: &str = "mcpg_insufficient_scope";
 
+/// JSON-RPC error `data` marker of a scope denial whose caller is a
+/// signed-out Personal Agent Protocol Session: `map_protocol_http_response`
+/// lifts it into [`SIGN_IN_REQUIRED_HEADER`], and the challenge builder
+/// answers `error="sign_in_required"` (PAP §6) instead of
+/// `insufficient_scope`.
+pub const SIGN_IN_REQUIRED_DATA_KEY: &str = "mcpg_sign_in_required";
+
+/// Internal header of [`SIGN_IN_REQUIRED_DATA_KEY`]; it never appears on
+/// the wire.
+pub const SIGN_IN_REQUIRED_HEADER: &str = "x-mcpg-sign-in-required";
+
 /// JSON-RPC error `data` marker carrying the whole seconds a refused caller
 /// should wait. `map_protocol_http_response` turns it into `Retry-After`
 /// and strips it from the wire body.
@@ -208,6 +230,7 @@ pub(crate) fn strip_internal_markers(error: &mut crate::protocol::shared::jsonrp
     if let Some(data) = error.error.data.as_mut().and_then(Value::as_object_mut) {
         data.remove(RETRY_AFTER_DATA_KEY);
         data.remove(INSUFFICIENT_SCOPE_DATA_KEY);
+        data.remove(SIGN_IN_REQUIRED_DATA_KEY);
         if data.is_empty() {
             error.error.data = None;
         }
@@ -401,6 +424,10 @@ pub(crate) fn with_www_authenticate_challenge(
         .remove(HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER))
         .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
         .filter(|s| !s.is_empty());
+    let sign_in_required = response
+        .headers_mut()
+        .remove(HeaderName::from_static(SIGN_IN_REQUIRED_HEADER))
+        .is_some();
 
     if !auth_enabled {
         return response;
@@ -451,8 +478,17 @@ pub(crate) fn with_www_authenticate_challenge(
         }
     } else if status == axum::http::StatusCode::FORBIDDEN {
         // SEP-2350 step-up: only a 403 that names the missing scopes is a
-        // re-authentication signal. A bare authorization 403 is not.
+        // re-authentication signal. A bare authorization 403 is not. A
+        // signed-out Personal Agent Protocol Session is told to sign in
+        // instead (PAP §6).
         match &insufficient_scope {
+            _ if sign_in_required => {
+                let url = sanitize_header_quotes(resource_metadata);
+                HeaderValue::from_str(&format!(
+                    "Bearer resource_metadata=\"{url}\", error=\"sign_in_required\""
+                ))
+                .ok()
+            }
             Some(scope) => {
                 let url = sanitize_header_quotes(resource_metadata);
                 let scope = sanitize_header_quotes(scope);
@@ -470,9 +506,10 @@ pub(crate) fn with_www_authenticate_challenge(
     let Some(value) = header_value else {
         return response;
     };
-    let dpop_caller = caller.is_some_and(|identity| {
-        identity.is_gateway_minted() && identity.attributes().contains_key(DPOP_JKT_ATTRIBUTE)
-    });
+    // Only the gateway's own DPoP checks set `dpop_jkt`, for the embedded
+    // server's tokens and for those `governance.access.dpop` covers.
+    let dpop_caller =
+        caller.is_some_and(|identity| identity.attributes().contains_key(DPOP_JKT_ATTRIBUTE));
     let value = match dpop {
         Some(dpop) if dpop_caller => in_dpop_scheme(&value, dpop.algs).unwrap_or(value),
         _ => value,

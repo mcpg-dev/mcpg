@@ -2653,3 +2653,6 @@ mod rar_details;
 
 #[path = "authorization_server_dpop_resource_tests.rs"]
 mod dpop_resource;
+
+#[path = "authorization_server_external_dpop_tests.rs"]
+mod external_dpop_resource;

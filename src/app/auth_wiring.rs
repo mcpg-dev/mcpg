@@ -417,6 +417,29 @@ pub(crate) fn ema_replay_ledger(
     tenant_seg: &Option<String>,
     previous: Option<&crate::runtime::authorization_server::AuthorizationServer>,
 ) -> crate::runtime::authorization_server::ReplayLedger {
+    replay_ledger(
+        config,
+        coordinator,
+        state_cipher,
+        tenant_seg,
+        previous.map(|server| server.replay_ledger()),
+        "single use of ID-JAGs and client assertions is enforced per replica, so each may be \
+         used once on each instance",
+    )
+}
+
+/// A replay ledger: the coordinator's shared KV in a clustered deployment,
+/// else an in-process one, taken over from `previous` when that is
+/// in-process too. `per_replica` says what a clustered deployment without
+/// a shared KV loses, logged once rather than on every reload.
+fn replay_ledger(
+    config: &AppConfig,
+    coordinator: Option<&Arc<dyn mcpg_cluster_api::ClusterBackend>>,
+    state_cipher: &StateEncryption,
+    tenant_seg: &Option<String>,
+    previous: Option<&crate::runtime::authorization_server::ReplayLedger>,
+    per_replica: &str,
+) -> crate::runtime::authorization_server::ReplayLedger {
     use crate::runtime::authorization_server::ReplayLedger;
     if !config.cluster.is_single_node() {
         if let Some(kv) = coordinator.and_then(|c| c.key_value_store()) {
@@ -426,27 +449,120 @@ pub(crate) fn ema_replay_ledger(
             ));
         }
         if per_replica_ledger_is_news(previous) {
-            warn!(
-                "the cluster coordinator exposes no key_value_store: single use of ID-JAGs and \
-                 client assertions is enforced per replica, so each may be used once on each \
-                 instance"
-            );
+            warn!("the cluster coordinator exposes no key_value_store: {per_replica}");
         }
     }
     previous
-        .map(|server| server.replay_ledger())
         .filter(|ledger| ledger.is_process_local())
         .cloned()
         .unwrap_or_else(ReplayLedger::in_process)
 }
 
+/// Boot and reload: the Personal Agent Protocol profile, while
+/// `governance.access.personal_agent` is set. A reload keeps `previous`
+/// while its config is unchanged, and with it the client metadata documents
+/// it has read: a reload runs on every registry sync pass.
+pub(crate) fn wire_personal_agent(
+    config: &AppConfig,
+    previous: Option<Arc<crate::runtime::personal_agent::PersonalAgentProfile>>,
+) -> Result<Option<Arc<crate::runtime::personal_agent::PersonalAgentProfile>>> {
+    let Some(block) = config.governance.access.personal_agent.as_ref() else {
+        return Ok(None);
+    };
+    if let Some(previous) = previous.filter(|previous| previous.config() == block) {
+        return Ok(Some(previous));
+    }
+    Ok(Some(Arc::new(
+        crate::runtime::personal_agent::PersonalAgentProfile::from_config(block)?,
+    )))
+}
+
+/// Boot and reload: the Personal Agent Protocol operations, while
+/// `governance.access.personal_agent.operations` is set. A clustered
+/// deployment keeps the operations in the coordinator's shared KV, so a
+/// confirm on any replica finds the operation and the action runs once
+/// across them all. Otherwise they are in-process and taken over from
+/// `previous`, the operations a reload replaces.
+pub(crate) fn wire_pap_operations(
+    config: &AppConfig,
+    coordinator: Option<&Arc<dyn mcpg_cluster_api::ClusterBackend>>,
+    state_cipher: &StateEncryption,
+    tenant_seg: &Option<String>,
+    previous: Option<&crate::runtime::personal_agent_operations::OperationsService>,
+) -> Result<Option<Arc<crate::runtime::personal_agent_operations::OperationsService>>> {
+    use crate::runtime::personal_agent_operations::OperationsService;
+    let Some(operations) = config
+        .governance
+        .access
+        .personal_agent
+        .as_ref()
+        .and_then(|block| block.operations.as_ref())
+    else {
+        return Ok(None);
+    };
+    if !config.cluster.is_single_node() {
+        if let Some(kv) = coordinator.and_then(|c| c.key_value_store()) {
+            return Ok(Some(Arc::new(OperationsService::from_config(
+                operations,
+                wrap_tenant_kv(wrap_state_kv(kv, state_cipher), tenant_seg),
+            )?)));
+        }
+        if previous.is_none_or(|previous| !previous.is_process_local()) {
+            warn!(
+                "the cluster coordinator exposes no key_value_store: Personal Agent Protocol \
+                 operations are kept per replica, so a confirm finds an operation only on the \
+                 replica that proposed it"
+            );
+        }
+    }
+    Ok(Some(Arc::new(OperationsService::in_process(
+        operations, previous,
+    )?)))
+}
+
+/// Boot and reload: DPoP for the tokens `oidc_oauth` or `jwks` verifies,
+/// while `governance.access.dpop` is on. Proofs are spent in the ledger of
+/// `ema`, the embedded server wired for the same config, when there is
+/// one, so a proof is accepted once whichever verifier takes its token;
+/// otherwise in a ledger chosen as the embedded server's is. `previous` is
+/// what a reload replaces.
+pub(crate) fn wire_external_dpop(
+    config: &AppConfig,
+    coordinator: Option<&Arc<dyn mcpg_cluster_api::ClusterBackend>>,
+    state_cipher: &StateEncryption,
+    tenant_seg: &Option<String>,
+    ema: Option<&crate::runtime::authorization_server::AuthorizationServer>,
+    previous: Option<&crate::runtime::authorization_server::ExternalDpop>,
+) -> Result<Option<Arc<crate::runtime::authorization_server::ExternalDpop>>> {
+    let access = &config.governance.access;
+    if !access.dpop.as_ref().is_some_and(|dpop| dpop.enabled) {
+        return Ok(None);
+    }
+    let replay = match ema {
+        Some(server) => server.replay_ledger().clone(),
+        None => replay_ledger(
+            config,
+            coordinator,
+            state_cipher,
+            tenant_seg,
+            previous.map(|dpop| dpop.replay_ledger()),
+            "single use of DPoP proofs is enforced per replica, so a proof may be used once on \
+             each instance",
+        ),
+    };
+    Ok(
+        crate::runtime::authorization_server::ExternalDpop::from_access(access, replay)?
+            .map(Arc::new),
+    )
+}
+
 /// Whether a per-replica ledger is worth reporting: at boot, or when the
-/// server it replaces shared one. A reload runs on every registry sync
+/// ledger it replaces was shared. A reload runs on every registry sync
 /// pass, so reporting it on each would repeat the same warning.
 pub(crate) fn per_replica_ledger_is_news(
-    previous: Option<&crate::runtime::authorization_server::AuthorizationServer>,
+    previous: Option<&crate::runtime::authorization_server::ReplayLedger>,
 ) -> bool {
-    previous.is_none_or(|server| !server.replay_ledger().is_process_local())
+    previous.is_none_or(|ledger| !ledger.is_process_local())
 }
 
 /// Build the AAuth resource role when `server.aauth_resource_metadata` is

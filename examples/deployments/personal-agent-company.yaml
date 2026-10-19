@@ -1,0 +1,181 @@
+# yaml-language-server: $schema=./config.schema.json
+#
+# Deployment: personal-agent-company
+# ----------------------------------
+# The MCP server a Personal Agent Protocol (PAP, draft 0.2) Company lists
+# in its poppy.json. The Company's own authorization server issues the
+# Session Tokens; the gateway verifies them, Bearer and DPoP, tells a
+# signed-out Personal Agent to sign in, serves poppy.json, and turns the
+# refund tool into an operation the User confirms before it runs.
+#
+# DPoP, and with it the operations endpoint, needs a license with the
+# `oauth.dpop` feature (Enterprise; see `license:`).
+#
+# The Company's authorization server must put these claims in a Session
+# Token (names below are this template's; map yours in
+# attribute_claim_mappings):
+#   client_id   — the Personal Agent's client_id (its metadata URL)
+#   sid         — the Session
+#   uid         — the User ID the agent gave the User at this Company
+#   acct        — the account, only while the Session is signed in
+#   cnf.jkt     — the agent's DPoP key, for a DPoP-bound token
+#
+# Required env vars:
+#   (none) — replace the hosts below with yours.
+#
+# Check: mcpg config check --deny-warnings personal-agent-company.yaml
+# Boot:  MCPG_CONFIG=personal-agent-company.yaml mcpg
+
+gateway:
+  server:
+    bind_address: "0.0.0.0:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    # The forwarded host for the resource the metadata names, and for the
+    # `htu` of each DPoP proof.
+    trust_proxy_ip: true
+    canonical_url: "https://mcp.shop.example"
+
+cluster:
+  # One replica keeps operations in the process; they survive a reload but
+  # not a restart. With a cluster coordinator they live in its key-value
+  # store, and a confirm on any replica runs the action once.
+  kind: single_node
+
+license:
+  token_file: "/etc/mcpg/license/license.jwt"
+
+governance:
+  access:
+    require_authentication: true
+    resource_metadata:
+      # The `url` of the MCP server in poppy.json, exactly.
+      resource: "https://mcp.shop.example/mcp"
+      authorization_servers: ["https://auth.shop.example"]
+      scopes_supported: ["orders:read", "orders:write"]
+    oidc_oauth:
+      providers:
+        - issuer: "https://auth.shop.example"
+          discovery_uri: "https://auth.shop.example/.well-known/oauth-authorization-server"
+          # Only Session Tokens issued for this server's `url`.
+          audiences: ["https://mcp.shop.example/mcp"]
+          verification:
+            kind: oidc_jwks
+            allowed_algs: ["ES256"]
+          claim_mappings:
+            attribute_claim_mappings:
+              client_id: client_id
+              sid: session_id
+              uid: user_id
+              acct: account
+    # Session Tokens bound to the Personal Agent's key (PAP: new MCP
+    # servers SHOULD accept them). Bearer tokens without `cnf` keep working.
+    dpop:
+      enabled: true
+      allowed_algs: ["ES256"]
+    personal_agent:
+      discovery:
+        # Served at GET /.well-known/poppy.json. Publish it only on the
+        # Company's own domain: PAP binds it to the host that serves it.
+        # The gateway adds extensions.operations for the block below.
+        document:
+          protocol_version: "0.2"
+          organization:
+            name: "Example Shop"
+            domain: "shop.example"
+          auth:
+            issuer: "https://auth.shop.example"
+          apis:
+            - type: mcp
+              url: "https://mcp.shop.example/mcp"
+              description: "Orders and refunds"
+      operations:
+        # Served by the gateway at /poppy/operations, on the resource's
+        # origin. It takes DPoP Session Tokens only.
+        endpoint: "https://mcp.shop.example/poppy/operations"
+        tools:
+          - tool: orders.refund
+            summary: "Refund ${arguments.amount} EUR for order ${arguments.order_id}."
+            # The same order proposed again revises its operation.
+            action_key: "${arguments.order_id}"
+            url: "https://shop.example/orders/${arguments.order_id}"
+            expires_after_secs: 900
+            # Money leaves the shop: the User approves each revision.
+            user_approval_required: true
+  audit:
+    enabled: true
+    sinks:
+      - kind: dev.mcpg.builtin.audit.local-file
+        config:
+          path: "/var/log/mcpg/audit.log"
+
+plugins:
+  # Its `providers` must match `governance.access.oidc_oauth.providers`.
+  - id: dev.mcpg.identity.oidc
+    class: identity_provider
+    source:
+      # Your mirror of the plugin channel; keep it in step with the gateway.
+      oci: "registry.shop.example/mcpg/plugins/identity-oidc:0.1.0"
+    granted_capabilities: [network_outbound]
+    config:
+      providers:
+        - issuer: "https://auth.shop.example"
+          discovery_uri: "https://auth.shop.example/.well-known/oauth-authorization-server"
+          audiences: ["https://mcp.shop.example/mcp"]
+          verification:
+            kind: oidc_jwks
+            allowed_algs: ["ES256"]
+          claim_mappings:
+            attribute_claim_mappings:
+              client_id: client_id
+              sid: session_id
+              uid: user_id
+              acct: account
+  - id: dev.mcpg.backend.http
+    class: backend
+    source:
+      oci: "registry.shop.example/mcpg/plugins/backend-http:0.1.0"
+    granted_capabilities: [network_outbound]
+
+mcp:
+  capabilities:
+    tools:
+      - name: orders.lookup
+        description: Look up an order.
+        input_schema:
+          type: object
+          required: [order_id]
+          properties:
+            order_id: { type: string }
+        governance:
+          minimum_trust: verified
+          required_scopes: ["orders:read"]
+        backend:
+          kind: http
+          url: "https://orders.internal.example/lookup"
+          method: post
+      - name: orders.refund
+        description: Refund an order. A Personal Agent confirms the refund first.
+        input_schema:
+          type: object
+          required: [order_id, amount]
+          additionalProperties: false
+          properties:
+            order_id: { type: string }
+            amount: { type: number, exclusiveMinimum: 0 }
+        governance:
+          minimum_trust: verified
+          # Only a signed-in Session holds it: a signed-out Personal Agent is
+          # told to sign in (403 sign_in_required).
+          required_scopes: ["orders:write"]
+        backend:
+          kind: http
+          url: "https://orders.internal.example/refund"
+          method: post
+
+observability:
+  logs:
+    level: info
+    sinks:
+      - kind: stderr
+        config: { format: json }

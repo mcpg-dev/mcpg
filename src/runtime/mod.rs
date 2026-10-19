@@ -23,6 +23,8 @@ pub(crate) use identity::identity_plugin;
 pub use identity::oidc;
 pub mod invocation;
 pub mod message_dispatcher;
+pub mod personal_agent;
+pub mod personal_agent_operations;
 pub mod ping_driver;
 pub(crate) mod policy;
 #[cfg(feature = "governance-quotas")]
@@ -374,6 +376,15 @@ pub struct RequestContext {
     /// elicitation. Shared by the clones of the context; in memory only.
     #[serde(skip)]
     pub(crate) connect_link: Arc<federation::idp_sessions::ConnectLinkSlot>,
+    /// The caller as a Personal Agent Protocol Session, while
+    /// `governance.access.personal_agent` is set and the caller is
+    /// verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personal_agent: Option<personal_agent::PersonalAgentCaller>,
+    /// The confirmed Personal Agent Protocol operation this tool call
+    /// performs: it runs outside any MCP session and proposes nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pap_operation: Option<String>,
     // Per-request session-snapshot cache. The first `load_session_cached`
     // call populates the OnceLock; subsequent calls within the same
     // request lifecycle skip the SessionStore Mutex / Redis RTT.
@@ -408,6 +419,8 @@ impl RequestContext {
             inbound_bearer: None,
             session_ephemeral: false,
             connect_link: Arc::default(),
+            personal_agent: None,
+            pap_operation: None,
             cached_session: Arc::new(OnceLock::new()),
         }
     }
@@ -853,6 +866,18 @@ pub struct GatewayRuntime {
     /// (`governance.access.authorization_server`). Installed via
     /// [`Self::set_ema_authorization_server`] after construction.
     ema_authorization_server: Option<std::sync::Arc<authorization_server::AuthorizationServer>>,
+    /// DPoP for the access tokens `oidc_oauth` or `jwks` verifies
+    /// (`governance.access.dpop`). Installed via
+    /// [`Self::set_external_dpop`] after construction.
+    external_dpop: Option<std::sync::Arc<authorization_server::ExternalDpop>>,
+    /// The Personal Agent Protocol profile
+    /// (`governance.access.personal_agent`). Installed via
+    /// [`Self::set_personal_agent`] after construction.
+    personal_agent: Option<std::sync::Arc<personal_agent::PersonalAgentProfile>>,
+    /// The Personal Agent Protocol operations
+    /// (`governance.access.personal_agent.operations`). Installed via
+    /// [`Self::set_pap_operations`] after construction.
+    pap_operations: Option<std::sync::Arc<personal_agent_operations::OperationsService>>,
     /// The gateway's AAuth resource role (`server.aauth_resource_metadata`):
     /// resource-token minting, revocation state, discovery endpoints.
     /// Installed via [`Self::set_aauth_resource`] after construction.

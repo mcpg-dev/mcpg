@@ -7,10 +7,11 @@
 //! the same entry point for plugin HTTP routes.
 
 use super::*;
-use crate::runtime::authorization_server::EmaBearerOutcome;
 use crate::runtime::authorization_server::dpop::{
-    DPOP_HEADER, DPOP_NONCE_HEADER, DPOP_SCHEME, DpopPresentation, DpopTarget, EmaRefusal,
+    DPOP_HEADER, DPOP_JKT_ATTRIBUTE, DPOP_NONCE_HEADER, DPOP_SCHEME, DpopPresentation, DpopTarget,
+    EmaRefusal,
 };
+use crate::runtime::authorization_server::{EmaBearerOutcome, ExternalDpop, ExternalProof};
 
 /// Build a request context with full identity resolution: transport-level + plugin chain.
 ///
@@ -44,6 +45,7 @@ pub(crate) async fn build_full_request_context(
         runtime.jwt_verifier(),
         runtime.oidc_resolver(),
         runtime.ema_authorization_server(),
+        runtime.external_dpop(),
         Some(runtime.plugin_registry()),
         trust_subject_header,
         peer_ip,
@@ -64,7 +66,81 @@ pub(crate) async fn build_full_request_context(
             .await?
         }
     };
-    enforce_aauth_resource_state(ctx, runtime).await
+    let ctx = enforce_aauth_resource_state(ctx, runtime).await?;
+    apply_personal_agent(ctx, runtime).await
+}
+
+/// The Personal Agent Protocol view of a verified caller, while
+/// `governance.access.personal_agent` is set, and the refusal of a Personal
+/// Agent that does not list a required extension (PAP §3.3, §6): 403
+/// `extension_required` on every request, never for one tool.
+async fn apply_personal_agent(
+    mut ctx: RequestContext,
+    runtime: &crate::runtime::GatewayRuntime,
+) -> Result<RequestContext, Response> {
+    let Some(profile) = runtime.personal_agent() else {
+        return Ok(ctx);
+    };
+    let Some(caller) = profile.caller(&ctx.identity).await else {
+        return Ok(ctx);
+    };
+    if let Some(extension) = profile.missing_extension(&caller) {
+        tracing::warn!(
+            request_id = %ctx.request_id.as_str(),
+            client_id = ?caller.client_id,
+            extension,
+            "a Personal Agent without a required extension, refusing it"
+        );
+        let dpop = ctx
+            .identity
+            .attributes()
+            .contains_key(DPOP_JKT_ATTRIBUTE)
+            .then(|| runtime.dpop_challenge())
+            .flatten();
+        return Err(extension_required_response(
+            &ctx.request_id,
+            extension,
+            dpop,
+        ));
+    }
+    ctx.personal_agent = Some(caller);
+    Ok(ctx)
+}
+
+/// HTTP 403 refusing a Personal Agent that does not list `extension`, with
+/// `WWW-Authenticate: <scheme> error="extension_required",
+/// extension="<name>"` in the scheme the caller authenticated with.
+fn extension_required_response(
+    request_id: &GatewayRequestId,
+    extension: &str,
+    dpop: Option<crate::runtime::authorization_server::dpop::DpopChallenge<'_>>,
+) -> Response {
+    let extension = extension.replace(['"', '\\'], "");
+    let challenge = match dpop {
+        Some(dpop) => format!(
+            "{DPOP_SCHEME} error=\"extension_required\", extension=\"{extension}\", algs=\"{}\"",
+            dpop.algs
+        ),
+        None => format!("Bearer error=\"extension_required\", extension=\"{extension}\""),
+    };
+    let mut response = (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": {
+                "code": -32003,
+                "message": format!("this server needs the `{extension}` extension, which the client does not list"),
+            },
+        })),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&challenge) {
+        response
+            .headers_mut()
+            .insert(axum::http::header::WWW_AUTHENTICATE, value);
+    }
+    with_request_id_header(response, request_id)
 }
 
 /// Where the transport cascade's identity came from.
@@ -121,6 +197,7 @@ pub(crate) async fn build_request_context(
     jwt_verifier: Option<&crate::runtime::identity::JwtVerifier>,
     oidc_resolver: Option<&crate::runtime::oidc::OidcOAuthResolver>,
     ema_authorization_server: Option<&crate::runtime::authorization_server::AuthorizationServer>,
+    external_dpop: Option<&ExternalDpop>,
     audit_registry: Option<&mcpg_plugin_host::PluginRegistry>,
     trust_subject_header: bool,
     peer_ip: Option<std::net::IpAddr>,
@@ -180,21 +257,23 @@ pub(crate) async fn build_request_context(
     // never falls through to another verifier, so a forgery cannot
     // shop for a laxer validation path. While DPoP is on, a token
     // presented with the `DPoP` scheme is verified there too, with its
-    // proof, whatever its `iss`: no other verifier reads that scheme.
-    let ema_outcome = match (ema_authorization_server, credential) {
-        (Some(ema), Some((AuthScheme::Bearer, bearer))) => Some(ema.verify_bearer(&bearer)),
-        (Some(ema), Some((AuthScheme::Dpop, token))) if ema.dpop_enabled() => {
-            let presentation = DpopPresentation::from_values(
-                headers
-                    .get_all(DPOP_HEADER)
-                    .iter()
-                    .map(HeaderValue::as_bytes),
-            );
-            Some(
-                ema.verify_dpop(&token, &presentation, target.as_ref())
-                    .await,
-            )
+    // proof: whatever its `iss` when `governance.access.dpop` is off, and
+    // when it names this server otherwise, the rest going to the
+    // verifiers that DPoP covers.
+    let ema_outcome = match (ema_authorization_server, credential.as_ref()) {
+        (Some(ema), Some((AuthScheme::Bearer, bearer))) => Some(ema.verify_bearer(bearer)),
+        (Some(ema), Some((AuthScheme::Dpop, token)))
+            if ema.dpop_enabled() && (external_dpop.is_none() || ema.names_this_issuer(token)) =>
+        {
+            let presentation = dpop_presentation(headers);
+            Some(ema.verify_dpop(token, &presentation, target.as_ref()).await)
         }
+        _ => None,
+    };
+    // The token of a request with the `DPoP` scheme, for the verifiers
+    // `governance.access.dpop` covers.
+    let dpop_token = match (external_dpop, credential.as_ref()) {
+        (Some(_), Some((AuthScheme::Dpop, token))) => Some(token.as_str()),
         _ => None,
     };
     let ema_identity = match ema_outcome {
@@ -278,8 +357,36 @@ pub(crate) async fn build_request_context(
     } else if let Some(identity) = ema_identity {
         identity
     } else if let Some(resolver) = oidc_resolver {
-        match resolver.verify_from_headers(headers).await {
+        let verified = match dpop_token {
+            Some(token) => resolver.verify_access_token(token).await,
+            None => resolver.verify_from_headers(headers).await,
+        };
+        match verified {
             crate::runtime::oidc::OidcVerificationResult::Verified(oidc_id) => {
+                let mut attributes = oidc_id.attributes;
+                match external_binding(
+                    external_dpop,
+                    dpop_token,
+                    oidc_id.confirmation_jkt.as_deref(),
+                    headers,
+                    target.as_ref(),
+                )
+                .await
+                {
+                    Ok(Some(jkt)) => {
+                        attributes.insert(DPOP_JKT_ATTRIBUTE.to_owned(), jkt);
+                    }
+                    Ok(None) => {}
+                    Err(refusal) => {
+                        return Err(external_refusal_response(
+                            refusal,
+                            &request_id,
+                            upstream_request_id,
+                            audit_registry,
+                        )
+                        .await);
+                    }
+                }
                 RequestIdentity::Verified {
                     subject_id: oidc_id.subject_id,
                     issuer: oidc_id.issuer,
@@ -290,7 +397,7 @@ pub(crate) async fn build_request_context(
                     roles: oidc_id.roles,
                     groups: oidc_id.groups,
                     scopes: oidc_id.scopes,
-                    attributes: oidc_id.attributes,
+                    attributes,
                 }
             }
             crate::runtime::oidc::OidcVerificationResult::Invalid(reason) => {
@@ -315,15 +422,52 @@ pub(crate) async fn build_request_context(
                     .with_upstream_request_id(upstream_request_id.clone());
                     let _ = reg.emit_audit_event(&event).await;
                 }
-                return Err(invalid_token_response(&request_id));
+                return Err(refused_token_response(
+                    &request_id,
+                    external_dpop,
+                    dpop_token,
+                    reason,
+                ));
             }
             crate::runtime::oidc::OidcVerificationResult::None => {
                 build_header_or_anonymous_identity(headers, trust_subject_header)
             }
         }
     } else if let Some(verifier) = jwt_verifier {
-        match verifier.verify_from_headers(headers) {
-            crate::runtime::identity::JwtVerificationResult::Verified { subject, issuer } => {
+        let verified = match dpop_token {
+            Some(token) => verifier.verify_access_token(token),
+            None => verifier.verify_from_headers(headers),
+        };
+        match verified {
+            crate::runtime::identity::JwtVerificationResult::Verified {
+                subject,
+                issuer,
+                confirmation_jkt,
+            } => {
+                let mut attributes = std::collections::BTreeMap::new();
+                match external_binding(
+                    external_dpop,
+                    dpop_token,
+                    confirmation_jkt.as_deref(),
+                    headers,
+                    target.as_ref(),
+                )
+                .await
+                {
+                    Ok(Some(jkt)) => {
+                        attributes.insert(DPOP_JKT_ATTRIBUTE.to_owned(), jkt);
+                    }
+                    Ok(None) => {}
+                    Err(refusal) => {
+                        return Err(external_refusal_response(
+                            refusal,
+                            &request_id,
+                            upstream_request_id,
+                            audit_registry,
+                        )
+                        .await);
+                    }
+                }
                 RequestIdentity::Verified {
                     subject_id: subject,
                     issuer: issuer.unwrap_or_default(),
@@ -332,7 +476,7 @@ pub(crate) async fn build_request_context(
                     roles: Vec::new(),
                     groups: Vec::new(),
                     scopes: Vec::new(),
-                    attributes: std::collections::BTreeMap::new(),
+                    attributes,
                 }
             }
             crate::runtime::identity::JwtVerificationResult::Invalid(reason) => {
@@ -354,7 +498,12 @@ pub(crate) async fn build_request_context(
                     .with_upstream_request_id(upstream_request_id.clone());
                     let _ = reg.emit_audit_event(&event).await;
                 }
-                return Err(invalid_token_response(&request_id));
+                return Err(refused_token_response(
+                    &request_id,
+                    external_dpop,
+                    dpop_token,
+                    reason,
+                ));
             }
             crate::runtime::identity::JwtVerificationResult::None => {
                 build_header_or_anonymous_identity(headers, trust_subject_header)
@@ -627,6 +776,105 @@ fn dpop_refusal_response(request_id: &GatewayRequestId, refusal: &EmaRefusal) ->
     }
 }
 
+/// The `DPoP` header values of a request.
+fn dpop_presentation(headers: &HeaderMap) -> DpopPresentation<'_> {
+    DpopPresentation::from_values(
+        headers
+            .get_all(DPOP_HEADER)
+            .iter()
+            .map(HeaderValue::as_bytes),
+    )
+}
+
+/// Why `governance.access.dpop` refuses a token that `oidc_oauth` or
+/// `jwks` accepted.
+enum ExternalRefusal {
+    Refused(EmaRefusal),
+    Unavailable,
+}
+
+/// What `external` makes of a token `oidc_oauth` or `jwks` accepted, bound
+/// to `bound` (`cnf.jkt`), when the request presented it with the `DPoP`
+/// scheme as `dpop_token` or otherwise: the thumbprint of the proven key
+/// for a bound token with a valid proof, `None` for an unbound token
+/// presented another way, or the refusal. Without `external`, nothing is
+/// checked.
+async fn external_binding(
+    external: Option<&ExternalDpop>,
+    dpop_token: Option<&str>,
+    bound: Option<&str>,
+    headers: &HeaderMap,
+    target: Option<&DpopTarget<'_>>,
+) -> Result<Option<String>, ExternalRefusal> {
+    let Some(external) = external else {
+        return Ok(None);
+    };
+    match dpop_token {
+        Some(token) => {
+            let presentation = dpop_presentation(headers);
+            match external.verify(token, bound, &presentation, target).await {
+                ExternalProof::Accepted(jkt) => Ok(Some(jkt)),
+                ExternalProof::Refused(refusal) => Err(ExternalRefusal::Refused(refusal)),
+                ExternalProof::Unavailable => Err(ExternalRefusal::Unavailable),
+            }
+        }
+        None if bound.is_some() => Err(ExternalRefusal::Refused(external.bound_token_as_bearer())),
+        None => match external.unbound_token_refused() {
+            Some(refusal) => Err(ExternalRefusal::Refused(refusal)),
+            None => Ok(None),
+        },
+    }
+}
+
+/// The response to an [`ExternalRefusal`], logged and audited like a
+/// refusal of the embedded server's DPoP.
+async fn external_refusal_response(
+    refusal: ExternalRefusal,
+    request_id: &GatewayRequestId,
+    upstream_request_id: Option<String>,
+    audit_registry: Option<&mcpg_plugin_host::PluginRegistry>,
+) -> Response {
+    let refusal = match refusal {
+        ExternalRefusal::Refused(refusal) => refusal,
+        ExternalRefusal::Unavailable => return replay_unavailable_response(request_id),
+    };
+    tracing::warn!(
+        request_id = %request_id.as_str(),
+        error = refusal.error.as_str(),
+        reason = %refusal.reason,
+        "access token refused with a DPoP challenge, rejecting with 401"
+    );
+    if let Some(reg) = audit_registry {
+        let mut event = mcpg_plugin_host::audit_events::auth_failed_event(
+            "external_dpop",
+            &refusal.reason,
+            request_id.as_str(),
+            "http",
+        )
+        .with_upstream_request_id(upstream_request_id);
+        event.details["error"] = serde_json::json!(refusal.error.as_str());
+        let _ = reg.emit_audit_event(&event).await;
+    }
+    dpop_refusal_response(request_id, &refusal)
+}
+
+/// HTTP 401 for a token `oidc_oauth` or `jwks` refused: with the DPoP
+/// challenge when it came with the `DPoP` scheme under `external`, else
+/// with the Bearer one.
+fn refused_token_response(
+    request_id: &GatewayRequestId,
+    external: Option<&ExternalDpop>,
+    dpop_token: Option<&str>,
+    reason: String,
+) -> Response {
+    match (external, dpop_token) {
+        (Some(external), Some(_)) => {
+            dpop_refusal_response(request_id, &external.invalid_token(reason))
+        }
+        _ => invalid_token_response(request_id),
+    }
+}
+
 /// HTTP 503 for a request whose DPoP proof the replay ledger cannot
 /// record: accepting it unrecorded would let it be replayed.
 fn replay_unavailable_response(request_id: &GatewayRequestId) -> Response {
@@ -763,3 +1011,7 @@ pub(crate) fn lift_idempotency_key_header(
     );
     Ok(body)
 }
+
+#[cfg(test)]
+#[path = "identity_external_dpop_tests.rs"]
+mod external_dpop_tests;

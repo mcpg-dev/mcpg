@@ -80,6 +80,8 @@ pub mod connect;
 pub mod dcr;
 #[path = "authorization_server_dpop.rs"]
 pub mod dpop;
+#[path = "authorization_server_external_dpop.rs"]
+pub mod external_dpop;
 #[path = "authorization_server_grants.rs"]
 pub mod grants;
 #[path = "authorization_server_interactive.rs"]
@@ -100,6 +102,7 @@ pub mod upstream;
 pub mod vault;
 
 pub use clients::CLIENT_ASSERTION_TYPE_JWT_BEARER;
+pub use external_dpop::{ExternalDpop, ExternalProof};
 pub use state::InteractiveState;
 pub use upstream::LoginIdp;
 
@@ -3163,8 +3166,22 @@ impl AuthorizationServer {
         scope: Option<&str>,
         jkt: Option<&str>,
     ) -> String {
+        self.mint_mapped_access_token_for_tests(subject, idp, scope, jkt, BTreeMap::new())
+    }
+
+    /// [`Self::mint_bound_access_token_for_tests`], carrying `attributes` as
+    /// the claims the IdP's mappings filled.
+    pub(crate) fn mint_mapped_access_token_for_tests(
+        &self,
+        subject: &str,
+        idp: &str,
+        scope: Option<&str>,
+        jkt: Option<&str>,
+        attributes: BTreeMap<String, String>,
+    ) -> String {
         let now = now_unix();
         let minted = MintedClaims {
+            attributes,
             cnf: Confirmation::of(jkt.map(str::to_owned)),
             iss: self.issuer.clone(),
             sub: subject.to_owned(),

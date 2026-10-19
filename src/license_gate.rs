@@ -97,6 +97,15 @@ pub fn licensed_config_surfaces(config: &AppConfig) -> Vec<(&'static str, String
     if events.enabled && events.webhook.enabled {
         surfaces.push((FEATURE_EVENTS_WEBHOOKS, EVENTS_WEBHOOK_SURFACE.to_owned()));
     }
+    if config
+        .governance
+        .access
+        .dpop
+        .as_ref()
+        .is_some_and(|dpop| dpop.enabled)
+    {
+        surfaces.push((FEATURE_DPOP, "governance.access.dpop".to_owned()));
+    }
     let Some(ref server) = config.governance.access.authorization_server else {
         return surfaces;
     };

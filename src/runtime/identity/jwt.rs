@@ -20,6 +20,9 @@ pub struct StandardClaims {
     pub iat: Option<u64>,
     #[serde(default)]
     pub nbf: Option<u64>,
+    /// The confirmation claim of a token bound to a key (RFC 9449 §6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +49,8 @@ pub enum JwtVerificationResult {
     Verified {
         subject: String,
         issuer: Option<String>,
+        /// The `cnf.jkt` thumbprint of a token bound to a key.
+        confirmation_jkt: Option<String>,
     },
     /// No bearer token was present in the request.
     None,
@@ -130,6 +135,12 @@ impl JwtVerifier {
             None => return JwtVerificationResult::None,
         };
 
+        self.verify_token(token)
+    }
+
+    /// Verify `token`, an access token the caller already took from its
+    /// request, such as one presented with the `DPoP` scheme.
+    pub fn verify_access_token(&self, token: &str) -> JwtVerificationResult {
         self.verify_token(token)
     }
 
@@ -239,9 +250,18 @@ impl JwtVerifier {
                         "JWT verified successfully"
                     );
 
+                    let confirmation_jkt = token_data
+                        .claims
+                        .cnf
+                        .as_ref()
+                        .and_then(|cnf| cnf.get("jkt"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|jkt| !jkt.is_empty())
+                        .map(str::to_owned);
                     return JwtVerificationResult::Verified {
                         subject,
                         issuer: token_data.claims.iss,
+                        confirmation_jkt,
                     };
                 }
                 Err(e) => {
@@ -336,6 +356,7 @@ mod tests {
             exp: Some(jsonwebtoken::get_current_timestamp() + 3600),
             iat: Some(jsonwebtoken::get_current_timestamp()),
             nbf: None,
+            cnf: None,
         }
     }
 
@@ -367,9 +388,14 @@ mod tests {
         headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
 
         match verifier.verify_from_headers(&headers) {
-            JwtVerificationResult::Verified { subject, issuer } => {
+            JwtVerificationResult::Verified {
+                subject,
+                issuer,
+                confirmation_jkt,
+            } => {
                 assert_eq!(subject, "user-42");
                 assert_eq!(issuer.as_deref(), Some("test-issuer"));
+                assert_eq!(confirmation_jkt, None);
             }
             other => panic!("expected Verified, got {other:?}"),
         }

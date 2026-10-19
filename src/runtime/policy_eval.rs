@@ -476,10 +476,24 @@ impl GatewayRuntime {
             _ => serde_json::Map::new(),
         };
         if let Some(scopes) = &denial.insufficient_scope {
-            obj.insert(
-                crate::transports::http::INSUFFICIENT_SCOPE_DATA_KEY.to_owned(),
-                serde_json::Value::String(scopes.join(" ")),
-            );
+            // A signed-out Personal Agent Protocol Session signs in rather
+            // than asking for more scopes (PAP §6). A plain MCP client signed
+            // in with MCP's own flow, so it is never told to.
+            if request_context
+                .personal_agent
+                .as_ref()
+                .is_some_and(|caller| caller.is_personal_agent() && !caller.signed_in)
+            {
+                obj.insert(
+                    crate::transports::http::SIGN_IN_REQUIRED_DATA_KEY.to_owned(),
+                    serde_json::Value::Bool(true),
+                );
+            } else {
+                obj.insert(
+                    crate::transports::http::INSUFFICIENT_SCOPE_DATA_KEY.to_owned(),
+                    serde_json::Value::String(scopes.join(" ")),
+                );
+            }
         }
         if obj.is_empty() {
             None

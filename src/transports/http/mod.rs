@@ -62,6 +62,7 @@ mod events_stream;
 mod events_webhooks;
 mod identity;
 mod oauth_browser;
+mod personal_agent_operations;
 mod probes;
 mod response;
 mod sse;
@@ -72,7 +73,8 @@ pub(crate) use discovery::{
     aauth_authorize_handler, aauth_jwks_handler, aauth_resource_metadata_handler,
     aauth_revoke_handler, oauth_authorization_server_metadata_handler, oauth_jwks_handler,
     oauth_protected_resource_handler, oauth_register_handler, oauth_revoke_handler,
-    oauth_token_handler, served_registry_list_handler, served_registry_version_handler,
+    oauth_token_handler, poppy_document_handler, served_registry_list_handler,
+    served_registry_version_handler,
 };
 pub(crate) use identity::{build_full_request_context, lift_idempotency_key_header};
 pub(crate) use oauth_browser::{
@@ -81,10 +83,10 @@ pub(crate) use oauth_browser::{
 };
 pub(crate) use probes::{health_handler, metrics_handler, readiness_handler, runtime_handler};
 pub(crate) use response::{
-    INSUFFICIENT_SCOPE_DATA_KEY, RETRY_AFTER_DATA_KEY, challenge_scope, map_gateway_response,
-    map_protocol_error_response, map_protocol_error_with_status, map_sse_events,
-    map_transport_rejection, reject_method_on_modern_wire, request_host, resource_metadata_url,
-    retry_after_data, strip_internal_markers, with_request_id_header,
+    INSUFFICIENT_SCOPE_DATA_KEY, RETRY_AFTER_DATA_KEY, SIGN_IN_REQUIRED_DATA_KEY, challenge_scope,
+    map_gateway_response, map_protocol_error_response, map_protocol_error_with_status,
+    map_sse_events, map_transport_rejection, reject_method_on_modern_wire, request_host,
+    resource_metadata_url, retry_after_data, strip_internal_markers, with_request_id_header,
     with_resource_metadata_pointer, with_session_id_header, with_www_authenticate_challenge,
 };
 pub(crate) use sse::{
@@ -305,6 +307,22 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         .route(
             "/.well-known/oauth-protected-resource/{*resource_path}",
             get(oauth_protected_resource_handler),
+        )
+        // Personal Agent Protocol discovery (`personal_agent.discovery`).
+        .route("/.well-known/poppy.json", get(poppy_document_handler))
+        // The operations endpoint (`personal_agent.operations`); 404 while
+        // unset.
+        .route(
+            "/poppy/operations/{operation_id}",
+            get(personal_agent_operations::pap_operation_handler),
+        )
+        .route(
+            "/poppy/operations/{operation_id}/confirm",
+            post(personal_agent_operations::pap_operation_confirm_handler),
+        )
+        .route(
+            "/poppy/operations/{operation_id}/cancel",
+            post(personal_agent_operations::pap_operation_cancel_handler),
         );
     let authorization_server = Router::new()
         .route(
@@ -907,9 +925,7 @@ fn authentication_required_response(
         challenge_scope(config).as_deref(),
         aauth,
         caller,
-        runtime
-            .ema_authorization_server()
-            .and_then(|server| server.dpop_challenge()),
+        runtime.dpop_challenge(),
     );
     Some(with_request_id_header(
         response,
@@ -1246,9 +1262,7 @@ async fn finish_response(
             resource,
             identity: caller,
         });
-    let dpop_challenge = runtime
-        .ema_authorization_server()
-        .and_then(|server| server.dpop_challenge());
+    let dpop_challenge = runtime.dpop_challenge();
     // SEP-2567/2575: a 2026-07-28 server MUST NOT surface `Mcp-Session-Id`
     // on the wire. The synthetic operational session still exists
     // internally (clustering / MRTR resume / delivery re-keying) but is

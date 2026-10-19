@@ -1,6 +1,6 @@
 [package]
 name = "mcpg"
-version = "0.1.0-beta.65"
+version = "0.1.0-beta.66"
 license = "Apache-2.0"
 edition = "2024"
 description = "MCPG gateway — the governed MCP endpoint. Binary: `mcpg`."
@@ -92,7 +92,7 @@ mcpg-plugin-storage-s3 = { git = "https://github.com/mcpg-dev/mcpg-plugin-storag
 # re-exports, the SSRF guard config validation calls, the resolver the
 # authorization server builds on). The plugin-ABI wrapper is a separate
 # crate — the gateway links the library, not the plugin.
-mcpg-plugin-identity-oidc-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-identity-oidc-core", tag = "v0.1.0-beta.40", version = "=0.1.0-beta.40" }
+mcpg-plugin-identity-oidc-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-identity-oidc-core", tag = "v0.1.0-beta.41", version = "=0.1.0-beta.41" }
 # CP-attached integration: optional dep gated by the `cp-attached`
 # feature so the flagship `mcpg` build stays lean.
 mcpg-control-plane-client = { git = "https://github.com/mcpg-dev/mcpg-control-plane-client", tag = "v0.1.0-beta.48", version = "=0.1.0-beta.48", optional = true }

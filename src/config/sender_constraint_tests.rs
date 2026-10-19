@@ -328,3 +328,61 @@ fn max_entries_is_bounded() {
         config.validate().expect("the bounds validate");
     }
 }
+
+/// A resource that verifies a Company's tokens with `jwks` and takes them
+/// with DPoP (`governance.access.dpop`).
+fn external(dpop: &str, verifier: bool, resource: bool) -> AppConfig {
+    let mut yaml = String::from("governance:\n  access:\n");
+    if verifier {
+        yaml.push_str(
+            "    jwks:\n      url: https://auth.example.com/jwks\n      issuer: \
+             https://auth.example.com\n      audience: https://mcp.example.com/mcp\n",
+        );
+    }
+    if resource {
+        yaml.push_str("    resource_metadata:\n      resource: https://mcp.example.com/mcp\n");
+    }
+    yaml.push_str(&format!("    dpop: {dpop}\n"));
+    serde_yaml::from_str(&yaml).expect("test config parses")
+}
+
+#[test]
+fn external_dpop_needs_a_verifier_a_resource_and_no_nonce() {
+    external("{ enabled: true }", true, true)
+        .validate()
+        .expect("a resource with jwks validates");
+    external("{ enabled: false }", false, false)
+        .validate()
+        .expect("a block that leaves it off needs nothing");
+    refused(
+        &external("{ enabled: true }", false, true),
+        "governance.access.dpop.enabled needs `oidc_oauth` or `jwks`",
+    );
+    refused(
+        &external("{ enabled: true }", true, false),
+        "governance.access.dpop.enabled needs `resource_metadata`",
+    );
+    refused(
+        &external("{ enabled: true, nonce: always }", true, true),
+        "governance.access.dpop.nonce must be `off`",
+    );
+    refused(
+        &external("{ enabled: true, allowed_algs: [HS256] }", true, true),
+        "governance.access.dpop.allowed_algs",
+    );
+    refused(
+        &external("{ required: true }", true, true),
+        "governance.access.dpop.required needs enabled: true",
+    );
+}
+
+#[test]
+fn external_dpop_is_a_licensed_surface_only_while_on() {
+    let on = external("{ enabled: true }", true, true);
+    assert!(
+        crate::license_gate::licensed_config_surfaces(&on)
+            .contains(&("oauth.dpop", "governance.access.dpop".to_owned()))
+    );
+    let off = external("{ enabled: false }", true, true);
+    assert!(crate::license_gate::licensed_config_surfaces(&off).is_empty());
+}

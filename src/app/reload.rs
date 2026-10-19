@@ -355,6 +355,26 @@ pub(crate) async fn reload_with_config(
             &tenant_seg,
             old_runtime.ema_authorization_server(),
         )?);
+        let external_dpop = crate::app::auth_wiring::wire_external_dpop(
+            &new_config,
+            cluster_backend.as_ref(),
+            &state_cipher,
+            &tenant_seg,
+            new_runtime.ema_authorization_server(),
+            old_runtime.external_dpop(),
+        )?;
+        new_runtime.set_external_dpop(external_dpop);
+        new_runtime.set_personal_agent(crate::app::auth_wiring::wire_personal_agent(
+            &new_config,
+            old_runtime.personal_agent_shared(),
+        )?);
+        new_runtime.set_pap_operations(crate::app::auth_wiring::wire_pap_operations(
+            &new_config,
+            cluster_backend.as_ref(),
+            &state_cipher,
+            &tenant_seg,
+            old_runtime.pap_operations(),
+        )?);
     }
     new_runtime.set_aauth_resource(crate::app::auth_wiring::build_aauth_resource(&new_config)?);
     #[cfg(feature = "governance-quotas")]

@@ -41,6 +41,7 @@ pub mod interactive_login;
 pub mod license;
 pub mod mcp;
 pub mod observability;
+pub mod personal_agent;
 pub mod plugins;
 pub mod policy;
 pub mod quotas;

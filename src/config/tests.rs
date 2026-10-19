@@ -2217,6 +2217,8 @@ fn validate_accepts_valid_jwks_auth_config() {
             access: AccessConfig {
                 authorization_server: None,
                 require_authentication: false,
+                dpop: None,
+                personal_agent: None,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2244,6 +2246,8 @@ fn validate_accepts_minimal_jwks_auth_config() {
             access: AccessConfig {
                 authorization_server: None,
                 require_authentication: false,
+                dpop: None,
+                personal_agent: None,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2271,6 +2275,8 @@ fn validate_rejects_jwks_without_url_or_keys() {
             access: AccessConfig {
                 authorization_server: None,
                 require_authentication: false,
+                dpop: None,
+                personal_agent: None,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2299,6 +2305,8 @@ fn validate_rejects_non_http_jwks_url() {
             access: AccessConfig {
                 authorization_server: None,
                 require_authentication: false,
+                dpop: None,
+                personal_agent: None,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2327,6 +2335,8 @@ fn validate_rejects_whitespace_only_jwks_issuer() {
             access: AccessConfig {
                 authorization_server: None,
                 require_authentication: false,
+                dpop: None,
+                personal_agent: None,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2355,6 +2365,8 @@ fn validate_rejects_empty_jwks_header_name() {
             access: AccessConfig {
                 authorization_server: None,
                 require_authentication: false,
+                dpop: None,
+                personal_agent: None,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {
@@ -2383,6 +2395,8 @@ fn validate_accepts_jwks_with_inline_keys_json() {
             access: AccessConfig {
                 authorization_server: None,
                 require_authentication: false,
+                dpop: None,
+                personal_agent: None,
                 oidc_oauth: None,
                 resource_metadata: None,
                 jwks: Some(JwksConfig {

@@ -317,8 +317,10 @@ Where the AAuth resource signing key comes from — exactly one source.
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `authorization_server` | [`AuthorizationServerConfig`](#authorizationserverconfig) (optional) |  | Embedded Enterprise-Managed Authorization server (MCP `io.modelcontextprotocol/enterprise-managed-authorization`). When set, the gateway acts as the OAuth Resource Authorization Server for ID-JAG grants: it serves RFC 8414 metadata at `GET /.well-known/oauth-authorization-server` advertising the `urn:ietf:params:oauth:grant-profile:id-jag` grant profile, and redeems Identity Assertion JWT Authorization Grants issued by the configured trusted enterprise IdPs at `POST /oauth/token` (`urn:ietf:params:oauth:grant-type:jwt-bearer`), minting audience-restricted access tokens the gateway itself accepts. With a `trusted_idps[].login` block it also signs users in interactively: an authorization endpoint (`authorization_code` with PKCE) that sends the user to that IdP, rotating refresh tokens, and optional dynamic client registration (see `interactive`). Without one there is no authorization endpoint, no refresh token and no registration endpoint. Requires `resource_metadata`, which is how clients discover this server. |
+| `dpop` | [`DpopConfig`](#dpopconfig) (optional) |  | DPoP (RFC 9449) for the access tokens that `oidc_oauth` or `jwks` verifies, such as a Personal Agent Protocol Company's Session Tokens. With `enabled: true`, a token presented with `Authorization: DPoP` is verified like a Bearer token and must carry `cnf.jkt` (in the JWT, or in the introspection response); its one `DPoP` proof must pass every check of RFC 9449 §4.3 (`typ`, an allowed asymmetric `alg`, a public key only, the signature, `htm` and `htu` against the request under a `resource_metadata` resource, `iat` within `proof_max_age_secs`, and `ath`), be of that key, and be unspent; it is then recorded in the replay ledger every replica shares. A token with `cnf` presented with `Bearer` is refused, and a Bearer token without `cnf` keeps working unless `required` is set. The caller carries the key's thumbprint as the `dpop_jkt` attribute, and the protected resource metadata publishes `dpop_signing_alg_values_supported`. `nonce` must stay `off`: no key is there to derive nonces from. Tokens of `authorization_server` follow `authorization_server.dpop` instead. Requires `oidc_oauth` or `jwks`, and `resource_metadata`; `enabled: true` requires a licence with the `oauth.dpop` feature. |
 | `jwks` | [`JwksConfig`](#jwksconfig) (optional) |  |  |
 | `oidc_oauth` | [`OidcOAuthConfig`](#oidcoauthconfig) (optional) |  | Inbound OIDC: verifies Bearer tokens against each provider. A provider's `claim_mappings.attribute_claim_mappings` may not map to an attribute that only a credential of this gateway sets (`token_issuer`, `grant_type`, `grant_id`, `dpop_jkt`, `authorization_details`, `authorization_details_types`) or to a name starting with `subject_token`: such a configuration is refused at load, whether DPoP and authorization details are on or not. An identity plugin's attributes of those six names are dropped. |
+| `personal_agent` | [`PersonalAgentConfig`](#personalagentconfig) (optional) |  | Serve as a Personal Agent Protocol Company's MCP server: read the Session Token's PAP values from identity attributes, answer a signed-out Personal Agent a tool's scopes refuse with `sign_in_required` (403) instead of `insufficient_scope`, read the extensions a Personal Agent lists, refuse one without `require_extensions`, serve `poppy.json`, and turn chosen tools into operations the Personal Agent confirms. Requires `oidc_oauth` or `jwks`; only `oidc_oauth` maps claims to identity attributes, so with `jwks` alone every caller is a plain MCP client. |
 | `require_authentication` | boolean | `false` | Refuse every MCP request (`POST`, `GET` and `DELETE` on the MCP path, every JSON-RPC method including `initialize`, `*/list` and `server/discover`) from a caller below `verified` with HTTP 401 and the `WWW-Authenticate: Bearer resource_metadata="…"` challenge. An OAuth or EMA client that authenticates only after a 401 starts its flow from that challenge; with this off, an anonymous `initialize` succeeds and such a client never authenticates. A request whose `Origin` is not allowed is still refused with 403 first. Only the MCP path is covered: the well-known metadata, the embedded authorization server's `/oauth/*` endpoints (`token`, `jwks`, `revoke`, `register`, `authorize`, `consent`, `callback`, `connect`), the AAuth resource endpoints, health, readiness, metrics, `/runtime`, `/v0.1/servers`, the `/webhooks/*` callbacks and the plugin HTTP routes (`/plugins/{id}/{entity}` and override paths) stay open to anonymous callers, each gated as it is without this key. Needs at least one verifier: `jwks`, `oidc_oauth`, `authorization_server` or an `identity_provider` plugin. |
 | `resource_metadata` | [`OAuthResourceMetadataConfig`](#oauthresourcemetadataconfig) (optional) |  | OAuth 2.1 Protected Resource Metadata (RFC 9728), served at `GET /.well-known/oauth-protected-resource` and its path-aware form. Without it that endpoint answers 404: the gateway never guesses its public `resource` from the bind address. Required with `authorization_server`. |
 
@@ -344,6 +346,28 @@ Where the AAuth resource signing key comes from — exactly one source.
 | `bind_address` | string | `"127.0.0.1:9090"` |  |
 | `disclosure` | [`DisclosureLevel`](#disclosurelevel) | `"summary"` |  |
 | `enabled` | boolean | `false` |  |
+
+### `AgentExtensionsConfig`
+
+Where a Personal Agent's extensions are read.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `allow_private_network` | boolean | `false` | Fetch client metadata documents from private addresses too. For a test network only. |
+| `allowed_hosts` | array&lt;string&gt; | `[]` | Hosts a client metadata document may be fetched from; empty allows any public host. |
+| `attribute` | string | `"agent_extensions"` | The identity attribute read with `source: attribute`. |
+| `cache_secs` | integer | `3600` | How long a fetched document is used, in seconds (60–86400); its `Cache-Control: max-age` shortens it. |
+| `source` | [`AgentExtensionsSource`](#agentextensionssource) | `"client_metadata"` | `client_metadata`: from `extensions` of the client metadata document at the agent's `client_id` URL, fetched over https without redirects, private addresses refused, and cached. `attribute`: from the identity attribute `attribute`, a JSON object of name to `{ "version": … }` or a space-separated list of names. `none`: no agent lists any. |
+
+### `AgentExtensionsSource`
+
+See [`AgentExtensionsConfig::source`].
+
+**Allowed values:**
+
+- `client_metadata`
+- `attribute`
+- `none`
 
 ### `Align`
 
@@ -776,7 +800,7 @@ Direct `tools/call` always runs the full pre-dispatch stack; the child path an L
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `attribute_claim_mappings` | map&lt;string, string&gt; | `{}` |  |
+| `attribute_claim_mappings` | map&lt;string, string&gt; | `{}` | Claim path (dotted, as `realm_access.roles`) to the identity attribute it fills. A string claim maps as it is, a number or boolean as its JSON text, an object or array as compact JSON. |
 | `group_claim_paths` | array&lt;string&gt; | `[]` |  |
 | `role_claim_paths` | array&lt;string&gt; | `[]` |  |
 | `scope_claim_paths` | array&lt;string&gt; | (see type) |  |
@@ -2020,6 +2044,64 @@ Policy for `deprecated` servers.
 
 - **`exclude`** — Drop the federation (clients see `list_changed`).
 
+### `OperationToolConfig`
+
+One tool that proposes an operation.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `action_key` | string (optional) |  | The same action proposed again with this key, while its operation is still `proposed`, revises that operation instead of proposing a new one: equal terms return it as it is, other terms make the next revision. A template over the arguments; unset, every call proposes a new operation. |
+| `expires_after_secs` | integer | `900` | How long a revision can be confirmed, in seconds (60–86400). |
+| `summary` | string |  | The terms in plain language, so the User can decide from them alone: what will happen, to what, and any cost, date or condition. A template over the call's arguments (`${arguments.order_id}`). The operation's `terms` are the validated arguments. |
+| `tool` | string |  | The MCP tool name. |
+| `url` | string (optional) |  | A page of the Company's website that shows the operation, a template over the arguments. |
+| `user_approval_required` | boolean | `false` | Accept only the User's approval of each revision, not a standing permission. |
+
+### `OperationsConfig`
+
+`governance.access.personal_agent.operations`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `confirm_wait_secs` | integer | `5` | How long a confirm waits for the action to finish before it answers `in_progress` with `Retry-After`, in seconds (1–30). |
+| `endpoint` | string |  | The operations endpoint's public URL, published in `poppy.json` as `extensions.operations.endpoint`: an https URL on the origin of a `resource_metadata` resource, with the path `/poppy/operations`, where the gateway serves it. It takes DPoP Session Tokens only, so `governance.access.dpop` (or the embedded server's `dpop`) must be on. |
+| `retain_final_secs` | integer | `604800` | How long a final operation stays readable, in seconds (3600–2592000). |
+| `tools` | array&lt;[`OperationToolConfig`](#operationtoolconfig)&gt; |  | The tools that propose an operation. |
+| `without_extension` | [`OperationsWithoutExtension`](#operationswithoutextension) | `"perform"` | What a tool call by a Personal Agent that does not list the extension does: `perform` runs the tool as without the extension; `refuse_agent` refuses such a Personal Agent on every request with `extension_required`, as `require_extensions` does. Plain MCP clients always run the tool. |
+
+### `OperationsWithoutExtension`
+
+See [`OperationsConfig::without_extension`].
+
+**Allowed values:**
+
+- `perform`
+- `refuse_agent`
+
+### `PersonalAgentAttributes`
+
+Identity attribute names of the PAP values of a Session Token.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `account` | string | `"account"` | The account the Session is signed in to, set only while it is. |
+| `client_id` | string | `"client_id"` | The Personal Agent's `client_id`: the URL of its client metadata document. |
+| `session_id` | string | `"session_id"` | The Session the token was issued for. |
+| `signed_in` | string | `"signed_in"` | `true` while the Session is signed in. Without this attribute, a caller is signed in when it has the `account` attribute. |
+| `user_id` | string | `"user_id"` | The User ID the Personal Agent gave the User at this Company. A plain MCP client's Session has none. |
+
+### `PersonalAgentConfig`
+
+The Personal Agent Protocol profile of the resource.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `agent_extensions` | [`AgentExtensionsConfig`](#agentextensionsconfig) | (see type) | Where the gateway reads the extensions a Personal Agent supports. |
+| `attributes` | [`PersonalAgentAttributes`](#personalagentattributes) | (see type) | The identity attributes that carry the Session Token's PAP values, filled by the verifier's claim mappings (for `oidc_oauth`, `claim_mappings.attribute_claim_mappings`). A caller with a `client_id` attribute is a Personal Agent; one without is a plain MCP client, which signed in with MCP's own flow. |
+| `discovery` | [`PoppyDiscoveryConfig`](#poppydiscoveryconfig) (optional) |  | The Company's `poppy.json`, served at `GET /.well-known/poppy.json`. |
+| `operations` | [`OperationsConfig`](#operationsconfig) (optional) |  | The operations extension, version 1: the listed tools propose an operation instead of acting, and the Personal Agent confirms it once at the operations endpoint. |
+| `require_extensions` | array&lt;string&gt; | `[]` | Extensions a Personal Agent must list to use this server at all: one that does not is refused on every request with 403 and `WWW-Authenticate: <scheme> error="extension_required", extension="<name>"`. Plain MCP clients are not refused. A plain name (`operations`) is one the protocol defines; any other starts with a domain (`example.com/gift-wrap`). |
+
 ### `PipelinesConfig`
 
 `pipelines:` config — pipeline state store + per-capability `store:` override. When `store` is unset, the pipeline KV inherits from the cluster's `key_value_store()` primitive.
@@ -2173,6 +2255,14 @@ Configuration for the policy decision cache (L1 process-local).
 | `cache` | [`PolicyCacheConfig`](#policycacheconfig) | (see type) |  |
 | `engine` | array&lt;[`KindRef`](#kindref)&gt; |  | Ordered chain of policy engines consulted at every decision point (`tool.call.pre`, `plugin.lifecycle.register`, etc.). Each entry is a [`KindRef`] — `kind:` resolves to a built-in keyword (`yaml-rules`), a short alias (`cedar`, `opa`, `casbin` → `dev.mcpg.policy.<alias>`), or a full reverse-domain plugin id. Chain semantics: the host walks the list in order, short-circuiting on the first `Allow` / `Deny`; `NotApplicable` falls through to the next engine. An empty chain is equivalent to `NotApplicable` everywhere — callers (e.g. `enforce_plugin_registration_policy`) decide whether that means "allow" (default-allow gateway) or "fail-closed" per their own policy posture. |
 | `tool_access` | [`ToolAccessPolicyConfig`](#toolaccesspolicyconfig) | (see type) |  |
+
+### `PoppyDiscoveryConfig`
+
+The `poppy.json` document the gateway serves.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `document` | any |  | The document, served as it is with `Cache-Control: max-age=300`. It needs `protocol_version` `0.x`, `organization.name` and `organization.domain`, and https URLs for `auth.issuer` and every `apis[].url`. PAP binds the document to the host that serves it, so publish it on the Company's own domain only. |
 
 ### `PromptArgumentConfig`
 

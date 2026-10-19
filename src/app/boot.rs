@@ -443,6 +443,23 @@ async fn build_with(
         &tenant_seg,
         None,
     )?);
+    let external_dpop = crate::app::auth_wiring::wire_external_dpop(
+        &config,
+        cluster_backend.as_ref(),
+        &state_cipher,
+        &tenant_seg,
+        runtime.ema_authorization_server(),
+        None,
+    )?;
+    runtime.set_external_dpop(external_dpop);
+    runtime.set_personal_agent(crate::app::auth_wiring::wire_personal_agent(&config, None)?);
+    runtime.set_pap_operations(crate::app::auth_wiring::wire_pap_operations(
+        &config,
+        cluster_backend.as_ref(),
+        &state_cipher,
+        &tenant_seg,
+        None,
+    )?);
     runtime.set_aauth_resource(crate::app::auth_wiring::build_aauth_resource(&config)?);
 
     // Install the runtime quota gate so the

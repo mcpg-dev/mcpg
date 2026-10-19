@@ -143,6 +143,57 @@ impl GatewayRuntime {
         self.ema_authorization_server = server;
     }
 
+    /// DPoP for externally issued access tokens, while
+    /// `governance.access.dpop` is on.
+    pub fn external_dpop(&self) -> Option<&crate::runtime::authorization_server::ExternalDpop> {
+        self.external_dpop.as_deref()
+    }
+
+    /// Install DPoP for externally issued access tokens. Called once right
+    /// after construction (and after each config-reload rebuild), before
+    /// the runtime is shared.
+    pub fn set_external_dpop(
+        &mut self,
+        dpop: Option<std::sync::Arc<crate::runtime::authorization_server::ExternalDpop>>,
+    ) {
+        self.external_dpop = dpop;
+    }
+
+    /// The Personal Agent Protocol profile, while
+    /// `governance.access.personal_agent` is set.
+    pub fn personal_agent(&self) -> Option<&crate::runtime::personal_agent::PersonalAgentProfile> {
+        self.personal_agent.as_deref()
+    }
+
+    /// The installed profile, shared, for a reload to keep while its config
+    /// is unchanged, and with it the documents it has read.
+    pub fn personal_agent_shared(
+        &self,
+    ) -> Option<std::sync::Arc<crate::runtime::personal_agent::PersonalAgentProfile>> {
+        self.personal_agent.clone()
+    }
+
+    /// Install the Personal Agent Protocol profile. Called once right after
+    /// construction (and after each config-reload rebuild), before the
+    /// runtime is shared.
+    pub fn set_personal_agent(
+        &mut self,
+        profile: Option<std::sync::Arc<crate::runtime::personal_agent::PersonalAgentProfile>>,
+    ) {
+        self.personal_agent = profile;
+    }
+
+    /// What the resource's challenges say about DPoP: the embedded
+    /// authorization server's while its DPoP is on, else that of
+    /// `governance.access.dpop`.
+    pub fn dpop_challenge(
+        &self,
+    ) -> Option<crate::runtime::authorization_server::dpop::DpopChallenge<'_>> {
+        self.ema_authorization_server()
+            .and_then(|server| server.dpop_challenge())
+            .or_else(|| self.external_dpop().map(|dpop| dpop.challenge()))
+    }
+
     /// The AAuth resource role, when `server.aauth_resource_metadata` is set.
     pub fn aauth_resource(&self) -> Option<&crate::runtime::aauth_resource::AauthResource> {
         self.aauth_resource.as_deref()

@@ -60,6 +60,38 @@ pub struct AccessConfig {
     /// `resource_metadata`, which is how clients discover this server.
     #[serde(default)]
     pub authorization_server: Option<AuthorizationServerConfig>,
+    /// DPoP (RFC 9449) for the access tokens that `oidc_oauth` or `jwks`
+    /// verifies, such as a Personal Agent Protocol Company's Session
+    /// Tokens. With `enabled: true`, a token presented with
+    /// `Authorization: DPoP` is verified like a Bearer token and must carry
+    /// `cnf.jkt` (in the JWT, or in the introspection response); its one
+    /// `DPoP` proof must pass every check of RFC 9449 §4.3 (`typ`, an
+    /// allowed asymmetric `alg`, a public key only, the signature, `htm`
+    /// and `htu` against the request under a `resource_metadata`
+    /// resource, `iat` within `proof_max_age_secs`, and `ath`), be of that
+    /// key, and be unspent; it is then recorded in the replay ledger every
+    /// replica shares. A token with `cnf` presented with `Bearer` is
+    /// refused, and a Bearer token without `cnf` keeps working unless
+    /// `required` is set. The caller carries the key's thumbprint as the
+    /// `dpop_jkt` attribute, and the protected resource metadata publishes
+    /// `dpop_signing_alg_values_supported`. `nonce` must stay `off`: no
+    /// key is there to derive nonces from. Tokens of `authorization_server`
+    /// follow `authorization_server.dpop` instead. Requires `oidc_oauth` or
+    /// `jwks`, and `resource_metadata`; `enabled: true` requires a licence
+    /// with the `oauth.dpop` feature.
+    #[serde(default)]
+    pub dpop: Option<DpopConfig>,
+    /// Serve as a Personal Agent Protocol Company's MCP server: read the
+    /// Session Token's PAP values from identity attributes, answer a
+    /// signed-out Personal Agent a tool's scopes refuse with
+    /// `sign_in_required` (403) instead of `insufficient_scope`, read the
+    /// extensions a Personal Agent lists, refuse one without
+    /// `require_extensions`, serve `poppy.json`, and turn chosen tools into
+    /// operations the Personal Agent confirms. Requires `oidc_oauth` or
+    /// `jwks`; only `oidc_oauth` maps claims to identity attributes, so with
+    /// `jwks` alone every caller is a plain MCP client.
+    #[serde(default)]
+    pub personal_agent: Option<super::personal_agent::PersonalAgentConfig>,
     /// Refuse every MCP request (`POST`, `GET` and `DELETE` on the MCP
     /// path, every JSON-RPC method including `initialize`, `*/list` and
     /// `server/discover`) from a caller below `verified` with HTTP 401
@@ -1679,6 +1711,71 @@ fn well_known_resource_metadata_url(resource: &str) -> String {
 }
 
 impl AccessConfig {
+    /// The operations endpoint takes DPoP Session Tokens only, and a proof
+    /// names a request under a `resource_metadata` resource's origin.
+    fn validate_operations_endpoint(
+        &self,
+        operations: &super::personal_agent::OperationsConfig,
+    ) -> Result<()> {
+        const AT: &str = "governance.access.personal_agent.operations.endpoint";
+        let external = self.dpop.as_ref().is_some_and(|dpop| dpop.enabled);
+        let embedded = self
+            .authorization_server
+            .as_ref()
+            .is_some_and(|authz| authz.dpop.enabled);
+        if !external && !embedded {
+            return Err(anyhow::anyhow!(
+                "{AT} takes DPoP Session Tokens only: turn on governance.access.dpop"
+            ));
+        }
+        let origin = |raw: &str| {
+            url::Url::parse(raw)
+                .ok()
+                .map(|url| url.origin().ascii_serialization())
+        };
+        let endpoint = origin(&operations.endpoint);
+        let served = self.resource_metadata.as_ref().is_some_and(|metadata| {
+            metadata
+                .resources()
+                .any(|resource| origin(resource) == endpoint)
+        });
+        if !served {
+            return Err(anyhow::anyhow!(
+                "{AT} `{}` must be on the origin of a resource_metadata resource, where DPoP \
+                 proofs of its requests are checked",
+                operations.endpoint
+            ));
+        }
+        Ok(())
+    }
+
+    /// `governance.access.dpop`: the shared DPoP checks, and what the
+    /// resource needs to verify proofs for externally issued tokens.
+    fn validate_external_dpop(&self, dpop: &DpopConfig) -> Result<()> {
+        const AT: &str = "governance.access.dpop";
+        dpop.validate(AT)?;
+        if !dpop.enabled {
+            return Ok(());
+        }
+        if dpop.nonce != super::sender_constraint::DpopNonceMode::Off {
+            return Err(anyhow::anyhow!(
+                "{AT}.nonce must be `off`: nonces for externally issued tokens are not offered"
+            ));
+        }
+        if self.oidc_oauth.is_none() && self.jwks.is_none() {
+            return Err(anyhow::anyhow!(
+                "{AT}.enabled needs `oidc_oauth` or `jwks`: it applies to the tokens they verify"
+            ));
+        }
+        if self.resource_metadata.is_none() {
+            return Err(anyhow::anyhow!(
+                "{AT}.enabled needs `resource_metadata`: a proof's `htu` must name a request \
+                 under one of its resources"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if let Some(ref jwks) = self.jwks {
             jwks.validate()?;
@@ -1707,6 +1804,21 @@ impl AccessConfig {
         }
         if let Some(ref rm) = self.resource_metadata {
             rm.validate()?;
+        }
+        if let Some(ref dpop) = self.dpop {
+            self.validate_external_dpop(dpop)?;
+        }
+        if let Some(ref personal_agent) = self.personal_agent {
+            personal_agent.validate()?;
+            if self.oidc_oauth.is_none() && self.jwks.is_none() {
+                return Err(anyhow::anyhow!(
+                    "governance.access.personal_agent needs `oidc_oauth` or `jwks`: the \
+                     Company's authorization server issues the Session Tokens"
+                ));
+            }
+            if let Some(ref operations) = personal_agent.operations {
+                self.validate_operations_endpoint(operations)?;
+            }
         }
         if let Some(ref authz) = self.authorization_server {
             authz.validate()?;

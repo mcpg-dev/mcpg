@@ -148,6 +148,14 @@ impl DpopSettings {
         &self.alg_names
     }
 
+    /// The last second a proof made at `iat` is accepted, and so how long
+    /// it stays in the replay ledger: its age limit plus the clock skew on
+    /// both sides.
+    pub(super) fn accepted_until(&self, iat: u64) -> u64 {
+        iat.saturating_add(self.max_age)
+            .saturating_add(self.skew.saturating_mul(2))
+    }
+
     /// The `algs` auth-param of a DPoP challenge (RFC 9449 §7.1).
     pub(super) fn algs_param(&self) -> &str {
         &self.algs_param
@@ -487,7 +495,7 @@ fn numeric_date(value: &serde_json::Value) -> Option<u64> {
     })
 }
 
-fn invalid(reason: DpopReason, description: impl Into<String>) -> DpopFailure {
+pub(super) fn invalid(reason: DpopReason, description: impl Into<String>) -> DpopFailure {
     DpopFailure::Invalid(reason, description.into())
 }
 
@@ -894,6 +902,13 @@ impl AuthorizationServer {
         self.dpop.enabled
     }
 
+    /// Whether `token` names this server in `iss`, before any check: which
+    /// verifier takes a token presented with the `DPoP` scheme while
+    /// `governance.access.dpop` covers the other verifiers.
+    pub fn names_this_issuer(&self, token: &str) -> bool {
+        unverified_claim_iss(token).as_deref() == Some(self.issuer.as_str())
+    }
+
     /// The current nonce, from the first signing key.
     fn current_dpop_nonce(&self) -> DpopNonce {
         mint_nonce(
@@ -979,11 +994,11 @@ impl AuthorizationServer {
         proven: &ProvenKey,
         endpoint: &'static str,
     ) -> Result<(), DpopFailure> {
-        let accepted_until = proven
-            .iat
-            .saturating_add(self.dpop.max_age)
-            .saturating_add(self.dpop.skew.saturating_mul(2));
-        let ttl = accepted_until.saturating_sub(now_unix()).max(1);
+        let ttl = self
+            .dpop
+            .accepted_until(proven.iat)
+            .saturating_sub(now_unix())
+            .max(1);
         let started = Instant::now();
         let claimed = self
             .replay
@@ -1107,7 +1122,7 @@ impl AuthorizationServer {
 
 /// Count one proof outcome at `endpoint`, and say at debug level why a
 /// proof was refused.
-fn count_proof(endpoint: &'static str, result: &Result<ProvenKey, DpopFailure>) {
+pub(super) fn count_proof(endpoint: &'static str, result: &Result<ProvenKey, DpopFailure>) {
     let (outcome, reason) = match result {
         Ok(_) => ("accepted", "none"),
         Err(DpopFailure::Invalid(DpopReason::Replayed, _)) => ("replayed", "replayed"),
