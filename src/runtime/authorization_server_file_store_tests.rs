@@ -332,18 +332,12 @@ async fn the_store_refuses_new_records_beyond_its_limits() {
         max_total_bytes: u64::MAX,
     };
     let store = FileStore::open(dir.path(), limits).expect("opens");
-    store
-        .put("as/v1/a", Bytes::from_static(b"1"), None)
-        .await
-        .expect("put");
-    store
-        .put(
-            "as/v1/b",
-            Bytes::from_static(b"2"),
-            Some(Duration::from_secs(1)),
-        )
-        .await
-        .expect("put");
+    for (key, value) in [("as/v1/a", b"1"), ("as/v1/b", b"2")] {
+        store
+            .put(key, Bytes::from_static(value), None)
+            .await
+            .expect("put");
+    }
     let full = store
         .put("as/v1/c", Bytes::from_static(b"3"), None)
         .await
@@ -359,6 +353,16 @@ async fn the_store_refuses_new_records_beyond_its_limits() {
         .expect_err("a value over the limit is refused");
     assert!(matches!(too_large, ClusterError::Precondition { .. }));
 
+    // The TTL is set only now, so no check above depends on how fast the
+    // runner is.
+    store
+        .put(
+            "as/v1/b",
+            Bytes::from_static(b"2"),
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .expect("a replacement is always admitted");
     std::thread::sleep(Duration::from_millis(1_100));
     store
         .put("as/v1/c", Bytes::from_static(b"3"), None)
