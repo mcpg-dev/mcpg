@@ -40,7 +40,7 @@ impl GatewayRuntime {
         let (mut page, next_cursor) = paginate_list_bound(
             &curated_tools,
             cursor,
-            Some(&self.cursor_binding_key(request_context.session_id.as_deref())),
+            Some(&self.cursor_binding_key(request_context)),
         );
         self.hide_pap_operation_output_schemas(request_context, &mut page);
         (page, next_cursor)
@@ -76,7 +76,7 @@ impl GatewayRuntime {
         paginate_list_bound(
             &all_prompts,
             cursor,
-            Some(&self.cursor_binding_key(request_context.session_id.as_deref())),
+            Some(&self.cursor_binding_key(request_context)),
         )
     }
 
@@ -121,7 +121,7 @@ impl GatewayRuntime {
         request_context: &RequestContext,
         cursor: Option<&str>,
     ) -> (Vec<crate::backends::ResourceDescriptor>, Option<String>) {
-        let bind_key = self.cursor_binding_key(request_context.session_id.as_deref());
+        let bind_key = self.cursor_binding_key(request_context);
         let mut all_resources = self.capability_registry.resources();
         // Gateway-authored apps are synthetic resources held
         // on the runtime, not in the capability registry — surface them
@@ -235,7 +235,7 @@ impl GatewayRuntime {
         paginate_list_bound(
             &all_templates,
             cursor,
-            Some(&self.cursor_binding_key(request_context.session_id.as_deref())),
+            Some(&self.cursor_binding_key(request_context)),
         )
     }
 

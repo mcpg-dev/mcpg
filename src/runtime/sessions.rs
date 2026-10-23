@@ -137,10 +137,14 @@ impl GatewayRuntime {
     /// Returns `true` when `cursor` is absent or decodes against this
     /// request's session-bound key, `false` when it is present and
     /// undecodable.
-    pub(crate) fn cursor_is_valid(&self, cursor: Option<&str>, session_id: Option<&str>) -> bool {
+    pub(crate) fn cursor_is_valid(
+        &self,
+        cursor: Option<&str>,
+        request_context: &RequestContext,
+    ) -> bool {
         match cursor {
             None => true,
-            Some(c) => decode_cursor(c, Some(&self.cursor_binding_key(session_id))).is_some(),
+            Some(c) => decode_cursor(c, Some(&self.cursor_binding_key(request_context))).is_some(),
         }
     }
 

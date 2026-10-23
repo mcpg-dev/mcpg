@@ -12,10 +12,7 @@ impl GatewayRuntime {
                     Ok(_) => {
                         // An opaque cursor that does not decode is invalid
                         // params (-32602), not a silent restart at page 1.
-                        if !self.cursor_is_valid(
-                            params.cursor.as_deref(),
-                            request_context.session_id.as_deref(),
-                        ) {
+                        if !self.cursor_is_valid(params.cursor.as_deref(), request_context) {
                             return protocol_http_error(
                                 200,
                                 Some(request_id),

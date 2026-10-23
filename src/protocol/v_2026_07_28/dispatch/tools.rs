@@ -41,7 +41,7 @@ pub(crate) async fn dispatch_tools_list(
 
     // An opaque cursor that does not decode is invalid params (-32602),
     // not a silent restart at page 1 (SEP pagination contract).
-    if !runtime.cursor_is_valid(params.cursor.as_deref(), ctx.session_id.as_deref()) {
+    if !runtime.cursor_is_valid(params.cursor.as_deref(), ctx) {
         return ProtocolHttpResponse {
             http_status: 200,
             session_id_header: None,

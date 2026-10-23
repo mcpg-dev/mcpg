@@ -3,7 +3,7 @@ use super::*;
 /// Paginate a list endpoint with HMAC-bound cursors. The cursor encodes an
 /// offset + HMAC so it is tamper-proof and session-scoped — a cursor from one
 /// session cannot be replayed on another because the binding key is derived from
-/// the session ID via the runtime's per-process HMAC key.
+/// the session ID via the runtime's cursor signing key.
 /// Security: cursor HMAC verification uses constant-time comparison.
 pub(super) fn paginate_list_bound<T: Clone>(
     items: &[T],
@@ -164,15 +164,34 @@ pub(super) fn decode_composite_cursor(
     serde_json::from_slice::<CompositeCursor>(&payload).ok()
 }
 
+/// Domain-separation label for the list-cursor key derived from the cluster
+/// state key, disjoint from the other keys derived from it.
+const LIST_CURSOR_KEY_DOMAIN: &[u8] = b"mcpg:list-cursor:v1";
+
+/// The key list cursors are signed with: a sub-key of
+/// `cluster.state_encryption_key_env` when that names a set key, so every
+/// replica, and the same one after a restart or a reload, verifies a cursor
+/// another issued; else `fallback`, the per-process key.
+pub(super) fn cursor_signing_key(
+    fallback: [u8; 32],
+    cluster: &crate::config::ClusterConfig,
+) -> [u8; 32] {
+    crate::app::cluster_state_key_bytes(cluster)
+        .ok()
+        .flatten()
+        .map(|base| crate::app::derive_cluster_subkey(&base, LIST_CURSOR_KEY_DOMAIN))
+        .unwrap_or(fallback)
+}
+
 impl GatewayRuntime {
     pub(super) fn generate_cursor_hmac_key() -> [u8; 32] {
         // 32 bytes of system-CSPRNG-backed randomness scoped to
         // this process. uuid::Uuid::new_v4 is backed by getrandom on
         // every supported target; concatenating two v4 UUIDs gives us
         // the required 32 bytes without adding the `rand` crate to the
-        // workspace. A gateway restart invalidates outstanding
-        // cursors, matching the replay-window semantics of the
-        // session store.
+        // workspace. Used only without a cluster state key (see
+        // `cursor_signing_key`): a restart then invalidates outstanding
+        // cursors.
         let mut key = [0u8; 32];
         let a = *uuid::Uuid::new_v4().as_bytes();
         let b = *uuid::Uuid::new_v4().as_bytes();
@@ -181,12 +200,28 @@ impl GatewayRuntime {
         key
     }
 
-    /// Derive a per-session cursor binding key from the runtime HMAC
-    /// key and the session identifier. A cursor issued under one
-    /// session can never be replayed on another because the MAC will
-    /// fail verification.
-    pub(super) fn cursor_binding_key(&self, session_id: Option<&str>) -> Vec<u8> {
-        let sid = session_id.unwrap_or("anonymous");
-        hmac_sha256::HMAC::mac(sid.as_bytes(), self.cursor_hmac_key).to_vec()
+    /// Derive a cursor binding key from the cursor signing key and what
+    /// the request is bound to: its session, or, for an ephemeral session
+    /// whose id is new on every request, its principal. A cursor issued
+    /// under one session or principal can never be replayed under another
+    /// because the MAC will fail verification.
+    pub(super) fn cursor_binding_key(&self, request_context: &RequestContext) -> Vec<u8> {
+        let principal = request_context
+            .session_ephemeral
+            .then(|| request_context.identity.synthetic_principal_key())
+            .flatten();
+        let sid = if request_context.session_ephemeral {
+            principal.as_deref().unwrap_or("anonymous")
+        } else {
+            request_context.session_id.as_deref().unwrap_or("anonymous")
+        };
+        let services = self.shared_services.load();
+        let key = match services.as_ref() {
+            Some(services) => {
+                cursor_signing_key(self.cursor_hmac_key, &services.config_snapshot.cluster)
+            }
+            None => self.cursor_hmac_key,
+        };
+        hmac_sha256::HMAC::mac(sid.as_bytes(), key).to_vec()
     }
 }

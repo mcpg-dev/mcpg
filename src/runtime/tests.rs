@@ -2903,6 +2903,93 @@ fn bound_cursor_roundtrips_for_same_session() {
     assert_eq!(p2[0], 100);
 }
 
+/// Replicas sharing the cluster state key sign list cursors with one key, so
+/// a page-2 cursor from one verifies on another; without the key each process
+/// keeps its own.
+#[test]
+fn cursor_signing_key_is_shared_through_the_cluster_state_key() {
+    let var = "MCPG_TEST_LIST_CURSOR_STATE_KEY";
+    // 32 zero bytes, URL-safe base64 without padding.
+    unsafe { std::env::set_var(var, "A".repeat(43)) };
+    let cluster = crate::config::ClusterConfig {
+        state_encryption_key_env: Some(var.to_owned()),
+        ..Default::default()
+    };
+    let (process_a, process_b) = ([1u8; 32], [2u8; 32]);
+    let key_a = super::cursor::cursor_signing_key(process_a, &cluster);
+    let key_b = super::cursor::cursor_signing_key(process_b, &cluster);
+    assert_eq!(key_a, key_b);
+    assert_ne!(key_a, process_a);
+
+    let items: Vec<i32> = (0..250).collect();
+    let bind = |key: [u8; 32]| hmac_sha256::HMAC::mac(b"anonymous", key).to_vec();
+    let (_page, next) = super::paginate_list_bound(&items, None, Some(&bind(key_a)));
+    let (page_two, _) = super::paginate_list_bound(&items, next.as_deref(), Some(&bind(key_b)));
+    assert_eq!(page_two[0], 100);
+
+    unsafe { std::env::remove_var(var) };
+    let no_key = crate::config::ClusterConfig::default();
+    assert_eq!(
+        super::cursor::cursor_signing_key(process_a, &no_key),
+        process_a
+    );
+}
+
+/// An ephemeral session's id is new on every request, so its cursors bind to
+/// the principal: a stateless caller's page-2 cursor verifies on its next
+/// request, and never for another principal. A real session still binds to
+/// its own id.
+#[test]
+fn ephemeral_session_cursors_bind_to_the_principal() {
+    let runtime = GatewayRuntime::new(
+        "mcpg",
+        "0.1.0",
+        "127.0.0.1:8787",
+        "/health",
+        "/mcp",
+        "info",
+        Vec::new(),
+        true,
+    );
+    let context = |session: &str, ephemeral: bool, identity: RequestIdentity| {
+        let mut ctx = RequestContext::new(
+            GatewayRequestId::new(),
+            None,
+            Some(session.to_owned()),
+            None,
+            identity,
+            TransportKind::Http,
+        );
+        ctx.session_ephemeral = ephemeral;
+        ctx
+    };
+    let anonymous = || RequestIdentity::Anonymous {
+        source: "test".to_owned(),
+    };
+    let asserted = |subject: &str| RequestIdentity::HttpHeader {
+        subject_id: subject.to_owned(),
+        source: "test".to_owned(),
+    };
+
+    let key = |ctx: &RequestContext| runtime.cursor_binding_key(ctx);
+    assert_eq!(
+        key(&context("e-1", true, anonymous())),
+        key(&context("e-2", true, anonymous()))
+    );
+    assert_eq!(
+        key(&context("e-1", true, asserted("alice"))),
+        key(&context("e-2", true, asserted("alice")))
+    );
+    assert_ne!(
+        key(&context("e-1", true, asserted("alice"))),
+        key(&context("e-1", true, asserted("bob")))
+    );
+    assert_ne!(
+        key(&context("s-1", false, anonymous())),
+        key(&context("s-2", false, anonymous()))
+    );
+}
+
 /// a cursor minted under session A MUST NOT advance
 /// pagination when presented under session B — it restarts at 0.
 #[test]
