@@ -192,9 +192,9 @@ impl BackendHealthProber {
             return probe_from_declaration(&profile.health_probe, &spec, timeout).await;
         }
 
-        // The trailing match only handles the gateway-native behavioral
-        // routes that have no registry plugin: `http` (url-probe) and
-        // `pipeline` (Skip — health is aggregated from its steps).
+        // The trailing match handles a binding whose kind declares no probe:
+        // `http` with its plugin not loaded (url-probe) and `pipeline` (Skip —
+        // health is aggregated from its steps).
         match binding.backend.kind.as_str() {
             "http" => match binding.backend.spec.get("url").and_then(|v| v.as_str()) {
                 Some(u) => probe_http(u, timeout).await,

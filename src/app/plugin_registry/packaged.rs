@@ -196,7 +196,10 @@ pub(crate) fn load_packaged_plugin(
                 enforce,
                 http_route: super::entities::native_http_route_overrides(entry),
             };
-            let svc = host_services_late.resolve();
+            // The late-bound wrapper itself, so host calls reach the real
+            // implementation once it is bound.
+            let svc: std::sync::Arc<dyn mcpg_plugin_host::host_services::HostServices> =
+                host_services_late.clone();
             // Record the operator's granted capabilities under this entry's
             // alias (entry.id — the alias the host bridge carries into every
             // host-service callback) so GatewayHostServices can filter per

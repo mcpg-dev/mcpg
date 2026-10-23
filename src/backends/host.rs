@@ -72,7 +72,7 @@ fn namespaced_cache_key(ctx: &BackendInvocationContext, key: &str) -> String {
 /// exec side-effects (`command`), the test fixture (`mock`), the
 /// synthetic boot-time tool source (`openapi`), and multi-step
 /// recursion (`pipeline`). This is a distinct concern from
-/// [`crate::backends::binding_plugin_kind`]'s `http`/`pipeline`
+/// [`crate::backends::binding_plugin_kind`]'s `pipeline`
 /// registry-dispatch exclusion — the two lists overlap only on
 /// `pipeline` and must not be conflated.
 const CHILD_TOOL_INELIGIBLE_KINDS: &[&str] = &["command", "mock", "openapi", "pipeline"];

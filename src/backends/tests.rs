@@ -1100,6 +1100,27 @@ fn dynamic_register_spec_http_threads_allow_private_backends() {
 }
 
 #[test]
+fn http_registers_with_its_plugin_and_pipeline_does_not() {
+    // The http plugin executes against a profile registered under the
+    // binding (or step) name, so both registration passes must see `http`
+    // as a plugin kind. A pipeline has no plugin of its own.
+    let binding = http_binding("svc.call");
+    let (kind, spec) =
+        super::binding_kind_and_spec(&binding.backend, true).expect("http registers");
+    assert_eq!(kind, "http");
+    assert_eq!(spec["url"], "https://api.example.com");
+    assert_eq!(
+        super::registry_lookup_kind(&binding.backend).as_deref(),
+        Some("http")
+    );
+    let pipeline = BackendImpl {
+        kind: "pipeline".to_owned(),
+        spec: Default::default(),
+    };
+    assert!(super::binding_kind_and_spec(&pipeline, true).is_none());
+}
+
+#[test]
 fn dynamic_register_spec_grpc_threads_fields_and_allow_private_backends() {
     // gRPC is a cdylib backend plugin now — the generic
     // dynamic-registration path claims it, mirroring the http spec

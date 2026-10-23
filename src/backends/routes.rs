@@ -2,22 +2,22 @@ use crate::config::{BackendConfig, BackendImpl};
 use serde_json::Value;
 
 /// Map a binding config to the `kind` string the plugin registry
-/// uses to look up its plugin. Returns `None` only for the gateway-native
-/// behavioral routes `http` and `pipeline`; every other kind (including
-/// `command` and `mock`) returns `Some(kind)` and is dispatched by the
-/// registry.
+/// uses to look up its plugin. Returns `None` only for `pipeline`, which
+/// has no plugin of its own; every other kind (including `http`,
+/// `command` and `mock`) returns `Some(kind)`, and its profiles are
+/// registered with that plugin.
 ///
 /// LLM bindings are split per provider: each provider
 /// is its own plugin (kind `openai.chat`, `azure_openai.chat`,
 /// `anthropic.chat`, `gemini.chat`, `compat.chat`).
 pub fn binding_plugin_kind(bt: &BackendImpl) -> Option<&str> {
-    // `http` + `pipeline` are gateway-native behavioral routes
-    // (NetworkJsonCall / Pipeline), not registry-dispatched plugins; every
-    // other kind dispatches to its plugin by name. This exclusion is a
-    // separate concern from `host::CHILD_TOOL_INELIGIBLE_KINDS` (which
-    // gates LLM child-tool eligibility); the two overlap only on `pipeline`.
+    // `http` keeps its own behavioral route (NetworkJsonCall / NetworkQueryCall)
+    // but executes in the http plugin against a profile registered there, so it
+    // is a plugin kind here. This exclusion is a separate concern from
+    // `host::CHILD_TOOL_INELIGIBLE_KINDS` (which gates LLM child-tool
+    // eligibility); the two overlap only on `pipeline`.
     match bt.kind.as_str() {
-        "http" | "pipeline" => None,
+        "pipeline" => None,
         k => Some(k),
     }
 }
@@ -31,8 +31,7 @@ pub fn binding_plugin_kind(bt: &BackendImpl) -> Option<&str> {
 /// that normalization so every registry-lookup site (boot guard, dynamic
 /// register pass, pipeline-step pass) resolves the same key and cannot drift.
 ///
-/// Returns `None` for the gateway-native behavioral routes that are never
-/// registry-dispatched (`http`, `pipeline`).
+/// Returns `None` for `pipeline`, which is never registry-dispatched.
 pub fn registry_lookup_kind(bt: &BackendImpl) -> Option<String> {
     let kind = binding_plugin_kind(bt)?;
     Some(match LlmKind::from_kind_str(kind) {

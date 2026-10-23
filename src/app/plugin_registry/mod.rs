@@ -147,17 +147,18 @@ pub(crate) async fn build_plugin_registry(
     // where `set()` is called from `run` / `reload_config`.
     let backend_late_host = mcpg_plugin_protocol::LateBoundBackendHost::new();
 
-    // Late-bound HostServices threaded into
-    // every native adapter at construction time. The Arc returned by
-    // `resolve()` initially points at `NullHostServices` (so any
-    // host-call attempted during early boot returns a typed error).
-    // Once the registry is wrapped in `Arc<PluginRegistry>` after
-    // this fn returns, the caller swaps in the real
-    // `GatewayHostServices` via `host_services_late.set(...)`,
-    // wiring all in-flight `HostBridge::with_services` Arcs to the
-    // production implementation.
-    let host_services_late =
-        std::sync::Arc::new(mcpg_plugin_host::host_services::LateBoundHostServices::new());
+    // Late-bound HostServices threaded into every native adapter at
+    // construction time. The adapters hold this wrapper itself, which reads
+    // its binding on each call: `NullHostServices` during early boot (a
+    // host-call then returns a typed error), the real `GatewayHostServices`
+    // once the caller binds it with `host_services_late.set(...)` after the
+    // registry is wrapped in `Arc<PluginRegistry>`. Subscriptions a plugin
+    // makes while its profiles register go to the late-bound backend host,
+    // which keeps them until the real host is bound.
+    let host_services_late = std::sync::Arc::new(
+        mcpg_plugin_host::host_services::LateBoundHostServices::new()
+            .with_subscriptions(backend_late_host.clone()),
+    );
 
     // Per-entry granted_capabilities is the source of truth. Each
     // `register*` site supplies its grants slice explicitly via
@@ -1089,15 +1090,13 @@ pub(crate) async fn build_plugin_registry(
                             &entry.id,
                         )
                         .await?;
-                        // Thread the late-bound HostServices into every
-                        // adapter so plugin → host calls (resolve_secret,
-                        // audit_event, metric_emit, …) reach the gateway's real
-                        // implementation. Resolved fresh per entry so each
-                        // `HostBridge::with_services` Arc points at whatever is
-                        // bound at the moment (currently `NullHostServices` —
-                        // the host services swap to the real impl after
-                        // `build_plugin_registry` returns).
-                        let svc = host_services_late.resolve();
+                        // The late-bound wrapper itself, not what it is bound
+                        // to now: plugin → host calls (resolve_secret,
+                        // resolve_credentials, audit_event, …) reach the real
+                        // implementation once it is bound after
+                        // `build_plugin_registry` returns.
+                        let svc: std::sync::Arc<dyn mcpg_plugin_host::host_services::HostServices> =
+                            host_services_late.clone();
                         // Record the operator-granted typed capabilities under
                         // this entry's alias (entry.id — the same alias the host
                         // bridge carries into every
