@@ -920,35 +920,37 @@ impl ExecutionDispatcher {
                         );
                     }
                 }
-                StepOutcome::Error(err) => {
+                stop @ (StepOutcome::Error(_) | StepOutcome::Failed(_)) => {
                     warn!(
                         pipeline = %profile,
                         step_id = %step_id,
                         step_index = i,
                         duration_ms = step_duration_ms,
-                        error = %err,
+                        error = %stop.reason(),
                         "pipeline step failed"
                     );
-                    return PipelineOutcome::Complete(ToolCallResult {
-                        content: vec![ToolContent::text(err)],
-                        structured_content: None,
-                        is_error: true,
-                        meta: None,
-                    });
+                    return PipelineOutcome::Complete(stopped_result(
+                        profile,
+                        &step_id,
+                        i,
+                        state.steps.len(),
+                        stop,
+                    ));
                 }
-                StepOutcome::GateAbort(msg) => {
+                stop @ StepOutcome::GateAbort(_) => {
                     warn!(
                         pipeline = %profile,
                         step_id = %step_id,
                         step_index = i,
                         "pipeline gate aborted execution"
                     );
-                    return PipelineOutcome::Complete(ToolCallResult {
-                        content: vec![ToolContent::text(msg)],
-                        structured_content: None,
-                        is_error: true,
-                        meta: None,
-                    });
+                    return PipelineOutcome::Complete(stopped_result(
+                        profile,
+                        &step_id,
+                        i,
+                        state.steps.len(),
+                        stop,
+                    ));
                 }
             }
         }
@@ -964,15 +966,7 @@ impl ExecutionDispatcher {
         )
         .increment(1);
 
-        PipelineOutcome::Complete(ToolCallResult {
-            content: vec![ToolContent::text(
-                serde_json::to_string_pretty(&last_step_output)
-                    .unwrap_or_else(|_| last_step_output.to_string()),
-            )],
-            structured_content: Some(last_step_output),
-            is_error: false,
-            meta: None,
-        })
+        PipelineOutcome::Complete(completed_result(last_step_output))
     }
 
     #[tracing::instrument(skip(self, request, _execution_context), fields(pipeline = %profile))]
@@ -1229,83 +1223,39 @@ impl ExecutionDispatcher {
                         },
                     );
                 }
-                StepOutcome::Error(error_msg) => {
+                stop @ (StepOutcome::Error(_) | StepOutcome::Failed(_)) => {
                     warn!(
                         pipeline = %profile,
                         step_id = %step_id,
                         step_index = i,
                         duration_ms = step_duration_ms,
-                        error = %error_msg,
+                        error = %stop.reason(),
                         "pipeline step failed"
                     );
-                    return ToolCallResult {
-                        content: vec![ToolContent::text(format!(
-                            "pipeline '{}' failed at step '{}': {}",
-                            profile, step_id, error_msg
-                        ))],
-                        structured_content: Some(serde_json::json!({
-                            "pipeline": profile,
-                            "failed_step": step_id,
-                            "error": error_msg,
-                            "completed_steps": i,
-                            "total_steps": step_count,
-                        })),
-                        is_error: true,
-                        meta: None,
-                    };
+                    return stopped_result(profile, &step_id, i, step_count, stop);
                 }
-                StepOutcome::GateAbort(error_msg) => {
+                stop @ StepOutcome::GateAbort(_) => {
                     info!(
                         pipeline = %profile,
                         step_id = %step_id,
                         step_index = i,
                         duration_ms = step_duration_ms,
-                        reason = %error_msg,
+                        reason = %stop.reason(),
                         "pipeline gate aborted"
                     );
-                    return ToolCallResult {
-                        content: vec![ToolContent::text(error_msg.clone())],
-                        structured_content: Some(serde_json::json!({
-                            "pipeline": profile,
-                            "gate_step": step_id,
-                            "reason": error_msg,
-                            "completed_steps": i,
-                            "total_steps": step_count,
-                        })),
-                        is_error: true,
-                        meta: None,
-                    };
+                    return stopped_result(profile, &step_id, i, step_count, stop);
                 }
             }
         }
 
-        let pipeline_duration_ms = pipeline_start.elapsed().as_millis() as u64;
-
         info!(
             pipeline = %profile,
             completed_steps = step_count,
-            duration_ms = pipeline_duration_ms,
+            duration_ms = pipeline_start.elapsed().as_millis() as u64,
             "pipeline completed"
         );
 
-        // The pipeline result is the last step's output
-        let result_text = match &last_step_output {
-            Value::String(s) => s.clone(),
-            other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_owned()),
-        };
-
-        ToolCallResult {
-            content: vec![ToolContent::text(result_text)],
-            structured_content: Some(serde_json::json!({
-                "pipeline": profile,
-                "result": last_step_output,
-                "completed_steps": step_count,
-                "total_steps": step_count,
-                "duration_ms": pipeline_duration_ms,
-            })),
-            is_error: false,
-            meta: None,
-        }
+        completed_result(last_step_output)
     }
 }
 
@@ -1315,9 +1265,12 @@ impl ExecutionDispatcher {
 pub(super) enum StepOutcome {
     /// Step ran and produced an output value to feed forward.
     Success(Value),
-    /// Step failed (backend error, bad transform, etc.); the whole
+    /// Step failed (bad transform, missing binding, etc.); the whole
     /// pipeline ends as an `is_error` result.
     Error(String),
+    /// A backend step answered with an error result of its own; the
+    /// pipeline ends with that result.
+    Failed(ToolCallResult),
     /// A CEL gate step evaluated to `false`. Distinct from `Error`
     /// because it's an intentional, operator-defined stop rather than
     /// a failure — but it still ends the pipeline as an `is_error`
@@ -1326,17 +1279,22 @@ pub(super) enum StepOutcome {
 }
 
 impl StepOutcome {
-    fn from_tool_result(result: ToolCallResult) -> Self {
+    /// The text a stopping outcome is logged with.
+    fn reason(&self) -> String {
+        match self {
+            Self::Error(reason) | Self::GateAbort(reason) => reason.clone(),
+            Self::Failed(result) => match result.content.first() {
+                Some(ToolContent::Text { text, .. }) => text.clone(),
+                Some(_) => "an error result with non-text content".to_owned(),
+                None => "an error result with no content".to_owned(),
+            },
+            Self::Success(_) => String::new(),
+        }
+    }
+
+    pub(super) fn from_tool_result(result: ToolCallResult) -> Self {
         if result.is_error {
-            let text = result
-                .content
-                .first()
-                .map(|c| match c {
-                    ToolContent::Text { text, .. } => text.clone(),
-                    _ => "step execution failed (non-text content)".to_owned(),
-                })
-                .unwrap_or_else(|| "step execution failed".to_owned());
-            Self::Error(text)
+            Self::Failed(result)
         } else {
             let output = result
                 .structured_content
@@ -1349,6 +1307,74 @@ impl StepOutcome {
                 .unwrap_or(Value::Null);
             Self::Success(output)
         }
+    }
+}
+
+/// A pipeline's result once every step ran, on the synchronous and the
+/// suspending path alike: the last step's output. An output carrying
+/// `__mcpg_verbatim_result` is that `CallToolResult` as-is (the convention
+/// backend bindings honour), so the last step can set `isError` itself.
+pub(super) fn completed_result(output: Value) -> ToolCallResult {
+    if let Some(verbatim) = output.get(super::VERBATIM_RESULT_KEY)
+        && let Ok(result) = serde_json::from_value::<ToolCallResult>(verbatim.clone())
+    {
+        return result;
+    }
+    let text = match &output {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "null".to_owned()),
+    };
+    ToolCallResult {
+        content: vec![ToolContent::text(text)],
+        // `structuredContent` is a JSON object on the wire.
+        structured_content: output.is_object().then_some(output),
+        is_error: false,
+        meta: None,
+    }
+}
+
+/// A pipeline's result when a step ends it: a backend step's own error
+/// result as-is, else the reason with where the pipeline stopped. A
+/// `Success` is a completed result.
+pub(super) fn stopped_result(
+    profile: &str,
+    step_id: &str,
+    completed_steps: usize,
+    total_steps: usize,
+    outcome: StepOutcome,
+) -> ToolCallResult {
+    let (text, structured) = match outcome {
+        StepOutcome::Failed(mut result) => {
+            result.is_error = true;
+            return result;
+        }
+        StepOutcome::Error(error) => (
+            format!("pipeline '{profile}' failed at step '{step_id}': {error}"),
+            serde_json::json!({
+                "pipeline": profile,
+                "failed_step": step_id,
+                "error": error,
+                "completed_steps": completed_steps,
+                "total_steps": total_steps,
+            }),
+        ),
+        StepOutcome::GateAbort(reason) => (
+            reason.clone(),
+            serde_json::json!({
+                "pipeline": profile,
+                "gate_step": step_id,
+                "reason": reason,
+                "completed_steps": completed_steps,
+                "total_steps": total_steps,
+            }),
+        ),
+        StepOutcome::Success(output) => return completed_result(output),
+    };
+    ToolCallResult {
+        content: vec![ToolContent::text(text)],
+        structured_content: Some(structured),
+        is_error: true,
+        meta: None,
     }
 }
 

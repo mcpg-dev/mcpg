@@ -297,6 +297,8 @@ pub struct EventsCore {
     inbox_nudge: Notify,
     owner: tokio::sync::Mutex<OwnerState>,
     loop_started: AtomicBool,
+    /// Set by [`Self::stop`]: the owner loop takes no lease after it.
+    stopped: AtomicBool,
     egress: ArcSwapOption<SafeEgress>,
     egress_factory: parking_lot::RwLock<Option<EgressFactory>>,
     verifying_hosts: Arc<InFlightHosts>,
@@ -377,6 +379,7 @@ impl EventsCore {
             inbox_nudge: Notify::new(),
             owner: tokio::sync::Mutex::new(OwnerState::default()),
             loop_started: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             egress: ArcSwapOption::empty(),
             egress_factory: parking_lot::RwLock::new(None),
             verifying_hosts: Arc::default(),
@@ -971,12 +974,21 @@ impl EventsCore {
         Ok(true)
     }
 
-    /// Stop every source and release the owner lease.
+    /// Stop every source and release the owner lease and the dispatcher
+    /// shards, so the other replicas take them at once rather than on
+    /// expiry.
     pub async fn shutdown(&self) {
         let mut owner = self.owner.lock().await;
         self.release_shards(&mut owner, None).await;
         step_down(&mut owner, &self.lease_tx).await;
         owner.replica_sources.stop_all();
+    }
+
+    /// [`Self::shutdown`] for good, at process exit: the owner loop takes no
+    /// lease after it.
+    pub async fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.shutdown().await;
     }
 
     /// Hold this replica's share of the dispatcher shards: renew what it
@@ -1012,7 +1024,7 @@ impl EventsCore {
         let mut lost = Vec::new();
         for (shard, lease) in &owner.shards {
             if let Err(error) = lease.renew().await {
-                tracing::warn!(shard, error = %error, "lost a dispatcher shard lease; another replica takes it");
+                tracing::warn!(shard, error = %error, "lost a dispatcher shard lease; the shard is taken again once its lease is free");
                 lost.push(*shard);
             }
         }
@@ -1041,6 +1053,7 @@ impl EventsCore {
             self.release_shards(owner, Some(&extra)).await;
         }
         let start = shard_offset(&node);
+        let mut taken = Vec::new();
         for i in 0..DISPATCH_SHARDS {
             if owner.shards.len() >= share {
                 break;
@@ -1055,6 +1068,7 @@ impl EventsCore {
             {
                 Ok(Some(lease)) => {
                     owner.shards.insert(shard, lease);
+                    taken.push(shard);
                 }
                 Ok(None) => {}
                 Err(error) => {
@@ -1062,6 +1076,16 @@ impl EventsCore {
                     break;
                 }
             }
+        }
+        if !taken.is_empty() || !extra.is_empty() {
+            tracing::info!(
+                taken = ?taken,
+                released = ?extra,
+                held = owner.shards.len(),
+                share,
+                replicas = nodes.len(),
+                "dispatcher shards changed"
+            );
         }
         let held: HashMap<u32, WriterLease> = owner
             .shards
@@ -1387,6 +1411,9 @@ impl EventsCore {
         let config = self.config.load_full();
         let stores = self.stores.load_full();
         let mut owner = self.owner.lock().await;
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(stores) = stores.filter(|_| config.enabled) else {
             self.release_shards(&mut owner, None).await;
             step_down(&mut owner, &self.lease_tx).await;

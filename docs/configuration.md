@@ -1886,8 +1886,10 @@ Two children that mirror MCP's own vocabulary: - `capabilities:` — what the se
 | `capabilities` | [`McpCapabilitiesConfig`](#mcpcapabilitiesconfig) | (see type) | What this MCP server advertises in the `initialize` handshake. Mirrors the protocol spec's `capabilities` vocabulary one-to-one. |
 | `configurations` | [`McpConfigurationsConfig`](#mcpconfigurationsconfig) | (see type) | Runtime-emergent state handling. Operator only tunes persistence + constraints; the items themselves are created by clients at runtime. |
 | `federations` | array&lt;[`FederationConfig`](#federationconfig)&gt; | `[]` | Upstream MCP servers federated through this gateway. Each entry is a *capability source* (1:N): MCPG connects to the upstream, imports its capabilities, and re-serves them under a prefix. Default empty — existing configs are unaffected. |
+| `instructions` | string (optional) |  | The `instructions` a client receives in `server/discover` and in the `initialize` result, typically shown to the model: what this server is for and how to use its tools. At most 64 KiB. Unset keeps MCPG's own text. |
 | `registries` | array&lt;[`McpRegistryConfig`](#mcpregistryconfig)&gt; | `[]` | MCP registries whose listed servers MCPG auto-federates: a background syncer crawls each registry's `/v0.1` API and materializes one federation per usable server, kept in sync as the registry changes. Default empty. |
 | `registry` | [`ServedRegistryConfig`](#servedregistryconfig) | (see type) | The registry MCPG *serves* (contrast `registries`, the registries MCPG *consumes*): a v0.1 MCP-Registry view of this gateway — one entry describing the governed catalog — so registry-driven clients (e.g. Copilot's allowed-registry policy) can discover MCPG as their approved server. Off by default. |
+| `server_info` | [`McpServerInfoConfig`](#mcpserverinfoconfig) | `{}` | How the server presents itself to clients: `serverInfo` in `server/discover` and in the `initialize` result. Every field is optional; an unset field keeps MCPG's own value. `version` is always the gateway's. |
 
 ### `McpConfigurationsConfig`
 
@@ -1944,6 +1946,18 @@ One MCP registry to auto-federate.
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `timeout_ms` | integer | `60000` | Maximum time the gateway waits for the client's sampling response. Default 60 000. |
+
+### `McpServerInfoConfig`
+
+`mcp.server_info:` — the operator's `serverInfo` fields.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `description` | string (optional) |  | One-paragraph description shown next to the title. |
+| `icons` | array&lt;[`BackendIconConfig`](#backendiconconfig)&gt; (optional) |  | Branding icons (`src`, `mime_type`, `sizes`, `theme`). |
+| `name` | string (optional) |  | Machine-readable server name, e.g. `com.example.docs`. Default `mcpg`. |
+| `title` | string (optional) |  | Human-readable display name. |
+| `website_url` | string (optional) |  | The server's website. |
 
 ### `MetricsConfig`
 
@@ -2545,6 +2559,7 @@ A named schema entry in the registry. Exactly one source must be provided.
 | `extra_resource_uri_schemes` | array&lt;string&gt; | `[]` | Extra resource-URI schemes (beyond the built-in allow-list) treated as first-class by the resource normalizer. Matched case-insensitively. |
 | `health_check` | [`HealthCheckConfig`](#healthcheckconfig) | (see type) | Periodic prober for every binding's backend (SQL server reachability, gRPC endpoint, REST upstream, ...). Distinct from `health_path:` above — that's the gateway's own liveness endpoint for load balancers; this prober actively pings each binding's underlying service and updates `PluginState::{Active, Degraded}` based on results. |
 | `health_path` | string | `"/health"` |  |
+| `legacy_wire` | boolean | `true` | Serve the session wire of the `2025-xx` revisions: `initialize`, `Mcp-Session-Id`, and the GET stream and DELETE on the MCP path. Default `true`. With `false` the gateway serves only the stateless `2026-07-28` revision, over HTTP: a POST that negotiates a `2025-xx` revision (by header, by `initialize`, or by sending neither header nor `_meta` version) is refused with HTTP 400 and JSON-RPC `-32022` (`data.supported` is `["2026-07-28"]`), a POST that carries `Mcp-Session-Id` is refused with HTTP 400 and `-32600`, GET and DELETE answer 405, and `server/discover` lists only `2026-07-28`. The stdio transport speaks `2025-11-25`, so it refuses to start with `false`. |
 | `max_request_body_mb` | integer | `4` | Maximum POST body accepted on the MCP endpoint, in MiB. Defaults to 4 MiB. `0` falls back to the default — an unbounded body is never acceptable on a public endpoint. |
 | `max_sessions_per_tenant` | integer | `0` | Per-tenant session quota. 0 = unlimited. The stricter of this and the global cap wins. |
 | `mcp_path` | string | `"/mcp"` |  |

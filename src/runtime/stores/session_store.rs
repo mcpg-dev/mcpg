@@ -524,6 +524,9 @@ pub struct KvBackedSessionStore {
     /// cascade; idle eviction otherwise skips it, so those ids are forwarded
     /// here for the runtime to cascade. `None` until registered / in tests.
     eviction_tx: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Other replicas write the same KV, so a local copy can lag the shared
+    /// row ([`Self::shared_across_replicas`]).
+    shared: bool,
 }
 
 impl std::fmt::Debug for KvBackedSessionStore {
@@ -547,7 +550,17 @@ impl KvBackedSessionStore {
             sessions: dashmap::DashMap::new(),
             last_pruned: std::sync::atomic::AtomicI64::new(0),
             eviction_tx: std::sync::OnceLock::new(),
+            shared: false,
         }
+    }
+
+    /// Mark the KV as shared with other replicas. A local copy still awaiting
+    /// `notifications/initialized` then checks the shared row's phase on each
+    /// access, since another replica may have taken the notification.
+    #[must_use]
+    pub fn shared_across_replicas(mut self, shared: bool) -> Self {
+        self.shared = shared;
+        self
     }
 
     /// Lazy per-entry expiry: atomically evict `session_id` iff it is still
@@ -640,6 +653,7 @@ impl KvBackedSessionStore {
             sessions,
             last_pruned: std::sync::atomic::AtomicI64::new(0),
             eviction_tx: std::sync::OnceLock::new(),
+            shared: false,
         })
     }
 
@@ -719,14 +733,17 @@ impl KvBackedSessionStore {
     /// shared KV and insert it, so a session created on another replica
     /// (or before a restart) resolves here instead of 404'ing.
     ///
-    /// No-op — and NO KV round-trip — when the session is already local
-    /// (the sticky-session / same-replica happy path). The `sessions`
+    /// No KV round-trip when the session is already local and operational
+    /// (the sticky-session / same-replica happy path); in a shared store, a
+    /// local copy still awaiting `notifications/initialized` checks the
+    /// shared row's phase ([`Self::adopt_shared_phase`]). The `sessions`
     /// lock is held only for the membership check and the final insert,
-    /// never across the (blocking) KV read. Mirrors `new()`'s
-    /// boot-hydrate idle-timeout check so a read-back behaves identically
-    /// to a restart hydrate.
+    /// never across the (blocking) KV read. Mirrors `new()`'s boot-hydrate
+    /// idle-timeout check so a read-back behaves identically to a restart
+    /// hydrate.
     fn ensure_hydrated(&self, session_id: &str) {
         if self.sessions.contains_key(session_id) {
+            self.adopt_shared_phase(session_id);
             return;
         }
         let key = Self::session_key(session_id);
@@ -752,6 +769,36 @@ impl KvBackedSessionStore {
         self.sessions
             .entry(session.session_id.clone())
             .or_insert(session);
+    }
+
+    /// A session's phase only moves forward, and the replica that takes
+    /// `notifications/initialized` need not be the one that created the
+    /// session: a local copy still awaiting it adopts the shared row's
+    /// `Operational`. One KV read per call, and only while the local copy
+    /// awaits `notifications/initialized`.
+    fn adopt_shared_phase(&self, session_id: &str) {
+        if !self.shared {
+            return;
+        }
+        let awaiting = self
+            .sessions
+            .get(session_id)
+            .is_some_and(|s| s.phase == SessionPhase::AwaitingInitialized);
+        if !awaiting {
+            return;
+        }
+        let key = Self::session_key(session_id);
+        let Ok(Some(value)) = Self::block(async { self.state.get(&key).await }) else {
+            return;
+        };
+        let Ok(shared) = serde_json::from_slice::<StoredSession>(&value.bytes) else {
+            return;
+        };
+        if shared.phase == SessionPhase::Operational
+            && let Some(mut local) = self.sessions.get_mut(session_id)
+        {
+            local.phase = SessionPhase::Operational;
+        }
     }
 
     /// Shared body for `stream_raw_message` / `stream_delivery_message`:
@@ -1478,6 +1525,39 @@ mod tests {
             store_b.session_protocol_version(&session_id).as_deref(),
             Some(SUPPORTED_PROTOCOL_VERSION),
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn initialized_on_one_replica_is_operational_on_the_one_that_created_it() {
+        // Round-robin without affinity: `initialize` lands on A,
+        // `notifications/initialized` on B, the next call on A again. A's own
+        // copy still awaits the notification; it must take the shared phase.
+        let shared_kv: std::sync::Arc<dyn mcpg_cluster_api::KeyValueStore> =
+            std::sync::Arc::new(crate::builtins::cluster_primitives::MemoryKv::new());
+        let store_a = KvBackedSessionStore::new(SessionStoreConfig::default(), shared_kv.clone())
+            .await
+            .expect("store A")
+            .shared_across_replicas(true);
+        let store_b = KvBackedSessionStore::new(SessionStoreConfig::default(), shared_kv.clone())
+            .await
+            .expect("store B")
+            .shared_across_replicas(true);
+
+        let snapshot = store_a.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+        let session_id = snapshot.session_id.clone();
+        assert!(matches!(
+            store_a.load_session(Some(&session_id), true),
+            Err(SessionAccessError::NotInitialized)
+        ));
+
+        store_b
+            .transition_session_to_operational(&session_id)
+            .expect("notifications/initialized on B");
+
+        let on_a = store_a
+            .load_session(Some(&session_id), true)
+            .expect("A sees the session operational");
+        assert_eq!(on_a.phase, SessionPhase::Operational);
     }
 
     #[tokio::test(flavor = "multi_thread")]

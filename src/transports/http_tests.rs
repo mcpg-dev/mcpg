@@ -2466,6 +2466,7 @@ async fn mcp_origin_is_rejected_when_not_allowed() {
                 unary_json_fast_path: false,
                 access_log: true,
                 enforce_modern_request_meta: false,
+                legacy_wire: true,
                 scrub_process_env_after_boot: false,
                 server_ping_interval_ms: None,
                 max_sessions_per_tenant: 0,
@@ -9245,6 +9246,267 @@ async fn modern_server_discover_routes_through_modern_handler() {
     // present instead.
     assert!(body["result"]["supportedVersions"].is_array());
     assert!(body["result"]["serverInfo"]["version"].is_string());
+}
+
+/// A test app with `gateway.server.legacy_wire: false`.
+fn stateless_only_app() -> Router {
+    let mut config = AppConfig::default();
+    config.gateway.server.trust_subject_header = true;
+    config.gateway.server.legacy_wire = false;
+    let state = finish_app_state(config, default_test_runtime());
+    install_protocol_registry_for_tests(&state);
+    router(state, "/health", "/mcp")
+}
+
+fn stateless_only_post(headers: &[(&str, &str)], body: Value) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCEPT, MCP_ACCEPT_HEADER);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    request.body(Body::from(body.to_string())).unwrap()
+}
+
+fn modern_meta() -> Value {
+    serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientInfo": { "name": "test-client", "version": "0.1.0" },
+        "io.modelcontextprotocol/clientCapabilities": {}
+    })
+}
+
+#[tokio::test]
+async fn without_the_legacy_wire_initialize_is_refused_with_the_served_versions() {
+    let response = stateless_only_app()
+        .oneshot(stateless_only_post(
+            &[],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "legacy-client", "version": "1.0" }
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.headers()["mcp-protocol-version"], "2026-07-28");
+    assert!(response.headers().get("mcp-session-id").is_none());
+    let body = response_json(response).await;
+    assert_eq!(body["id"], 1);
+    assert_eq!(body["error"]["code"], -32022);
+    assert_eq!(body["error"]["data"]["requested"], "2025-11-25");
+    assert_eq!(
+        body["error"]["data"]["supported"],
+        serde_json::json!(["2026-07-28"])
+    );
+}
+
+#[tokio::test]
+async fn without_the_legacy_wire_a_2025_version_header_is_refused() {
+    for version in ["2025-11-25", "2025-06-18", "2025-03-26"] {
+        let response = stateless_only_app()
+            .oneshot(stateless_only_post(
+                &[("mcp-protocol-version", version)],
+                serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{version}");
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["code"], -32022, "{version}");
+        assert_eq!(body["error"]["data"]["requested"], version);
+        assert_eq!(
+            body["error"]["data"]["supported"],
+            serde_json::json!(["2026-07-28"])
+        );
+    }
+}
+
+#[tokio::test]
+async fn without_the_legacy_wire_a_session_id_is_refused() {
+    let response = stateless_only_app()
+        .oneshot(stateless_only_post(
+            &[
+                ("mcp-protocol-version", "2026-07-28"),
+                ("mcp-method", "tools/list"),
+                ("mcp-session-id", "4b8f0c3e-1d2a-4f5b-9c6d-7e8f9a0b1c2d"),
+            ],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/list",
+                "params": { "_meta": modern_meta() }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response_json(response).await;
+    assert_eq!(body["id"], 3);
+    assert_eq!(body["error"]["code"], -32600);
+}
+
+#[tokio::test]
+async fn without_the_legacy_wire_get_and_delete_answer_405() {
+    for method in ["GET", "DELETE"] {
+        let response = stateless_only_app()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/mcp")
+                    .header(header::ACCEPT, "text/event-stream")
+                    .header("mcp-session-id", "4b8f0c3e-1d2a-4f5b-9c6d-7e8f9a0b1c2d")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method}"
+        );
+        assert_eq!(response.headers()["allow"], "POST");
+    }
+}
+
+#[tokio::test]
+async fn without_the_legacy_wire_the_stateless_revision_is_served_and_discovered_alone() {
+    let app = stateless_only_app();
+    let discover = app
+        .clone()
+        .oneshot(stateless_only_post(
+            &[
+                ("mcp-protocol-version", "2026-07-28"),
+                ("mcp-method", "server/discover"),
+            ],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "server/discover",
+                "params": { "_meta": modern_meta() }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(discover.status(), StatusCode::OK);
+    let body = response_json(discover).await;
+    assert_eq!(
+        body["result"]["supportedVersions"],
+        serde_json::json!(["2026-07-28"])
+    );
+
+    let tools = app
+        .oneshot(stateless_only_post(
+            &[
+                ("mcp-protocol-version", "2026-07-28"),
+                ("mcp-method", "tools/list"),
+            ],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/list",
+                "params": { "_meta": modern_meta() }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(tools.status(), StatusCode::OK);
+    assert!(tools.headers().get("mcp-session-id").is_none());
+    let body = response_json(tools).await;
+    assert!(body["result"]["tools"].is_array(), "{body}");
+}
+
+/// A test app whose `mcp.server_info` and `mcp.instructions` are set.
+fn configured_identity_app() -> Router {
+    let mut config = AppConfig::default();
+    config.gateway.server.trust_subject_header = true;
+    config.mcp.server_info = crate::config::McpServerInfoConfig {
+        name: Some("com.example.docs".to_owned()),
+        title: Some("Example Docs".to_owned()),
+        description: Some("Searches the example documentation.".to_owned()),
+        icons: Some(vec![crate::config::BackendIconConfig {
+            src: "https://example.com/icon.png".to_owned(),
+            mime_type: Some("image/png".to_owned()),
+            sizes: Some(vec!["48x48".to_owned()]),
+            theme: None,
+        }]),
+        website_url: Some("https://example.com".to_owned()),
+    };
+    config.mcp.instructions = Some("Search the docs before you answer.".to_owned());
+    let state = finish_app_state(config, default_test_runtime());
+    install_protocol_registry_for_tests(&state);
+    router(state, "/health", "/mcp")
+}
+
+fn assert_configured_identity(result: &Value) {
+    let info = &result["serverInfo"];
+    assert_eq!(info["name"], "com.example.docs");
+    assert_eq!(info["title"], "Example Docs");
+    assert_eq!(info["description"], "Searches the example documentation.");
+    assert_eq!(info["websiteUrl"], "https://example.com");
+    assert_eq!(info["icons"][0]["src"], "https://example.com/icon.png");
+    assert_eq!(info["icons"][0]["mimeType"], "image/png");
+    assert!(info["version"].is_string());
+    assert_eq!(result["instructions"], "Search the docs before you answer.");
+}
+
+#[tokio::test]
+async fn server_discover_carries_the_configured_server_info_and_instructions() {
+    let response = configured_identity_app()
+        .oneshot(stateless_only_post(
+            &[
+                ("mcp-protocol-version", "2026-07-28"),
+                ("mcp-method", "server/discover"),
+            ],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": { "_meta": modern_meta() }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_configured_identity(&response_json(response).await["result"]);
+}
+
+#[tokio::test]
+async fn initialize_carries_the_configured_server_info_and_instructions() {
+    let response = configured_identity_app()
+        .oneshot(stateless_only_post(
+            &[],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "clientInfo": { "name": "legacy-client", "version": "1.0" }
+                }
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = sse_response_text(response).await;
+    let frame = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find_map(|data| serde_json::from_str::<Value>(data).ok())
+        .or_else(|| serde_json::from_str::<Value>(&body).ok())
+        .expect("an initialize result");
+    assert_configured_identity(&frame["result"]);
 }
 
 #[tokio::test]

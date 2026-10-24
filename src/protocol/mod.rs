@@ -103,6 +103,21 @@ pub use v_2025_11_25::wire::{
     PROTOCOL_VERSION_HEADER, SESSION_ID_HEADER, SUPPORTED_PROTOCOL_VERSION,
 };
 
+/// The revisions the gateway serves, oldest first: every `2025-xx`
+/// revision and `2026-07-28`, or only `2026-07-28` when
+/// `gateway.server.legacy_wire` is off.
+pub(crate) fn served_protocol_versions(legacy_wire: bool) -> Vec<String> {
+    let modern = v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION.to_owned();
+    if !legacy_wire {
+        return vec![modern];
+    }
+    LEGACY_PROTOCOL_VERSIONS
+        .iter()
+        .map(|v| (*v).to_owned())
+        .chain([SUPPORTED_PROTOCOL_VERSION.to_owned(), modern])
+        .collect()
+}
+
 // This module no longer holds any inline wire types, validators,
 // parser, router, or tests of its own — every such item now lives
 // under `shared/` or `v_2025_11_25/wire/`. The remaining content

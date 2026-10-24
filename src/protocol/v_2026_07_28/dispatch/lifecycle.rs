@@ -6,7 +6,6 @@ use crate::protocol::shared::deprecation::{
     DEPRECATIONS_META_KEY, FEATURE_LOGGING, FEATURE_ROOTS, FEATURE_SAMPLING,
 };
 use crate::protocol::v_2026_07_28::extensions::events::wire::EXTENSION_ID as EVENTS_EXTENSION_ID;
-use crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION;
 use crate::protocol::v_2026_07_28::wire::lifecycle::{
     CacheCapability, CompletionCapability, DiscoverResult, EventsCapability, ImplementationInfo,
     PromptsCapability, ResourcesCapability, ServerCapabilities, ToolsCapability,
@@ -14,6 +13,10 @@ use crate::protocol::v_2026_07_28::wire::lifecycle::{
 use crate::protocol::v_2026_07_28::wire::tools::CacheScope;
 use crate::runtime::TransportKind;
 use crate::runtime::shared_services::SharedServices;
+
+/// `server/discover`'s `instructions` when `mcp.instructions` is unset.
+const DEFAULT_INSTRUCTIONS: &str = "MCPG is speaking 2026-07-28. Capabilities reflect the \
+     operator's configured bindings; absence of a capability means no backend is wired for it.";
 
 pub(crate) fn build_discover_result(
     services: &SharedServices,
@@ -137,26 +140,29 @@ pub(crate) fn build_discover_result(
     // error response — keep the two correlated so the conformance
     // suite's `ServerUnsupportedVersionError` check sees a strict
     // subset relationship.
-    let mut supported_versions: Vec<String> = crate::protocol::LEGACY_PROTOCOL_VERSIONS
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
-    supported_versions.push(crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_owned());
-    supported_versions.push(SUPPORTED_PROTOCOL_VERSION.to_owned());
+    let supported_versions = crate::protocol::served_protocol_versions(
+        services.config_snapshot.gateway.server.legacy_wire,
+    );
 
+    let identity = &services.config_snapshot.mcp.server_info;
     DiscoverResult {
         result_type: crate::protocol::shared::caching::default_result_type_complete(),
         supported_versions,
         server_info: ImplementationInfo {
-            name: "mcpg".to_owned(),
-            title: Some("MCPG — MCP Gateway".to_owned()),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            description: Some(
-                "Cluster-aware MCP gateway with policy, quota, and observability plugins."
-                    .to_owned(),
+            name: identity.name.clone().unwrap_or_else(|| "mcpg".to_owned()),
+            title: Some(
+                identity
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| "MCPG — MCP Gateway".to_owned()),
             ),
-            icons: None,
-            website_url: None,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            description: Some(identity.description.clone().unwrap_or_else(|| {
+                "Cluster-aware MCP gateway with policy, quota, and observability plugins."
+                    .to_owned()
+            })),
+            icons: crate::config::binding_icons(identity.icons.as_ref()),
+            website_url: identity.website_url.clone(),
         },
         capabilities: ServerCapabilities {
             tools: has_tools.then_some(ToolsCapability {
@@ -188,9 +194,12 @@ pub(crate) fn build_discover_result(
             },
         },
         instructions: Some(
-            "MCPG is speaking 2026-07-28. Capabilities reflect the operator's configured \
-             bindings; absence of a capability means no backend is wired for it."
-                .to_owned(),
+            services
+                .config_snapshot
+                .mcp
+                .instructions
+                .clone()
+                .unwrap_or_else(|| DEFAULT_INSTRUCTIONS.to_owned()),
         ),
         // Discovery is identical for every client of this gateway, so
         // the result is publicly cacheable.

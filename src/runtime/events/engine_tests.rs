@@ -673,6 +673,25 @@ async fn core_on(
 }
 
 #[tokio::test]
+async fn a_stopped_replica_takes_no_lease_again() {
+    let backend: Arc<dyn ClusterBackend> =
+        crate::builtins::cluster_single_node::SingleNodeClusterBackend::new();
+    let log_kv = Arc::new(MemoryKv::new());
+    let runtime = test_runtime();
+    let a = core_on(Some(&backend), &log_kv, &runtime, EventCatalog::empty()).await;
+    let b = core_on(Some(&backend), &log_kv, &runtime, EventCatalog::empty()).await;
+
+    a.owner_tick().await;
+    assert!(a.is_owner());
+    a.stop().await;
+    a.owner_tick().await;
+    assert!(!a.is_owner());
+    assert!(a.held_shards(now_ms()).is_empty());
+    b.owner_tick().await;
+    assert!(b.is_owner(), "the stopped replica released the owner lease");
+}
+
+#[tokio::test]
 async fn one_replica_owns_the_logs_at_a_time() {
     let backend: Arc<dyn ClusterBackend> =
         crate::builtins::cluster_single_node::SingleNodeClusterBackend::new();

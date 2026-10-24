@@ -781,9 +781,11 @@ fn pipeline_two_mock_steps_returns_last_output() {
 
     assert!(!result.is_error, "pipeline should succeed");
     let structured = result.structured_content.expect("structured content");
-    assert_eq!(structured["result"]["second"], true);
-    assert_eq!(structured["completed_steps"], 2);
-    assert_eq!(structured["total_steps"], 2);
+    assert_eq!(structured, serde_json::json!({"second": true}));
+    match &result.content[0] {
+        ToolContent::Text { text, .. } => assert_eq!(text, r#"{"second":true}"#),
+        _ => panic!("unexpected content type"),
+    }
 }
 
 #[test]
@@ -816,8 +818,12 @@ fn pipeline_transform_step_produces_derived_value() {
     );
 
     assert!(!result.is_error, "pipeline should succeed");
-    let structured = result.structured_content.expect("structured content");
-    assert_eq!(structured["result"], "hello");
+    // A string output is text only: structuredContent is a JSON object.
+    assert!(result.structured_content.is_none());
+    match &result.content[0] {
+        ToolContent::Text { text, .. } => assert_eq!(text, "hello"),
+        _ => panic!("unexpected content type"),
+    }
 }
 
 #[test]
@@ -853,7 +859,7 @@ fn pipeline_cel_gate_pass_allows_continuation() {
 
     assert!(!result.is_error, "pipeline should pass gate");
     let structured = result.structured_content.expect("structured content");
-    assert_eq!(structured["result"]["final"], "done");
+    assert_eq!(structured["final"], "done");
 }
 
 #[test]
@@ -1000,8 +1006,80 @@ fn pipeline_context_accumulates_across_steps() {
 
     assert!(!result.is_error, "pipeline should succeed");
     let structured = result.structured_content.expect("structured content");
-    assert_eq!(structured["result"]["a"], 42);
-    assert_eq!(structured["result"]["b"], 99);
+    assert_eq!(structured["a"], 42);
+    assert_eq!(structured["b"], 99);
+}
+
+#[test]
+fn a_final_output_with_a_verbatim_result_is_that_result() {
+    let verbatim = serde_json::json!({
+        "__mcpg_verbatim_result": {
+            "content": [{"type": "text", "text": "needs confirmation"}],
+            "structuredContent": {"status": "needs_confirmation", "confirm_token": "t1"},
+            "isError": true
+        }
+    });
+    let binding = pipeline_binding("pipe", vec![mock_step("call", verbatim)]);
+    let dispatcher = ExecutionDispatcher::from_runtime_debug_config(
+        RuntimeDebugConfig {
+            default_allow_private_backends: true,
+            ..RuntimeDebugConfig::default()
+        },
+        &[binding],
+    );
+
+    let result = dispatcher.dispatch_tool_call(
+        BackendInvocationRoute::Pipeline {
+            profile: "pipe".to_owned(),
+        },
+        &sample_request(),
+        Some(sample_snapshot()),
+    );
+
+    assert!(result.is_error);
+    assert_eq!(
+        result.structured_content,
+        Some(serde_json::json!({"status": "needs_confirmation", "confirm_token": "t1"}))
+    );
+    match &result.content[0] {
+        ToolContent::Text { text, .. } => assert_eq!(text, "needs confirmation"),
+        _ => panic!("unexpected content type"),
+    }
+}
+
+#[test]
+fn a_backend_step_error_result_is_the_pipeline_result() {
+    let own = ToolCallResult {
+        content: vec![ToolContent::text("version conflict")],
+        structured_content: Some(serde_json::json!({"error": "version_conflict", "current": 7})),
+        is_error: true,
+        meta: None,
+    };
+    let outcome = super::StepOutcome::from_tool_result(own.clone());
+    assert!(matches!(outcome, super::StepOutcome::Failed(_)));
+    let result = super::stopped_result("pipe", "call", 0, 2, outcome);
+    assert!(result.is_error);
+    assert_eq!(result.structured_content, own.structured_content);
+    assert_eq!(result.content.len(), 1);
+    match &result.content[0] {
+        ToolContent::Text { text, .. } => assert_eq!(text, "version conflict"),
+        _ => panic!("unexpected content type"),
+    }
+}
+
+#[test]
+fn both_paths_complete_with_the_same_result() {
+    // The synchronous executor and the suspending one end through the same
+    // function, so a completed pipeline has one shape.
+    let object = serde_json::json!({"items": [1, 2]});
+    assert_eq!(
+        super::completed_result(object.clone()).structured_content,
+        Some(object)
+    );
+    assert_eq!(
+        super::completed_result(serde_json::json!([1, 2])).structured_content,
+        None
+    );
 }
 
 #[test]
@@ -1517,6 +1595,7 @@ async fn sql_tx_commits_nested_statements() {
     let value = match outcome {
         super::StepOutcome::Success(v) => v,
         super::StepOutcome::Error(e) => panic!("expected Success, got Error: {e}"),
+        super::StepOutcome::Failed(r) => panic!("expected Success, got Failed: {r:?}"),
         super::StepOutcome::GateAbort(m) => panic!("expected Success, got GateAbort: {m}"),
     };
     assert_eq!(
@@ -1629,6 +1708,7 @@ async fn sql_tx_rolls_back_on_nested_failure() {
             );
         }
         super::StepOutcome::Success(v) => panic!("expected Error, got Success: {v}"),
+        super::StepOutcome::Failed(r) => panic!("expected Error, got Failed: {r:?}"),
         super::StepOutcome::GateAbort(m) => panic!("expected Error, got GateAbort: {m}"),
     }
 
@@ -1723,6 +1803,7 @@ async fn sql_await_pipeline_step_returns_matched_row() {
             assert_eq!(v["id"], serde_json::json!(1));
         }
         super::StepOutcome::Error(e) => panic!("expected Success, got Error: {e}"),
+        super::StepOutcome::Failed(r) => panic!("expected Success, got Failed: {r:?}"),
         super::StepOutcome::GateAbort(m) => panic!("expected Success, got GateAbort: {m}"),
     }
 }
@@ -1803,6 +1884,7 @@ async fn sql_await_pipeline_step_errors_on_timeout() {
         super::StepOutcome::Success(v) => {
             panic!("expected Error on timeout, got Success: {v}")
         }
+        super::StepOutcome::Failed(r) => panic!("expected Error, got Failed: {r:?}"),
         super::StepOutcome::GateAbort(m) => panic!("expected Error, got GateAbort: {m}"),
     }
 }

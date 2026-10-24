@@ -129,6 +129,9 @@ impl GatewayRuntime {
                     }
                     if map.is_empty() { None } else { Some(map) }
                 };
+                let services = self.shared_services.load_full();
+                let mcp = services.as_ref().map(|s| &s.config_snapshot.mcp);
+                let identity = mcp.map(|m| &m.server_info);
                 let result = InitializeResult {
                     protocol_version: negotiated_version.to_owned(),
                     capabilities: ServerCapabilities {
@@ -167,17 +170,29 @@ impl GatewayRuntime {
                         extensions,
                     },
                     server_info: ImplementationInfo {
-                        name: self.service_name.clone(),
-                        title: Some("Model Context Protocol Gateway".to_owned()),
+                        name: identity
+                            .and_then(|i| i.name.clone())
+                            .unwrap_or_else(|| self.service_name.clone()),
+                        title: Some(
+                            identity
+                                .and_then(|i| i.title.clone())
+                                .unwrap_or_else(|| "Model Context Protocol Gateway".to_owned()),
+                        ),
                         version: self.service_version.clone(),
                         description: Some(
-                            "MCPG lifecycle bootstrap and gateway runtime server".to_owned(),
+                            identity.and_then(|i| i.description.clone()).unwrap_or_else(|| {
+                                "MCPG lifecycle bootstrap and gateway runtime server".to_owned()
+                            }),
                         ),
-                        website_url: None,
-                        icons: None,
+                        website_url: identity.and_then(|i| i.website_url.clone()),
+                        icons: crate::config::binding_icons(
+                            identity.and_then(|i| i.icons.as_ref()),
+                        ),
                     },
                     instructions: Some(
-                        "Complete lifecycle bootstrap by sending notifications/initialized before normal MCP operations.".to_owned(),
+                        mcp.and_then(|m| m.instructions.clone()).unwrap_or_else(|| {
+                            "Complete lifecycle bootstrap by sending notifications/initialized before normal MCP operations.".to_owned()
+                        }),
                     ),
                 };
 

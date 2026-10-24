@@ -83,6 +83,44 @@ pub struct McpConfig {
     /// default.
     #[serde(default)]
     pub registry: crate::config::registry::ServedRegistryConfig,
+
+    /// How the server presents itself to clients: `serverInfo` in
+    /// `server/discover` and in the `initialize` result. Every field is
+    /// optional; an unset field keeps MCPG's own value. `version` is always
+    /// the gateway's.
+    #[serde(default)]
+    pub server_info: McpServerInfoConfig,
+
+    /// The `instructions` a client receives in `server/discover` and in the
+    /// `initialize` result, typically shown to the model: what this server
+    /// is for and how to use its tools. At most 64 KiB. Unset keeps MCPG's
+    /// own text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Longest `mcp.instructions` the gateway accepts, in bytes.
+pub const MAX_INSTRUCTIONS_BYTES: usize = 64 * 1024;
+
+/// `mcp.server_info:` — the operator's `serverInfo` fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerInfoConfig {
+    /// Machine-readable server name, e.g. `com.example.docs`. Default `mcpg`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Human-readable display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// One-paragraph description shown next to the title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Branding icons (`src`, `mime_type`, `sizes`, `theme`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Vec<crate::config::BackendIconConfig>>,
+    /// The server's website.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub website_url: Option<String>,
 }
 
 /// `mcp.capabilities:` — the MCP protocol-advertised surface.
@@ -154,6 +192,29 @@ impl McpConfig {
         self.configurations.validate()?;
         self.validate_federations()?;
         self.validate_registries()?;
+        self.validate_identity()?;
+        Ok(())
+    }
+
+    /// Refuse a blank server name and instructions above
+    /// [`MAX_INSTRUCTIONS_BYTES`].
+    fn validate_identity(&self) -> Result<()> {
+        if self
+            .server_info
+            .name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            anyhow::bail!("mcp.server_info.name must not be blank");
+        }
+        if let Some(instructions) = &self.instructions
+            && instructions.len() > MAX_INSTRUCTIONS_BYTES
+        {
+            anyhow::bail!(
+                "mcp.instructions is {} bytes; at most {MAX_INSTRUCTIONS_BYTES} are accepted",
+                instructions.len()
+            );
+        }
         Ok(())
     }
 
@@ -505,6 +566,32 @@ mod tests {
         assert_eq!(cfg.capabilities.elicitation.timeout_ms, 60_000);
         assert_eq!(cfg.capabilities.sampling.timeout_ms, 60_000);
         assert_eq!(cfg.capabilities.roots.timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn a_blank_server_name_and_oversized_instructions_are_refused() {
+        let blank = McpConfig {
+            server_info: McpServerInfoConfig {
+                name: Some("  ".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = blank.validate().unwrap_err().to_string();
+        assert!(err.contains("mcp.server_info.name"), "{err}");
+
+        let long = McpConfig {
+            instructions: Some("x".repeat(MAX_INSTRUCTIONS_BYTES + 1)),
+            ..Default::default()
+        };
+        let err = long.validate().unwrap_err().to_string();
+        assert!(err.contains("mcp.instructions"), "{err}");
+
+        let fits = McpConfig {
+            instructions: Some("x".repeat(4 * 1024)),
+            ..Default::default()
+        };
+        fits.validate().expect("4 KiB of instructions is accepted");
     }
 
     #[test]

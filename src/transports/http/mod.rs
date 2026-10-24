@@ -96,8 +96,9 @@ pub(crate) use sse::{
 };
 pub use validate::origin_admitted;
 pub(crate) use validate::{
-    enforce_http_protocol_version_header, post_accepts_sse, validate_get_accept, validate_origin,
-    validate_post_accept, validate_post_content_type,
+    enforce_http_protocol_version_header, legacy_wire_refused, post_accepts_sse,
+    session_header_refused, validate_get_accept, validate_origin, validate_post_accept,
+    validate_post_content_type,
 };
 pub(crate) use webhooks::{webhook_approval_resolution_handler, webhook_resource_updated_handler};
 // Reached only from this transport's test module.
@@ -782,10 +783,21 @@ async fn mcp_handler(
     // envelope echoes it back (SEP-2575 says all error responses
     // carry the request id; otherwise the client can't correlate).
     let body_id_for_errors = body.as_object().and_then(|obj| obj.get("id")).cloned();
+    let legacy_wire = config.gateway.server.legacy_wire;
     if let Err(response) =
-        enforce_http_protocol_version_header(&headers, body_id_for_errors.as_ref())
+        enforce_http_protocol_version_header(&headers, body_id_for_errors.as_ref(), legacy_wire)
     {
         return response;
+    }
+    // Without the legacy wire, a request that negotiated a `2025-xx`
+    // revision or names a session is refused before any session work.
+    if !legacy_wire {
+        if !wire.is_modern() {
+            return legacy_wire_refused(&headers, &body);
+        }
+        if headers.contains_key(SESSION_ID_HEADER) {
+            return session_header_refused(body_id_for_errors);
+        }
     }
 
     // MCP 2025-11-25: POST body MUST be a single JSON-RPC request, notification, or response.
@@ -1800,15 +1812,16 @@ async fn mcp_get_handler(
     // SEP-2575: a 2026-07-28 server has no server-push GET stream
     // (`subscriptions/listen` over POST replaces it) — answer 405.
     // Legacy GET (SSE delivery) is unchanged.
+    let legacy_wire = config.gateway.server.legacy_wire;
     if let Some(response) =
-        reject_method_on_modern_wire(&runtime, &headers, &request_context.request_id)
+        reject_method_on_modern_wire(&runtime, &headers, &request_context.request_id, legacy_wire)
     {
         return response;
     }
     if let Some(response) = validate_get_accept(&headers, &request_context.request_id) {
         return response;
     }
-    if let Err(response) = enforce_http_protocol_version_header(&headers, None) {
+    if let Err(response) = enforce_http_protocol_version_header(&headers, None, legacy_wire) {
         return response;
     }
     // Session-owner binding: only the session's creator may drain its
@@ -2086,12 +2099,13 @@ async fn mcp_delete_handler(
     // SEP-2567/2575: the modern wire has no protocol-level sessions to
     // terminate — answer 405 on DELETE. Legacy DELETE (session
     // termination) is unchanged.
+    let legacy_wire = config.gateway.server.legacy_wire;
     if let Some(response) =
-        reject_method_on_modern_wire(&runtime, &headers, &request_context.request_id)
+        reject_method_on_modern_wire(&runtime, &headers, &request_context.request_id, legacy_wire)
     {
         return response;
     }
-    if let Err(response) = enforce_http_protocol_version_header(&headers, None) {
+    if let Err(response) = enforce_http_protocol_version_header(&headers, None, legacy_wire) {
         return response;
     }
     let Some(session_id) = request_context.session_id.as_deref() else {

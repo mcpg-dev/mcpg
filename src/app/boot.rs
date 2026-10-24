@@ -193,7 +193,9 @@ async fn build_with(
     .await?;
     let session_kv = wrap_tenant_kv(wrap_state_kv(session_kv, &state_cipher), &tenant_seg);
     let session_store: Arc<dyn crate::runtime::session_store::SessionStore> = Arc::new(
-        crate::runtime::session_store::KvBackedSessionStore::new(store_config, session_kv).await?,
+        crate::runtime::session_store::KvBackedSessionStore::new(store_config, session_kv)
+            .await?
+            .shared_across_replicas(!config.cluster.is_single_node()),
     );
 
     // Unified delivery_bus path: every backend variant resolves to a

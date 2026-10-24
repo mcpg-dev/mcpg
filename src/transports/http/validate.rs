@@ -153,9 +153,12 @@ pub(crate) fn post_accepts_sse(headers: &HeaderMap) -> bool {
 /// observable via `mcpg_protocol_version_absent_total`. We accept the
 /// current revision plus the declared legacy revisions here; the runtime
 /// still reconciles the effective version with the session state.
+///
+/// With `legacy_wire` off, a `2025-xx` header is refused like an unknown one.
 pub(crate) fn enforce_http_protocol_version_header(
     headers: &HeaderMap,
     body_id: Option<&Value>,
+    legacy_wire: bool,
 ) -> Result<(), Response> {
     let Some(raw) = headers.get(PROTOCOL_VERSION_HEADER) else {
         metrics::counter!(
@@ -168,6 +171,15 @@ pub(crate) fn enforce_http_protocol_version_header(
     let header = raw
         .to_str()
         .map_err(|_| invalid_request_protocol_version(body_id.cloned()))?;
+    let session_wire = header == crate::protocol::SUPPORTED_PROTOCOL_VERSION
+        || crate::protocol::LEGACY_PROTOCOL_VERSIONS.contains(&header);
+    if session_wire && !legacy_wire {
+        return Err(unsupported_protocol_version_response(
+            header,
+            body_id.cloned(),
+            false,
+        ));
+    }
     if header == crate::protocol::SUPPORTED_PROTOCOL_VERSION {
         return Ok(());
     }
@@ -196,7 +208,39 @@ pub(crate) fn enforce_http_protocol_version_header(
     Err(unsupported_protocol_version_response(
         header,
         body_id.cloned(),
+        legacy_wire,
     ))
+}
+
+/// The refusal of a POST that negotiated a `2025-xx` revision while
+/// `legacy_wire` is off. `requested` names the revision the client asked
+/// for: the header, else `initialize`'s `params.protocolVersion`, else the
+/// revision a request with neither is taken to speak.
+pub(crate) fn legacy_wire_refused(headers: &HeaderMap, body: &Value) -> Response {
+    let requested = headers
+        .get(PROTOCOL_VERSION_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| {
+            body.pointer("/params/protocolVersion")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or(crate::protocol::LEGACY_DEFAULT_PROTOCOL_VERSION);
+    unsupported_protocol_version_response(requested, body.get("id").cloned(), false)
+}
+
+/// The refusal of a POST that carries `Mcp-Session-Id` while `legacy_wire`
+/// is off: `2026-07-28` has no sessions.
+pub(crate) fn session_header_refused(body_id: Option<Value>) -> Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": body_id.unwrap_or(Value::Null),
+        "error": {
+            "code": -32600,
+            "message": "Mcp-Session-Id is not accepted: this gateway serves only \
+                        2026-07-28, which has no sessions",
+        }
+    });
+    protocol_version_error_response(body, false)
 }
 
 /// JSON-RPC error for a present-but-unservable `Mcp-Protocol-Version`.
@@ -206,16 +250,15 @@ pub(crate) fn enforce_http_protocol_version_header(
 /// which is reserved for a malformed header. The `error.data` here adds a
 /// `kind` discriminator (the registry's variant omits it); both carry
 /// `requested` + `supported`.
-fn unsupported_protocol_version_response(requested: &str, body_id: Option<Value>) -> Response {
+fn unsupported_protocol_version_response(
+    requested: &str,
+    body_id: Option<Value>,
+    legacy_wire: bool,
+) -> Response {
     // Advertise every revision MCPG can actually serve, not just
     // the default, so a client receiving the error can pick a working
     // revision without trial-and-error.
-    let mut supported: Vec<String> = crate::protocol::LEGACY_PROTOCOL_VERSIONS
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
-    supported.push(crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_owned());
-    supported.push(crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION.to_owned());
+    let supported = crate::protocol::served_protocol_versions(legacy_wire);
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": body_id.unwrap_or(Value::Null),
@@ -229,7 +272,7 @@ fn unsupported_protocol_version_response(requested: &str, body_id: Option<Value>
             }
         }
     });
-    protocol_version_error_response(body)
+    protocol_version_error_response(body, legacy_wire)
 }
 
 /// JSON-RPC error for a malformed (non-UTF-8) `Mcp-Protocol-Version`
@@ -244,18 +287,24 @@ fn invalid_request_protocol_version(body_id: Option<Value>) -> Response {
             "message": "Mcp-Protocol-Version header is not valid UTF-8",
         }
     });
-    protocol_version_error_response(body)
+    protocol_version_error_response(body, true)
 }
 
 /// Shared 400 + JSON body + `Mcp-Protocol-Version` response header used by
-/// both protocol-version rejection paths. The id is carried in the body
+/// the protocol-version rejection paths. The id is carried in the body
 /// (SEP-2575 mandates error responses correlate against the request id).
-fn protocol_version_error_response(body: Value) -> Response {
+/// The header names `2026-07-28` when the legacy wire is off.
+fn protocol_version_error_response(body: Value, legacy_wire: bool) -> Response {
     use axum::http::StatusCode;
     let mut resp = (StatusCode::BAD_REQUEST, Json(body)).into_response();
+    let version = if legacy_wire {
+        crate::protocol::SUPPORTED_PROTOCOL_VERSION
+    } else {
+        crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION
+    };
     resp.headers_mut().insert(
         HeaderName::from_static(PROTOCOL_VERSION_HEADER),
-        HeaderValue::from_static(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+        HeaderValue::from_static(version),
     );
     resp
 }

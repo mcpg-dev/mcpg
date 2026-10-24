@@ -154,13 +154,15 @@ pub(crate) fn map_protocol_http_response(response: ProtocolHttpResponse) -> Resp
 
 /// SEP-2567/2575: a 2026-07-28 server exposes only the POST endpoint.
 /// Return an HTTP 405 response when the request negotiates the modern
-/// wire; `None` lets the legacy GET/DELETE handler proceed.
+/// wire, or always when the legacy wire is off; `None` lets the legacy
+/// GET/DELETE handler proceed.
 pub(crate) fn reject_method_on_modern_wire(
     runtime: &crate::runtime::GatewayRuntime,
     headers: &HeaderMap,
     request_id: &GatewayRequestId,
+    legacy_wire: bool,
 ) -> Option<Response> {
-    if WireVersion::from_headers(runtime, headers).is_modern() {
+    if !legacy_wire || WireVersion::from_headers(runtime, headers).is_modern() {
         Some(with_request_id_header(
             (
                 axum::http::StatusCode::METHOD_NOT_ALLOWED,

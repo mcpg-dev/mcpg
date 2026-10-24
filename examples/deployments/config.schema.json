@@ -4354,6 +4354,7 @@
               "unhealthy_threshold": 3
             },
             "health_path": "/health",
+            "legacy_wire": true,
             "max_request_body_mb": 4,
             "max_sessions_per_tenant": 0,
             "mcp_path": "/mcp",
@@ -5695,6 +5696,13 @@
           },
           "type": "array"
         },
+        "instructions": {
+          "description": "The `instructions` a client receives in `server/discover` and in the `initialize` result, typically shown to the model: what this server is for and how to use its tools. At most 64 KiB. Unset keeps MCPG's own text.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "registries": {
           "default": [],
           "description": "MCP registries whose listed servers MCPG auto-federates: a background syncer crawls each registry's `/v0.1` API and materializes one federation per usable server, kept in sync as the registry changes. Default empty.",
@@ -5714,6 +5722,15 @@
             "name": ""
           },
           "description": "The registry MCPG *serves* (contrast `registries`, the registries MCPG *consumes*): a v0.1 MCP-Registry view of this gateway — one entry describing the governed catalog — so registry-driven clients (e.g. Copilot's allowed-registry policy) can discover MCPG as their approved server. Off by default."
+        },
+        "server_info": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/McpServerInfoConfig"
+            }
+          ],
+          "default": {},
+          "description": "How the server presents itself to clients: `serverInfo` in `server/discover` and in the `initialize` result. Every field is optional; an unset field keeps MCPG's own value. `version` is always the gateway's."
         }
       },
       "type": "object"
@@ -6099,6 +6116,51 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "McpServerInfoConfig": {
+      "additionalProperties": false,
+      "description": "`mcp.server_info:` — the operator's `serverInfo` fields.",
+      "properties": {
+        "description": {
+          "description": "One-paragraph description shown next to the title.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "icons": {
+          "description": "Branding icons (`src`, `mime_type`, `sizes`, `theme`).",
+          "items": {
+            "$ref": "#/definitions/BackendIconConfig"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Machine-readable server name, e.g. `com.example.docs`. Default `mcpg`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "Human-readable display name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "website_url": {
+          "description": "The server's website.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -8134,6 +8196,11 @@
         "health_path": {
           "default": "/health",
           "type": "string"
+        },
+        "legacy_wire": {
+          "default": true,
+          "description": "Serve the session wire of the `2025-xx` revisions: `initialize`, `Mcp-Session-Id`, and the GET stream and DELETE on the MCP path. Default `true`. With `false` the gateway serves only the stateless `2026-07-28` revision, over HTTP: a POST that negotiates a `2025-xx` revision (by header, by `initialize`, or by sending neither header nor `_meta` version) is refused with HTTP 400 and JSON-RPC `-32022` (`data.supported` is `[\"2026-07-28\"]`), a POST that carries `Mcp-Session-Id` is refused with HTTP 400 and `-32600`, GET and DELETE answer 405, and `server/discover` lists only `2026-07-28`. The stdio transport speaks `2025-11-25`, so it refuses to start with `false`.",
+          "type": "boolean"
         },
         "max_request_body_mb": {
           "default": 4,
@@ -10542,6 +10609,7 @@
             "unhealthy_threshold": 3
           },
           "health_path": "/health",
+          "legacy_wire": true,
           "max_request_body_mb": 4,
           "max_sessions_per_tenant": 0,
           "mcp_path": "/mcp",
@@ -10811,7 +10879,8 @@
         "registry": {
           "enabled": false,
           "name": ""
-        }
+        },
+        "server_info": {}
       },
       "description": "`mcp:` namespace — the MCP protocol surface. Two children: `capabilities:` (tools / prompts / resources / resource_templates / tasks / elicitation / sampling / roots — what the server advertises in `initialize`) and `configurations:` (sessions / pipelines / subscriptions / delivery / cancellation — runtime-emergent state). Capability persistence (`store:` / `bus:`) defaults to `kind: cluster` — the cluster coordinator's primitive — and can be overridden per capability with `kind: memory` / `file`."
     },

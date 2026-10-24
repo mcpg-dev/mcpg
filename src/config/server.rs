@@ -200,6 +200,18 @@ pub struct ServerConfig {
     /// unaffected until they adopt the triple.
     #[serde(default)]
     pub enforce_modern_request_meta: bool,
+    /// Serve the session wire of the `2025-xx` revisions: `initialize`,
+    /// `Mcp-Session-Id`, and the GET stream and DELETE on the MCP path.
+    /// Default `true`. With `false` the gateway serves only the stateless
+    /// `2026-07-28` revision, over HTTP: a POST that negotiates a `2025-xx`
+    /// revision (by header, by `initialize`, or by sending neither header
+    /// nor `_meta` version) is refused with HTTP 400 and JSON-RPC `-32022`
+    /// (`data.supported` is `["2026-07-28"]`), a POST that carries
+    /// `Mcp-Session-Id` is refused with HTTP 400 and `-32600`, GET and DELETE
+    /// answer 405, and `server/discover` lists only `2026-07-28`. The stdio
+    /// transport speaks `2025-11-25`, so it refuses to start with `false`.
+    #[serde(default = "crate::config::default_true")]
+    pub legacy_wire: bool,
     /// After boot (plugins loaded, config-origin `env://` / `${env.X}`
     /// secrets already captured by the env secret provider's snapshot),
     /// remove those referenced env vars from the live process
@@ -306,6 +318,7 @@ impl Default for ServerConfig {
             unary_json_fast_path: false,
             access_log: true,
             enforce_modern_request_meta: false,
+            legacy_wire: true,
             scrub_process_env_after_boot: false,
             server_ping_interval_ms: None,
             max_sessions_per_tenant: 0,

@@ -230,6 +230,17 @@ pub async fn run(state: AppState) -> Result<()> {
     // listener uses, so reloads propagate to extra transports
     // without restarting them. Failure to start refuses boot
     // — operators see the bind / config error directly.
+    let server = &config.gateway.server;
+    if !server.legacy_wire {
+        let stdio = server.transport == TransportMode::Stdio
+            && !server.tunnel.as_ref().is_some_and(|t| t.enabled);
+        if stdio || !server.transports.is_empty() {
+            anyhow::bail!(
+                "gateway.server.legacy_wire: false serves only 2026-07-28, over HTTP; the \
+                 stdio transport and the gateway.server.transports entries speak 2025-11-25"
+            );
+        }
+    }
     let extra_transport_handles = start_extra_transports(
         &config.gateway.server.transports,
         &config.plugins,
@@ -494,6 +505,19 @@ pub async fn run(state: AppState) -> Result<()> {
     }
     cancellation_subscriber_handle.abort();
     info!("cancellation subscriber stopped");
+
+    // Release the events owner lease and the dispatcher shards while the
+    // cluster coordinator plugin still runs, so another replica takes them
+    // at once rather than when they expire.
+    if let Some(events) = state.runtime.load().events_core() {
+        match tokio::time::timeout(shutdown_timeout, events.stop()).await {
+            Ok(()) => info!("events leases released"),
+            Err(_) => warn!(
+                timeout_secs = shutdown_timeout.as_secs(),
+                "events lease release exceeded shutdown timeout"
+            ),
+        }
+    }
 
     // Drain plugin-owned background state (audit sinks, webhook buffers).
     // Each plugin gets a bounded budget so a misbehaving shutdown hook

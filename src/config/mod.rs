@@ -116,7 +116,7 @@ pub use interactive_login::{
 pub use license::LicenseConfig;
 pub use mcp::{
     McpCapabilitiesConfig, McpConfig, McpConfigurationsConfig, McpElicitationConfig,
-    McpRootsConfig, McpSamplingConfig,
+    McpRootsConfig, McpSamplingConfig, McpServerInfoConfig,
 };
 pub use observability::{LogsConfig, MetricsConfig, ObservabilityConfig, SinkConfig, TracesConfig};
 pub use plugins::{
