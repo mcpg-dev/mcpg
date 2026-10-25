@@ -357,7 +357,7 @@ data: {"jsonrpc":"2.0","id":"srv-1","method":"elicitation/create","params":{...}
 
 ### Resumption
 
-Send `Last-Event-Id: stream-1:5` header on reconnect. Events after the cursor are replayed from the replay window. If the cursor has expired, the server returns HTTP 409 Conflict.
+Send `Last-Event-Id: stream-1:5` header on reconnect. Events after the cursor are replayed from the replay window. If the cursor has expired, the server returns HTTP 409 Conflict. A session keeps the replay of its 16 most recent streams, within 256 KiB of events; a cursor on an older stream has expired too.
 
 ---
 

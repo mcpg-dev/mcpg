@@ -30,20 +30,27 @@ backend:
       expression: 'steps.step1.output.data'
 ```
 
-**Validation rules**:
-- All step IDs must be unique within a pipeline
-- CEL expressions in `transform`, `cel_gate`, and `input_transform` must not reference forward (undefined) step IDs
+**Step IDs**:
+- Give each step an ID of its own: a step's result is kept under its ID, so a later step with the same ID replaces it
+- An expression that names a step that has not run fails the step that evaluates it
 - Step IDs are used as keys in the `steps` context variable
 
 ## Pipeline Context
 
-Every step has access to the pipeline context with three top-level variables:
+`transform`, `cel_gate` and `input_transform` are CEL expressions over these
+variables:
 
 | Variable | Type | Description |
 |---|---|---|
-| `original_args` | JSON object | Tool arguments from the original `tools/call` |
-| `request_context` | JSON object | Request ID, session ID, identity, transport |
+| `arguments` (also `args`) | JSON object | The arguments of the call: a tool's arguments, or `{uri}` for a resource read |
 | `steps` | JSON object | Completed step results keyed by step ID |
+| `context` | JSON object | The caller: `principal_id`, `trust_level`, `auth_provider`, `session_id`, `transport`, `roles`, `groups`, `scopes`, `attributes` |
+| `tool_name` | string | The binding's name |
+
+A backend step's own templates (`url`, headers, …) see `arguments` (the
+step's input) and `context`, not `steps`; an earlier step's output reaches
+a backend step through `input_transform`. The text of `log`, `progress`,
+`elicitation` and `sampling` steps is sent as written.
 
 Each `steps` entry:
 ```json
@@ -79,7 +86,7 @@ config flattens directly onto the step. Each supports an optional
   expected_status_codes: [200]
   require_json_response: true
   headers: {}
-  input_transform: 'original_args'       # Optional CEL expression
+  input_transform: '{"id": arguments.user_id}'   # Optional CEL expression: the JSON body
 ```
 
 #### Command Step
@@ -207,7 +214,7 @@ Emits a `notifications/message`.
 - kind: log
   id: "announce"
   level: info
-  data: "Charging order ${original_args.order_id}"
+  data: "Charging the order"
 ```
 
 #### Progress Step

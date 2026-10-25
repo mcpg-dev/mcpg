@@ -502,7 +502,7 @@ pub async fn run(state: AppState) -> Result<()> {
         handle.abort();
         info!("cluster health probe stopped");
     }
-    state.runtime.load().stop_cluster_listeners();
+    state.runtime.load_full().stop_cluster_listeners().await;
     info!("cancellation subscriber and session end listener stopped");
 
     // Release the events owner lease and the dispatcher shards while the

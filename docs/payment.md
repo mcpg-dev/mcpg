@@ -604,7 +604,7 @@ If the `mpp` crate API does not match these signatures at implementation time, t
 
 **Deliverables**:
 - `PipelineStepConfig::Payment` variant
-- CEL expression for amount computation (`expression: 'string(size(original_args.data) * 10)'`)
+- CEL expression for amount computation (`expression: 'string(size(arguments.data) * 10)'`)
 - Suspension behavior (like elicitation) if client needs to sign new credential for computed amount
 
 ### x402 + ACP Adapters

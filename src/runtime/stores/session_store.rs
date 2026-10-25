@@ -410,6 +410,32 @@ impl StoredSession {
     fn touch(&mut self) {
         self.last_seen_at = Utc::now();
     }
+
+    /// Drop the replay of the oldest streams while more than
+    /// [`RETAINED_STREAMS`] are kept or their events hold more than
+    /// [`RETAINED_REPLAY_BYTES`]; the active stream stays.
+    fn retire_old_streams(&mut self) {
+        let mut ids: Vec<(u64, String)> = self
+            .streams
+            .keys()
+            .map(|id| (stream_ordinal(id).unwrap_or(0), id.clone()))
+            .collect();
+        ids.sort_unstable();
+        let mut kept = ids.len();
+        let mut bytes: usize = self.streams.values().map(StoredStream::replay_bytes).sum();
+        for (_, id) in ids {
+            if kept <= RETAINED_STREAMS && bytes <= RETAINED_REPLAY_BYTES {
+                break;
+            }
+            if self.active_stream_id.as_deref() == Some(id.as_str()) {
+                continue;
+            }
+            if let Some(stream) = self.streams.remove(&id) {
+                kept -= 1;
+                bytes -= stream.replay_bytes();
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -420,6 +446,16 @@ struct StoredStream {
     /// persisted; `None` until the first log attempt fills it lazily.
     #[serde(skip)]
     log_bucket: Option<LogTokenBucket>,
+}
+
+impl StoredStream {
+    /// The bytes of event data the replay holds.
+    fn replay_bytes(&self) -> usize {
+        self.replay_window
+            .iter()
+            .map(|event| event.event_id.len() + event.data.len())
+            .sum()
+    }
 }
 
 /// Per-stream token bucket for logging-notification rate limiting.
@@ -451,6 +487,21 @@ impl LogTokenBucket {
 }
 
 const SSE_RETRY_MS: u64 = 1500;
+
+/// The streams a session keeps the replay of: its most recent ones. A client
+/// resumes a stream it was cut from, not one it finished long ago; every
+/// request opens a stream, so without a bound the row grows at each one.
+const RETAINED_STREAMS: usize = 16;
+
+/// The most event data a session's replay keeps, in bytes: the oldest
+/// streams go first. A response stream holds its whole result, and a row
+/// must stay well under a coordinator's message limit (NATS: 1 MiB).
+const RETAINED_REPLAY_BYTES: usize = 256 * 1024;
+
+/// The ordinal of a `stream-{ordinal}` id.
+fn stream_ordinal(stream_id: &str) -> Option<u64> {
+    stream_id.strip_prefix("stream-")?.parse().ok()
+}
 
 /// How often a read refreshes the row of a session in use: a quarter of
 /// the idle timeout, at least a second.
@@ -1154,19 +1205,34 @@ impl KvBackedSessionStore {
             Err(_) => return false,
         };
         let payload = bytes::Bytes::from(bytes);
+        let row_bytes = payload.len();
         let at_ms = Utc::now().timestamp_millis();
         let ttl = self.row_ttl();
         let slot = Self::tenant_slot_key(session);
-        let written = Self::block(async {
-            let written = self.state.put(&key, payload, Some(ttl)).await.is_ok();
-            if written && let Some(slot) = &slot {
+        let outcome = Self::block(async {
+            let outcome = self.state.put(&key, payload, Some(ttl)).await;
+            if outcome.is_ok()
+                && let Some(slot) = &slot
+            {
                 let _ = self
                     .state
                     .put(slot, bytes::Bytes::from_static(b"1"), Some(ttl))
                     .await;
             }
-            written
+            outcome
         });
+        let written = match outcome {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %session.session_id,
+                    row_bytes,
+                    %error,
+                    "session row write failed; other replicas read the last copy written"
+                );
+                false
+            }
+        };
         if written {
             self.mark_written(&session.session_id, at_ms);
             // An end removes the copy before it deletes the row, so a write
@@ -1697,10 +1763,16 @@ impl SessionStore for KvBackedSessionStore {
         if let Some(resume_cursor) = resume_cursor {
             let (stream_id, last_ordinal) = parse_event_id(&resume_cursor.last_event_id)
                 .ok_or(StreamAccessError::InvalidCursor)?;
-            let stream = session
-                .streams
-                .get(stream_id)
-                .ok_or(StreamAccessError::InvalidCursor)?;
+            let Some(stream) = session.streams.get(stream_id) else {
+                // A stream the session opened and has since retired.
+                let retired = stream_ordinal(stream_id)
+                    .is_some_and(|ordinal| ordinal < session.next_stream_ordinal);
+                return Err(if retired {
+                    StreamAccessError::ExpiredCursor
+                } else {
+                    StreamAccessError::InvalidCursor
+                });
+            };
             // Compare on the canonical `{stream_id}:{ordinal}` core so a
             // delivery-tagged cursor still matches its stored record
             // regardless of the opaque delivery-id suffix.
@@ -1766,6 +1838,7 @@ impl SessionStore for KvBackedSessionStore {
             Some(logging_event) => vec![prime_event, logging_event],
             None => vec![prime_event],
         };
+        session.retire_old_streams();
         let stored = session.clone();
         drop(session);
         self.persist_session(&stored);
@@ -1872,6 +1945,7 @@ impl SessionStore for KvBackedSessionStore {
         }
         events.extend(pending_events);
         events.push(response_event);
+        session.retire_old_streams();
         let stored = session.clone();
         drop(session);
         self.persist_session(&stored);
@@ -2658,6 +2732,109 @@ mod tests {
         assert!(
             store.session_lifetime(&id).is_none(),
             "an ended session has no streams to hold"
+        );
+    }
+
+    fn operational_session(store: &KvBackedSessionStore) -> String {
+        let id = store
+            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
+            .session_id;
+        store.transition_session_to_operational(&id).unwrap();
+        id
+    }
+
+    fn resume(store: &KvBackedSessionStore, id: &str, event: &SseEventRecord) -> StreamAccessError {
+        store
+            .open_sse_stream(
+                Some(id),
+                Some(&ResumeCursor {
+                    last_event_id: event.event_id.clone(),
+                }),
+            )
+            .err()
+            .unwrap_or(StreamAccessError::UnknownSession)
+    }
+
+    /// Every request opens a stream; a session keeps the replay of its most
+    /// recent ones, so its row stays small however many requests it serves.
+    #[test]
+    fn a_session_keeps_the_replay_of_its_recent_streams_only() {
+        let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
+        let id = operational_session(&store);
+        let mut answers = Vec::new();
+        for _ in 0..200 {
+            answers.push(
+                store
+                    .stream_protocol_response(&id, &ProtocolResponse::NotificationAccepted)
+                    .unwrap(),
+            );
+        }
+        let kept = store.sessions.get(&id).unwrap().streams.len();
+        assert_eq!(kept, RETAINED_STREAMS, "streams kept after 200 requests");
+
+        let last = answers.last().unwrap().last().unwrap();
+        assert!(
+            store
+                .open_sse_stream(
+                    Some(&id),
+                    Some(&ResumeCursor {
+                        last_event_id: answers[199][0].event_id.clone(),
+                    }),
+                )
+                .unwrap()
+                .contains(last),
+            "the latest stream resumes"
+        );
+        assert_eq!(
+            resume(&store, &id, &answers[0][0]),
+            StreamAccessError::ExpiredCursor,
+            "a retired stream is an expired cursor, not an invalid one"
+        );
+        assert_eq!(
+            resume(
+                &store,
+                &id,
+                &SseEventRecord {
+                    event_id: "stream-9999:0".to_owned(),
+                    data: String::new(),
+                    retry_ms: None,
+                }
+            ),
+            StreamAccessError::InvalidCursor
+        );
+    }
+
+    /// A response stream holds its whole result: the replay drops the
+    /// oldest streams once their events pass the byte budget.
+    #[test]
+    fn large_results_keep_the_replay_under_its_byte_budget() {
+        let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
+        let id = operational_session(&store);
+        let result = serde_json::json!({ "text": "x".repeat(100 * 1024) });
+        for n in 0..10 {
+            let answer = ProtocolResponse::JsonRpcSuccess(crate::protocol::JsonRpcSuccess {
+                jsonrpc: JSONRPC_VERSION,
+                id: serde_json::json!(n),
+                result: result.clone(),
+            });
+            store.stream_protocol_response(&id, &answer).unwrap();
+        }
+        let session = store.sessions.get(&id).unwrap();
+        let bytes: usize = session
+            .streams
+            .values()
+            .map(StoredStream::replay_bytes)
+            .sum();
+        assert!(
+            bytes <= RETAINED_REPLAY_BYTES,
+            "{bytes} bytes of replay in {} streams",
+            session.streams.len()
+        );
+        assert!(
+            session
+                .streams
+                .contains_key(session.active_stream_id.as_deref().unwrap()),
+            "the active stream stays"
         );
     }
 

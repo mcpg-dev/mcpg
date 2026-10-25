@@ -288,8 +288,11 @@ pub(crate) fn build_watch_resource_fetcher(
             cancellation_token: None,
             idempotency_hint: None,
         };
-        let result =
-            execution_dispatcher.dispatch_tool_call(binding_route, &execution_request, None);
+        let result = execution_dispatcher.dispatch_tool_call(
+            binding_route.clone(),
+            &execution_request,
+            None,
+        );
 
         if result.is_error {
             warn!(
@@ -301,7 +304,26 @@ pub(crate) fn build_watch_resource_fetcher(
             return None;
         }
 
-        let decoded = invocation::decode_resource_result(&result, uri).ok()?;
+        let decoded = match invocation::decode_binding_resource_result(
+            &binding_route,
+            &result,
+            uri,
+            capability_registry
+                .resource_mime_type(uri, &profile)
+                .as_deref(),
+        ) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                warn!(
+                    resource_uri = uri,
+                    profile = %profile,
+                    %error,
+                    "watch resource fetcher: the backend's answer is not resource \
+                     contents; leaving snapshot unchanged for this poll tick"
+                );
+                return None;
+            }
+        };
         decoded.contents.into_iter().find_map(|c| match c {
             crate::protocol::ResourceContents::Text(t) => Some(t.text),
             crate::protocol::ResourceContents::Blob(_) => None,

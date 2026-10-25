@@ -759,12 +759,12 @@ backend:
       # …http step fields
     - id: "transform"
       kind: transform
-      expression: 'completed_steps.fetch.output.data'
+      expression: 'steps.fetch.output.response.json.data'
 ```
 
 **Execution**:
 - Executes steps sequentially
-- Each step reads from pipeline context (original_args, request_context, completed_steps)
+- Each step reads from pipeline context (`arguments`, `steps`, `context`)
 - Suspending steps (elicitation, sampling) persist state and resume on client response
 - First error aborts the pipeline
 

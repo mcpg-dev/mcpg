@@ -225,7 +225,7 @@ kinds**, each a flat `kind:` discriminator with `id:` plus its own fields:
 
 Suspending steps serialize pipeline state to the pipeline store, send a server-initiated JSON-RPC request to the client via the delivery bus, and resume when the client responds.
 
-Pipeline context flows data between steps: each step reads from `original_args`, `request_context`, and `completed_steps[step_id].output`. CEL expressions in `transform` and `cel_gate` steps operate over this context.
+Pipeline context flows data between steps: CEL expressions in `transform`, `cel_gate` and `input_transform` read `arguments`, `context` and `steps.<step_id>.output`.
 
 ## Distributed Infrastructure
 

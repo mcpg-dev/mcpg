@@ -3523,42 +3523,26 @@ fn build_test_fetcher(
 ) -> Arc<dyn Fn(&str) -> Option<String> + Send + Sync> {
     use crate::backends::{DebugToolBackends, DebugToolExposure};
     use crate::runtime::execution::{ExecutionDispatcher, RuntimeDebugConfig};
-    // Resource fixtures are mock-backed; register the in-tree mock plugin
-    // + its per-binding profiles so the fetcher's dispatch resolves
+    // Resource fixtures are mock- or http-backed; register those in-tree
+    // plugins + their per-binding profiles so the fetcher's dispatch resolves
     // (the bare dispatcher bypasses the Runtime's #[cfg(test)] fallback).
     let mut plugin_registry = mcpg_plugin_host::PluginRegistry::new();
-    let mock_bindings: Vec<&crate::config::BackendConfig> = bindings
-        .iter()
-        .filter(|b| b.backend.kind == "mock")
-        .collect();
-    if !mock_bindings.is_empty() {
-        let mock_plugin = Arc::new(mcpg_plugin_backend_mock::MockBackendPlugin::new());
-        mcpg_plugin_host::FirstPartyRegistrar::new(&mut plugin_registry)
-            .register(
-                mcpg_plugin_backend_mock::BINDING_DESCRIPTOR_YAML,
-                &[],
-                (),
-                |reg, _host| {
-                    reg.register_backend(
-                        mock_plugin.clone(),
-                        mcpg_plugin_protocol::PluginTier::Native,
-                    )
-                },
-            )
-            .expect("register mock plugin");
-        let host = mcpg_plugin_protocol::noop_backend_host();
-        for binding in &mock_bindings {
-            if let Some(spec) = crate::backends::dynamic_register_spec(&binding.backend, true) {
-                futures::executor::block_on(mcpg_plugin_protocol::BackendPlugin::register_profile(
-                    mock_plugin.as_ref(),
-                    &binding.name,
-                    &spec,
-                    host.clone(),
-                ))
-                .expect("register mock profile");
-            }
-        }
-    }
+    register_test_backend(
+        &mut plugin_registry,
+        "mock",
+        mcpg_plugin_backend_mock::BINDING_DESCRIPTOR_YAML,
+        &[],
+        Arc::new(mcpg_plugin_backend_mock::MockBackendPlugin::new()),
+        bindings,
+    );
+    register_test_backend(
+        &mut plugin_registry,
+        "http",
+        mcpg_plugin_backend_http::BINDING_DESCRIPTOR_YAML,
+        &[mcpg_plugin_protocol::capability::Capability::NetworkOutbound],
+        Arc::new(mcpg_plugin_backend_http::HttpBackendPlugin::new()),
+        bindings,
+    );
     let plugin_registry = Arc::new(plugin_registry);
     let registry = Arc::new(CapabilityRegistry::new(
         false,
@@ -3575,6 +3559,40 @@ fn build_test_fetcher(
     dispatcher.set_plugin_registry(Arc::clone(&plugin_registry));
     let dispatcher = Arc::new(dispatcher);
     build_watch_resource_fetcher(registry, dispatcher)
+}
+
+/// Register `plugin` for `kind`, with the capabilities a `plugins[]` entry
+/// would grant it, and the profile of every binding of that kind.
+fn register_test_backend<P: mcpg_plugin_protocol::BackendPlugin + 'static>(
+    plugin_registry: &mut mcpg_plugin_host::PluginRegistry,
+    kind: &str,
+    descriptor_yaml: &str,
+    granted: &[mcpg_plugin_protocol::capability::Capability],
+    plugin: Arc<P>,
+    bindings: &[crate::config::BackendConfig],
+) {
+    let kind_bindings: Vec<&crate::config::BackendConfig> =
+        bindings.iter().filter(|b| b.backend.kind == kind).collect();
+    if kind_bindings.is_empty() {
+        return;
+    }
+    mcpg_plugin_host::FirstPartyRegistrar::new(plugin_registry)
+        .register(descriptor_yaml, granted, (), |reg, _host| {
+            reg.register_backend(plugin.clone(), mcpg_plugin_protocol::PluginTier::Native)
+        })
+        .unwrap_or_else(|e| panic!("register {kind} plugin: {e}"));
+    let host = mcpg_plugin_protocol::noop_backend_host();
+    for binding in kind_bindings {
+        if let Some(spec) = crate::backends::dynamic_register_spec(&binding.backend, true) {
+            futures::executor::block_on(mcpg_plugin_protocol::BackendPlugin::register_profile(
+                plugin.as_ref(),
+                &binding.name,
+                &spec,
+                host.clone(),
+            ))
+            .unwrap_or_else(|e| panic!("register {kind} profile {}: {e:?}", binding.name));
+        }
+    }
 }
 
 #[tokio::test]
@@ -3626,6 +3644,38 @@ async fn watch_fetcher_returns_none_for_runtime_overview() {
     let fetcher = build_test_fetcher(&[]);
     let content = fetcher("mcpg://runtime/overview");
     assert_eq!(content, None);
+}
+
+/// A watched `http` resource polls its upstream's body, as a read serves it.
+#[tokio::test]
+async fn watch_fetcher_polls_the_body_of_an_http_resource() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener bound");
+    let addr = listener.local_addr().expect("local addr");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept connection");
+        let mut buffer = [0_u8; 1024];
+        let count = stream.read(&mut buffer).expect("read request");
+        let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+        assert!(request.starts_with("GET /notes/today"), "{request}");
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\n# Today";
+        stream.write_all(response).expect("write response");
+    });
+    let binding: crate::config::BackendConfig = serde_json::from_value(serde_json::json!({
+        "name": "notes",
+        "description": "Today's notes.",
+        "uri": "notes://today",
+        "backend": {
+            "kind": "http",
+            "url": format!("http://{addr}/notes/today"),
+            "method": "get",
+        },
+    }))
+    .expect("resource binding");
+
+    let fetcher = build_test_fetcher(&[binding]);
+    assert_eq!(fetcher("notes://today").as_deref(), Some("# Today"));
+    server.join().expect("server joined");
 }
 
 // ── MCP Apps: resources/read `_meta.ui` passthrough ──────────

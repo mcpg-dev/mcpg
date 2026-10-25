@@ -2349,3 +2349,43 @@ async fn progress_never_goes_back_and_ends_with_its_session() {
         "a back step is dropped; the end of `a` resets `a` alone"
     );
 }
+
+/// The http plugin owns the spec's field set: a field the gateway's read of
+/// the spec does not name keeps the binding's network profile, which every
+/// call of the binding needs.
+#[test]
+fn an_http_binding_keeps_its_profile_beside_a_field_the_plugin_reads() {
+    let fetch = serde_json::json!({
+        "url": "http://127.0.0.1:1/r",
+        "method": "get",
+        "allow_private_backends": true,
+    });
+    let mut backend = fetch.clone();
+    backend["kind"] = "http".into();
+    let tool: BackendConfig = serde_json::from_value(serde_json::json!({
+        "name": "fetch",
+        "description": "Fetch.",
+        "backend": backend,
+    }))
+    .unwrap();
+    let mut step = fetch;
+    step["kind"] = "http".into();
+    step["id"] = "fetch".into();
+    let pipeline: BackendConfig = serde_json::from_value(serde_json::json!({
+        "name": "flow",
+        "description": "Flow.",
+        "backend": {"kind": "pipeline", "steps": [step]},
+    }))
+    .unwrap();
+
+    let dispatcher = ExecutionDispatcher::from_runtime_debug_config(
+        RuntimeDebugConfig::default(),
+        &[tool, pipeline],
+    );
+    assert!(dispatcher.network_profiles.contains_key("fetch"));
+    assert!(
+        dispatcher
+            .network_profiles
+            .contains_key("flow._step_.fetch")
+    );
+}

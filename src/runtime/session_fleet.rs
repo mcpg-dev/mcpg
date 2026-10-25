@@ -341,7 +341,7 @@ mod tests {
         let a = replica(&kv, &bus, SessionStoreConfig::default()).await;
         let b = replica(&kv, &bus, SessionStoreConfig::default()).await;
         until_heard(&a, &b).await;
-        b.stop_cluster_listeners();
+        b.stop_cluster_listeners().await;
 
         let session_id = operational_session(&a);
         b.session_store()

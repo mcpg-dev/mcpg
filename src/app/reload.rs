@@ -583,7 +583,7 @@ pub(crate) async fn reload_with_config(
     // The new runtime hears the fleet from here on, the old one no more;
     // what is told in between, the cancellation backstop and the recorded
     // ends of sessions recover.
-    old_runtime.stop_cluster_listeners();
+    old_runtime.stop_cluster_listeners().await;
     state.runtime.load_full().start_cluster_listeners();
     let mut events_listed_changed = false;
     if let (Some(core), Some(prepared)) = (events_core.as_ref(), prepared_events) {

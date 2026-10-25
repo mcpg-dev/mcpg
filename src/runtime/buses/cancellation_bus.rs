@@ -285,7 +285,7 @@ impl CancellationBus for BusBackedCancellationBus {
                             Err(e) => {
                                 tracing::warn!(
                                     error = %e,
-                                    "cancellation backstop drain failed (W-14); live bus only this pass"
+                                    "cancellation backstop drain failed; live bus only this pass"
                                 );
                             }
                         }
@@ -322,7 +322,7 @@ impl CancellationBus for BusBackedCancellationBus {
                     tracing::warn!(
                         error = %e,
                         key = %key,
-                        "cancellation backstop KV put failed (W-14); relying on live bus only"
+                        "cancellation backstop KV put failed; relying on live bus only"
                     );
                 }
             }

@@ -795,7 +795,7 @@ tools/call (pipeline backend)
 └─ Response via SSE stream
 ```
 
-Pipeline context flows data between steps. Each step can read `original_args`, `request_context`, and `completed_steps[step_id].output`.
+Pipeline context flows data between steps: CEL expressions in `transform`, `cel_gate` and `input_transform` read `arguments`, `context` and `steps.<step_id>.output`.
 
 **Suspending step kinds (4):** `elicitation` (asks client for input), `sampling` (asks client for LLM completion), `roots_list` (asks client to enumerate roots), and `gather` (emits several input requests in one suspension, SEP-2322).
 

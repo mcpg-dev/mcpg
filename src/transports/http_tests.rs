@@ -1101,6 +1101,99 @@ async fn mcp_resources_read_returns_resource_contents() {
     assert!(body.contains("application/json"));
 }
 
+/// An `http` binding under `resources` serves its upstream's body as the
+/// resource's contents; the plugin's call envelope stays in the gateway.
+#[tokio::test]
+async fn mcp_resources_read_serves_an_http_binding_body_as_its_contents() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener bound");
+    let addr = listener.local_addr().expect("local addr");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept connection");
+        let mut buffer = [0_u8; 1024];
+        let count = stream.read(&mut buffer).expect("read request");
+        let request = String::from_utf8_lossy(&buffer[..count]).to_string();
+        assert!(request.starts_with("GET /notes/today"), "{request}");
+        let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\nConnection: close\r\n\r\n# Today";
+        stream.write_all(response).expect("write response");
+    });
+    let binding: BackendConfig = serde_json::from_value(serde_json::json!({
+        "name": "notes",
+        "description": "Today's notes.",
+        "uri": "notes://today",
+        "mime_type": "text/markdown",
+        "backend": {
+            "kind": "http",
+            "url": format!("http://{addr}/notes/today"),
+            "method": "get",
+        },
+    }))
+    .expect("resource binding");
+    let mut config = AppConfig::default();
+    config.gateway.server.allow_private_backends = true;
+    config.gateway.server.trust_subject_header = true;
+    let runtime = GatewayRuntime::new_with_configs_and_runtime_controls(
+        "mcpg",
+        "0.1.0",
+        "127.0.0.1:8787",
+        "/health",
+        "/mcp",
+        "info",
+        vec![crate::config::SinkConfig {
+            kind: "stdout".to_owned(),
+            config: serde_json::json!({"format": "json"}),
+            level: None,
+        }],
+        true,
+        SessionStoreConfig::default(),
+        ToolAccessPolicyConfig::default(),
+        RuntimeDebugConfig::default(),
+        &[],
+        &[],
+        &[binding],
+        &[],
+    );
+    let (app, session_id) =
+        initialize_session(router(finish_app_state(config, runtime), "/health", "/mcp")).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+                .header(
+                    PROTOCOL_VERSION_HEADER,
+                    crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                )
+                .header(SESSION_ID_HEADER, &session_id)
+                .header(header::HeaderName::from_static(SUBJECT_ID_HEADER), "user-1")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 122,
+                        "method": "resources/read",
+                        "params": { "uri": "notes://today" }
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let message = extract_jsonrpc_from_sse(&response_text(response).await, 122);
+    let contents = message["result"]["contents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a read result: {message}"));
+    assert_eq!(contents.len(), 1, "{message}");
+    assert_eq!(contents[0]["uri"], "notes://today");
+    assert_eq!(contents[0]["mimeType"], "text/markdown");
+    assert_eq!(contents[0]["text"], "# Today");
+    server.join().expect("server joined");
+}
+
 #[tokio::test]
 async fn mcp_hidden_runtime_overview_resource_is_not_listed_or_invocable() {
     let state = build_test_state_with_debug_config(RuntimeDebugConfig {
@@ -2364,7 +2457,7 @@ async fn a_cancellation_reaches_work_that_began_before_a_reload() {
         "the reload installs a runtime"
     );
     // Told while nothing listens: only the backstop can carry it.
-    after.stop_cluster_listeners();
+    after.stop_cluster_listeners().await;
 
     let context = RequestContext::new(
         GatewayRequestId::new(),
@@ -2385,7 +2478,7 @@ async fn a_cancellation_reaches_work_that_began_before_a_reload() {
     tokio::time::timeout(std::time::Duration::from_secs(10), token.cancelled())
         .await
         .expect("the cancellation reaches work that began before the reload");
-    after.stop_cluster_listeners();
+    after.stop_cluster_listeners().await;
 }
 
 /// Every event stream — the legacy GET stream, the modern

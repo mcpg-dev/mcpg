@@ -1580,6 +1580,53 @@ fn resource_template_not_included_in_resources_list() {
     assert_eq!(registry.resource_templates().len(), 1);
 }
 
+#[test]
+fn resource_mime_type_is_the_one_the_binding_declares() {
+    let resource: BackendConfig = serde_json::from_value(serde_json::json!({
+        "name": "notes",
+        "description": "Today's notes.",
+        "uri": "notes://today",
+        "mime_type": "text/markdown",
+        "backend": {"kind": "mock", "response": "x"},
+    }))
+    .unwrap();
+    let template: BackendConfig = serde_json::from_value(serde_json::json!({
+        "name": "forecast",
+        "description": "Forecast by city.",
+        "uri_template": "weather://{city}/forecast",
+        "mime_type": "application/json",
+        "backend": {"kind": "mock", "response": "x"},
+    }))
+    .unwrap();
+    let registry = CapabilityRegistry::new(
+        false,
+        DebugToolBackends::default(),
+        DebugToolExposure::default(),
+        &[],
+        &[],
+        &[resource],
+        &[template],
+        None,
+    );
+    assert_eq!(
+        registry
+            .resource_mime_type("NOTES://today", "notes")
+            .as_deref(),
+        Some("text/markdown"),
+        "a resource answers to its normalised URI"
+    );
+    assert_eq!(
+        registry
+            .resource_mime_type("weather://paris/forecast", "forecast")
+            .as_deref(),
+        Some("application/json")
+    );
+    assert_eq!(
+        registry.resource_mime_type("weather://paris/forecast", "other"),
+        None
+    );
+}
+
 // URI normalization.
 #[test]
 fn normalize_lowercases_scheme_and_host() {

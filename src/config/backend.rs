@@ -347,8 +347,10 @@ impl BackendImpl {
     }
 }
 
+/// The gateway's read of an `http` binding spec. The http plugin owns the
+/// spec's field set and validates it, so a field this read does not name
+/// is left to the plugin rather than refused.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct HttpBackendConfig {
     pub url: String,
     #[serde(default = "default_http_binding_method")]

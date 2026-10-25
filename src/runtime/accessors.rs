@@ -65,15 +65,20 @@ impl GatewayRuntime {
 
     /// Stop hearing the fleet: a runtime a reload retired acts on nothing
     /// more, and its subscriptions end before its coordinator does.
-    pub(crate) fn stop_cluster_listeners(&self) {
+    pub(crate) async fn stop_cluster_listeners(&self) {
         let listeners = std::mem::take(
             &mut *self
                 .cluster_listeners
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        for listener in listeners {
+        for listener in &listeners {
             listener.abort();
+        }
+        // An abort lands at a listener's next yield: one inside a poll still
+        // handles the messages already buffered, so wait for each to end.
+        for listener in listeners {
+            let _ = listener.await;
         }
     }
 

@@ -303,20 +303,23 @@ impl GatewayRuntime {
         // plugin loader from a `plugins[]` row, like kafka/nats/sql/LLMs) —
         // the gateway hard-wires no backend. Tests that build the `Runtime`
         // directly bypass the loader, so under `#[cfg(test)]` we register the
-        // in-tree http plugin shell (dev-dependency) when http bindings need
-        // it and nothing else registered it; the generic dynamic-register
-        // pass wires the per-binding profiles like every other backend.
+        // in-tree http plugin shell (dev-dependency), with the grant its
+        // `plugins[]` row carries, and its per-binding profiles when http
+        // bindings need it and nothing else registered it.
         #[cfg(test)]
         let plugin_registry = {
             let mut plugin_registry = plugin_registry;
             let http_already_registered = plugin_registry.backend("http").is_some();
-            let has_http_bindings = binding_configs.iter().any(|b| b.backend.kind == "http");
-            if has_http_bindings && !http_already_registered {
+            let http_bindings: Vec<&crate::config::BackendConfig> = binding_configs
+                .iter()
+                .filter(|b| b.backend.kind == "http")
+                .collect();
+            if !http_bindings.is_empty() && !http_already_registered {
                 let http_plugin =
                     std::sync::Arc::new(mcpg_plugin_backend_http::HttpBackendPlugin::new());
                 mcpg_plugin_host::FirstPartyRegistrar::new(&mut plugin_registry).register(
                     mcpg_plugin_backend_http::BINDING_DESCRIPTOR_YAML,
-                    &[],
+                    &[mcpg_plugin_protocol::capability::Capability::NetworkOutbound],
                     (),
                     |reg, _host| {
                         reg.register_backend(
@@ -325,12 +328,28 @@ impl GatewayRuntime {
                         )
                     },
                 )?;
+                let host = mcpg_plugin_protocol::noop_backend_host();
+                for binding in &http_bindings {
+                    if let Some(spec) =
+                        crate::backends::dynamic_register_spec(&binding.backend, true)
+                    {
+                        futures::executor::block_on(
+                            mcpg_plugin_protocol::BackendPlugin::register_profile(
+                                http_plugin.as_ref(),
+                                &binding.name,
+                                &spec,
+                                host.clone(),
+                            ),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("register http profile {}: {:?}", binding.name, e)
+                        })?;
+                    }
+                }
             }
 
             // Command bindings dispatch via the dev.mcpg.backend.command
-            // plugin. Unlike http (whose in-test tools only check
-            // availability), the promoted command-tool tests dispatch +
-            // assert the envelope, so we register the plugin AND its
+            // plugin; as for http, we register the plugin AND its
             // per-binding profiles here. `register_profile`'s body is
             // sync (spec parse + arg-template compile + map insert), so a
             // `futures` block_on suffices — no tokio runtime needed.

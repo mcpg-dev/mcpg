@@ -876,12 +876,18 @@ impl GatewayRuntime {
                     .needs_runtime_snapshot()
                     .then(|| self.runtime_snapshot());
                 let result = self.execution_dispatcher.dispatch_tool_call(
-                    route,
+                    route.clone(),
                     &execution_request,
                     snapshot,
                 );
-                // resource surface uses a strict native codec.
-                invocation::decode_resource_result(&result, &params.uri)
+                invocation::decode_binding_resource_result(
+                    &route,
+                    &result,
+                    &params.uri,
+                    self.capability_registry
+                        .resource_mime_type(&params.uri, profile)
+                        .as_deref(),
+                )
             }
             ResourceRoute::Template {
                 ref profile,
@@ -924,11 +930,18 @@ impl GatewayRuntime {
                     .needs_runtime_snapshot()
                     .then(|| self.runtime_snapshot());
                 let result = self.execution_dispatcher.dispatch_tool_call(
-                    route,
+                    route.clone(),
                     &execution_request,
                     snapshot,
                 );
-                invocation::decode_resource_result(&result, &params.uri)
+                invocation::decode_binding_resource_result(
+                    &route,
+                    &result,
+                    &params.uri,
+                    self.capability_registry
+                        .resource_mime_type(&params.uri, profile)
+                        .as_deref(),
+                )
             }
             ResourceRoute::Federated {
                 ref source,

@@ -82,8 +82,15 @@ impl DeliveryBus for BusBackedDeliveryBus {
             };
             tokio::spawn(async move {
                 use futures::StreamExt;
-                while let Some(msg) = stream.next().await {
-                    let Ok(msg) = msg else { break };
+                loop {
+                    // The receiver goes with the SSE stream it feeds, and no
+                    // message comes for a session that ended: wait on both, so
+                    // the bus subscription ends with the stream.
+                    let msg = tokio::select! {
+                        () = tx.closed() => break,
+                        msg = stream.next() => msg,
+                    };
+                    let Some(Ok(msg)) = msg else { break };
                     let Ok(delivery) = serde_json::from_slice::<DeliveryMessage>(&msg.payload)
                     else {
                         continue;
@@ -168,5 +175,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(received.kind, DeliveryKind::PipelineError);
+    }
+
+    /// A bus that counts the subscriptions alive on it.
+    #[derive(Debug)]
+    struct CountingBus {
+        inner: crate::builtins::cluster_primitives::MemoryBus,
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct Counted {
+        inner: mcpg_cluster_api::Subscription,
+        live: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl futures::Stream for Counted {
+        type Item = Result<mcpg_cluster_api::Message, mcpg_cluster_api::ClusterError>;
+        fn poll_next(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.get_mut().inner.as_mut().poll_next(cx)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mcpg_cluster_api::PubSub for CountingBus {
+        async fn publish(
+            &self,
+            topic: &str,
+            payload: bytes::Bytes,
+        ) -> Result<(), mcpg_cluster_api::ClusterError> {
+            self.inner.publish(topic, payload).await
+        }
+
+        async fn subscribe(
+            &self,
+            pattern: &str,
+            queue_group: Option<&str>,
+        ) -> Result<mcpg_cluster_api::Subscription, mcpg_cluster_api::ClusterError> {
+            let inner = self.inner.subscribe(pattern, queue_group).await?;
+            self.live.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::pin(Counted {
+                inner,
+                live: std::sync::Arc::clone(&self.live),
+            }))
+        }
+    }
+
+    /// The SSE stream a session's deliveries feed ends with the session; no
+    /// message comes for it after, so its bus subscription must end with the
+    /// receiver, not at a next message.
+    #[tokio::test]
+    async fn a_subscription_ends_with_its_receiver() {
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bus = BusBackedDeliveryBus::new(std::sync::Arc::new(CountingBus {
+            inner: crate::builtins::cluster_primitives::MemoryBus::new(),
+            live: std::sync::Arc::clone(&live),
+        }));
+        let rx = bus.subscribe("sess-1").await;
+        assert_eq!(live.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while live.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the bus subscription ends with its receiver");
     }
 }

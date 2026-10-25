@@ -153,7 +153,105 @@ pub fn decode_resource_result(
         serde_json::from_str(body).map_err(|err| SurfaceDecodeError::MalformedResponse {
             reason: format!("resource body for {requested_uri} is not JSON: {err}"),
         })?;
+    decode_resource_contents(&parsed, requested_uri)
+}
 
+/// Decode a resource binding's answer: an `http` binding's through
+/// [`decode_http_resource_result`], any other strictly.
+pub fn decode_binding_resource_result(
+    route: &crate::backends::BackendInvocationRoute,
+    result: &ToolCallResult,
+    requested_uri: &str,
+    mime_type: Option<&str>,
+) -> Result<ResourceReadResult, SurfaceDecodeError> {
+    match route {
+        crate::backends::BackendInvocationRoute::NetworkJsonCall { .. }
+        | crate::backends::BackendInvocationRoute::NetworkQueryCall { .. } => {
+            decode_http_resource_result(result, requested_uri, mime_type)
+        }
+        _ => decode_resource_result(result, requested_uri),
+    }
+}
+
+/// Decode an `http` binding's answer as a resource-read result. The binding
+/// answers its call envelope; the upstream's body is the resource. A body that
+/// decodes as MCP `contents` is served as those contents, any other body as the
+/// one text content of `requested_uri`, typed `mime_type` (else the response's
+/// content type). A body cut at the binding's `max_response_bytes`, or one that
+/// is not UTF-8, is refused: a resource is neither served nor watched in part or
+/// damaged.
+pub fn decode_http_resource_result(
+    result: &ToolCallResult,
+    requested_uri: &str,
+    mime_type: Option<&str>,
+) -> Result<ResourceReadResult, SurfaceDecodeError> {
+    if result.is_error {
+        let message = primary_text_body(result)
+            .unwrap_or("tool returned isError without a text body")
+            .to_owned();
+        return Err(SurfaceDecodeError::BackendError { message });
+    }
+    let response = result
+        .structured_content
+        .as_ref()
+        .and_then(|envelope| envelope.get("response"))
+        .ok_or_else(|| SurfaceDecodeError::MalformedResponse {
+            reason: format!("the http answer for {requested_uri} carries no response"),
+        })?;
+    if response
+        .get("bodyTruncated")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return Err(SurfaceDecodeError::MalformedResponse {
+            reason: format!(
+                "the body of {requested_uri} is longer than the binding's max_response_bytes"
+            ),
+        });
+    }
+    if let Some(read) = response
+        .get("json")
+        .and_then(|json| decode_resource_contents(json, requested_uri).ok())
+    {
+        return Ok(read);
+    }
+    let text = response
+        .get("body")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    // The plugin reads the body lossily, so a replacement character marks bytes
+    // that were not UTF-8: serving them would hand out a damaged copy.
+    if text.contains(char::REPLACEMENT_CHARACTER) {
+        return Err(SurfaceDecodeError::MalformedResponse {
+            reason: format!("the body of {requested_uri} is not UTF-8 text"),
+        });
+    }
+    let mime_type = mime_type
+        .or_else(|| {
+            response
+                .get("contentType")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_owned);
+    Ok(ResourceReadResult {
+        contents: vec![ResourceContents::Text(ResourceTextContents {
+            uri: requested_uri.to_owned(),
+            mime_type,
+            text,
+            meta: None,
+        })],
+        ttl_ms: Some(crate::protocol::shared::caching::DEFAULT_READ_TTL_MS),
+        cache_scope: Some(crate::protocol::shared::caching::CacheScope::Private),
+        cache_token: None,
+    })
+}
+
+/// Decode the MCP `contents` of a resource-read answer.
+fn decode_resource_contents(
+    parsed: &serde_json::Value,
+    requested_uri: &str,
+) -> Result<ResourceReadResult, SurfaceDecodeError> {
     let contents_value =
         parsed
             .get("contents")
@@ -361,5 +459,151 @@ mod tests {
         };
         let err = decode_resource_result(&result, "r://a").expect_err("empty rejected");
         assert!(matches!(err, SurfaceDecodeError::EmptyResponse));
+    }
+
+    /// An `http` binding's answer: the plugin's envelope around `response`.
+    fn http_answer(response: serde_json::Value) -> ToolCallResult {
+        let envelope = serde_json::json!({
+            "toolName": "notes",
+            "response": response,
+            "downstreamError": null,
+        });
+        ToolCallResult {
+            content: vec![ToolContent::text(envelope.to_string())],
+            structured_content: Some(envelope),
+            is_error: false,
+            meta: None,
+        }
+    }
+
+    fn http_response(content_type: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "statusCode": 200,
+            "contentType": content_type,
+            "body": body,
+            "bodyTruncated": false,
+            "json": serde_json::from_str::<serde_json::Value>(body).ok(),
+        })
+    }
+
+    fn only_text(result: &ResourceReadResult) -> &ResourceTextContents {
+        match result.contents.as_slice() {
+            [ResourceContents::Text(text)] => text,
+            other => panic!("expected one text content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_http_resource_serves_its_upstream_body_as_its_contents() {
+        let answer = http_answer(http_response("text/plain; charset=utf-8", "# Today"));
+
+        let declared = decode_http_resource_result(&answer, "notes://today", Some("text/markdown"))
+            .expect("decoded");
+        let text = only_text(&declared);
+        assert_eq!(text.uri, "notes://today");
+        assert_eq!(text.text, "# Today");
+        assert_eq!(text.mime_type.as_deref(), Some("text/markdown"));
+
+        let undeclared =
+            decode_http_resource_result(&answer, "notes://today", None).expect("decoded");
+        assert_eq!(
+            only_text(&undeclared).mime_type.as_deref(),
+            Some("text/plain; charset=utf-8"),
+            "without a declared type the upstream's content type is the resource's"
+        );
+    }
+
+    #[test]
+    fn an_http_resource_serves_a_json_body_as_its_text() {
+        // An API's own `contents` field is data, not MCP contents.
+        for body in [
+            r#"{"items":[1,2]}"#,
+            r#"{"contents":[{"id":"a"}],"totalCount":1}"#,
+        ] {
+            let answer = http_answer(http_response("application/json", body));
+            let got = decode_http_resource_result(&answer, "r://items", None).expect("decoded");
+            assert_eq!(only_text(&got).text, body);
+            assert_eq!(
+                only_text(&got).mime_type.as_deref(),
+                Some("application/json")
+            );
+        }
+    }
+
+    #[test]
+    fn an_http_resource_that_answers_mcp_contents_serves_them_as_they_are() {
+        let body = r#"{"contents":[{"uri":"r://logo","blob":"AAEC","mimeType":"image/png"}]}"#;
+        let answer = http_answer(http_response("application/json", body));
+        let got =
+            decode_http_resource_result(&answer, "r://logo", Some("text/plain")).expect("decoded");
+        match got.contents.as_slice() {
+            [ResourceContents::Blob(blob)] => {
+                assert_eq!(blob.uri, "r://logo");
+                assert_eq!(blob.blob, "AAEC");
+                assert_eq!(blob.mime_type.as_deref(), Some("image/png"));
+            }
+            other => panic!("expected one blob, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_http_resource_cut_at_its_size_limit_is_refused() {
+        let mut response = http_response("text/plain", "# To");
+        response["bodyTruncated"] = true.into();
+        let err = decode_http_resource_result(&http_answer(response), "notes://today", None)
+            .expect_err("a cut body is refused");
+        assert!(
+            matches!(err, SurfaceDecodeError::MalformedResponse { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_http_resource_whose_body_is_not_utf8_is_refused() {
+        let answer = http_answer(http_response("image/png", "\u{FFFD}PNG"));
+        let err = decode_http_resource_result(&answer, "r://logo", None)
+            .expect_err("a damaged body is refused");
+        assert!(
+            matches!(err, SurfaceDecodeError::MalformedResponse { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_http_resource_error_answer_is_a_backend_error() {
+        let mut answer = http_answer(http_response("text/plain", "down"));
+        answer.is_error = true;
+        let err = decode_http_resource_result(&answer, "r://a", None).expect_err("an error");
+        assert!(
+            matches!(err, SurfaceDecodeError::BackendError { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn only_an_http_route_reads_the_answer_envelope() {
+        use crate::backends::BackendInvocationRoute;
+        let answer = http_answer(http_response("text/plain", "hello"));
+        for route in [
+            BackendInvocationRoute::NetworkQueryCall {
+                profile: "notes".to_owned(),
+            },
+            BackendInvocationRoute::NetworkJsonCall {
+                profile: "notes".to_owned(),
+            },
+        ] {
+            let got =
+                decode_binding_resource_result(&route, &answer, "r://a", None).expect("decoded");
+            assert_eq!(only_text(&got).text, "hello");
+        }
+        let mock = BackendInvocationRoute::MockResponse {
+            profile: "notes".to_owned(),
+        };
+        let err = decode_binding_resource_result(&mock, &answer, "r://a", None)
+            .expect_err("any other route answers MCP contents");
+        assert!(
+            matches!(err, SurfaceDecodeError::MalformedResponse { .. }),
+            "{err:?}"
+        );
     }
 }

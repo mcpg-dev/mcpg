@@ -562,7 +562,7 @@ impl ApprovalRegistry {
                 warn!(
                     approval_id,
                     error = %e,
-                    "approvals: backstop KV put failed (W-14); relying on live topic only"
+                    "approvals: backstop KV put failed; relying on live topic only"
                 );
             }
         }
@@ -891,7 +891,7 @@ async fn resolution_backstop_drain_loop(
                     {
                         Ok(e) => e,
                         Err(err) => {
-                            warn!(error = %err, key = %key, "approvals: malformed backstop entry (W-14)");
+                            warn!(error = %err, key = %key, "approvals: malformed backstop entry");
                             continue;
                         }
                     };
@@ -911,7 +911,7 @@ async fn resolution_backstop_drain_loop(
                                 .increment(1);
                             debug!(
                                 approval_id = %event.approval_id,
-                                "approvals: resolved local pending entry from backstop drain (W-14)"
+                                "approvals: resolved local pending entry from backstop drain"
                             );
                         }
                         // Resolution belongs to another instance, or a race
@@ -922,7 +922,7 @@ async fn resolution_backstop_drain_loop(
                 seen = current;
             }
             Err(e) => {
-                warn!(error = %e, "approvals: backstop drain failed (W-14); live topic only this pass");
+                warn!(error = %e, "approvals: backstop drain failed; live topic only this pass");
             }
         }
         tokio::time::sleep(RESOLUTION_REDRAIN_INTERVAL).await;

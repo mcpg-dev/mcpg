@@ -986,6 +986,19 @@ impl CapabilityRegistry {
             .map(|binding| binding.descriptor.clone())
     }
 
+    /// The `mime_type` a resource binding declares: of the resource at `uri`,
+    /// else of the template the binding `profile` serves.
+    pub fn resource_mime_type(&self, uri: &str, profile: &str) -> Option<String> {
+        self.resource_descriptor(uri)
+            .and_then(|descriptor| descriptor.mime_type)
+            .or_else(|| {
+                self.resource_templates
+                    .iter()
+                    .find(|template| template.name == profile)
+                    .and_then(|template| template.mime_type.clone())
+            })
+    }
+
     /// Return the raw `mcp_app_url` pattern for a resource binding, if it
     /// contains dynamic expressions. Static URLs are already in `_meta`;
     /// this is only non-None when CEL resolution is needed at read time.
