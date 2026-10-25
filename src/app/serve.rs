@@ -126,27 +126,24 @@ pub async fn run(state: AppState) -> Result<()> {
     let task_reaper_handle =
         task_reaper.spawn(state.runtime.load().task_store(), reaper_leadership);
 
-    // Session idle-eviction cascade. The session store forwards every
-    // idle-evicted session id here; the drain runs the runtime's per-session
-    // cleanup cascade (tenant quota, subscriptions, progress, request-id
-    // tracker, task cancellation) that explicit terminate does but idle
-    // eviction otherwise skips — without which an idle-expired session leaks
-    // that state forever (and its tenant-quota slot). The store is preserved
-    // across config reloads, so a single registration suffices; the drain
-    // always cascades on the CURRENT runtime.
+    // Session end cleanup. The session store tells of every session that
+    // ends without a terminate call — idle on every replica, or ended by
+    // another replica — and the drain runs the runtime's per-session cleanup
+    // (tenant quota, subscriptions, progress, request-id tracker, task
+    // cancellation) that explicit terminate runs itself — without which such
+    // a session leaks that state forever (and its tenant-quota slot). The
+    // store is preserved across config reloads, so a single registration
+    // suffices; the drain always cleans up on the CURRENT runtime.
     {
-        let (evict_tx, mut evict_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        state
-            .runtime
-            .load()
-            .install_session_eviction_notifier(evict_tx);
+        let (end_tx, mut end_rx) = tokio::sync::mpsc::unbounded_channel();
+        state.runtime.load().install_session_end_notifier(end_tx);
         let runtime_holder = std::sync::Arc::downgrade(&state.runtime);
         tokio::spawn(async move {
-            while let Some(session_id) = evict_rx.recv().await {
+            while let Some(ended) = end_rx.recv().await {
                 let Some(holder) = runtime_holder.upgrade() else {
                     break;
                 };
-                holder.load().on_session_evicted(&session_id);
+                holder.load().on_session_end(&ended);
             }
         });
     }
@@ -187,7 +184,9 @@ pub async fn run(state: AppState) -> Result<()> {
         }
     };
 
-    let cancellation_subscriber_handle = state.runtime.load_full().spawn_cancellation_subscriber();
+    // The cancellation subscriber and the listener for the ends of sessions;
+    // a config reload moves them to the runtime it installs.
+    state.runtime.load_full().start_cluster_listeners();
 
     // Registry auto-federation: crawls `mcp.registries` and composes the
     // synthesized federations through the reload pipeline. Reads the
@@ -503,8 +502,8 @@ pub async fn run(state: AppState) -> Result<()> {
         handle.abort();
         info!("cluster health probe stopped");
     }
-    cancellation_subscriber_handle.abort();
-    info!("cancellation subscriber stopped");
+    state.runtime.load().stop_cluster_listeners();
+    info!("cancellation subscriber and session end listener stopped");
 
     // Release the events owner lease and the dispatcher shards while the
     // cluster coordinator plugin still runs, so another replica takes them
@@ -517,6 +516,23 @@ pub async fn run(state: AppState) -> Result<()> {
                 "events lease release exceeded shutdown timeout"
             ),
         }
+    }
+
+    // Stop the resource watchers. Each is a spawned task holding a poll timer
+    // or an upstream subscription; nothing else ends them, so without this
+    // they keep running through the drain window. Before the plugins drain,
+    // so the coordinator can still release the watch shards.
+    match tokio::time::timeout(
+        shutdown_timeout,
+        state.runtime.load().subscriptions().shutdown(),
+    )
+    .await
+    {
+        Ok(()) => info!("resource watchers stopped"),
+        Err(_) => warn!(
+            timeout_secs = shutdown_timeout.as_secs(),
+            "resource watcher stop exceeded shutdown timeout"
+        ),
     }
 
     // Drain plugin-owned background state (audit sinks, webhook buffers).
@@ -534,12 +550,6 @@ pub async fn run(state: AppState) -> Result<()> {
         abandoned = shutdown_report.timed_out.len(),
         "plugin shutdown complete"
     );
-
-    // Stop the resource watchers. Each is a spawned task holding a poll timer
-    // or an upstream subscription; nothing else ends them, so without this
-    // they keep running through the drain window.
-    state.runtime.load().subscriptions().shutdown().await;
-    info!("resource watchers stopped");
 
     // Drain the built content-store profile instances. These live
     // in the runtime's ContentStoreRegistry (built via

@@ -20,6 +20,17 @@ pub struct ServerConfig {
     pub allowed_origins: Vec<String>,
     #[serde(default = "default_replay_window_limit")]
     pub replay_window_limit: usize,
+    /// How long a session of the `2025-xx` revisions lives without use, in
+    /// milliseconds. A session ends when it was not used for this long; its
+    /// open streams end with it, and the client's next request gets 404.
+    ///
+    /// When the replicas share the session store, a replica in use writes
+    /// the session's last use at most every quarter of this timeout (at
+    /// least 1 s), so the fleet ends a session only once no replica used it
+    /// for this timeout plus that quarter. The end — this or a `DELETE` —
+    /// reaches every replica at once; a replica that misses the word stops
+    /// serving the session the first time it uses it after that quarter, at
+    /// most 30 s.
     #[serde(default = "default_session_idle_timeout_ms")]
     pub session_idle_timeout_ms: u64,
     #[serde(default = "default_shutdown_timeout_ms")]
@@ -35,10 +46,13 @@ pub struct ServerConfig {
     ///
     /// Two limits worth knowing before setting this:
     ///
-    /// - **It is a per-replica cap.** The counter lives in this process,
-    ///   so a fleet of N replicas admits up to N x this value per tenant,
-    ///   and a reconnect that lands on another replica starts fresh.
-    ///   Divide by the replica count if you need a fleet-wide ceiling.
+    /// - **It counts the fleet when the replicas share the session
+    ///   store** (`cluster.kind` other than `single_node`, and sessions not
+    ///   on a `memory` or `file` store). Each counted session keeps a slot
+    ///   next to its row in the store; a session that ends, on any replica,
+    ///   frees its slot. With a session store of its own per replica the cap
+    ///   counts that replica's sessions, so N replicas admit up to N x this
+    ///   value per tenant.
     /// - **Anonymous callers share one bucket**, because an unauthenticated
     ///   request carries nothing to separate them by. Aggregate anonymous
     ///   usage is capped rather than per-caller usage; per-caller
@@ -57,6 +71,7 @@ pub struct ServerConfig {
     pub server_ping_interval_ms: Option<u64>,
     /// Per-session rate limit on `completion/complete` requests (cap per
     /// second). `None` disables. Guards against broken autocomplete UIs.
+    /// Counted by the replica that serves the request.
     #[serde(default)]
     pub completion_rate_limit_per_sec: Option<u64>,
     /// Per-IP request-rate cap on the MCP endpoint for requests below
@@ -67,7 +82,11 @@ pub struct ServerConfig {
     /// credential) skips this — it is attributable and metered per tenant.
     /// Defaults generous (600/min = 10 rps sustained per client IP), far above
     /// interactive agent use; `0` disables (e.g. when an upstream WAF
-    /// throttles, or for single-IP load testing).
+    /// throttles, or for single-IP load testing). Each replica counts its
+    /// own requests, with no store call on unauthenticated traffic: behind a
+    /// balancer that spreads one client over N replicas the client gets up
+    /// to N x this rate, behind one that pins a client IP to a replica,
+    /// this rate.
     #[serde(default = "default_anonymous_rate_limit_per_min")]
     pub anonymous_rate_limit_per_min: u32,
     /// Burst allowance for `anonymous_rate_limit_per_min`.

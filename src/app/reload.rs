@@ -404,6 +404,31 @@ pub(crate) async fn reload_with_config(
     );
     new_runtime.set_tunnel_federation(new_config.gateway.server.tunnel_federation.as_ref());
     new_runtime.set_license_state((&license).into());
+    // The cluster buses ride the new coordinator: the old one shuts down
+    // with the old registry below. The work in flight across the swap stays
+    // cancellable through the registry the new runtime takes over.
+    new_runtime.set_cancellation_bus(
+        cancellation_bus(&new_config, cluster_backend.as_ref(), &state_cipher).await?,
+    );
+    new_runtime.set_session_fleet(
+        session_fleet(&new_config, cluster_backend.as_ref(), &state_cipher).await?,
+    );
+    new_runtime.adopt_cancellation_tokens(&state.runtime.load());
+    // The new engine shares the watchers through the new coordinator. The
+    // old engine gives its shards back once the swap is done; the new one
+    // is attached again then, so it takes them at once.
+    let fleet_watch = watch_cluster(
+        &new_config,
+        cluster_backend.as_ref(),
+        &state_cipher,
+        new_runtime.session_store(),
+    )
+    .await?;
+    new_runtime
+        .watch_engine
+        .attach_cluster(fleet_watch.clone())
+        .await;
+    let new_watch_engine = new_runtime.watch_engine.clone();
     // CP-attached hooks are installed once, at attach time; a fresh runtime
     // starts on the no-op defaults, so they must be carried across every
     // reload or the CP stops receiving its own telemetry.
@@ -555,6 +580,11 @@ pub(crate) async fn reload_with_config(
 
     // Atomically swap config, runtime, overlay, and policy chain
     state.runtime.store(Arc::new(new_runtime));
+    // The new runtime hears the fleet from here on, the old one no more;
+    // what is told in between, the cancellation backstop and the recorded
+    // ends of sessions recover.
+    old_runtime.stop_cluster_listeners();
+    state.runtime.load_full().start_cluster_listeners();
     let mut events_listed_changed = false;
     if let (Some(core), Some(prepared)) = (events_core.as_ref(), prepared_events) {
         events_listed_changed = core.commit(prepared, &state.runtime).await;
@@ -596,16 +626,18 @@ pub(crate) async fn reload_with_config(
         }
     }
 
+    // Stop the OLD watch engine and every watcher it started. The engine's
+    // control loop would otherwise outlive the reload for as long as any clone
+    // of its sender survives — and each reload would add another generation of
+    // watchers polling the same resources. Before the old registry drains, so
+    // its coordinator can still release the watch shards.
+    old_runtime.subscriptions().shutdown().await;
+    new_watch_engine.attach_cluster(fleet_watch).await;
     // Drain the OLD registry's plugin background state, otherwise every old
     // plugin's background tasks/buffers (sinks, transports, providers, …)
     // would leak until process exit. The new runtime is already live, so the
     // old one is detached — safe to drain.
     old_runtime.plugin_registry().shutdown_all().await;
-    // Stop the OLD watch engine and every watcher it started. The engine's
-    // control loop would otherwise outlive the reload for as long as any clone
-    // of its sender survives — and each reload would add another generation of
-    // watchers polling the same resources.
-    old_runtime.subscriptions().shutdown().await;
     // Likewise drain the OLD runtime's built content-store profiles
     // (held outside the plugin registry) so a reload flushes them too.
     if let Some(content_stores) = old_runtime.content_stores() {

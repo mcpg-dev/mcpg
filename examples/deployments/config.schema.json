@@ -1202,7 +1202,7 @@
         },
         "rate_limit_per_min": {
           "default": 120,
-          "description": "Refused token requests allowed per minute from one client IP address at `POST /oauth/token`, which `POST /oauth/revoke` and `POST /oauth/register` share. Every request takes from the budget and a successful redemption gives it back, so only refused requests (a bad assertion or client credential, an unknown client) spend it; the budget refills continuously and a full minute's worth may arrive at once. While it is spent, requests from that address are answered `429` with `Retry-After` and the OAuth error `temporarily_unavailable`. The client IP is the first `X-Forwarded-For` hop when `gateway.server.trust_proxy_ip` is set, else the connection's peer, so behind a proxy without `trust_proxy_ip` every client shares one budget. Clients behind one egress address — a NAT, or a hosted MCP client calling from its own servers — also share it. `0` disables the limit.",
+          "description": "Refused token requests allowed per minute from one client IP address at `POST /oauth/token`, which `POST /oauth/revoke` and `POST /oauth/register` share. Every request takes from the budget and a successful redemption gives it back, so only refused requests (a bad assertion or client credential, an unknown client) spend it; the budget refills continuously and a full minute's worth may arrive at once. While it is spent, requests from that address are answered `429` with `Retry-After` and the OAuth error `temporarily_unavailable`. The client IP is the first `X-Forwarded-For` hop when `gateway.server.trust_proxy_ip` is set, else the connection's peer, so behind a proxy without `trust_proxy_ip` every client shares one budget. Clients behind one egress address — a NAT, or a hosted MCP client calling from its own servers — also share it. `0` disables the limit. Each replica counts its own requests, as for `gateway.server.anonymous_rate_limit_per_min`.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -1624,10 +1624,10 @@
     },
     "BudgetPolicy": {
       "additionalProperties": false,
-      "description": "One named budget policy (cost cap / call count / token count).",
+      "description": "One named budget policy (cost cap / call count / token count).\n\nA budget is counted in the quota store with atomic counters per window, so it is one budget for every replica that shares the store. A call counts itself before it runs: `cap_calls` is exact. Tokens and cost are charged after the call from the usage its backend reports (the LLM chat and embedding backends report it; the cost comes from their rate card), so a call runs while the spend is under the cap and the call that crosses it can go over by its own spend.",
       "properties": {
         "acknowledge_unenforced": {
-          "description": "Acknowledge that a `cost` / `token_count` budget is advisory. Per-call USD spend and token usage are not available to the gateway after dispatch, so these caps cannot be enforced at runtime — only `call_count` is. A `cost`/`token_count` budget must set this to load, making the no-op posture an explicit operator choice rather than a silent fail-open. No effect for `call_count`.",
+          "description": "Acknowledge that a `cost` / `token_count` budget charges nothing on some of its bindings. A budget's tokens and cost are charged from the usage a backend reports with each result (the LLM backends report it). A `cost`/`token_count` budget referenced by a binding whose backend reports no usage loads only with this set, so the no-op is an explicit operator choice rather than a silent fail-open. No effect for `call_count`.",
           "type": "boolean"
         },
         "cap_calls": {
@@ -1682,7 +1682,7 @@
           "type": "string"
         },
         "warn_at_pct": {
-          "description": "Emit `governance.quota.warn` when drawdown crosses this percentage of the cap. Defaults to no warning. `0..=100`.",
+          "description": "Emit `governance.quota.warn` when drawdown crosses this percentage of the cap: once per window and measure, on the call or the charge that crosses it. Defaults to no warning. `0..=100`.",
           "format": "uint8",
           "maximum": 255,
           "minimum": 0,
@@ -1692,7 +1692,7 @@
           ]
         },
         "window": {
-          "description": "Rolling window over which the cap applies. Suffixes `s`/`m`/ `h`/`d`. Maximum `30d`.",
+          "description": "Window over which the cap applies, from the first call of the window; the next call after it ends opens a new window at zero. Suffixes `s`/`m`/`h`/`d`. Maximum `30d`.",
           "type": "string"
         }
       },
@@ -2187,7 +2187,7 @@
           ]
         },
         "max_concurrent": {
-          "description": "Maximum simultaneous in-flight calls.",
+          "description": "Maximum simultaneous in-flight calls. In a fleet whose replicas share the quota store (`cluster.kind` other than `single_node`, store not `memory` or `file`) it counts the calls of every replica: each acquire costs one counter write and one listing of the scope's counters, and the permits of a replica that dies come back within 30 s. On a single node it is an in-process count.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -5068,7 +5068,7 @@
         },
         "rate_limit_per_min": {
           "default": 120,
-          "description": "Requests allowed per minute from one client IP address across the browser endpoints (`/oauth/authorize`, `/oauth/consent`, `/oauth/callback`, `/oauth/connect`); the IP is found as for `authorization_server.rate_limit_per_min`. `0` disables the limit.",
+          "description": "Requests allowed per minute from one client IP address across the browser endpoints (`/oauth/authorize`, `/oauth/consent`, `/oauth/callback`, `/oauth/connect`); the IP is found as for `authorization_server.rate_limit_per_min`, and each replica counts its own requests. `0` disables the limit.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -8121,7 +8121,7 @@
         },
         "anonymous_rate_limit_per_min": {
           "default": 600,
-          "description": "Per-IP request-rate cap on the MCP endpoint for requests below cryptographically-verified trust — i.e. anonymous AND header-asserted identities (sustained requests/minute, with `anonymous_rate_limit_burst` headroom). A self-asserted `x-mcpg-subject-id` does NOT buy an exemption. Only Verified traffic (a real OIDC/JWKS/identity-plugin credential) skips this — it is attributable and metered per tenant. Defaults generous (600/min = 10 rps sustained per client IP), far above interactive agent use; `0` disables (e.g. when an upstream WAF throttles, or for single-IP load testing).",
+          "description": "Per-IP request-rate cap on the MCP endpoint for requests below cryptographically-verified trust — i.e. anonymous AND header-asserted identities (sustained requests/minute, with `anonymous_rate_limit_burst` headroom). A self-asserted `x-mcpg-subject-id` does NOT buy an exemption. Only Verified traffic (a real OIDC/JWKS/identity-plugin credential) skips this — it is attributable and metered per tenant. Defaults generous (600/min = 10 rps sustained per client IP), far above interactive agent use; `0` disables (e.g. when an upstream WAF throttles, or for single-IP load testing). Each replica counts its own requests, with no store call on unauthenticated traffic: behind a balancer that spreads one client over N replicas the client gets up to N x this rate, behind one that pins a client IP to a replica, this rate.",
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -8146,7 +8146,7 @@
         },
         "completion_rate_limit_per_sec": {
           "default": null,
-          "description": "Per-session rate limit on `completion/complete` requests (cap per second). `None` disables. Guards against broken autocomplete UIs.",
+          "description": "Per-session rate limit on `completion/complete` requests (cap per second). `None` disables. Guards against broken autocomplete UIs. Counted by the replica that serves the request.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -8211,7 +8211,7 @@
         },
         "max_sessions_per_tenant": {
           "default": 0,
-          "description": "Per-tenant session quota. 0 = unlimited. The stricter of this and the global cap wins.\n\nA \"tenant\" is the trust-qualified principal, so the same subject string asserted by a header and verified by an IdP are separate tenants and cannot exhaust each other's quota.\n\nTwo limits worth knowing before setting this:\n\n- **It is a per-replica cap.** The counter lives in this process, so a fleet of N replicas admits up to N x this value per tenant, and a reconnect that lands on another replica starts fresh. Divide by the replica count if you need a fleet-wide ceiling. - **Anonymous callers share one bucket**, because an unauthenticated request carries nothing to separate them by. Aggregate anonymous usage is capped rather than per-caller usage; per-caller protection for anonymous traffic is `anonymous_rate_limit_per_min`, which meters by source IP.",
+          "description": "Per-tenant session quota. 0 = unlimited. The stricter of this and the global cap wins.\n\nA \"tenant\" is the trust-qualified principal, so the same subject string asserted by a header and verified by an IdP are separate tenants and cannot exhaust each other's quota.\n\nTwo limits worth knowing before setting this:\n\n- **It counts the fleet when the replicas share the session store** (`cluster.kind` other than `single_node`, and sessions not on a `memory` or `file` store). Each counted session keeps a slot next to its row in the store; a session that ends, on any replica, frees its slot. With a session store of its own per replica the cap counts that replica's sessions, so N replicas admit up to N x this value per tenant. - **Anonymous callers share one bucket**, because an unauthenticated request carries nothing to separate them by. Aggregate anonymous usage is capped rather than per-caller usage; per-caller protection for anonymous traffic is `anonymous_rate_limit_per_min`, which meters by source IP.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -8259,6 +8259,7 @@
         },
         "session_idle_timeout_ms": {
           "default": 900000,
+          "description": "How long a session of the `2025-xx` revisions lives without use, in milliseconds. A session ends when it was not used for this long; its open streams end with it, and the client's next request gets 404.\n\nWhen the replicas share the session store, a replica in use writes the session's last use at most every quarter of this timeout (at least 1 s), so the fleet ends a session only once no replica used it for this timeout plus that quarter. The end — this or a `DELETE` — reaches every replica at once; a replica that misses the word stops serving the session the first time it uses it after that quarter, at most 30 s.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"

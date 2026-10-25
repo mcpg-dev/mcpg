@@ -1169,6 +1169,8 @@ impl GatewayRuntime {
             backend_health: backend_health::new_health_map(binding_configs),
             cancellation_bus: Arc::new(cancellation_bus::BusBackedCancellationBus::new_in_memory()),
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
+            session_fleet: session_fleet::SessionFleet::default(),
+            cluster_listeners: std::sync::Mutex::new(Vec::new()),
             completion_limiter: dashmap::DashMap::new(),
             completion_rate_limit_per_sec: None,
             cursor_hmac_key: Self::generate_cursor_hmac_key(),

@@ -386,25 +386,24 @@ pub(crate) struct ExecutionDispatcher {
     /// `take_pending_deliveries`. `None` in tests that build the
     /// dispatcher standalone.
     pipeline_store: Option<Arc<dyn super::pipeline_store::PipelineStore>>,
-    /// last emitted `progress` value per
-    /// (session_id, progress_token_string). MCP 2025-11-25 §Progress
-    /// requires progress to be strictly non-decreasing — any emission
-    /// that would go backwards is dropped with an observability
-    /// counter.
+    /// last emitted `progress` value per session_id, then per
+    /// progress_token_string. MCP 2025-11-25 §Progress requires progress to
+    /// be strictly non-decreasing — any emission that would go backwards is
+    /// dropped with an observability counter.
     ///
-    /// pruned on session terminate (see
-    /// `clear_progress_state_for_session`) so a long-running gateway
-    /// does not retain a row per (session, token) for the lifetime
-    /// of the process.
+    /// pruned when the session ends (see
+    /// `clear_progress_state_for_session`) so a long-running gateway does
+    /// not retain a row per (session, token) for the lifetime of the
+    /// process. Keyed by session first: every replica prunes for every
+    /// session that ends in the fleet.
     /// Perf: DashMap avoids global Mutex contention on progress emission.
-    progress_state: dashmap::DashMap<(String, String), f64>,
+    progress_state: dashmap::DashMap<String, std::collections::HashMap<String, f64>>,
 }
 
 impl ExecutionDispatcher {
-    /// Drop every (session_id, *) entry from the progress
-    /// monotonicity tracker on session terminate.
+    /// Drop the progress monotonicity state of a session that ended.
     pub(crate) fn clear_progress_state_for_session(&self, session_id: &str) {
-        self.progress_state.retain(|(sid, _), _| sid != session_id);
+        self.progress_state.remove(session_id);
     }
 }
 
@@ -706,24 +705,21 @@ impl ExecutionDispatcher {
             _ => String::new(),
         };
         if !token_str.is_empty() {
-            let key = (session_id.clone(), token_str);
-            let prev = self
-                .progress_state
-                .get(&key)
-                .map(|v| *v)
-                .unwrap_or(f64::NEG_INFINITY);
+            let mut tokens = self.progress_state.entry(session_id.clone()).or_default();
+            let prev = tokens.get(&token_str).copied().unwrap_or(f64::NEG_INFINITY);
             if completed < prev {
+                drop(tokens);
                 metrics::counter!("mcpg_progress_non_monotonic_dropped_total").increment(1);
                 tracing::warn!(
-                    session_id = %key.0,
-                    progress_token = %key.1,
+                    session_id = %session_id,
+                    progress_token = %token_str,
                     previous = prev,
                     attempted = completed,
                     "dropping non-monotonic progress emission (spec MUST)"
                 );
                 return;
             }
-            self.progress_state.insert(key, completed);
+            tokens.insert(token_str, completed);
         }
 
         let notification = crate::protocol::ProgressNotification {
@@ -1413,6 +1409,7 @@ fn execute_binding_plugin(
             headers.push(("tracestate".to_owned(), ts.to_owned()));
         }
     }
+    headers.push(accept_usage_header());
 
     let binding_request = mcpg_plugin_protocol::BackendRequest {
         payload,
@@ -1475,8 +1472,9 @@ fn execute_binding_plugin(
 
     match result {
         Ok(reply) => {
-            let reply_text = String::from_utf8_lossy(&reply.payload);
-            let structured: Option<serde_json::Value> = serde_json::from_slice(&reply.payload).ok();
+            let (payload, usage) = split_reported_usage(&reply.payload);
+            let reply_text = String::from_utf8_lossy(&payload);
+            let structured: Option<serde_json::Value> = serde_json::from_slice(&payload).ok();
             // Verbatim-result convention: a plugin may wrap a full
             // CallToolResult under `__mcpg_verbatim_result` to control
             // `is_error` + a literal multi-block `content` array.
@@ -1484,7 +1482,10 @@ fn execute_binding_plugin(
                 && let Ok(mut projected) =
                     serde_json::from_value::<ToolCallResult>(verbatim.clone())
             {
-                projected.meta = Some(binding_audit_meta(kind, profile, projected.is_error));
+                projected.meta = Some(with_reported_usage(
+                    binding_audit_meta(kind, profile, projected.is_error),
+                    usage,
+                ));
                 return projected;
             }
             // A non-null `downstreamError` slot is the plugin's tool-level
@@ -1504,7 +1505,10 @@ fn execute_binding_plugin(
                 content: vec![ToolContent::text(content_text)],
                 structured_content: structured,
                 is_error: envelope_is_error,
-                meta: Some(binding_audit_meta(kind, profile, envelope_is_error)),
+                meta: Some(with_reported_usage(
+                    binding_audit_meta(kind, profile, envelope_is_error),
+                    usage,
+                )),
             }
         }
         Err(e) => ToolCallResult {
@@ -1567,6 +1571,7 @@ async fn execute_binding_plugin_streaming(
     // response envelope (HTTP today). Non-tool-aware backends
     // (LLM, NATS, …) ignore unknown header names.
     headers.push(("mcpg-tool-name".to_owned(), request.tool_name.clone()));
+    headers.push(accept_usage_header());
 
     let binding_request = mcpg_plugin_protocol::BackendRequest {
         payload,
@@ -1666,8 +1671,9 @@ async fn execute_binding_plugin_streaming(
         };
     };
 
-    let reply_text = String::from_utf8_lossy(&reply.payload);
-    let structured: Option<serde_json::Value> = serde_json::from_slice(&reply.payload).ok();
+    let (payload, usage) = split_reported_usage(&reply.payload);
+    let reply_text = String::from_utf8_lossy(&payload);
+    let structured: Option<serde_json::Value> = serde_json::from_slice(&payload).ok();
     let mut content_text = reply_text.to_string();
     if reply.truncated {
         content_text.push_str("\n[response truncated]");
@@ -1686,7 +1692,10 @@ async fn execute_binding_plugin_streaming(
         content: vec![ToolContent::text(content_text)],
         structured_content: structured,
         is_error: envelope_is_error,
-        meta: Some(binding_audit_meta(kind, profile, envelope_is_error)),
+        meta: Some(with_reported_usage(
+            binding_audit_meta(kind, profile, envelope_is_error),
+            usage,
+        )),
     }
 }
 
@@ -1708,7 +1717,20 @@ fn emit_chunk_notification(
     chunk_index: u64,
     chunk: &mcpg_plugin_protocol::BackendChunk,
 ) {
-    let chunk_value = match serde_json::to_value(chunk) {
+    let chunk_value = match chunk {
+        // The client sees the result without the usage it travels with.
+        mcpg_plugin_protocol::BackendChunk::Done(reply) => {
+            let (payload, _) = split_reported_usage(&reply.payload);
+            serde_json::to_value(mcpg_plugin_protocol::BackendChunk::Done(
+                mcpg_plugin_protocol::BackendResponse {
+                    payload: payload.into_owned(),
+                    truncated: reply.truncated,
+                },
+            ))
+        }
+        other => serde_json::to_value(other),
+    };
+    let chunk_value = match chunk_value {
         Ok(v) => v,
         Err(_) => return,
     };
@@ -1783,6 +1805,63 @@ fn binding_audit_meta(kind: &str, profile: &str, is_error: bool) -> serde_json::
             "outcome": if is_error { "error" } else { "success" },
         }
     })
+}
+
+/// `_meta` key of the usage a backend reported, between the dispatch and
+/// the budget charge; the client never receives it.
+pub(crate) const USAGE_META_KEY: &str = "dev.mcpg/usage";
+
+/// Tells a backend that this host takes a result with its usage.
+fn accept_usage_header() -> (String, String) {
+    (
+        mcpg_plugin_protocol::ACCEPT_USAGE_HEADER.to_owned(),
+        "1".to_owned(),
+    )
+}
+
+/// The result a backend payload carries, and the usage it reported with it
+/// ([`mcpg_plugin_protocol::BackendUsage`]).
+fn split_reported_usage(
+    payload: &[u8],
+) -> (
+    std::borrow::Cow<'_, [u8]>,
+    Option<mcpg_plugin_protocol::BackendUsage>,
+) {
+    let Ok(value) = serde_json::from_slice::<Value>(payload) else {
+        return (std::borrow::Cow::Borrowed(payload), None);
+    };
+    match mcpg_plugin_protocol::BackendUsage::split(value) {
+        (result, Some(usage)) => match serde_json::to_vec(&result) {
+            Ok(bytes) => (std::borrow::Cow::Owned(bytes), Some(usage)),
+            Err(_) => (std::borrow::Cow::Borrowed(payload), None),
+        },
+        (_, None) => (std::borrow::Cow::Borrowed(payload), None),
+    }
+}
+
+/// `meta` with the reported `usage` under [`USAGE_META_KEY`].
+fn with_reported_usage(
+    mut meta: Value,
+    usage: Option<mcpg_plugin_protocol::BackendUsage>,
+) -> Value {
+    if let (Some(usage), Some(object)) = (usage, meta.as_object_mut())
+        && let Ok(usage) = serde_json::to_value(usage)
+    {
+        object.insert(USAGE_META_KEY.to_owned(), usage);
+    }
+    meta
+}
+
+/// Take the usage the backend reported out of `result`.
+pub(crate) fn take_reported_usage(
+    result: &mut ToolCallResult,
+) -> Option<mcpg_plugin_protocol::BackendUsage> {
+    let usage = result
+        .meta
+        .as_mut()?
+        .as_object_mut()?
+        .remove(USAGE_META_KEY)?;
+    serde_json::from_value(usage).ok()
 }
 
 #[tracing::instrument(skip(request, plugin_registry), fields(profile = %profile))]
@@ -2031,6 +2110,7 @@ fn execute_envelope_plugin(
         }
     }
     headers.push(("mcpg-tool-name".to_owned(), request.tool_name.clone()));
+    headers.push(accept_usage_header());
 
     let binding_request = mcpg_plugin_protocol::BackendRequest {
         payload,
@@ -2083,8 +2163,9 @@ fn execute_envelope_plugin(
 
     match result {
         Ok(reply) => {
-            let reply_text = String::from_utf8_lossy(&reply.payload);
-            let structured: Option<serde_json::Value> = serde_json::from_slice(&reply.payload).ok();
+            let (payload, usage) = split_reported_usage(&reply.payload);
+            let reply_text = String::from_utf8_lossy(&payload);
+            let structured: Option<serde_json::Value> = serde_json::from_slice(&payload).ok();
             // Verbatim-result convention: a plugin (mock) that needs to
             // control `is_error` + a literal multi-block `content` array
             // (which the standard projection can't express) wraps a full
@@ -2094,7 +2175,10 @@ fn execute_envelope_plugin(
                 && let Ok(mut projected) =
                     serde_json::from_value::<ToolCallResult>(verbatim.clone())
             {
-                projected.meta = Some(binding_audit_meta(kind, profile, projected.is_error));
+                projected.meta = Some(with_reported_usage(
+                    binding_audit_meta(kind, profile, projected.is_error),
+                    usage,
+                ));
                 return projected;
             }
             // A non-null `downstreamError` slot is the plugin's
@@ -2114,7 +2198,10 @@ fn execute_envelope_plugin(
                 content: vec![ToolContent::text(content_text)],
                 structured_content: structured,
                 is_error: envelope_is_error,
-                meta: Some(binding_audit_meta(kind, profile, envelope_is_error)),
+                meta: Some(with_reported_usage(
+                    binding_audit_meta(kind, profile, envelope_is_error),
+                    usage,
+                )),
             }
         }
         Err(e) => ToolCallResult {

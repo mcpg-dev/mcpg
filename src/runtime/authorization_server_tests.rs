@@ -611,11 +611,12 @@ impl KeyValueStore for UnreachableKv {
     async fn delete(&self, _: &str) -> Result<bool, mcpg_cluster_api::ClusterError> {
         Err(unreachable())
     }
-    async fn list_prefix(
+    async fn list_page(
         &self,
         _: &str,
+        _: Option<&str>,
         _: usize,
-    ) -> Result<Vec<(String, mcpg_cluster_api::Entry)>, mcpg_cluster_api::ClusterError> {
+    ) -> Result<mcpg_cluster_api::KvPage, mcpg_cluster_api::ClusterError> {
         Err(unreachable())
     }
     async fn expire(

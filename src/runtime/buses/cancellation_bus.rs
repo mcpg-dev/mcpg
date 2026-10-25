@@ -258,7 +258,8 @@ impl CancellationBus for BusBackedCancellationBus {
                 let tx_drain = tx;
                 tokio::spawn(async move {
                     let mut seen: HashSet<String> = HashSet::new();
-                    loop {
+                    // Drains for as long as the subscriber listens.
+                    while !tx_drain.is_closed() {
                         match kv.list_prefix(PENDING_PREFIX, DRAIN_LIMIT).await {
                             Ok(entries) => {
                                 let mut current = HashSet::with_capacity(entries.len());

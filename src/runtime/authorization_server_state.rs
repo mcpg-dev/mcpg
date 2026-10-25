@@ -1383,11 +1383,12 @@ impl KeyValueStore for UnavailableStore {
         Err(self.error())
     }
 
-    async fn list_prefix(
+    async fn list_page(
         &self,
         _prefix: &str,
+        _cursor: Option<&str>,
         _limit: usize,
-    ) -> Result<Vec<(String, Entry)>, ClusterError> {
+    ) -> Result<mcpg_cluster_api::KvPage, ClusterError> {
         Err(self.error())
     }
 

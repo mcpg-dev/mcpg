@@ -266,7 +266,9 @@ pub struct AuthorizationServerConfig {
     /// else the connection's peer, so behind a proxy without
     /// `trust_proxy_ip` every client shares one budget. Clients behind one
     /// egress address — a NAT, or a hosted MCP client calling from its
-    /// own servers — also share it. `0` disables the limit.
+    /// own servers — also share it. `0` disables the limit. Each replica
+    /// counts its own requests, as for
+    /// `gateway.server.anonymous_rate_limit_per_min`.
     #[serde(default = "default_token_rate_limit_per_min")]
     pub rate_limit_per_min: u32,
     /// Settings of interactive sign-in, which a `trusted_idps[].login`

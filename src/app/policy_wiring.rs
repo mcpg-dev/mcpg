@@ -21,6 +21,16 @@ pub(crate) async fn build_quota_gate(
     if quotas.is_empty() && binding_refs.is_empty() {
         return Ok(None);
     }
+    check_unreported_budgets(config, |kind| {
+        plugin_registry
+            .backend_profile(kind)
+            .is_some_and(|profile| {
+                profile
+                    .usage_reporting_kinds
+                    .iter()
+                    .any(|reported| reported == kind)
+            })
+    })?;
     use std::sync::Arc;
     // Convert KindRef → StoreOverrideConfig so the existing KV
     // resolver picks it up. Default to `kind: cluster` when the
@@ -54,18 +64,65 @@ pub(crate) async fn build_quota_gate(
         &config.cluster.tenant_segment,
     );
     let store = crate::runtime::quota_gate::QuotaStore::new(kv);
+    // The replicas of a fleet share the quota store unless it is each
+    // replica's own.
+    let fleet =
+        !config.cluster.is_single_node() && !matches!(over.kind.as_str(), "memory" | "file");
     let gate = Arc::new(crate::runtime::quota_gate::QuotaGate::new(
         quotas,
         binding_refs,
         store,
+        fleet,
     ));
     info!(
         rate_limits = quotas.rate_limits.len(),
         budgets = quotas.budgets.len(),
         concurrency = quotas.concurrency.len(),
+        concurrency_counted = if fleet { "fleet" } else { "replica" },
         "runtime quota gate constructed"
     );
     Ok(Some(gate))
+}
+
+/// A `cost` or `token_count` budget is charged from the usage a backend
+/// reports with each result. A binding whose backend kind reports none
+/// charges such a budget nothing, so a budget it references loads only
+/// with `acknowledge_unenforced`.
+#[cfg(feature = "governance-quotas")]
+pub(crate) fn check_unreported_budgets(
+    config: &crate::config::AppConfig,
+    reports_usage: impl Fn(&str) -> bool,
+) -> Result<()> {
+    for (_list, binding) in config.all_bindings() {
+        let Some(budget_id) = binding.quotas.as_ref().and_then(|q| q.budget.as_deref()) else {
+            continue;
+        };
+        let Some(policy) = config
+            .governance
+            .quotas
+            .budgets
+            .iter()
+            .find(|budget| budget.id == budget_id)
+        else {
+            continue;
+        };
+        if !matches!(policy.kind.as_str(), "cost" | "token_count") || policy.acknowledge_unenforced
+        {
+            continue;
+        }
+        let kind = binding.backend.kind.as_str();
+        if !reports_usage(kind) {
+            anyhow::bail!(
+                "governance.quotas.budgets[{budget_id}]: binding `{}` (kind `{kind}`) reports \
+                 no usage, so its `kind: {}` budget would charge it nothing. Set \
+                 `acknowledge_unenforced: true` on the budget to accept that, or use \
+                 `kind: call_count`.",
+                binding.name,
+                policy.kind
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Walk every binding under `mcp.capabilities.{tools,prompts,
@@ -243,5 +300,64 @@ pub(crate) fn build_tool_access_policy_config(config: &AppConfig) -> ToolAccessP
         ),
         cel_allow_if: config.governance.policy.tool_access.cel_allow_if.clone(),
         rules,
+    }
+}
+
+#[cfg(all(test, feature = "governance-quotas"))]
+mod unreported_budget_tests {
+    use super::*;
+
+    fn config(kind: &str, budget_kind: &str, acknowledge: bool) -> crate::config::AppConfig {
+        let cap = match budget_kind {
+            "cost" => "cap_usd: 5.0",
+            "token_count" => "cap_token_count: 1000",
+            _ => "cap_calls: 10",
+        };
+        serde_yaml::from_str(&format!(
+            r#"
+governance:
+  quotas:
+    budgets:
+      - id: spend
+        kind: {budget_kind}
+        {cap}
+        window: 24h
+        scope: global
+        acknowledge_unenforced: {acknowledge}
+mcp:
+  capabilities:
+    tools:
+      - name: the.tool
+        description: a tool
+        backend:
+          kind: {kind}
+        quotas:
+          budget: spend
+"#
+        ))
+        .expect("config parses")
+    }
+
+    fn reports(kind: &str) -> bool {
+        kind == "openai.chat"
+    }
+
+    #[test]
+    fn a_cost_budget_on_a_backend_without_usage_needs_the_acknowledgement() {
+        let error = check_unreported_budgets(&config("http", "cost", false), reports)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            error.contains("binding `the.tool` (kind `http`) reports no usage"),
+            "{error}"
+        );
+        assert!(check_unreported_budgets(&config("http", "token_count", false), reports).is_err());
+        assert!(check_unreported_budgets(&config("http", "cost", true), reports).is_ok());
+    }
+
+    #[test]
+    fn a_backend_that_reports_usage_or_a_call_budget_needs_none() {
+        assert!(check_unreported_budgets(&config("openai.chat", "cost", false), reports).is_ok());
+        assert!(check_unreported_budgets(&config("http", "call_count", false), reports).is_ok());
     }
 }

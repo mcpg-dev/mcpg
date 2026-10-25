@@ -578,7 +578,8 @@ pub struct InteractiveLoginConfig {
     /// Requests allowed per minute from one client IP address across the
     /// browser endpoints (`/oauth/authorize`, `/oauth/consent`,
     /// `/oauth/callback`, `/oauth/connect`); the IP is found as for
-    /// `authorization_server.rate_limit_per_min`. `0` disables the limit.
+    /// `authorization_server.rate_limit_per_min`, and each replica counts
+    /// its own requests. `0` disables the limit.
     #[serde(default = "default_browser_rate_limit_per_min")]
     pub rate_limit_per_min: u32,
     /// How often each replica reads the revoked grants other replicas

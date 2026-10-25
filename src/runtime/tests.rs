@@ -122,7 +122,7 @@ impl SessionStore for CountingSessionStore {
     ) -> Result<(), SessionAccessError> {
         self.inner.set_session_log_level(session_id, level)
     }
-    fn terminate_session(&self, session_id: &str) -> bool {
+    fn terminate_session(&self, session_id: &str) -> Option<session_store::EndedSession> {
         self.inner.terminate_session(session_id)
     }
     fn open_sse_stream(

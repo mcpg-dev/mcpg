@@ -155,6 +155,12 @@ impl AdminService {
         rt.watch_engine.list_watches().await
     }
 
+    /// The watch shards this replica holds, of `WATCH_SHARDS`.
+    pub async fn owned_watch_shards(&self) -> Vec<u32> {
+        let rt = self.runtime.load();
+        rt.watch_engine.owned_shards().await
+    }
+
     /// GET /admin/v1/runtime
     pub fn runtime_info(&self) -> RuntimeInfoResponse {
         let rt = self.runtime.load();

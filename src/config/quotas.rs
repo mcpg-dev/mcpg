@@ -292,6 +292,14 @@ impl RateLimitPolicy {
 }
 
 /// One named budget policy (cost cap / call count / token count).
+///
+/// A budget is counted in the quota store with atomic counters per
+/// window, so it is one budget for every replica that shares the store.
+/// A call counts itself before it runs: `cap_calls` is exact. Tokens and
+/// cost are charged after the call from the usage its backend reports
+/// (the LLM chat and embedding backends report it; the cost comes from
+/// their rate card), so a call runs while the spend is under the cap and
+/// the call that crosses it can go over by its own spend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetPolicy {
@@ -321,12 +329,14 @@ pub struct BudgetPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cap_calls: Option<u64>,
 
-    /// Rolling window over which the cap applies. Suffixes `s`/`m`/
-    /// `h`/`d`. Maximum `30d`.
+    /// Window over which the cap applies, from the first call of the
+    /// window; the next call after it ends opens a new window at zero.
+    /// Suffixes `s`/`m`/`h`/`d`. Maximum `30d`.
     pub window: String,
 
     /// Emit `governance.quota.warn` when drawdown crosses this
-    /// percentage of the cap. Defaults to no warning. `0..=100`.
+    /// percentage of the cap: once per window and measure, on the call or
+    /// the charge that crosses it. Defaults to no warning. `0..=100`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warn_at_pct: Option<u8>,
 
@@ -335,13 +345,13 @@ pub struct BudgetPolicy {
     #[serde(default = "default_on_exceeded")]
     pub on_exceeded: String,
 
-    /// Acknowledge that a `cost` / `token_count` budget is advisory.
-    /// Per-call USD spend and token usage are not available to the
-    /// gateway after dispatch, so these caps cannot be enforced at
-    /// runtime — only `call_count` is. A `cost`/`token_count` budget
-    /// must set this to load, making the no-op posture an explicit
-    /// operator choice rather than a silent fail-open. No effect for
-    /// `call_count`.
+    /// Acknowledge that a `cost` / `token_count` budget charges nothing on
+    /// some of its bindings. A budget's tokens and cost are charged from
+    /// the usage a backend reports with each result (the LLM backends
+    /// report it). A `cost`/`token_count` budget referenced by a binding
+    /// whose backend reports no usage loads only with this set, so the
+    /// no-op is an explicit operator choice rather than a silent
+    /// fail-open. No effect for `call_count`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub acknowledge_unenforced: bool,
 }
@@ -358,14 +368,6 @@ impl BudgetPolicy {
                         "{path}: `kind: cost` requires `cap_usd:` to be set"
                     ));
                 }
-                if !self.acknowledge_unenforced {
-                    return Err(anyhow!(
-                        "{path}: `kind: cost` budgets are not enforced at runtime — per-call USD \
-                         spend is not reported back to the gateway after dispatch, so `cap_usd` \
-                         cannot be charged. Set `acknowledge_unenforced: true` to accept an \
-                         advisory budget, or use `kind: call_count`."
-                    ));
-                }
             }
             "call_count" => {
                 if self.cap_calls.is_none() {
@@ -378,14 +380,6 @@ impl BudgetPolicy {
                 if self.cap_token_count.is_none() {
                     return Err(anyhow!(
                         "{path}: `kind: token_count` requires `cap_token_count:` to be set"
-                    ));
-                }
-                if !self.acknowledge_unenforced {
-                    return Err(anyhow!(
-                        "{path}: `kind: token_count` budgets are not enforced at runtime — per-call \
-                         token usage is not reported back to the gateway after dispatch, so \
-                         `cap_token_count` cannot be charged. Set `acknowledge_unenforced: true` to \
-                         accept an advisory budget, or use `kind: call_count`."
                     ));
                 }
             }
@@ -412,7 +406,12 @@ impl BudgetPolicy {
 #[serde(deny_unknown_fields)]
 pub struct ConcurrencyPolicy {
     pub id: String,
-    /// Maximum simultaneous in-flight calls.
+    /// Maximum simultaneous in-flight calls. In a fleet whose replicas share
+    /// the quota store (`cluster.kind` other than `single_node`, store not
+    /// `memory` or `file`) it counts the calls of every replica: each
+    /// acquire costs one counter write and one listing of the scope's
+    /// counters, and the permits of a replica that dies come back within
+    /// 30 s. On a single node it is an in-process count.
     pub max_concurrent: u32,
     /// Scope (typically `per_tool`, `global`, or `per_identity`).
     #[serde(default = "default_scope")]
@@ -697,23 +696,18 @@ mod tests {
         assert!(err.contains("must be `deny`"), "{err}");
     }
 
+    /// Whether a cost or token budget needs `acknowledge_unenforced` depends
+    /// on the backends of its bindings, which the gate build checks; the
+    /// policy alone validates.
     #[test]
-    fn cost_budget_without_acknowledge_is_rejected() {
+    fn cost_and_token_budgets_validate_without_acknowledge() {
         let mut p = budget("x");
         p.acknowledge_unenforced = false;
-        let err = p.validate("path").unwrap_err().to_string();
-        assert!(err.contains("not enforced at runtime"), "{err}");
-    }
-
-    #[test]
-    fn token_budget_without_acknowledge_is_rejected() {
-        let mut p = budget("x");
+        assert!(p.validate("path").is_ok());
         p.kind = "token_count".to_owned();
         p.cap_usd = None;
         p.cap_token_count = Some(1000);
-        p.acknowledge_unenforced = false;
-        let err = p.validate("path").unwrap_err().to_string();
-        assert!(err.contains("not enforced at runtime"), "{err}");
+        assert!(p.validate("path").is_ok());
     }
 
     #[test]

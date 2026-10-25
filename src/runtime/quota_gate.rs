@@ -33,20 +33,24 @@
 //! call's refund racing another replica's consume), never an
 //! over-grant.
 //!
-//! Budget state is different: its window accumulator is a multi-field
-//! JSON record that a single counter cannot carry, so it keeps the
-//! local read-modify-write under the per-key `Mutex`. Correct on a
-//! single instance; two replicas sharing a budget can still race the
-//! same window and drift by a small constant. Operators who need
-//! hard cross-replica budget enforcement should keep replicas at 1
-//! for now.
+//! A budget is atomic counters too: the window's calls, tokens and
+//! micro-dollars each move only by `incr` under keys of the window
+//! ([`BudgetWindow`]), so replicas sharing the store never lose a
+//! charge. A `call_count` cap is exact: the call counts itself and
+//! gives the count back when that went over. Tokens and cost are known
+//! only after the call ([`QuotaGate::charge_usage`] charges what the
+//! backend reported), so a call starts while the spend is under the
+//! cap, and the one call that crosses it can go over.
 //!
-//! Concurrency caps don't suffer from this: in-flight permits are
-//! tracked entirely in-process via a [`tokio::sync::Semaphore`]
-//! per policy (no KV round-trip), so the cap is exact within
-//! a single gateway instance. Multi-instance concurrency caps
-//! become per-instance caps; operators who want a cluster-wide
-//! cap split it across replicas at config time.
+//! A concurrency cap counts the fleet. In a fleet the permits are
+//! counted in the quota store
+//! ([`super::fleet_semaphore::FleetSemaphore`]: one counter per
+//! replica and scope, summed on acquire), so `max_concurrent` is
+//! the number of calls in flight across every replica; a replica
+//! that dies gives its permits back within the counter TTL. On a
+//! single node an in-process [`tokio::sync::Semaphore`] per scope
+//! is exact and costs no store call. `on_exceeded: queue` waits up
+//! to `queue_timeout_ms` for a permit in both cases.
 
 #![cfg(feature = "governance-quotas")]
 
@@ -74,8 +78,12 @@ pub enum QuotaDecision {
     /// gate acquired a concurrency permit that must be released
     /// when the request finishes (or fails). The caller holds
     /// the permit through the binding execution and drops it on
-    /// completion.
-    Allow { permit: Option<ConcurrencyPermit> },
+    /// completion. `warnings` are the budgets this call moved past
+    /// their `warn_at_pct`.
+    Allow {
+        permit: Option<ConcurrencyPermit>,
+        warnings: Vec<QuotaWarning>,
+    },
     /// The request must be refused. `policy_id` names the
     /// specific policy that blocked it; `kind` says whether it
     /// was a rate / budget / concurrency policy. Higher layers
@@ -86,6 +94,18 @@ pub enum QuotaDecision {
         kind: QuotaKind,
         reason: String,
     },
+}
+
+/// A budget whose spend one call moved past its `warn_at_pct`; the caller
+/// emits `governance.quota.warn` for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaWarning {
+    pub policy_id: String,
+    /// `calls`, `tokens` or `usd`.
+    pub measure: &'static str,
+    pub used: f64,
+    pub cap: f64,
+    pub warn_at_pct: u8,
 }
 
 /// Which policy kind blocked a request.
@@ -114,7 +134,16 @@ impl QuotaKind {
 /// `QuotaDecision` itself so the consumer can move it.
 #[must_use = "permit must outlive the binding execution; drop after dispatch returns"]
 pub struct ConcurrencyPermit {
-    _inner: tokio::sync::OwnedSemaphorePermit,
+    _inner: PermitInner,
+}
+
+enum PermitInner {
+    Replica {
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    },
+    Fleet {
+        _permit: super::fleet_semaphore::FleetPermit,
+    },
 }
 
 impl std::fmt::Debug for ConcurrencyPermit {
@@ -132,8 +161,7 @@ impl std::fmt::Debug for ConcurrencyPermit {
 /// per-key serialization on top of the KV's own atomicity.
 /// Rate-limit accounting drives the KV's atomic `incr` under the
 /// per-key lock (locally sequential decisions, cross-replica-atomic
-/// spend); the budget accumulator is a read-modify-write that the
-/// lock alone serializes (in-process only — see the module doc).
+/// spend); budget counters use `incr` alone.
 #[derive(Debug)]
 pub struct QuotaStore {
     kv: Arc<dyn KeyValueStore>,
@@ -154,30 +182,6 @@ impl QuotaStore {
             .entry(key.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
-    }
-
-    /// Read-modify-write under the per-key lock. The closure
-    /// receives the previous bytes (or `None` if absent), returns
-    /// the new bytes + optional TTL + caller's return value.
-    /// On success the new bytes are stored.
-    pub async fn read_modify_write<F, R>(&self, key: &str, f: F) -> Result<R>
-    where
-        F: FnOnce(Option<Bytes>) -> Result<(Bytes, Option<Duration>, R)>,
-    {
-        let lock = self.lock_for(key);
-        let _guard = lock.lock().await;
-        let entry = self
-            .kv
-            .get(key)
-            .await
-            .with_context(|| format!("quota_store: get failed for `{key}`"))?;
-        let prev = entry.map(|e| e.bytes);
-        let (next, ttl, ret) = f(prev)?;
-        self.kv
-            .put(key, next, ttl)
-            .await
-            .with_context(|| format!("quota_store: put failed for `{key}`"))?;
-        Ok(ret)
     }
 }
 
@@ -305,107 +309,283 @@ impl ConcurrencyTracker {
     /// a deny.
     fn try_acquire(&self, key: &str, max: u32) -> Option<ConcurrencyPermit> {
         let sem = self.semaphore_for(key, max);
-        sem.try_acquire_owned()
+        sem.try_acquire_owned().ok().map(|p| ConcurrencyPermit {
+            _inner: PermitInner::Replica { _permit: p },
+        })
+    }
+
+    /// Wait up to `timeout` for a permit.
+    async fn acquire_within(
+        &self,
+        key: &str,
+        max: u32,
+        timeout: Duration,
+    ) -> Option<ConcurrencyPermit> {
+        let sem = self.semaphore_for(key, max);
+        tokio::time::timeout(timeout, sem.acquire_owned())
+            .await
             .ok()
-            .map(|p| ConcurrencyPermit { _inner: p })
+            .and_then(Result::ok)
+            .map(|p| ConcurrencyPermit {
+                _inner: PermitInner::Replica { _permit: p },
+            })
     }
 }
 
+/// Where a concurrency cap is counted.
+#[derive(Debug)]
+enum Concurrency {
+    /// One process serves every call: an in-process semaphore is exact.
+    Replica(ConcurrencyTracker),
+    /// A fleet: the permits are counted in the quota store.
+    Fleet(Arc<super::fleet_semaphore::FleetSemaphore>),
+}
+
 // ---------------------------------------------------------------------------
-// Budget primitive (cost / token / call accumulator).
+// Budget primitive (call / token / cost counters).
 // ---------------------------------------------------------------------------
 
-/// Persisted budget state. Stored as JSON in the quota KV under
-/// `quotas.budget.<policy_id>.<scope_key>`.
+/// The record of the read-modify-write accounting the counters replace,
+/// under `quotas.budget.<policy_id>.<scope_key>`: it seeds the count of
+/// the window it was in.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct BudgetState {
-    /// Accumulated cost in dollars. `f64` to match `cap_usd` shape;
-    /// precision loss at floating-point edges is fine — budgets
-    /// are policy estimates, not invoicing.
     cost_usd: f64,
-    /// Accumulated token count (for `cap_token_count` budgets).
     tokens: u64,
-    /// Accumulated call count (for `cap_calls` budgets).
     calls: u64,
-    /// UTC epoch ms when the current window started. The window's
-    /// length is `policy.window`; rollover resets all counters and
-    /// updates this stamp.
     window_started_unix_ms: i64,
 }
 
-/// Window roll: if `now_ms - window_started >= window_ms`, reset.
-fn maybe_roll_window(state: &mut BudgetState, window_ms: i64, now_ms: i64) -> bool {
-    let elapsed = now_ms - state.window_started_unix_ms;
-    if elapsed >= window_ms {
-        state.cost_usd = 0.0;
-        state.tokens = 0;
-        state.calls = 0;
-        state.window_started_unix_ms = now_ms;
-        true
-    } else {
-        false
+/// A measure's cap as a counter value: whole calls and tokens, and
+/// micro-dollars for cost.
+fn usd_to_micro(usd: f64) -> i64 {
+    (usd * 1_000_000.0).round() as i64
+}
+
+/// The current window of a budget scope.
+///
+/// The first call of a window writes its anchor `<base>.window`
+/// (`put_if_absent`, TTL the window) with the window's start; the
+/// window's counters are `<base>.<start>.calls|tokens|micro_usd`, which
+/// move only by `incr` and live twice the window. A new window starts
+/// from zero because its counters have new keys.
+struct BudgetWindow {
+    prefix: String,
+    ttl: Duration,
+}
+
+impl BudgetWindow {
+    async fn open(store: &QuotaStore, base: &str, window_ms: i64, now_ms: i64) -> Result<Self> {
+        let window_ms = window_ms.max(1);
+        let anchor = format!("{base}.window");
+        let start = match read_start(store, &anchor).await? {
+            Some(start) => start,
+            None => {
+                let legacy = legacy_budget(store, base, window_ms, now_ms).await;
+                let start = legacy
+                    .as_ref()
+                    .map(|state| state.window_started_unix_ms)
+                    .unwrap_or(now_ms);
+                let left = Duration::from_millis((window_ms - (now_ms - start)).max(1) as u64);
+                let opened = store
+                    .kv
+                    .put_if_absent(&anchor, Bytes::from(start.to_string()), Some(left))
+                    .await
+                    .with_context(|| {
+                        format!("quota_store: budget window open failed for `{base}`")
+                    })?;
+                if opened {
+                    if let Some(state) = legacy
+                        && state.calls > 0
+                    {
+                        let calls = format!("{base}.{start}.calls");
+                        let ttl = Duration::from_millis((window_ms as u64).saturating_mul(2));
+                        let _ = store
+                            .kv
+                            .put_if_absent(&calls, Bytes::from(state.calls.to_string()), Some(ttl))
+                            .await;
+                    }
+                    start
+                } else {
+                    // Another replica opened the window first.
+                    read_start(store, &anchor).await?.unwrap_or(start)
+                }
+            }
+        };
+        Ok(Self {
+            prefix: format!("{base}.{start}"),
+            ttl: Duration::from_millis((window_ms as u64).saturating_mul(2)),
+        })
+    }
+
+    async fn read(&self, store: &QuotaStore, measure: &str) -> Result<i64> {
+        let key = format!("{}.{measure}", self.prefix);
+        match store
+            .kv
+            .get(&key)
+            .await
+            .with_context(|| format!("quota_store: get failed for `{key}`"))?
+        {
+            Some(entry) => Ok(mcpg_cluster_api::parse_counter(&entry.bytes).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    async fn add(&self, store: &QuotaStore, measure: &str, delta: i64) -> Result<i64> {
+        let key = format!("{}.{measure}", self.prefix);
+        store
+            .kv
+            .incr(&key, delta, Some(self.ttl))
+            .await
+            .with_context(|| format!("quota_store: incr failed for `{key}`"))
+    }
+
+    /// Give back the count of a call that did not run.
+    async fn give_back_call(&self, store: &QuotaStore, policy_id: &str) {
+        if let Err(error) = self.add(store, "calls", -1).await {
+            // The count stays one high until the window ends; that only
+            // denies.
+            tracing::warn!(policy = %policy_id, %error, "budget call count not given back");
+        }
     }
 }
 
-/// Pre-flight check: would charging zero (i.e. the binding hasn't
-/// run yet, we're checking only the cap) deny? For pre-flight we
-/// only deny if the cap is already met or exceeded. A future
-/// post-dispatch `record_*` call applies the actual charge; the gate
-/// today does pre-flight only and approximates "denied if cap
-/// reached".
+async fn read_start(store: &QuotaStore, anchor: &str) -> Result<Option<i64>> {
+    Ok(store
+        .kv
+        .get(anchor)
+        .await
+        .with_context(|| format!("quota_store: get failed for `{anchor}`"))?
+        .and_then(|entry| std::str::from_utf8(&entry.bytes).ok()?.parse().ok()))
+}
+
+/// The legacy record of `base`, while its window is still open.
+async fn legacy_budget(
+    store: &QuotaStore,
+    base: &str,
+    window_ms: i64,
+    now_ms: i64,
+) -> Option<BudgetState> {
+    let entry = store.kv.get(base).await.ok()??;
+    let state: BudgetState = serde_json::from_slice(&entry.bytes).ok()?;
+    (now_ms - state.window_started_unix_ms < window_ms && state.window_started_unix_ms <= now_ms)
+        .then_some(state)
+}
+
+/// The warning for a measure that moved from `before` to `after` past the
+/// policy's `warn_at_pct` of `cap`.
+fn crossing(
+    policy: &BudgetPolicy,
+    measure: &'static str,
+    before: i64,
+    after: i64,
+    cap: i64,
+    scale: f64,
+) -> Option<QuotaWarning> {
+    let pct = policy.warn_at_pct?;
+    let threshold = (cap as f64 * f64::from(pct) / 100.0).ceil() as i64;
+    (before < threshold && after >= threshold).then(|| QuotaWarning {
+        policy_id: policy.id.clone(),
+        measure,
+        used: after as f64 / scale,
+        cap: cap as f64 / scale,
+        warn_at_pct: pct,
+    })
+}
+
+/// The pre-flight result of a budget.
+enum BudgetCheck {
+    /// `counted` is the window the call was counted in, to give the count
+    /// back if a later check refuses the call.
+    Allowed {
+        warnings: Vec<QuotaWarning>,
+        counted: Option<BudgetWindow>,
+    },
+    Denied(&'static str),
+}
+
+/// Pre-flight: deny when spent tokens or cost already reach their caps;
+/// count the call and deny (giving the count back) when that goes over
+/// `cap_calls`. Caps set together deny on the first one reached.
 async fn check_budget_pre_flight(
     store: &QuotaStore,
-    key: &str,
+    base: &str,
     policy: &BudgetPolicy,
     now_ms: i64,
-) -> Result<bool> {
+) -> Result<BudgetCheck> {
     let window_ms = window_to_ms(&policy.window).unwrap_or(86_400_000);
-    let cap_usd = policy.cap_usd;
-    let cap_tokens = policy.cap_token_count;
-    let cap_calls = policy.cap_calls;
-    let ttl = Some(Duration::from_millis((window_ms as u64).saturating_mul(2)));
+    let window = BudgetWindow::open(store, base, window_ms, now_ms).await?;
+    if let Some(cap) = policy.cap_token_count
+        && window.read(store, "tokens").await? >= cap as i64
+    {
+        return Ok(BudgetCheck::Denied("tokens"));
+    }
+    if let Some(cap) = policy.cap_usd
+        && window.read(store, "micro_usd").await? >= usd_to_micro(cap)
+    {
+        return Ok(BudgetCheck::Denied("usd"));
+    }
+    let Some(cap) = policy.cap_calls else {
+        return Ok(BudgetCheck::Allowed {
+            warnings: Vec::new(),
+            counted: None,
+        });
+    };
+    let cap = cap as i64;
+    let calls = window.add(store, "calls", 1).await?;
+    if calls > cap {
+        window.give_back_call(store, &policy.id).await;
+        return Ok(BudgetCheck::Denied("calls"));
+    }
+    Ok(BudgetCheck::Allowed {
+        warnings: crossing(policy, "calls", calls - 1, calls, cap, 1.0)
+            .into_iter()
+            .collect(),
+        counted: Some(window),
+    })
+}
 
-    store
-        .read_modify_write(key, move |prev| {
-            let mut state = match prev {
-                Some(b) => serde_json::from_slice::<BudgetState>(&b).unwrap_or(BudgetState {
-                    cost_usd: 0.0,
-                    tokens: 0,
-                    calls: 0,
-                    window_started_unix_ms: now_ms,
-                }),
-                None => BudgetState {
-                    cost_usd: 0.0,
-                    tokens: 0,
-                    calls: 0,
-                    window_started_unix_ms: now_ms,
-                },
-            };
-            maybe_roll_window(&mut state, window_ms, now_ms);
-
-            // Pre-flight: deny when the cap is already exhausted.
-            // Because the gate doesn't yet integrate post-flight
-            // accounting (binding-emitted cost / token deltas), it
-            // approximates: the budget acts as a per-window call
-            // counter, and exceeding any declared cap denies.
-            // Operators who set BOTH cap_usd and cap_calls today
-            // get an OR semantics — first-tripped wins.
-            let denied_by_calls = cap_calls.is_some_and(|c| state.calls >= c);
-            let denied_by_cost = cap_usd.is_some_and(|c| state.cost_usd >= c);
-            let denied_by_tokens = cap_tokens.is_some_and(|c| state.tokens >= c);
-            let allowed = !(denied_by_calls || denied_by_cost || denied_by_tokens);
-
-            // Pre-flight reservation: count this call upfront. If
-            // the binding fails post-dispatch, the count remains
-            // (over-counts on errors). A future refinement could
-            // separate reserve / commit / refund.
-            if allowed {
-                state.calls = state.calls.saturating_add(1);
-            }
-            let bytes = Bytes::from(serde_json::to_vec(&state)?);
-            Ok((bytes, ttl, allowed))
-        })
-        .await
+/// Charge what a call used to its budget's token and cost counters.
+async fn charge_budget(
+    store: &QuotaStore,
+    base: &str,
+    policy: &BudgetPolicy,
+    usage: &mcpg_plugin_protocol::BackendUsage,
+    now_ms: i64,
+) -> Result<Vec<QuotaWarning>> {
+    let window_ms = window_to_ms(&policy.window).unwrap_or(86_400_000);
+    let window = BudgetWindow::open(store, base, window_ms, now_ms).await?;
+    let mut warnings = Vec::new();
+    let tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+    if let Some(cap) = policy.cap_token_count
+        && tokens > 0
+    {
+        let delta = i64::try_from(tokens).unwrap_or(i64::MAX);
+        let after = window.add(store, "tokens", delta).await?;
+        warnings.extend(crossing(
+            policy,
+            "tokens",
+            after.saturating_sub(delta),
+            after,
+            cap as i64,
+            1.0,
+        ));
+    }
+    if let Some(cap) = policy.cap_usd
+        && let Some(cost) = usage.cost_usd.filter(|cost| *cost > 0.0)
+    {
+        let delta = usd_to_micro(cost);
+        let after = window.add(store, "micro_usd", delta).await?;
+        warnings.extend(crossing(
+            policy,
+            "usd",
+            after.saturating_sub(delta),
+            after,
+            usd_to_micro(cap),
+            1_000_000.0,
+        ));
+    }
+    Ok(warnings)
 }
 
 /// Convert a window string ("60s", "5m", "24h", "1d") to ms.
@@ -456,7 +636,7 @@ pub struct QuotaGate {
     rate_limits: HashMap<String, RateLimitPolicy>,
     budgets: HashMap<String, BudgetPolicy>,
     concurrency_policies: HashMap<String, ConcurrencyPolicy>,
-    concurrency: ConcurrencyTracker,
+    concurrency: Concurrency,
     /// Per-binding `quotas:` reference, keyed by binding name
     /// (the operator-facing tool/prompt/resource id used at
     /// dispatch time). Built at boot from
@@ -475,11 +655,13 @@ impl QuotaGate {
     /// and the per-binding `quotas:` references collected from
     /// every `mcp.capabilities.*[]` entry. The dispatch hook in
     /// the runtime calls [`Self::evaluate_for_tool`] which looks
-    /// up the binding's ref by name.
+    /// up the binding's ref by name. `fleet` counts concurrency caps
+    /// in the store, for a store the replicas of a fleet share.
     pub fn new(
         quotas: &QuotasConfig,
         binding_refs: HashMap<String, BackendQuotasRef>,
         store: Arc<QuotaStore>,
+        fleet: bool,
     ) -> Self {
         let rate_limits = quotas
             .rate_limits
@@ -496,14 +678,46 @@ impl QuotaGate {
             .iter()
             .map(|p| (p.id.clone(), p.clone()))
             .collect();
+        let concurrency = if fleet {
+            Concurrency::Fleet(super::fleet_semaphore::FleetSemaphore::new(Arc::clone(
+                &store.kv,
+            )))
+        } else {
+            Concurrency::Replica(ConcurrencyTracker::default())
+        };
         Self {
             store,
             rate_limits,
             budgets,
             concurrency_policies,
-            concurrency: ConcurrencyTracker::default(),
+            concurrency,
             binding_refs,
             fail_open_on_error: quotas.fail_open_on_error(),
+        }
+    }
+
+    /// A permit of the concurrency `scope`, waiting up to `queue` for one.
+    async fn acquire_concurrency(
+        &self,
+        scope: &str,
+        max: u32,
+        queue: Option<Duration>,
+    ) -> Result<Option<ConcurrencyPermit>> {
+        match &self.concurrency {
+            Concurrency::Replica(tracker) => Ok(match queue {
+                None => tracker.try_acquire(scope, max),
+                Some(timeout) => tracker.acquire_within(scope, max, timeout).await,
+            }),
+            Concurrency::Fleet(semaphore) => {
+                let permit = match queue {
+                    None => semaphore.try_acquire(scope, max).await,
+                    Some(timeout) => semaphore.acquire_within(scope, max, timeout).await,
+                }
+                .with_context(|| format!("fleet concurrency count failed for `{scope}`"))?;
+                Ok(permit.map(|p| ConcurrencyPermit {
+                    _inner: PermitInner::Fleet { _permit: p },
+                }))
+            }
         }
     }
 
@@ -535,11 +749,15 @@ impl QuotaGate {
         session_id: Option<&str>,
         identity: &RequestIdentity,
     ) -> Result<QuotaDecision> {
+        let allow = || QuotaDecision::Allow {
+            permit: None,
+            warnings: Vec::new(),
+        };
         let Some(bref) = self.binding_refs.get(tool_name) else {
-            return Ok(QuotaDecision::Allow { permit: None });
+            return Ok(allow());
         };
         if bref.is_empty() {
-            return Ok(QuotaDecision::Allow { permit: None });
+            return Ok(allow());
         }
         self.evaluate(QuotaEvalContext {
             bref,
@@ -547,6 +765,43 @@ impl QuotaGate {
             session_id,
             identity,
         })
+        .await
+    }
+
+    /// Charge what a call to `tool_name` used to its budget's token and
+    /// cost counters, after the call. Returns the budgets the charge moved
+    /// past their `warn_at_pct`.
+    pub async fn charge_usage(
+        &self,
+        tool_name: &str,
+        session_id: Option<&str>,
+        identity: &RequestIdentity,
+        usage: &mcpg_plugin_protocol::BackendUsage,
+    ) -> Result<Vec<QuotaWarning>> {
+        let Some(bref) = self.binding_refs.get(tool_name) else {
+            return Ok(Vec::new());
+        };
+        let Some(policy) = bref.budget.as_deref().and_then(|id| self.budgets.get(id)) else {
+            return Ok(Vec::new());
+        };
+        if policy.cap_token_count.is_none() && policy.cap_usd.is_none() {
+            return Ok(Vec::new());
+        }
+        let ctx = QuotaEvalContext {
+            bref,
+            tool_name,
+            session_id,
+            identity,
+        };
+        let scope_key = scope_key(&policy.scope, policy.identity_claim.as_deref(), &ctx);
+        let key = format!("quotas.budget.{}.{}", policy.id, scope_key);
+        charge_budget(
+            &self.store,
+            &key,
+            policy,
+            usage,
+            Utc::now().timestamp_millis(),
+        )
         .await
     }
 
@@ -577,18 +832,31 @@ impl QuotaGate {
         }
 
         // Budget check.
+        let mut warnings = Vec::new();
+        let mut counted: Option<(BudgetWindow, &str)> = None;
         if let Some(id) = ctx.bref.budget.as_deref()
             && let Some(policy) = self.budgets.get(id)
         {
             let scope_key = scope_key(&policy.scope, policy.identity_claim.as_deref(), &ctx);
             let key = format!("quotas.budget.{}.{}", policy.id, scope_key);
-            let allowed = check_budget_pre_flight(&self.store, &key, policy, now_ms).await?;
-            if !allowed {
-                return Ok(QuotaDecision::Deny {
-                    policy_id: policy.id.clone(),
-                    kind: QuotaKind::Budget,
-                    reason: format!("budget `{}` exhausted for scope `{}`", policy.id, scope_key),
-                });
+            match check_budget_pre_flight(&self.store, &key, policy, now_ms).await? {
+                BudgetCheck::Allowed {
+                    warnings: crossed,
+                    counted: window,
+                } => {
+                    warnings = crossed;
+                    counted = window.map(|window| (window, policy.id.as_str()));
+                }
+                BudgetCheck::Denied(measure) => {
+                    return Ok(QuotaDecision::Deny {
+                        policy_id: policy.id.clone(),
+                        kind: QuotaKind::Budget,
+                        reason: format!(
+                            "budget `{}` exhausted for scope `{}` ({measure})",
+                            policy.id, scope_key
+                        ),
+                    });
+                }
             }
         }
 
@@ -599,15 +867,31 @@ impl QuotaGate {
             && let Some(policy) = self.concurrency_policies.get(id)
         {
             let scope_key = scope_key(&policy.scope, policy.identity_claim.as_deref(), &ctx);
-            let key = format!("{}.{}", policy.id, scope_key);
-            match self.concurrency.try_acquire(&key, policy.max_concurrent) {
+            // A separator no policy id carries, so `a.b`+`c` and `a`+`b.c`
+            // count apart.
+            let key = format!("{}\u{1f}{}", policy.id, scope_key);
+            let queue = (policy.on_exceeded == "queue")
+                .then(|| Duration::from_millis(policy.queue_timeout_ms));
+            let acquired = self
+                .acquire_concurrency(&key, policy.max_concurrent, queue)
+                .await;
+            if !matches!(acquired, Ok(Some(_)))
+                && let Some((window, budget_id)) = &counted
+            {
+                // The call the budget counted does not run.
+                window.give_back_call(&self.store, budget_id).await;
+            }
+            match acquired? {
                 Some(p) => Some(p),
                 None => {
+                    let waited = queue
+                        .map(|q| format!("; waited {} ms", q.as_millis()))
+                        .unwrap_or_default();
                     return Ok(QuotaDecision::Deny {
                         policy_id: policy.id.clone(),
                         kind: QuotaKind::Concurrency,
                         reason: format!(
-                            "concurrency cap `{}` reached for scope `{}` ({}/{} in flight)",
+                            "concurrency cap `{}` reached for scope `{}` ({}/{} in flight{waited})",
                             policy.id, scope_key, policy.max_concurrent, policy.max_concurrent,
                         ),
                     });
@@ -617,7 +901,7 @@ impl QuotaGate {
             None
         };
 
-        Ok(QuotaDecision::Allow { permit })
+        Ok(QuotaDecision::Allow { permit, warnings })
     }
 }
 
@@ -743,13 +1027,14 @@ mod tests {
             Ok(self.inner.lock().await.remove(key).is_some())
         }
 
-        async fn list_prefix(
+        async fn list_page(
             &self,
             _prefix: &str,
+            _cursor: Option<&str>,
             _limit: usize,
-        ) -> std::result::Result<Vec<(String, Entry)>, mcpg_cluster_api::error::ClusterError>
+        ) -> std::result::Result<mcpg_cluster_api::KvPage, mcpg_cluster_api::error::ClusterError>
         {
-            Ok(Vec::new())
+            Ok(mcpg_cluster_api::KvPage::default())
         }
 
         async fn expire(
@@ -943,7 +1228,7 @@ mod tests {
     #[tokio::test]
     async fn gate_allows_when_no_refs_set() {
         let qc = QuotasConfig::default();
-        let gate = QuotaGate::new(&qc, HashMap::new(), store());
+        let gate = QuotaGate::new(&qc, HashMap::new(), store(), false);
         let bref = BackendQuotasRef::default();
         let identity = RequestIdentity::Anonymous {
             source: "test".into(),
@@ -964,7 +1249,7 @@ mod tests {
     async fn gate_denies_on_drained_rate_limit() {
         let mut qc = QuotasConfig::default();
         qc.rate_limits.push(rate_limit_policy("rl", 60, Some(1)));
-        let gate = QuotaGate::new(&qc, HashMap::new(), store());
+        let gate = QuotaGate::new(&qc, HashMap::new(), store(), false);
         let bref = BackendQuotasRef {
             rate_limit: Some("rl".into()),
             ..Default::default()
@@ -1016,7 +1301,7 @@ mod tests {
             on_exceeded: "deny".into(),
             queue_timeout_ms: 0,
         });
-        let gate = QuotaGate::new(&qc, HashMap::new(), store());
+        let gate = QuotaGate::new(&qc, HashMap::new(), store(), false);
         let bref = BackendQuotasRef {
             concurrency: Some("cc".into()),
             ..Default::default()
@@ -1035,7 +1320,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(first, QuotaDecision::Allow { permit: Some(_) }));
+        assert!(matches!(
+            first,
+            QuotaDecision::Allow {
+                permit: Some(_),
+                ..
+            }
+        ));
 
         // Second concurrent attempt while permit is still held → deny.
         let second = gate
@@ -1065,7 +1356,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(matches!(third, QuotaDecision::Allow { permit: Some(_) }));
+        assert!(matches!(
+            third,
+            QuotaDecision::Allow {
+                permit: Some(_),
+                ..
+            }
+        ));
     }
 
     // -- evaluate_for_tool (runtime hook) -----------------------------
@@ -1077,7 +1374,7 @@ mod tests {
         // Allow without touching the KV.
         let mut qc = QuotasConfig::default();
         qc.rate_limits.push(rate_limit_policy("rl", 60, Some(1)));
-        let gate = QuotaGate::new(&qc, HashMap::new(), store());
+        let gate = QuotaGate::new(&qc, HashMap::new(), store(), false);
         let identity = RequestIdentity::Anonymous {
             source: "test".into(),
         };
@@ -1104,7 +1401,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                matches!(dec, QuotaDecision::Allow { permit: None }),
+                matches!(dec, QuotaDecision::Allow { permit: None, .. }),
                 "no binding ref → fast Allow"
             );
         }
@@ -1122,7 +1419,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let gate = QuotaGate::new(&qc, refs, store());
+        let gate = QuotaGate::new(&qc, refs, store(), false);
         let identity = RequestIdentity::Anonymous {
             source: "test".into(),
         };
@@ -1144,7 +1441,7 @@ mod tests {
             .evaluate_for_tool("other-tool", None, &identity)
             .await
             .unwrap();
-        assert!(matches!(other, QuotaDecision::Allow { permit: None }));
+        assert!(matches!(other, QuotaDecision::Allow { permit: None, .. }));
     }
 
     #[tokio::test]
@@ -1152,7 +1449,7 @@ mod tests {
         let qc = QuotasConfig::default();
         let mut refs = HashMap::new();
         refs.insert("my-tool".to_owned(), BackendQuotasRef::default());
-        let gate = QuotaGate::new(&qc, refs, store());
+        let gate = QuotaGate::new(&qc, refs, store(), false);
         let identity = RequestIdentity::Anonymous {
             source: "test".into(),
         };
@@ -1161,7 +1458,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(dec, QuotaDecision::Allow { permit: None }),
+            matches!(dec, QuotaDecision::Allow { permit: None, .. }),
             "empty BackendQuotasRef short-circuits to Allow"
         );
     }
@@ -1169,7 +1466,7 @@ mod tests {
     #[test]
     fn is_empty_returns_true_when_no_refs_or_policies() {
         let qc = QuotasConfig::default();
-        let gate = QuotaGate::new(&qc, HashMap::new(), store());
+        let gate = QuotaGate::new(&qc, HashMap::new(), store(), false);
         assert!(gate.is_empty());
     }
 
@@ -1178,7 +1475,432 @@ mod tests {
         let qc = QuotasConfig::default();
         let mut refs = HashMap::new();
         refs.insert("tool".into(), BackendQuotasRef::default());
-        let gate = QuotaGate::new(&qc, refs, store());
+        let gate = QuotaGate::new(&qc, refs, store(), false);
         assert!(!gate.is_empty());
+    }
+
+    fn one_permit(on_exceeded: &str, queue_timeout_ms: u64) -> QuotasConfig {
+        let mut qc = QuotasConfig::default();
+        qc.concurrency.push(ConcurrencyPolicy {
+            id: "cc".into(),
+            max_concurrent: 1,
+            scope: "global".into(),
+            identity_claim: None,
+            on_exceeded: on_exceeded.into(),
+            queue_timeout_ms,
+        });
+        qc
+    }
+
+    async fn call(gate: &QuotaGate) -> QuotaDecision {
+        let bref = BackendQuotasRef {
+            concurrency: Some("cc".into()),
+            ..Default::default()
+        };
+        let identity = RequestIdentity::Anonymous {
+            source: "test".into(),
+        };
+        gate.evaluate(QuotaEvalContext {
+            bref: &bref,
+            tool_name: "my-tool",
+            session_id: None,
+            identity: &identity,
+        })
+        .await
+        .unwrap()
+    }
+
+    fn shared_kv() -> Arc<dyn KeyValueStore> {
+        Arc::new(crate::builtins::cluster_primitives::MemoryKv::new())
+    }
+
+    async fn settle() {
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Two replicas' gates over one store share one cap.
+    #[tokio::test]
+    async fn a_fleet_cap_counts_every_replica() {
+        let qc = one_permit("deny", 0);
+        let kv = shared_kv();
+        let a = QuotaGate::new(&qc, HashMap::new(), QuotaStore::new(Arc::clone(&kv)), true);
+        let b = QuotaGate::new(&qc, HashMap::new(), QuotaStore::new(Arc::clone(&kv)), true);
+
+        let held = call(&a).await;
+        assert!(matches!(
+            held,
+            QuotaDecision::Allow {
+                permit: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            matches!(
+                call(&b).await,
+                QuotaDecision::Deny {
+                    kind: QuotaKind::Concurrency,
+                    ..
+                }
+            ),
+            "the permit A holds counts on B"
+        );
+        drop(held);
+        settle().await;
+        assert!(matches!(
+            call(&b).await,
+            QuotaDecision::Allow {
+                permit: Some(_),
+                ..
+            }
+        ));
+    }
+
+    /// Gates that count per replica do not see each other.
+    #[tokio::test]
+    async fn a_replica_cap_counts_one_process() {
+        let qc = one_permit("deny", 0);
+        let kv = shared_kv();
+        let a = QuotaGate::new(&qc, HashMap::new(), QuotaStore::new(Arc::clone(&kv)), false);
+        let b = QuotaGate::new(&qc, HashMap::new(), QuotaStore::new(Arc::clone(&kv)), false);
+        let _a = call(&a).await;
+        assert!(matches!(
+            call(&b).await,
+            QuotaDecision::Allow {
+                permit: Some(_),
+                ..
+            }
+        ));
+    }
+
+    /// `on_exceeded: queue` waits for the permit a holder gives back, on a
+    /// replica and in a fleet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_queued_call_takes_the_permit_given_back() {
+        for fleet in [false, true] {
+            let qc = one_permit("queue", 5_000);
+            let gate = Arc::new(QuotaGate::new(
+                &qc,
+                HashMap::new(),
+                QuotaStore::new(shared_kv()),
+                fleet,
+            ));
+            let held = call(&gate).await;
+            assert!(matches!(
+                held,
+                QuotaDecision::Allow {
+                    permit: Some(_),
+                    ..
+                }
+            ));
+            let queued = {
+                let gate = Arc::clone(&gate);
+                tokio::spawn(async move { call(&gate).await })
+            };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!queued.is_finished(), "fleet={fleet}: the call waits");
+            drop(held);
+            let got = tokio::time::timeout(Duration::from_secs(3), queued)
+                .await
+                .expect("the queued call ends")
+                .unwrap();
+            assert!(
+                matches!(
+                    got,
+                    QuotaDecision::Allow {
+                        permit: Some(_),
+                        ..
+                    }
+                ),
+                "fleet={fleet}: the queued call gets the permit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_queued_call_is_denied_at_its_timeout() {
+        for fleet in [false, true] {
+            let qc = one_permit("queue", 100);
+            let gate = QuotaGate::new(&qc, HashMap::new(), QuotaStore::new(shared_kv()), fleet);
+            let _held = call(&gate).await;
+            let started = std::time::Instant::now();
+            match call(&gate).await {
+                QuotaDecision::Deny { reason, .. } => {
+                    assert!(reason.contains("waited 100 ms"), "{reason}");
+                }
+                QuotaDecision::Allow { .. } => panic!("fleet={fleet}: expected a deny"),
+            }
+            assert!(started.elapsed() >= Duration::from_millis(100));
+        }
+    }
+
+    fn budget_policy(window: &str) -> BudgetPolicy {
+        BudgetPolicy {
+            id: "bb".into(),
+            kind: "call_count".into(),
+            scope: "global".into(),
+            identity_claim: None,
+            cap_usd: None,
+            cap_token_count: None,
+            cap_calls: None,
+            window: window.into(),
+            warn_at_pct: None,
+            on_exceeded: "deny".into(),
+            acknowledge_unenforced: false,
+        }
+    }
+
+    fn budget_gate(policy: BudgetPolicy, kv: Arc<dyn KeyValueStore>) -> QuotaGate {
+        let mut qc = QuotasConfig::default();
+        qc.budgets.push(policy);
+        let mut refs = HashMap::new();
+        refs.insert(
+            "my-tool".to_owned(),
+            BackendQuotasRef {
+                budget: Some("bb".into()),
+                ..Default::default()
+            },
+        );
+        QuotaGate::new(&qc, refs, QuotaStore::new(kv), true)
+    }
+
+    fn anonymous() -> RequestIdentity {
+        RequestIdentity::Anonymous {
+            source: "test".into(),
+        }
+    }
+
+    async fn budget_call(gate: &QuotaGate) -> QuotaDecision {
+        gate.evaluate_for_tool("my-tool", None, &anonymous())
+            .await
+            .unwrap()
+    }
+
+    fn used(
+        input_tokens: u64,
+        output_tokens: u64,
+        cost_usd: Option<f64>,
+    ) -> mcpg_plugin_protocol::BackendUsage {
+        mcpg_plugin_protocol::BackendUsage {
+            input_tokens,
+            output_tokens,
+            cost_usd,
+        }
+    }
+
+    /// A call cap holds exactly across replicas that call at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_cap_is_exact_across_replicas() {
+        let kv = shared_kv();
+        let mut policy = budget_policy("24h");
+        policy.cap_calls = Some(5);
+        let gates: Vec<Arc<QuotaGate>> = (0..2)
+            .map(|_| Arc::new(budget_gate(policy.clone(), Arc::clone(&kv))))
+            .collect();
+        let mut calls = Vec::new();
+        for n in 0..24 {
+            let gate = Arc::clone(&gates[n % 2]);
+            calls.push(tokio::spawn(async move { budget_call(&gate).await }));
+        }
+        let mut allowed = 0;
+        for call in calls {
+            if matches!(call.await.unwrap(), QuotaDecision::Allow { .. }) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, 5, "exactly the cap is admitted");
+    }
+
+    /// Tokens and cost are charged after the call; a call starts while the
+    /// spend is under the cap, and the next one after it reached the cap is
+    /// denied, on any replica.
+    #[tokio::test]
+    async fn charged_tokens_and_cost_stop_the_next_call() {
+        for (policy, usage) in [
+            (
+                BudgetPolicy {
+                    kind: "token_count".into(),
+                    cap_token_count: Some(1_000),
+                    ..budget_policy("24h")
+                },
+                used(400, 300, None),
+            ),
+            (
+                BudgetPolicy {
+                    kind: "cost".into(),
+                    cap_usd: Some(0.05),
+                    ..budget_policy("24h")
+                },
+                used(1, 1, Some(0.03)),
+            ),
+        ] {
+            let kv = shared_kv();
+            let a = budget_gate(policy.clone(), Arc::clone(&kv));
+            let b = budget_gate(policy.clone(), Arc::clone(&kv));
+            for _ in 0..2 {
+                assert!(matches!(budget_call(&a).await, QuotaDecision::Allow { .. }));
+                a.charge_usage("my-tool", None, &anonymous(), &usage)
+                    .await
+                    .unwrap();
+            }
+            match budget_call(&b).await {
+                QuotaDecision::Deny { kind, .. } => assert_eq!(kind, QuotaKind::Budget),
+                QuotaDecision::Allow { .. } => {
+                    panic!("{}: the spend A charged stops B", policy.kind)
+                }
+            }
+        }
+    }
+
+    /// `warn_at_pct` warns once in a window: on the charge or the call that
+    /// crosses it.
+    #[tokio::test]
+    async fn the_warn_threshold_warns_once() {
+        let kv = shared_kv();
+        let policy = BudgetPolicy {
+            cap_calls: Some(10),
+            warn_at_pct: Some(50),
+            ..budget_policy("24h")
+        };
+        let gate = budget_gate(policy, Arc::clone(&kv));
+        let mut warned = Vec::new();
+        for n in 1..=10 {
+            if let QuotaDecision::Allow { warnings, .. } = budget_call(&gate).await
+                && !warnings.is_empty()
+            {
+                assert_eq!(warnings[0].measure, "calls");
+                warned.push(n);
+            }
+        }
+        assert_eq!(warned, vec![5], "the fifth call of ten crosses 50 %");
+
+        let policy = BudgetPolicy {
+            kind: "cost".into(),
+            cap_usd: Some(1.0),
+            warn_at_pct: Some(80),
+            ..budget_policy("24h")
+        };
+        let gate = budget_gate(policy, shared_kv());
+        let mut warnings = Vec::new();
+        for _ in 0..5 {
+            warnings.extend(
+                gate.charge_usage("my-tool", None, &anonymous(), &used(0, 0, Some(0.3)))
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_eq!(warnings.len(), 1, "0.9 USD crosses 80 % of 1 USD once");
+        assert_eq!(warnings[0].measure, "usd");
+        assert!((warnings[0].used - 0.9).abs() < 1e-9);
+    }
+
+    /// A new window starts from zero.
+    #[tokio::test]
+    async fn a_new_window_starts_from_zero() {
+        let policy = BudgetPolicy {
+            cap_calls: Some(1),
+            ..budget_policy("1s")
+        };
+        let gate = budget_gate(policy, shared_kv());
+        assert!(matches!(
+            budget_call(&gate).await,
+            QuotaDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            budget_call(&gate).await,
+            QuotaDecision::Deny { .. }
+        ));
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(matches!(
+            budget_call(&gate).await,
+            QuotaDecision::Allow { .. }
+        ));
+    }
+
+    /// A record of the accounting the counters replace counts the calls of
+    /// the window it was in.
+    #[tokio::test]
+    async fn a_legacy_record_seeds_its_window() {
+        let kv = shared_kv();
+        let legacy = BudgetState {
+            cost_usd: 0.0,
+            tokens: 0,
+            calls: 2,
+            window_started_unix_ms: Utc::now().timestamp_millis() - 1_000,
+        };
+        kv.put(
+            "quotas.budget.bb.global",
+            Bytes::from(serde_json::to_vec(&legacy).unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+        let gate = budget_gate(
+            BudgetPolicy {
+                cap_calls: Some(3),
+                ..budget_policy("24h")
+            },
+            kv,
+        );
+        assert!(matches!(
+            budget_call(&gate).await,
+            QuotaDecision::Allow { .. }
+        ));
+        assert!(matches!(
+            budget_call(&gate).await,
+            QuotaDecision::Deny { .. }
+        ));
+    }
+
+    /// A call the concurrency cap refuses does not count against the
+    /// budget.
+    #[tokio::test]
+    async fn a_call_refused_by_concurrency_is_not_counted() {
+        let kv = shared_kv();
+        let mut qc = QuotasConfig::default();
+        qc.budgets.push(BudgetPolicy {
+            cap_calls: Some(2),
+            ..budget_policy("24h")
+        });
+        qc.concurrency.push(ConcurrencyPolicy {
+            id: "cc".into(),
+            max_concurrent: 1,
+            scope: "global".into(),
+            identity_claim: None,
+            on_exceeded: "deny".into(),
+            queue_timeout_ms: 0,
+        });
+        let mut refs = HashMap::new();
+        refs.insert(
+            "my-tool".to_owned(),
+            BackendQuotasRef {
+                budget: Some("bb".into()),
+                concurrency: Some("cc".into()),
+                ..Default::default()
+            },
+        );
+        let gate = QuotaGate::new(&qc, refs, QuotaStore::new(kv), true);
+        let held = budget_call(&gate).await;
+        assert!(matches!(
+            held,
+            QuotaDecision::Allow {
+                permit: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            budget_call(&gate).await,
+            QuotaDecision::Deny {
+                kind: QuotaKind::Concurrency,
+                ..
+            }
+        ));
+        drop(held);
+        settle().await;
+        assert!(
+            matches!(budget_call(&gate).await, QuotaDecision::Allow { .. }),
+            "the refused call gave its count back, so the second of two runs"
+        );
     }
 }

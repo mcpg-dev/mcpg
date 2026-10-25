@@ -2289,6 +2289,105 @@ async fn delete_mcp_session_terminates_it() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
+/// DELETE ends the session's open GET stream, so the client hears of the
+/// end at once rather than at its next request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_mcp_session_ends_its_open_get_stream() {
+    let (app, session_id) = initialize_session(router(build_test_state(), "/health", "/mcp")).await;
+    // The last router to go takes the runtime and its delivery bus along,
+    // which would end the stream too.
+    let _serving = app.clone();
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mcp")
+                .header(header::ACCEPT, "text/event-stream")
+                .header(SESSION_ID_HEADER, &session_id)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    tokio::time::timeout(std::time::Duration::from_secs(1), body.next())
+        .await
+        .expect("the priming event")
+        .expect("a frame")
+        .expect("a readable frame");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/mcp")
+                .header(SESSION_ID_HEADER, &session_id)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while body.next().await.is_some() {}
+    })
+    .await;
+    assert!(drained.is_ok(), "the GET stream ends with its session");
+}
+
+/// `notifications/cancelled` keeps working across a config reload: the
+/// runtime the reload installs publishes on, and hears, the cancellation bus
+/// of the reloaded coordinator — with its durable backstop, which recovers a
+/// cancellation told while no subscriber listened — and work that began
+/// before the reload stays cancellable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancellation_reaches_work_that_began_before_a_reload() {
+    let state = build_test_state();
+    let before = state.runtime.load_full();
+    before.start_cluster_listeners();
+    let key = GatewayRuntime::request_cancellation_key(Some("sess-1"), "7");
+    let token = before.register_cancellation_token(&key, Some("sess-1"), None);
+
+    crate::app::reload_config_from_yaml(
+        &state,
+        "gateway:\n  server:\n    bind_address: \"127.0.0.1:0\"\n",
+    )
+    .await
+    .expect("reload");
+    let after = state.runtime.load_full();
+    assert!(
+        !Arc::ptr_eq(&before, &after),
+        "the reload installs a runtime"
+    );
+    // Told while nothing listens: only the backstop can carry it.
+    after.stop_cluster_listeners();
+
+    let context = RequestContext::new(
+        GatewayRequestId::new(),
+        None,
+        Some("sess-1".to_owned()),
+        None::<ResumeCursor>,
+        RequestIdentity::Anonymous {
+            source: "test".to_owned(),
+        },
+        TransportKind::Http,
+    );
+    after
+        .handle_request_cancellation(&context, &serde_json::json!(7), None)
+        .await;
+    // The publish runs on a task of its own.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    after.start_cluster_listeners();
+    tokio::time::timeout(std::time::Duration::from_secs(10), token.cancelled())
+        .await
+        .expect("the cancellation reaches work that began before the reload");
+    after.stop_cluster_listeners();
+}
+
 /// Every event stream — the legacy GET stream, the modern
 /// `subscriptions/listen` POST — carries `X-Accel-Buffering: no`, so an
 /// nginx-family proxy in front of the gateway does not hold the body until

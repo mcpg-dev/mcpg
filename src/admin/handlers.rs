@@ -92,11 +92,16 @@ pub async fn list_plugins(State(svc): State<SharedAdmin>) -> impl IntoResponse {
     Json(svc.list_plugins())
 }
 
-/// Lists every running resource watcher: its URI, strategy, and subscriber
-/// count. A watcher exists only while something is subscribed, so an empty
-/// list means no subscriptions rather than no configuration.
+/// Lists every resource watcher this replica runs: its URI, strategy, shard,
+/// and the subscribers this replica serves, with the watch shards it holds.
+/// A watcher runs only while something in the fleet is subscribed and this
+/// replica holds the URI's shard, so an empty list on one replica of a fleet
+/// can mean another replica runs the watchers.
 pub async fn list_watches(State(svc): State<SharedAdmin>) -> impl IntoResponse {
-    Json(serde_json::json!({ "watches": svc.list_watches().await }))
+    Json(serde_json::json!({
+        "watches": svc.list_watches().await,
+        "shards": svc.owned_watch_shards().await,
+    }))
 }
 
 /// Disable a registered plugin. The plugin stays loaded but is

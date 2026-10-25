@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::stream::StreamExt;
-use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, Message, PubSub, Subscription};
+use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, KvPage, Message, PubSub, Subscription};
 use tokio::sync::broadcast;
 
 // ---------------------------------------------------------------------------
@@ -47,6 +47,35 @@ impl StoredEntry {
 impl MemoryKv {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Up to `limit` live entries under `prefix` after `cursor`, in map
+    /// order.
+    fn live_entries(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Vec<(String, Entry)> {
+        let now = Instant::now();
+        self.inner
+            .iter()
+            .filter(|entry| {
+                entry.key().starts_with(prefix)
+                    && cursor.is_none_or(|c| entry.key().as_str() > c)
+                    && !entry.is_expired(now)
+            })
+            .take(limit)
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    Entry {
+                        bytes: entry.bytes.clone(),
+                        expires_at: entry.expires_system,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Spawn a background sweeper that drops expired entries every
@@ -148,43 +177,35 @@ impl KeyValueStore for MemoryKv {
         Ok(self.inner.remove(key).is_some())
     }
 
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, ClusterError> {
+        let live = self.live_entries(prefix, cursor, usize::MAX);
+        Ok(KvPage::from_unordered(live, prefix, cursor, limit))
+    }
+
     async fn list_prefix(
         &self,
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, Entry)>, ClusterError> {
-        let now = Instant::now();
-        let mut out = Vec::new();
-        for entry in self.inner.iter() {
-            if !entry.key().starts_with(prefix) {
-                continue;
-            }
-            if entry.is_expired(now) {
-                continue;
-            }
-            out.push((
-                entry.key().clone(),
-                Entry {
-                    bytes: entry.bytes.clone(),
-                    expires_at: entry.expires_system,
-                },
-            ));
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
+        // One pass over the map, not one per page.
+        Ok(self.live_entries(prefix, None, limit))
     }
 
     async fn expire(&self, key: &str, ttl: Option<Duration>) -> Result<bool, ClusterError> {
+        let now = Instant::now();
         let (expires_system, expires_instant) = compute_deadline(ttl);
         match self.inner.get_mut(key) {
-            Some(mut entry) => {
+            Some(mut entry) if !entry.is_expired(now) => {
                 entry.expires_system = expires_system;
                 entry.expires_instant = expires_instant;
                 Ok(true)
             }
-            None => Ok(false),
+            _ => Ok(false),
         }
     }
 

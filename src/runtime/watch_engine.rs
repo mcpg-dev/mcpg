@@ -1,22 +1,99 @@
 //! Resource watch engine — detects resource changes via poll, NATS,
 //! Kafka, or webhook and fans out `notifications/resources/updated`
 //! to subscribed sessions through the delivery bus.
+//!
+//! In a fleet the watcher of a URI runs on one replica, the holder of the
+//! URI's watch shard ([`super::watch_shards`]), and fans out to every
+//! subscriber row whichever replica serves the subscriber. The holder learns
+//! of subscribers on other replicas from the demand markers of the
+//! subscription store: at once from a nudge on the watch bus, and within
+//! [`MAINTAIN_TICK`] from the collector's listing. A poll watcher keeps its
+//! last hash in the store, so the next holder of a shard tells of a change
+//! made while the shard moved.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+use mcpg_cluster_api::{ClusterBackend, PubSub};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+use super::watch_shards::{ShardLeases, ShardSet, shard_of};
 use crate::config::NotificationFilterConfig;
 use crate::protocol::{JSONRPC_VERSION, ResourceUpdatedNotification, ResourceUpdatedParams};
 use crate::runtime::pipeline_store::{DeliveryKind, DeliveryMessage};
-use crate::runtime::subscription_store::{SubscriberIdentity, SubscriptionStore};
+use crate::runtime::subscription_store::{SubscriberIdentity, SubscriptionStore, WatchState};
 use mcpg_plugin_host::PluginRegistry;
 use mcpg_plugin_protocol::async_trait;
 use mcpg_plugin_protocol::{WatchEvent, WatchEventSink};
+
+/// Interval of the collector: this member's liveness, the shard leases and
+/// the demand listing.
+pub const MAINTAIN_TICK: Duration = Duration::from_secs(5);
+/// A member that has not marked itself alive for this long has left.
+const MEMBER_TTL: Duration = Duration::from_secs(20);
+/// Interval at which the collector removes the rows of subscribers that are
+/// gone. A row is removed on the second pass that finds it gone.
+pub(crate) const COLLECT_INTERVAL: Duration = Duration::from_secs(60);
+/// Rows one collection pass reads, and sessions it checks, at most.
+const COLLECT_ROW_BUDGET: usize = 50_000;
+const COLLECT_SESSION_BUDGET: usize = 5_000;
+/// Sweeper passes between two demand backfills, the first pass included:
+/// the backfill reads every row of the fleet.
+const BACKFILL_EVERY: u32 = 10;
+/// How long the control loop waits on the store for one demand check.
+const DEMAND_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a shutdown waits for the shards to be given back.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+/// A poll watcher writes its baseline again after this long without a
+/// change, so the baseline outlives a resource that does not change.
+const BASELINE_REFRESH: Duration = Duration::from_secs(3600);
+/// Bus topic of demand nudges; the payload is the URI.
+pub const DEMAND_TOPIC: &str = "mcpg.watch.demand";
+/// How long a subscribed URI that no config watches waits before its
+/// config is looked up again: a federation import or a reload can add one.
+const UNWATCHED_RECHECK: Duration = Duration::from_secs(60);
+
+/// Whether a session is still in use anywhere in the fleet, as
+/// `SessionStore::session_alive` answers it.
+pub type SessionLiveness = Arc<dyn Fn(&str) -> Option<bool> + Send + Sync>;
+
+/// Called when this member finds itself gone from the store, so its holders
+/// write their rows again.
+pub type RejoinHook = Arc<dyn Fn() + Send + Sync>;
+
+/// What the engine shares the watchers of the fleet through.
+#[derive(Clone, Default)]
+pub struct WatchCluster {
+    /// The coordinator the shard leases are taken on; `None` holds every
+    /// shard.
+    pub backend: Option<Arc<dyn ClusterBackend>>,
+    /// The bus demand nudges travel on; `None` leaves the holder of a shard
+    /// to the collector's listing.
+    pub bus: Option<Arc<dyn PubSub>>,
+    pub tenant_segment: Option<String>,
+    /// Lets the collector remove the rows of sessions that ended; `None`
+    /// keeps them.
+    pub session_alive: Option<SessionLiveness>,
+}
+
+impl std::fmt::Debug for WatchCluster {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchCluster")
+            .field(
+                "backend",
+                &self.backend.as_ref().map(|b| b.manifest().id.clone()),
+            )
+            .field("bus", &self.bus.is_some())
+            .field("tenant_segment", &self.tenant_segment)
+            .field("session_alive", &self.session_alive.is_some())
+            .finish()
+    }
+}
 
 /// Configuration for a resource watch.
 #[derive(Debug, Clone)]
@@ -61,7 +138,6 @@ pub enum WatchStrategy {
 #[derive(Debug)]
 struct WatchHandle {
     cancel: CancellationToken,
-    subscriber_count: usize,
     strategy: &'static str,
 }
 
@@ -70,7 +146,11 @@ struct WatchHandle {
 pub struct WatchSnapshot {
     pub uri: String,
     pub strategy: &'static str,
+    /// Subscribers of the URI this replica serves; the watcher tells the
+    /// subscribers of every replica.
     pub subscriber_count: usize,
+    /// The watch shard of the URI, which this replica holds.
+    pub shard: u32,
 }
 
 /// Resolves a subscribed URI with no static `watch:` config to a
@@ -81,12 +161,24 @@ pub struct WatchSnapshot {
 pub type WatchProbe = Arc<dyn Fn(&str) -> Option<WatchConfig> + Send + Sync>;
 
 /// Channel message to communicate with the watch engine control loop.
-#[derive(Debug)]
-pub enum WatchCommand {
-    /// A session subscribed to a resource URI.
+enum WatchCommand {
+    /// A session on this replica subscribed to a resource URI.
     Subscribe { uri: String },
-    /// A session unsubscribed from a resource URI.
+    /// A session on this replica unsubscribed from a resource URI.
     Unsubscribe { uri: String },
+    /// A subscribe or unsubscribe on another replica may have changed the
+    /// demand for `uri`.
+    Nudge { uri: String },
+    /// The demand markers the collector listed, from `listed_at`.
+    Demand {
+        uris: HashSet<String>,
+        listed_at: Instant,
+    },
+    /// Share the watchers with the fleet.
+    Attach(Box<WatchCluster>),
+    /// This member was gone from the store; its holders write their rows
+    /// again.
+    Rejoined,
     /// External notification that a resource changed (webhook / admin API).
     ExternalNotify { uri: String },
     /// Report how many watchers are running.
@@ -97,23 +189,44 @@ pub enum WatchCommand {
     ListWatchers {
         reply: tokio::sync::oneshot::Sender<Vec<WatchSnapshot>>,
     },
-    /// Shut down all watchers.
-    Shutdown,
+    /// Report the watch shards this replica holds.
+    OwnedShards {
+        reply: tokio::sync::oneshot::Sender<Vec<u32>>,
+    },
+    /// Shut down all watchers and give the shards back; `done` fires once
+    /// they are.
+    Shutdown {
+        done: tokio::sync::oneshot::Sender<()>,
+    },
 }
 
 /// The watch engine manages background watchers for subscribed resources.
 ///
-/// It activates a watcher when the first client subscribes to a resource and
-/// deactivates it when the last subscriber leaves. Change detection depends on
-/// the `WatchStrategy` configured for each resource binding.
+/// It runs a watcher while a URI whose shard this replica holds has a
+/// subscriber anywhere in the fleet. Change detection depends on the
+/// `WatchStrategy` configured for each resource binding.
 ///
 /// For multi-instance deployments, the delivery happens through the shared
 /// `DeliveryBus` (NATS / Redis pub/sub), so notifications reach all instances.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WatchEngine {
     command_tx: mpsc::Sender<WatchCommand>,
     /// Reverse map: webhook token → resource URI (for inbound webhook routing).
     webhook_tokens: Arc<HashMap<String, String>>,
+    /// This engine's member id: the holder named in the rows of the
+    /// subscriptions its streams hold. `None` for an engine that runs no
+    /// collector, which keeps no member alive.
+    member: Option<Arc<str>>,
+    rejoin: Arc<OnceLock<RejoinHook>>,
+}
+
+impl std::fmt::Debug for WatchEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WatchEngine")
+            .field("member", &self.member)
+            .field("webhook_tokens", &self.webhook_tokens.len())
+            .finish()
+    }
 }
 
 impl WatchEngine {
@@ -178,24 +291,63 @@ impl WatchEngine {
         // synchronous test contexts has none — degrade to an inert
         // engine there (the dropped receiver makes every notify a
         // no-op), keeping the webhook map for sync resolution.
-        match tokio::runtime::Handle::try_current() {
+        let rejoin: Arc<OnceLock<RejoinHook>> = Arc::new(OnceLock::new());
+        let member = match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(watch_engine_loop(
-                    command_rx,
-                    watch_configs,
-                    subscription_store,
-                    delivery_publish,
-                    resource_fetcher,
-                    plugin_registry,
-                    watch_probe,
-                ));
+                let member: Arc<str> = Arc::from(uuid::Uuid::new_v4().simple().to_string());
+                let state = subscription_store.watch_state();
+                let shards = Arc::new(ShardSet::all());
+                let collector_cancel = CancellationToken::new();
+                let (cluster_tx, cluster_rx) = tokio::sync::watch::channel(None);
+                let collector = state.clone().map(|state| {
+                    handle.spawn(run_collector(
+                        Collector::new(
+                            state,
+                            Arc::clone(&member),
+                            Arc::clone(&shards),
+                            command_tx.downgrade(),
+                        ),
+                        cluster_rx,
+                        collector_cancel.clone(),
+                    ))
+                });
+                let member = collector.as_ref().map(|_| member);
+                let engine = EngineLoop {
+                    configs: watch_configs,
+                    probe: watch_probe,
+                    ctx: WatchContext {
+                        subscription_store,
+                        delivery_publish,
+                        resource_fetcher,
+                        plugin_registry,
+                        shards,
+                        state,
+                    },
+                    active: HashMap::new(),
+                    local: HashMap::new(),
+                    demanded: HashSet::new(),
+                    checked: HashMap::new(),
+                    unwatched: HashMap::new(),
+                    bus: None,
+                    cluster_tx,
+                    collector,
+                    collector_cancel,
+                    rejoin: Arc::clone(&rejoin),
+                };
+                handle.spawn(engine.run(command_rx));
+                member
             }
-            Err(_) => drop(command_rx),
-        }
+            Err(_) => {
+                drop(command_rx);
+                None
+            }
+        };
 
         Self {
             command_tx,
             webhook_tokens: Arc::new(tokens),
+            member,
+            rejoin,
         }
     }
 
@@ -205,7 +357,29 @@ impl WatchEngine {
         Self {
             command_tx,
             webhook_tokens: Arc::new(HashMap::new()),
+            member: None,
+            rejoin: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The holder this engine's streams name in their subscription rows;
+    /// `None` when no collector keeps it alive.
+    pub fn member_id(&self) -> Option<&str> {
+        self.member.as_deref()
+    }
+
+    /// Run `hook` whenever this member finds itself gone from the store.
+    /// The first hook set stays.
+    pub fn on_rejoin(&self, hook: RejoinHook) {
+        let _ = self.rejoin.set(hook);
+    }
+
+    /// Share the watchers with the fleet through `cluster`.
+    pub async fn attach_cluster(&self, cluster: WatchCluster) {
+        let _ = self
+            .command_tx
+            .send(WatchCommand::Attach(Box::new(cluster)))
+            .await;
     }
 
     /// Notify the engine that a session subscribed to a URI.
@@ -262,6 +436,21 @@ impl WatchEngine {
         answer.await.unwrap_or_default()
     }
 
+    /// The watch shards this replica holds, in order. Empty once the engine
+    /// has shut down.
+    pub async fn owned_shards(&self) -> Vec<u32> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        if self
+            .command_tx
+            .send(WatchCommand::OwnedShards { reply })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        answer.await.unwrap_or_default()
+    }
+
     /// Externally notify that a resource has changed (webhook / admin).
     pub async fn notify_resource_changed(&self, uri: &str) {
         let _ = self
@@ -282,157 +471,738 @@ impl WatchEngine {
         &self.webhook_tokens
     }
 
-    /// Shut down the engine and all active watchers.
+    /// Shut down the engine and all active watchers, and give the shards
+    /// back so other replicas take them at once.
     pub async fn shutdown(&self) {
-        let _ = self.command_tx.send(WatchCommand::Shutdown).await;
+        let (done, released) = tokio::sync::oneshot::channel();
+        if self
+            .command_tx
+            .send(WatchCommand::Shutdown { done })
+            .await
+            .is_ok()
+        {
+            let _ = released.await;
+        }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn watch_engine_loop(
-    mut command_rx: mpsc::Receiver<WatchCommand>,
-    watch_configs: HashMap<String, WatchConfig>,
+/// What every watcher of an engine shares.
+#[derive(Clone)]
+struct WatchContext {
     subscription_store: Arc<dyn SubscriptionStore>,
     delivery_publish: Arc<dyn Fn(&str, DeliveryMessage) + Send + Sync>,
     resource_fetcher: Arc<dyn Fn(&str) -> Option<String> + Send + Sync>,
     plugin_registry: Option<Arc<PluginRegistry>>,
-    watch_probe: Option<WatchProbe>,
-) {
-    let mut active_watches: HashMap<String, WatchHandle> = HashMap::new();
+    /// A watcher tells of a change only while this replica holds its URI's
+    /// shard.
+    shards: Arc<ShardSet>,
+    state: Option<WatchState>,
+}
 
-    while let Some(cmd) = command_rx.recv().await {
-        match cmd {
-            WatchCommand::Subscribe { uri } => {
-                if let Some(handle) = active_watches.get_mut(&uri) {
-                    handle.subscriber_count += 1;
-                    debug!(uri = %uri, subscribers = handle.subscriber_count, "watch: subscriber added");
-                } else if let Some(config) = watch_configs
-                    .get(&uri)
-                    .cloned()
-                    .or_else(|| watch_probe.as_ref().and_then(|probe| probe(&uri)))
-                {
-                    let cancel = CancellationToken::new();
-                    let handle = WatchHandle {
-                        cancel: cancel.clone(),
-                        subscriber_count: 1,
-                        strategy: strategy_name(&config.strategy),
-                    };
+/// The control loop: one task owns the watcher table, so starting and
+/// stopping a watcher never races another command.
+struct EngineLoop {
+    configs: HashMap<String, WatchConfig>,
+    probe: Option<WatchProbe>,
+    ctx: WatchContext,
+    active: HashMap<String, WatchHandle>,
+    /// Holders on this replica, per URI.
+    local: HashMap<String, usize>,
+    /// URIs with a demand marker, as last seen.
+    demanded: HashSet<String>,
+    /// Targeted demand checks newer than the last listing: when each
+    /// started, and whether the marker was there.
+    checked: HashMap<String, (Instant, bool)>,
+    /// Demanded URIs no config watches, and when that was found: the probe
+    /// runs again after [`UNWATCHED_RECHECK`], or on a subscribe here.
+    unwatched: HashMap<String, Instant>,
+    bus: Option<Arc<dyn PubSub>>,
+    cluster_tx: tokio::sync::watch::Sender<Option<Arc<WatchCluster>>>,
+    collector: Option<tokio::task::JoinHandle<()>>,
+    collector_cancel: CancellationToken,
+    rejoin: Arc<OnceLock<RejoinHook>>,
+}
 
-                    let sub_store = subscription_store.clone();
-                    let publish = delivery_publish.clone();
-                    let fetcher = resource_fetcher.clone();
-                    let uri_owned = uri.clone();
-                    let strategy = config.strategy.clone();
-                    let nf = config.notification_filter.clone();
-                    let compiled = config.compiled_filter_program.clone();
-                    let registry = plugin_registry.clone();
-
-                    tokio::spawn(async move {
-                        run_watcher(
-                            uri_owned, strategy, cancel, sub_store, publish, fetcher, nf, compiled,
-                            registry,
-                        )
-                        .await;
-                    });
-
-                    active_watches.insert(uri.clone(), handle);
-                    metrics::gauge!("mcpg_watch_active_watchers").set(active_watches.len() as f64);
-                    metrics::counter!(
-                        "mcpg_watch_watchers_started_total",
-                        "strategy" => strategy_name(&config.strategy),
-                    )
-                    .increment(1);
-                    info!(uri = %uri, strategy = strategy_name(&config.strategy), "watch: watcher started");
-                } else {
-                    debug!(uri = %uri, "watch: no config for resource, ignoring subscribe");
-                }
-            }
-            WatchCommand::Unsubscribe { uri } => {
-                if let Some(handle) = active_watches.get_mut(&uri) {
-                    handle.subscriber_count = handle.subscriber_count.saturating_sub(1);
-                    if handle.subscriber_count == 0 {
-                        handle.cancel.cancel();
-                        active_watches.remove(&uri);
-                        metrics::gauge!("mcpg_watch_active_watchers")
-                            .set(active_watches.len() as f64);
-                        info!(uri = %uri, "watch: watcher stopped (no subscribers)");
-                    } else {
-                        debug!(uri = %uri, subscribers = handle.subscriber_count, "watch: subscriber removed");
+impl EngineLoop {
+    async fn run(mut self, mut command_rx: mpsc::Receiver<WatchCommand>) {
+        let mut done = None;
+        while let Some(command) = command_rx.recv().await {
+            match command {
+                WatchCommand::Subscribe { uri } => self.subscribe(uri),
+                WatchCommand::Unsubscribe { uri } => self.unsubscribe(uri).await,
+                WatchCommand::Nudge { uri } => {
+                    // Only the holder of the URI's shard acts on its demand.
+                    if self.ctx.shards.owns_uri(&uri) {
+                        self.check_demand(&uri).await;
+                        self.reconcile(&uri);
                     }
                 }
-            }
-            WatchCommand::ExternalNotify { uri } => {
-                // Directly fan out notifications to subscribers, respecting the filter.
-                let (filter, compiled) = watch_configs
-                    .get(&uri)
-                    .and_then(|c| {
-                        c.notification_filter
-                            .as_ref()
-                            .map(|f| (Some(f), c.compiled_filter_program.as_deref()))
-                    })
-                    .unwrap_or((None, None));
-                let count = notify_subscribers_filtered(
-                    &uri,
-                    &*subscription_store,
-                    &*delivery_publish,
-                    filter,
-                    compiled,
-                    &EventContext::default(),
-                );
-                let strategy = active_watches
-                    .get(&uri)
-                    .map(|h| h.strategy)
-                    .unwrap_or("external");
-                metrics::counter!("mcpg_watch_fired_total", "strategy" => strategy).increment(1);
-                metrics::counter!("mcpg_watch_notifications_sent_total", "strategy" => strategy)
-                    .increment(count as u64);
-                if count > 0 {
-                    info!(uri = %uri, subscriber_count = count, "watch: external notify delivered");
-                } else {
-                    debug!(uri = %uri, "watch: external notify but no subscribers");
+                WatchCommand::Demand { uris, listed_at } => self.listed(uris, listed_at),
+                WatchCommand::Attach(cluster) => {
+                    self.bus = cluster.bus.clone();
+                    let _ = self.cluster_tx.send(Some(Arc::new(*cluster)));
                 }
-                // Emit an audit event: the webhook watch strategy fired.
-                if let Some(registry) = plugin_registry.clone() {
-                    let uri_owned = uri.clone();
-                    let count_u64 = count as u64;
-                    tokio::spawn(async move {
-                        let event = mcpg_plugin_host::audit_events::watch_fired_event(
-                            &uri_owned, "webhook", None, count_u64,
-                        );
-                        let _ = registry.emit_audit_event(&event).await;
-                    });
+                WatchCommand::Rejoined => {
+                    if let Some(hook) = self.rejoin.get() {
+                        hook();
+                    }
+                }
+                WatchCommand::ExternalNotify { uri } => self.external_notify(&uri),
+                WatchCommand::CountWatchers { reply } => {
+                    let _ = reply.send(self.active.len());
+                }
+                WatchCommand::ListWatchers { reply } => {
+                    let _ = reply.send(self.snapshot());
+                }
+                WatchCommand::OwnedShards { reply } => {
+                    let _ = reply.send(self.ctx.shards.owned());
+                }
+                WatchCommand::Shutdown { done: reply } => {
+                    done = Some(reply);
+                    break;
                 }
             }
-            WatchCommand::CountWatchers { reply } => {
-                let _ = reply.send(active_watches.len());
+        }
+
+        // A collector blocked on a full channel sees it closed, so it reaches
+        // its cancellation and gives the shards back.
+        drop(command_rx);
+
+        // Cancel on EVERY exit, not just the `Shutdown` command: the loop also
+        // ends when its last sender drops (a retired runtime), and a
+        // `CancellationToken` does not cancel when dropped — so exiting without
+        // this would leave every spawned watcher polling its resource until the
+        // process ends.
+        for (uri, handle) in self.active.drain() {
+            handle.cancel.cancel();
+            debug!(uri = %uri, "watch: watcher cancelled");
+        }
+        self.collector_cancel.cancel();
+        if let Some(done) = done {
+            if let Some(collector) = self.collector.take() {
+                let _ = tokio::time::timeout(RELEASE_TIMEOUT, collector).await;
             }
-            WatchCommand::ListWatchers { reply } => {
-                let mut snapshot: Vec<WatchSnapshot> = active_watches
-                    .iter()
-                    .map(|(uri, handle)| WatchSnapshot {
-                        uri: uri.clone(),
-                        strategy: handle.strategy,
-                        subscriber_count: handle.subscriber_count,
-                    })
-                    .collect();
-                // Stable order: the admin API is read by humans and by diffing
-                // scripts, and a HashMap iteration order is neither.
-                snapshot.sort_by(|a, b| a.uri.cmp(&b.uri));
-                let _ = reply.send(snapshot);
-            }
-            WatchCommand::Shutdown => break,
+            let _ = done.send(());
         }
     }
 
-    // Cancel on EVERY exit, not just the `Shutdown` command: the loop also
-    // ends when its last sender drops (a retired runtime), and a
-    // `CancellationToken` does not cancel when dropped — so exiting without
-    // this would leave every spawned watcher polling its resource until the
-    // process ends.
-    for (uri, handle) in active_watches.drain() {
-        handle.cancel.cancel();
-        debug!(uri = %uri, "watch: watcher cancelled");
+    fn subscribe(&mut self, uri: String) {
+        *self.local.entry(uri.clone()).or_default() += 1;
+        self.unwatched.remove(&uri);
+        if self.ctx.shards.owns_uri(&uri) {
+            self.reconcile(&uri);
+        } else {
+            // The store wrote the marker before this command was sent; the
+            // holder of the shard reads it on the nudge.
+            self.nudge(&uri);
+        }
     }
+
+    async fn unsubscribe(&mut self, uri: String) {
+        let Some(count) = self.local.get_mut(&uri) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count > 0 {
+            return;
+        }
+        self.local.remove(&uri);
+        if self.ctx.shards.owns_uri(&uri) {
+            // Subscribers on other replicas keep the watcher up.
+            self.check_demand(&uri).await;
+            self.reconcile(&uri);
+        } else {
+            self.nudge(&uri);
+        }
+    }
+
+    /// Read the demand marker of `uri` now. A failed read keeps what the
+    /// loop knew: the next listing decides.
+    async fn check_demand(&mut self, uri: &str) {
+        let Some(state) = &self.ctx.state else {
+            self.demanded.remove(uri);
+            return;
+        };
+        let started = Instant::now();
+        match tokio::time::timeout(DEMAND_CHECK_TIMEOUT, state.has_demand(uri)).await {
+            Ok(Ok(present)) => {
+                if present {
+                    self.demanded.insert(uri.to_owned());
+                } else {
+                    self.demanded.remove(uri);
+                }
+                self.checked.insert(uri.to_owned(), (started, present));
+            }
+            Ok(Err(error)) => {
+                debug!(uri = %uri, %error, "watch: demand check failed; the next listing decides");
+            }
+            Err(_) => debug!(uri = %uri, "watch: demand check timed out; the next listing decides"),
+        }
+    }
+
+    /// Take the collector's listing as the demand, except where a targeted
+    /// check that started after the listing knows better.
+    fn listed(&mut self, uris: HashSet<String>, listed_at: Instant) {
+        let checked = &self.checked;
+        let newer = |uri: &str| {
+            checked
+                .get(uri)
+                .filter(|(at, _)| *at > listed_at)
+                .map(|(_, present)| *present)
+        };
+        let mut demanded: HashSet<String> = uris
+            .into_iter()
+            .filter(|uri| newer(uri) != Some(false))
+            .collect();
+        demanded.extend(
+            checked
+                .iter()
+                .filter(|(_, (at, present))| *present && *at > listed_at)
+                .map(|(uri, _)| uri.clone()),
+        );
+        self.demanded = demanded;
+        self.checked.retain(|_, (at, _)| *at > listed_at);
+        self.unwatched.retain(|uri, _| self.demanded.contains(uri));
+        metrics::gauge!("mcpg_watch_demanded_uris").set(self.demanded.len() as f64);
+        self.reconcile_all();
+    }
+
+    fn reconcile_all(&mut self) {
+        let uris: HashSet<String> = self
+            .active
+            .keys()
+            .chain(self.demanded.iter())
+            .chain(self.local.keys())
+            .cloned()
+            .collect();
+        for uri in uris {
+            self.reconcile(&uri);
+        }
+    }
+
+    /// Start or stop the watcher of `uri`: it runs while this replica holds
+    /// the URI's shard and the URI has a subscriber anywhere.
+    fn reconcile(&mut self, uri: &str) {
+        let owned = self.ctx.shards.owns_uri(uri);
+        let wanted = owned && (self.local.contains_key(uri) || self.demanded.contains(uri));
+        if wanted && !self.active.contains_key(uri) {
+            self.start(uri);
+        } else if !wanted && let Some(handle) = self.active.remove(uri) {
+            handle.cancel.cancel();
+            metrics::gauge!("mcpg_watch_active_watchers").set(self.active.len() as f64);
+            if owned {
+                // No subscriber is left: a later watcher of the URI starts
+                // from what it reads then.
+                if handle.strategy == "poll" {
+                    self.clear_baseline(uri);
+                }
+                info!(uri = %uri, "watch: watcher stopped (no subscribers)");
+            } else {
+                info!(uri = %uri, "watch: watcher stopped (its shard moved to another replica)");
+            }
+        }
+    }
+
+    fn start(&mut self, uri: &str) {
+        if self
+            .unwatched
+            .get(uri)
+            .is_some_and(|at| at.elapsed() < UNWATCHED_RECHECK)
+        {
+            return;
+        }
+        let Some(config) = self
+            .configs
+            .get(uri)
+            .cloned()
+            .or_else(|| self.probe.as_ref().and_then(|probe| probe(uri)))
+        else {
+            if self
+                .unwatched
+                .insert(uri.to_owned(), Instant::now())
+                .is_none()
+            {
+                debug!(uri = %uri, "watch: no config for resource, nothing to watch");
+            }
+            return;
+        };
+        self.unwatched.remove(uri);
+        let cancel = CancellationToken::new();
+        let strategy = strategy_name(&config.strategy);
+        tokio::spawn(run_watcher(
+            uri.to_owned(),
+            config.strategy,
+            cancel.clone(),
+            self.ctx.clone(),
+            config.notification_filter,
+            config.compiled_filter_program,
+        ));
+        self.active
+            .insert(uri.to_owned(), WatchHandle { cancel, strategy });
+        metrics::gauge!("mcpg_watch_active_watchers").set(self.active.len() as f64);
+        metrics::counter!("mcpg_watch_watchers_started_total", "strategy" => strategy).increment(1);
+        info!(uri = %uri, strategy, shard = shard_of(uri), "watch: watcher started");
+    }
+
+    fn clear_baseline(&self, uri: &str) {
+        let Some(state) = self.ctx.state.clone() else {
+            return;
+        };
+        let uri = uri.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = state.clear_baseline(&uri).await {
+                debug!(uri = %uri, %error, "watch: poll baseline not cleared; it expires on its own");
+            }
+        });
+    }
+
+    /// Tell the holder of `uri`'s shard that its demand may have changed.
+    fn nudge(&self, uri: &str) {
+        let Some(bus) = self.bus.clone() else {
+            return;
+        };
+        let payload = Bytes::from(uri.to_owned());
+        tokio::spawn(async move {
+            if let Err(error) = bus.publish(DEMAND_TOPIC, payload).await {
+                debug!(%error, "watch: demand nudge not published; the holder's listing finds it");
+            }
+        });
+    }
+
+    fn external_notify(&self, uri: &str) {
+        // Directly fan out notifications to subscribers, respecting the filter.
+        let (filter, compiled) = self
+            .configs
+            .get(uri)
+            .and_then(|c| {
+                c.notification_filter
+                    .as_ref()
+                    .map(|f| (Some(f), c.compiled_filter_program.as_deref()))
+            })
+            .unwrap_or((None, None));
+        let count = notify_subscribers_filtered(
+            uri,
+            &*self.ctx.subscription_store,
+            &*self.ctx.delivery_publish,
+            filter,
+            compiled,
+            &EventContext::default(),
+        );
+        let strategy = self
+            .active
+            .get(uri)
+            .map(|h| h.strategy)
+            .unwrap_or("external");
+        metrics::counter!("mcpg_watch_fired_total", "strategy" => strategy).increment(1);
+        metrics::counter!("mcpg_watch_notifications_sent_total", "strategy" => strategy)
+            .increment(count as u64);
+        if count > 0 {
+            info!(uri = %uri, subscriber_count = count, "watch: external notify delivered");
+        } else {
+            debug!(uri = %uri, "watch: external notify but no subscribers");
+        }
+        // Emit an audit event: the webhook watch strategy fired.
+        if let Some(registry) = self.ctx.plugin_registry.clone() {
+            let uri_owned = uri.to_owned();
+            let count_u64 = count as u64;
+            tokio::spawn(async move {
+                let event = mcpg_plugin_host::audit_events::watch_fired_event(
+                    &uri_owned, "webhook", None, count_u64,
+                );
+                let _ = registry.emit_audit_event(&event).await;
+            });
+        }
+    }
+
+    fn snapshot(&self) -> Vec<WatchSnapshot> {
+        let mut snapshot: Vec<WatchSnapshot> = self
+            .active
+            .iter()
+            .map(|(uri, handle)| WatchSnapshot {
+                uri: uri.clone(),
+                strategy: handle.strategy,
+                subscriber_count: self.local.get(uri).copied().unwrap_or(0),
+                shard: shard_of(uri),
+            })
+            .collect();
+        // Stable order: the admin API is read by humans and by diffing
+        // scripts, and a HashMap iteration order is neither.
+        snapshot.sort_by(|a, b| a.uri.cmp(&b.uri));
+        snapshot
+    }
+}
+
+/// Keeps this member alive in the store, holds its share of the shards,
+/// lists the demand for the control loop, and runs the sweeper. It starts
+/// when the runtime attaches the fleet ([`WatchEngine::attach_cluster`]).
+struct Collector {
+    state: WatchState,
+    member: Arc<str>,
+    shards: Arc<ShardSet>,
+    commands: mpsc::WeakSender<WatchCommand>,
+    leases: Option<ShardLeases>,
+    nudges: Option<tokio::task::JoinHandle<()>>,
+    bus: Option<Arc<dyn PubSub>>,
+    sweeper: Option<tokio::task::JoinHandle<()>>,
+    sweeper_cancel: CancellationToken,
+    /// The live members as the last pass read them, for the sweeper; `None`
+    /// when that read failed.
+    live_tx: tokio::sync::watch::Sender<Option<Arc<HashSet<String>>>>,
+    /// Whether this member has marked itself alive since it started.
+    joined: bool,
+    members: usize,
+}
+
+impl Collector {
+    fn new(
+        state: WatchState,
+        member: Arc<str>,
+        shards: Arc<ShardSet>,
+        commands: mpsc::WeakSender<WatchCommand>,
+    ) -> Self {
+        Self {
+            state,
+            member,
+            shards,
+            commands,
+            leases: None,
+            nudges: None,
+            bus: None,
+            sweeper: None,
+            sweeper_cancel: CancellationToken::new(),
+            live_tx: tokio::sync::watch::channel(None).0,
+            joined: false,
+            members: 1,
+        }
+    }
+
+    async fn attach(&mut self, cluster: Arc<WatchCluster>) {
+        let same_backend = match (&self.leases, &cluster.backend) {
+            (Some(leases), Some(backend)) => {
+                std::ptr::addr_eq(Arc::as_ptr(leases.backend()), Arc::as_ptr(backend))
+            }
+            _ => false,
+        };
+        if !same_backend {
+            if let Some(mut leases) = self.leases.take() {
+                leases.release_all().await;
+            }
+            match &cluster.backend {
+                Some(backend) => {
+                    self.leases = Some(ShardLeases::new(
+                        Arc::clone(backend),
+                        cluster.tenant_segment.as_deref(),
+                        Arc::clone(&self.shards),
+                    ));
+                }
+                None => self.shards.hold_all(),
+            }
+        }
+        self.bus = cluster.bus.clone();
+        self.listen_for_nudges().await;
+
+        self.sweeper_cancel.cancel();
+        if let Some(sweeper) = self.sweeper.take() {
+            sweeper.abort();
+        }
+        self.sweeper_cancel = CancellationToken::new();
+        self.sweeper = Some(tokio::spawn(run_sweeper(
+            self.state.clone(),
+            Arc::clone(&self.shards),
+            self.live_tx.subscribe(),
+            cluster.session_alive.clone(),
+            self.sweeper_cancel.clone(),
+        )));
+    }
+
+    async fn listen_for_nudges(&mut self) {
+        if let Some(nudges) = self.nudges.take() {
+            nudges.abort();
+        }
+        let Some(bus) = &self.bus else {
+            return;
+        };
+        match bus.subscribe(DEMAND_TOPIC, None).await {
+            Ok(stream) => {
+                self.nudges = Some(tokio::spawn(forward_nudges(stream, self.commands.clone())));
+            }
+            Err(error) => warn!(
+                %error,
+                "watch: demand nudges unavailable; a shard holder finds new demand within the listing interval"
+            ),
+        }
+    }
+
+    async fn pass(&mut self) {
+        self.beat().await;
+        if let Some(leases) = &mut self.leases {
+            leases.maintain(&self.member, self.members).await;
+        }
+        if self.bus.is_some() && self.nudges.as_ref().is_none_or(|n| n.is_finished()) {
+            self.listen_for_nudges().await;
+        }
+        let listed_at = Instant::now();
+        match self.state.demanded().await {
+            Ok(uris) => {
+                self.send(WatchCommand::Demand {
+                    uris: uris.into_iter().collect(),
+                    listed_at,
+                })
+                .await;
+            }
+            Err(error) => warn!(%error, "watch: demand listing failed; next pass"),
+        }
+    }
+
+    async fn beat(&mut self) {
+        let listed = match self.state.members().await {
+            Ok(members) => Some(members.into_iter().collect::<HashSet<String>>()),
+            Err(error) => {
+                warn!(%error, "watch: member listing failed; next pass");
+                None
+            }
+        };
+        if self.joined
+            && let Some(live) = &listed
+            && !live.contains(&*self.member)
+        {
+            warn!(
+                "watch: this replica was gone from the subscription store; its subscriptions are written again"
+            );
+            self.send(WatchCommand::Rejoined).await;
+        }
+        match self.state.beat(&self.member, MEMBER_TTL).await {
+            Ok(()) => self.joined = true,
+            Err(error) => warn!(%error, "watch: this replica could not mark itself alive"),
+        }
+        // Without a listing the share stays as it was, and the sweeper
+        // waits rather than judge rows against an old view. This replica
+        // counts itself whether or not its mark was written.
+        let live = listed.map(|mut live| {
+            live.insert(self.member.to_string());
+            self.members = live.len();
+            Arc::new(live)
+        });
+        metrics::gauge!("mcpg_watch_members").set(self.members as f64);
+        self.live_tx.send_replace(live);
+    }
+
+    async fn send(&self, command: WatchCommand) {
+        if let Some(commands) = self.commands.upgrade() {
+            let _ = commands.send(command).await;
+        }
+    }
+
+    /// Give the shards back and leave the members, so the other replicas
+    /// take over at once rather than on expiry.
+    async fn stop(&mut self) {
+        self.sweeper_cancel.cancel();
+        if let Some(sweeper) = self.sweeper.take() {
+            sweeper.abort();
+        }
+        if let Some(nudges) = self.nudges.take() {
+            nudges.abort();
+        }
+        if let Some(mut leases) = self.leases.take() {
+            leases.release_all().await;
+        }
+        if self.joined
+            && let Err(error) = self.state.leave(&self.member).await
+        {
+            debug!(%error, "watch: member not removed; it expires on its own");
+        }
+    }
+}
+
+async fn run_collector(
+    mut collector: Collector,
+    mut cluster_rx: tokio::sync::watch::Receiver<Option<Arc<WatchCluster>>>,
+    cancel: CancellationToken,
+) {
+    // Nothing is shared before the runtime attaches the fleet: until then
+    // this replica holds every shard and watches what its own sessions
+    // subscribe to.
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            changed = cluster_rx.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let cluster = cluster_rx.borrow_and_update().clone();
+                if let Some(cluster) = cluster {
+                    collector.attach(cluster).await;
+                    break;
+                }
+            }
+        }
+    }
+    let mut tick = tokio::time::interval(MAINTAIN_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => break,
+            changed = cluster_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let cluster = cluster_rx.borrow_and_update().clone();
+                if let Some(cluster) = cluster {
+                    collector.attach(cluster).await;
+                }
+                collector.pass().await;
+            }
+            _ = tick.tick() => collector.pass().await,
+        }
+    }
+    collector.stop().await;
+}
+
+async fn forward_nudges(
+    mut stream: mcpg_cluster_api::Subscription,
+    commands: mpsc::WeakSender<WatchCommand>,
+) {
+    use futures::StreamExt as _;
+    while let Some(message) = stream.next().await {
+        let Ok(message) = message else {
+            continue;
+        };
+        let Ok(uri) = String::from_utf8(message.payload.to_vec()) else {
+            continue;
+        };
+        let Some(commands) = commands.upgrade() else {
+            return;
+        };
+        if commands.send(WatchCommand::Nudge { uri }).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Removes the rows of subscribers that are gone, on the shards this
+/// replica holds: a row whose holder left the fleet, or whose session
+/// ended. A row goes on the second pass that finds it gone, so one late
+/// beat or one failed read does not drop a live subscription. A URI left
+/// without rows loses its demand marker, which stops its watcher.
+async fn run_sweeper(
+    state: WatchState,
+    shards: Arc<ShardSet>,
+    live: tokio::sync::watch::Receiver<Option<Arc<HashSet<String>>>>,
+    session_alive: Option<SessionLiveness>,
+    cancel: CancellationToken,
+) {
+    let mut suspects = HashSet::new();
+    let mut tick = tokio::time::interval(COLLECT_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick is immediate; the members need a pass to mark
+    // themselves alive first.
+    tick.tick().await;
+    let mut passes: u32 = 0;
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+        // One replica of the fleet, the holder of shard 0, backfills.
+        if passes.is_multiple_of(BACKFILL_EVERY) && shards.owns(0) {
+            match state.backfill_demand().await {
+                Ok(0) => {}
+                Ok(written) => info!(
+                    written,
+                    "watch: demand markers written for rows without one"
+                ),
+                Err(error) => debug!(%error, "watch: demand backfill failed; next time"),
+            }
+        }
+        passes = passes.wrapping_add(1);
+        let Some(members) = live.borrow().clone() else {
+            continue;
+        };
+        suspects = sweep(&state, &shards, &members, session_alive.as_ref(), &suspects).await;
+    }
+}
+
+/// One sweeper pass; returns the rows found gone that it kept.
+async fn sweep(
+    state: &WatchState,
+    shards: &ShardSet,
+    live: &HashSet<String>,
+    session_alive: Option<&SessionLiveness>,
+    suspects: &HashSet<(String, String)>,
+) -> HashSet<(String, String)> {
+    let uris = match state.demanded().await {
+        Ok(uris) => uris,
+        Err(error) => {
+            warn!(%error, "watch: sweeper listing failed; next pass");
+            return suspects.clone();
+        }
+    };
+    let mut kept = HashSet::new();
+    let mut rows_read = 0usize;
+    let mut sessions_checked = 0usize;
+    for uri in uris.into_iter().filter(|uri| shards.owns_uri(uri)) {
+        if rows_read >= COLLECT_ROW_BUDGET {
+            warn!(
+                rows_read,
+                "watch: sweeper stopped at its row budget; the remaining URIs wait for the next pass"
+            );
+            break;
+        }
+        let rows = match state.rows(&uri).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                debug!(uri = %uri, %error, "watch: sweeper could not read the rows of a URI");
+                continue;
+            }
+        };
+        rows_read += rows.len();
+        let mut removed = 0usize;
+        for row in &rows {
+            let gone = match &row.holder {
+                Some(holder) => !live.contains(holder),
+                None => match session_alive {
+                    Some(alive) if sessions_checked < COLLECT_SESSION_BUDGET => {
+                        sessions_checked += 1;
+                        alive(&row.session_id) == Some(false)
+                    }
+                    _ => false,
+                },
+            };
+            if !gone {
+                continue;
+            }
+            let key = (uri.clone(), row.session_id.clone());
+            if !suspects.contains(&key) {
+                kept.insert(key);
+                continue;
+            }
+            match state.remove_row(&row.session_id, &uri).await {
+                Ok(()) => {
+                    removed += 1;
+                    let reason = if row.holder.is_some() {
+                        "holder_gone"
+                    } else {
+                        "session_ended"
+                    };
+                    metrics::counter!("mcpg_watch_rows_collected_total", "reason" => reason)
+                        .increment(1);
+                }
+                Err(error) => {
+                    debug!(uri = %uri, %error, "watch: sweeper could not remove a row; next pass");
+                    kept.insert(key);
+                }
+            }
+        }
+        if removed == rows.len()
+            && let Err(error) = state.drop_demand_if_unsubscribed(&uri).await
+        {
+            debug!(uri = %uri, %error, "watch: sweeper could not drop a demand marker; next pass");
+        }
+    }
+    kept
 }
 
 /// Poll cadence for a poll watcher: the configured `interval_ms`
@@ -776,12 +1546,9 @@ async fn run_watcher(
     uri: String,
     strategy: WatchStrategy,
     cancel: CancellationToken,
-    subscription_store: Arc<dyn SubscriptionStore>,
-    delivery_publish: Arc<dyn Fn(&str, DeliveryMessage) + Send + Sync>,
-    resource_fetcher: Arc<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    ctx: WatchContext,
     notification_filter: Option<NotificationFilterConfig>,
     compiled_filter_program: Option<Arc<cel::Program>>,
-    plugin_registry: Option<Arc<PluginRegistry>>,
 ) {
     match strategy {
         WatchStrategy::Poll { interval_ms } => {
@@ -789,12 +1556,9 @@ async fn run_watcher(
                 uri,
                 interval_ms,
                 cancel,
-                subscription_store,
-                delivery_publish,
-                resource_fetcher,
+                ctx,
                 notification_filter,
                 compiled_filter_program,
-                plugin_registry,
             )
             .await;
         }
@@ -810,11 +1574,9 @@ async fn run_watcher(
                 kind,
                 spec,
                 cancel,
-                subscription_store,
-                delivery_publish,
+                ctx,
                 notification_filter,
                 compiled_filter_program,
-                plugin_registry,
             )
             .await;
         }
@@ -835,6 +1597,7 @@ struct ResourceUpdatedSink {
     compiled_filter_program: Option<Arc<cel::Program>>,
     plugin_kind: String,
     plugin_registry: Option<Arc<PluginRegistry>>,
+    shards: Arc<ShardSet>,
     /// Positions of handled events, for the watcher to acknowledge.
     acks: mpsc::Sender<serde_json::Value>,
 }
@@ -842,6 +1605,12 @@ struct ResourceUpdatedSink {
 #[async_trait]
 impl WatchEventSink for ResourceUpdatedSink {
     async fn emit(&self, event: WatchEvent) {
+        // A replica that gave the shard up leaves the event to the new
+        // holder, unacknowledged: an upstream that redelivers delivers it
+        // there.
+        if !self.shards.owns_uri(&self.uri) {
+            return;
+        }
         // A notification is told once and never retried, so the event is
         // handled as soon as it is fanned out. A full queue only delays the
         // acknowledgement to the upstream's redelivery.
@@ -901,13 +1670,11 @@ async fn run_plugin_watcher(
     kind: String,
     spec: serde_json::Value,
     cancel: CancellationToken,
-    subscription_store: Arc<dyn SubscriptionStore>,
-    delivery_publish: Arc<dyn Fn(&str, DeliveryMessage) + Send + Sync>,
+    ctx: WatchContext,
     notification_filter: Option<NotificationFilterConfig>,
     compiled_filter_program: Option<Arc<cel::Program>>,
-    plugin_registry: Option<Arc<PluginRegistry>>,
 ) {
-    let Some(registry) = plugin_registry else {
+    let Some(registry) = ctx.plugin_registry.clone() else {
         debug!(
             uri = %uri,
             kind = %kind,
@@ -929,12 +1696,13 @@ async fn run_plugin_watcher(
     let (acks, mut handled) = mpsc::channel(PLUGIN_ACK_CAPACITY);
     let sink = Arc::new(ResourceUpdatedSink {
         uri: uri.clone(),
-        subscription_store,
-        delivery_publish,
+        subscription_store: ctx.subscription_store,
+        delivery_publish: ctx.delivery_publish,
         notification_filter,
         compiled_filter_program,
         plugin_kind: kind.clone(),
         plugin_registry: Some(registry.clone()),
+        shards: ctx.shards,
         acks,
     });
 
@@ -969,20 +1737,20 @@ const PLUGIN_ACK_CAPACITY: usize = 1024;
 
 // ─── Poll Watcher ────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 async fn run_poll_watcher(
     uri: String,
     interval_ms: u64,
     cancel: CancellationToken,
-    subscription_store: Arc<dyn SubscriptionStore>,
-    delivery_publish: Arc<dyn Fn(&str, DeliveryMessage) + Send + Sync>,
-    resource_fetcher: Arc<dyn Fn(&str) -> Option<String> + Send + Sync>,
+    ctx: WatchContext,
     notification_filter: Option<NotificationFilterConfig>,
     compiled_filter_program: Option<Arc<cel::Program>>,
-    plugin_registry: Option<Arc<PluginRegistry>>,
 ) {
-    // Content-hash comparison: store the SHA-256 of the last fetch to detect changes.
-    let last_hash: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+    // Content-hash comparison against the SHA-256 of the last fetch. The
+    // last holder of the URI's shard left it in the store, wherever it ran,
+    // so a change made while the shard moved is still told.
+    let mut last_hash: Option<[u8; 32]> = None;
+    let mut baseline_read = false;
+    let mut written: Option<Instant> = None;
     let interval = poll_interval(interval_ms);
 
     loop {
@@ -994,7 +1762,27 @@ async fn run_poll_watcher(
             _ = tokio::time::sleep(interval) => {}
         }
 
-        let body = match resource_fetcher(&uri) {
+        // A replica that gave the shard up leaves the fetch, the baseline and
+        // the fan-out to the new holder: a baseline written here would hide
+        // the change from it. Should the shard come back, the baseline the
+        // other holder left is read again.
+        if !ctx.shards.owns_uri(&uri) {
+            baseline_read = false;
+            continue;
+        }
+        if !baseline_read {
+            last_hash = match &ctx.state {
+                Some(state) => state.baseline(&uri).await.unwrap_or_else(|error| {
+                    debug!(uri = %uri, %error, "poll: stored baseline unreadable; this fetch sets one");
+                    None
+                }),
+                None => last_hash,
+            };
+            baseline_read = true;
+            written = None;
+        }
+
+        let body = match (ctx.resource_fetcher)(&uri) {
             Some(b) => b,
             None => {
                 // A failed read leaves the baseline untouched, so a broken
@@ -1014,26 +1802,28 @@ async fn run_poll_watcher(
             result
         };
 
-        let changed = {
-            let mut last = last_hash.lock().unwrap();
-            if let Some(prev) = *last {
-                if prev == hash {
-                    false
-                } else {
-                    *last = Some(hash);
-                    true
-                }
-            } else {
-                *last = Some(hash);
-                false
+        // The fetch can outlast the lease.
+        if !ctx.shards.owns_uri(&uri) {
+            baseline_read = false;
+            continue;
+        }
+        let changed = last_hash.is_some_and(|prev| prev != hash);
+        let stale = written.is_none_or(|at| at.elapsed() >= BASELINE_REFRESH);
+        last_hash = Some(hash);
+        if (changed || stale)
+            && let Some(state) = &ctx.state
+        {
+            match state.set_baseline(&uri, hash).await {
+                Ok(()) => written = Some(Instant::now()),
+                Err(error) => debug!(uri = %uri, %error, "poll: baseline not stored; next fetch"),
             }
-        };
+        }
 
         if changed {
             let count = notify_subscribers_filtered(
                 &uri,
-                &*subscription_store,
-                &*delivery_publish,
+                &*ctx.subscription_store,
+                &*ctx.delivery_publish,
                 notification_filter.as_ref(),
                 compiled_filter_program.as_deref(),
                 &EventContext::default(),
@@ -1049,7 +1839,7 @@ async fn run_poll_watcher(
                 );
             }
             // Emit an audit event: the poll watch strategy fired.
-            if let Some(registry) = plugin_registry.clone() {
+            if let Some(registry) = ctx.plugin_registry.clone() {
                 let uri_owned = uri.clone();
                 let count_u64 = count as u64;
                 tokio::spawn(async move {
@@ -1073,6 +1863,7 @@ async fn run_poll_watcher(
 mod tests {
     use super::*;
     use crate::runtime::subscription_store::KvBackedSubscriptionStore;
+    use std::sync::Mutex;
 
     #[tokio::test]
     async fn watch_engine_starts_and_shuts_down() {

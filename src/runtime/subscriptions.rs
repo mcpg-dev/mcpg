@@ -24,7 +24,7 @@
 //! goes through one mutex, so "how many holders does this `(session, uri)`
 //! have" has exactly one answer.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::mpsc;
@@ -35,6 +35,17 @@ use super::watch_engine::WatchEngine;
 /// `(session_id, uri)` — the granularity at which the store keys a
 /// subscription, and therefore the granularity a lease refcounts.
 type Key = (String, String);
+
+/// The holders of one `(session, uri)` row, and what the row was written
+/// with.
+struct Holders {
+    count: usize,
+    identity: Option<SubscriberIdentity>,
+    /// Streams hold the row under this replica's watch member, so it goes
+    /// when the member leaves the fleet; otherwise it lives as long as the
+    /// session.
+    held: bool,
+}
 
 /// Owns the store rows, the watch-engine refcounts, and the holder counts that
 /// tie them together.
@@ -47,7 +58,8 @@ pub struct SubscriptionService {
     /// reaper tears it down; a count of zero means "released, teardown
     /// pending", which is deliberately still an entry — see
     /// [`SubscriptionService::acquire`].
-    holders: Mutex<HashMap<Key, usize>>,
+    /// Ordered by session first, so a session's keys are one range.
+    holders: Mutex<BTreeMap<Key, Holders>>,
     /// Keys posted by [`SubscriptionLease::drop`], drained by the reaper.
     ///
     /// `Drop` may run on any thread, inside or outside a reactor, so it cannot
@@ -83,13 +95,61 @@ impl SubscriptionService {
         let service = Arc::new(Self {
             store,
             watch,
-            holders: Mutex::new(HashMap::new()),
+            holders: Mutex::new(BTreeMap::new()),
             release_tx,
         });
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(reap_releases(Arc::downgrade(&service), release_rx));
         }
+        let weak = Arc::downgrade(&service);
+        service.watch.on_rejoin(Arc::new(move || {
+            if let Some(service) = weak.upgrade() {
+                service.rewrite_rows();
+            }
+        }));
         service
+    }
+
+    /// Write every row this replica holds again: the watch member was gone
+    /// from the store, so another replica may have removed them.
+    fn rewrite_rows(self: &Arc<Self>) {
+        let rows: Vec<(Key, Option<SubscriberIdentity>, bool)> = self
+            .lock_holders()
+            .iter()
+            .filter(|(_, holders)| holders.count > 0)
+            .map(|(key, holders)| (key.clone(), holders.identity.clone(), holders.held))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let service = Arc::clone(self);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                for ((session_id, uri), identity, held) in rows {
+                    if let Err(error) = service.write_row(&session_id, &uri, identity, held) {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            uri = %uri,
+                            %error,
+                            "subscription row not written again"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    fn write_row(
+        &self,
+        session_id: &str,
+        uri: &str,
+        identity: Option<SubscriberIdentity>,
+        held: bool,
+    ) -> Result<(), SubscriptionError> {
+        match self.watch.member_id().filter(|_| held) {
+            Some(member) => self.store.subscribe_held(session_id, uri, identity, member),
+            None => self.store.subscribe(session_id, uri, identity),
+        }
     }
 
     /// Take a lease on `(session_id, uri)`.
@@ -134,19 +194,26 @@ impl SubscriptionService {
                 // instead of re-creating them. The queued release then finds a
                 // non-zero count and does nothing, which is what keeps
                 // acquire/release from racing.
-                Some(count) => {
-                    *count += 1;
+                Some(existing) => {
+                    existing.count += 1;
                     false
                 }
                 None => {
-                    holders.insert(key.clone(), 1);
+                    holders.insert(
+                        key.clone(),
+                        Holders {
+                            count: 1,
+                            identity: identity.clone(),
+                            held: true,
+                        },
+                    );
                     true
                 }
             }
         };
 
         if fresh {
-            if let Err(error) = self.store.subscribe(session_id, uri, identity) {
+            if let Err(error) = self.write_row(session_id, uri, identity, true) {
                 self.lock_holders().remove(&key);
                 return Err(error);
             }
@@ -168,22 +235,46 @@ impl SubscriptionService {
     /// key that no longer exists, which is a no-op — so the store row and the
     /// watcher are torn down exactly once.
     pub fn release_session(self: &Arc<Self>, session_id: &str) {
-        let released: Vec<String> = {
-            let mut holders = self.lock_holders();
-            let keys: Vec<Key> = holders
-                .keys()
-                .filter(|(session, _)| session == session_id)
-                .cloned()
-                .collect();
-            for key in &keys {
-                holders.remove(key);
-            }
-            keys.into_iter().map(|(_, uri)| uri).collect()
-        };
+        let released = self.take_session_holders(session_id);
         // Rows can exist with no local key — written by another replica, or by
         // a lease whose reaper never ran. The store is the source of truth for
         // the fan-out, so clear it whether or not this replica held anything.
         self.store.clear_session(session_id);
+        self.unwatch(released);
+    }
+
+    /// [`Self::release_session`] on a replica other than the one that
+    /// recorded the session's end, which clears the rows every replica
+    /// shares: this replica releases its own holders, and the rows of a store
+    /// it may keep alone.
+    pub fn release_session_here(self: &Arc<Self>, session_id: &str) {
+        let released = self.take_session_holders(session_id);
+        if released.is_empty() {
+            return;
+        }
+        self.store.clear_session(session_id);
+        self.unwatch(released);
+    }
+
+    /// Remove the holders of `session_id`; returns their URIs. Every replica
+    /// does this for every session that ends in the fleet, so it reads only
+    /// the session's own range.
+    fn take_session_holders(&self, session_id: &str) -> Vec<String> {
+        let mut holders = self.lock_holders();
+        let keys: Vec<Key> = holders
+            .range((session_id.to_owned(), String::new())..)
+            .map(|(key, _)| key)
+            .take_while(|(session, _)| session == session_id)
+            .cloned()
+            .collect();
+        for key in &keys {
+            holders.remove(key);
+        }
+        keys.into_iter().map(|(_, uri)| uri).collect()
+    }
+
+    /// Tell the watch engine that this replica no longer holds `released`.
+    fn unwatch(&self, released: Vec<String>) {
         if released.is_empty() {
             return;
         }
@@ -216,14 +307,21 @@ impl SubscriptionService {
         let key = (session_id.to_owned(), uri.to_owned());
         {
             let mut holders = self.lock_holders();
-            if let Some(count) = holders.get_mut(&key) {
+            if let Some(existing) = holders.get_mut(&key) {
                 // Also revives a zero count whose release is still queued.
-                *count = 1;
+                existing.count = 1;
                 return Ok(false);
             }
-            holders.insert(key.clone(), 1);
+            holders.insert(
+                key.clone(),
+                Holders {
+                    count: 1,
+                    identity: identity.clone(),
+                    held: false,
+                },
+            );
         }
-        if let Err(error) = self.store.subscribe(session_id, uri, identity) {
+        if let Err(error) = self.write_row(session_id, uri, identity, false) {
             self.lock_holders().remove(&key);
             return Err(error);
         }
@@ -261,11 +359,11 @@ impl SubscriptionService {
     pub fn live_keys(&self) -> usize {
         self.lock_holders()
             .values()
-            .filter(|count| **count > 0)
+            .filter(|holders| holders.count > 0)
             .count()
     }
 
-    fn lock_holders(&self) -> std::sync::MutexGuard<'_, HashMap<Key, usize>> {
+    fn lock_holders(&self) -> std::sync::MutexGuard<'_, BTreeMap<Key, Holders>> {
         // A panic under this lock would leave a count wrong, not memory
         // unsound; recovering keeps subscriptions working rather than
         // poisoning every later call.
@@ -279,7 +377,7 @@ impl SubscriptionService {
             match holders.get(&key) {
                 // Re-acquired between the release and now — the row and the
                 // watcher are still wanted.
-                Some(count) if *count > 0 => return,
+                Some(existing) if existing.count > 0 => return,
                 Some(_) => {
                     holders.remove(&key);
                 }
@@ -328,9 +426,9 @@ impl Drop for SubscriptionLease {
         let hit_zero = {
             let mut holders = service.lock_holders();
             match holders.get_mut(&self.key) {
-                Some(count) => {
-                    *count = count.saturating_sub(1);
-                    *count == 0
+                Some(existing) => {
+                    existing.count = existing.count.saturating_sub(1);
+                    existing.count == 0
                 }
                 None => false,
             }
@@ -510,6 +608,27 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(service.live_keys(), 0);
+    }
+
+    /// The release of a session takes its own keys only: not those of a
+    /// session whose id it begins, or that begins it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn releasing_a_session_leaves_its_neighbours() {
+        let service = service();
+        let mut leases = Vec::new();
+        for session in ["ses", "sess", "sess-2", "sesst"] {
+            for uri in ["file:///a", "file:///b"] {
+                leases.push(service.acquire(session, uri, None).await.expect("lease"));
+            }
+        }
+        assert_eq!(service.live_keys(), 8);
+
+        service.release_session_here("sess");
+        assert_eq!(service.live_keys(), 6);
+        assert!(service.store.subscriptions_for_session("sess").is_empty());
+        for neighbour in ["ses", "sess-2", "sesst"] {
+            assert_eq!(service.store.subscriptions_for_session(neighbour).len(), 2);
+        }
     }
 
     /// The legacy wire's contract: subscribing twice then unsubscribing once

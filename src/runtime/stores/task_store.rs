@@ -320,7 +320,9 @@ pub trait TaskStore: Send + Sync + std::fmt::Debug {
 /// `Handle::current().block_on(...)`. Making the `TaskStore` trait
 /// fully async is a future migration.
 ///
-/// Key scheme: `task:{task_id}` → JSON-encoded [`TaskRecord`].
+/// Key scheme: `task:{task_id}` → JSON-encoded [`TaskRecord`], and
+/// `task-s:{session}:{task_id}` → the session's task index, so the
+/// per-session limit and `tasks/list` read one session's tasks.
 /// Per-key TTL is the originally-supplied `task.ttl`; backends auto-expire
 /// stale entries so [`gc_expired_tasks`] is a no-op for KV-backed stores.
 /// Told of every status a task store writes, after it is stored. Called
@@ -380,8 +382,24 @@ impl KvBackedTaskStore {
         format!("task:{task_id}")
     }
 
-    fn task_prefix() -> &'static str {
-        "task:"
+    /// The prefix of a session's task index: one key per task the session
+    /// created, living as long as the task. The session id is encoded, so
+    /// no session's prefix starts another's.
+    fn session_tasks_prefix(session_id: &str) -> String {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(session_id);
+        format!("task-s:{encoded}:")
+    }
+
+    /// The ids of the tasks `session_id` holds, from its task index.
+    async fn session_task_ids(&self, session_id: &str) -> Result<Vec<String>, TaskStoreError> {
+        let prefix = Self::session_tasks_prefix(session_id);
+        Ok(mcpg_cluster_api::list_all(&*self.state, &prefix)
+            .await
+            .map_err(|e| TaskStoreError::Internal(format!("kv list_page: {e}")))?
+            .into_iter()
+            .filter_map(|(key, _)| key.strip_prefix(&prefix).map(str::to_owned))
+            .collect())
     }
 
     fn block<F, T>(fut: F) -> T
@@ -427,20 +445,17 @@ impl TaskStore for KvBackedTaskStore {
     ) -> Result<TaskRecord, TaskStoreError> {
         Self::block(async {
             if self.policy.max_tasks_per_session > 0 {
-                let entries = self
+                // The session's own index, not every task of the fleet.
+                let held = self
                     .state
-                    .list_prefix(Self::task_prefix(), 4096)
+                    .list_prefix(
+                        &Self::session_tasks_prefix(session_id),
+                        self.policy.max_tasks_per_session,
+                    )
                     .await
-                    .map_err(|e| TaskStoreError::Internal(format!("kv list_prefix: {e}")))?;
-                let count = entries
-                    .iter()
-                    .filter(|(_, v)| {
-                        serde_json::from_slice::<TaskRecord>(&v.bytes)
-                            .map(|r| r.session_id == session_id)
-                            .unwrap_or(false)
-                    })
-                    .count();
-                if count >= self.policy.max_tasks_per_session {
+                    .map_err(|e| TaskStoreError::Internal(format!("kv list_prefix: {e}")))?
+                    .len();
+                if held >= self.policy.max_tasks_per_session {
                     return Err(TaskStoreError::QuotaExceeded {
                         limit: self.policy.max_tasks_per_session,
                     });
@@ -469,11 +484,20 @@ impl TaskStore for KvBackedTaskStore {
             };
             let bytes = serde_json::to_vec(&record)
                 .map_err(|e| TaskStoreError::Internal(format!("encode TaskRecord: {e}")))?;
+            let ttl = std::time::Duration::from_millis(ttl);
             self.state
                 .put(
                     &Self::task_key(&task_id),
                     bytes::Bytes::from(bytes),
-                    Some(std::time::Duration::from_millis(ttl)),
+                    Some(ttl),
+                )
+                .await
+                .map_err(|e| TaskStoreError::Internal(format!("kv put: {e}")))?;
+            self.state
+                .put(
+                    &format!("{}{task_id}", Self::session_tasks_prefix(session_id)),
+                    bytes::Bytes::from_static(b"1"),
+                    Some(ttl),
                 )
                 .await
                 .map_err(|e| TaskStoreError::Internal(format!("kv put: {e}")))?;
@@ -718,16 +742,20 @@ impl TaskStore for KvBackedTaskStore {
         limit: usize,
     ) -> Result<(Vec<Task>, Option<String>), TaskStoreError> {
         Self::block(async {
-            let entries = self
-                .state
-                .list_prefix(Self::task_prefix(), 4096)
-                .await
-                .map_err(|e| TaskStoreError::Internal(format!("kv list_prefix: {e}")))?;
-            let mut session_tasks: Vec<TaskRecord> = entries
-                .into_iter()
-                .filter_map(|(_, v)| serde_json::from_slice::<TaskRecord>(&v.bytes).ok())
-                .filter(|r| r.session_id == session_id)
-                .collect();
+            let mut session_tasks: Vec<TaskRecord> = Vec::new();
+            for task_id in self.session_task_ids(session_id).await? {
+                let value = self
+                    .state
+                    .get(&Self::task_key(&task_id))
+                    .await
+                    .map_err(|e| TaskStoreError::Internal(format!("kv get: {e}")))?;
+                if let Some(record) = value
+                    .and_then(|v| serde_json::from_slice::<TaskRecord>(&v.bytes).ok())
+                    .filter(|r| r.session_id == session_id)
+                {
+                    session_tasks.push(record);
+                }
+            }
             session_tasks.sort_by_key(|t| std::cmp::Reverse(t.created_at_utc));
             let start_index = if let Some(cursor_id) = cursor {
                 session_tasks
@@ -769,6 +797,34 @@ mod tests {
 
     fn make_store() -> KvBackedTaskStore {
         KvBackedTaskStore::new_in_memory_default()
+    }
+
+    /// More tasks in the store than the old 4096 listing cap: the
+    /// per-session limit and `tasks/list` read the session's own tasks.
+    #[test]
+    fn a_session_sees_its_own_tasks_among_many() {
+        let store = KvBackedTaskStore::new_in_memory(TaskRetentionPolicy {
+            default_ttl_ms: 600_000,
+            max_tasks_per_session: 3,
+            result_wait_ms: 30_000,
+        });
+        for i in 0..4_500 {
+            store
+                .create_task(&format!("other-{i}"), serde_json::json!(i), "tool", None)
+                .unwrap();
+        }
+        for i in 0..3 {
+            store
+                .create_task("mine", serde_json::json!(i), "tool", None)
+                .expect("under the limit");
+        }
+        let err = store
+            .create_task("mine", serde_json::json!(9), "tool", None)
+            .expect_err("the fourth is over the limit");
+        assert!(matches!(err, TaskStoreError::QuotaExceeded { limit: 3 }));
+        let (tasks, next) = store.list_tasks("mine", None, 100).unwrap();
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(next, None);
     }
 
     #[test]

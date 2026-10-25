@@ -195,7 +195,8 @@ async fn build_with(
     let session_store: Arc<dyn crate::runtime::session_store::SessionStore> = Arc::new(
         crate::runtime::session_store::KvBackedSessionStore::new(store_config, session_kv)
             .await?
-            .shared_across_replicas(!config.cluster.is_single_node()),
+            .shared_across_replicas(!config.cluster.is_single_node())
+            .fleet_visible(sessions_fleet_visible(&config)),
     );
 
     // Unified delivery_bus path: every backend variant resolves to a
@@ -650,43 +651,23 @@ async fn build_with(
     //
     // When `cancellation_bus.bus: { kind, … }` is set, the override
     // drives PubSub construction directly.
-    let cancel_pubsub: Arc<dyn mcpg_cluster_api::PubSub> = resolve_capability_bus(
-        config.mcp.configurations.cancellation.bus.as_ref(),
-        "cancellation",
+    runtime.set_cancellation_bus(
+        cancellation_bus(&config, cluster_backend.as_ref(), &state_cipher).await?,
+    );
+    // The replicas of a fleet tell each other the ends of sessions.
+    runtime
+        .set_session_fleet(session_fleet(&config, cluster_backend.as_ref(), &state_cipher).await?);
+
+    // One watcher per subscribed resource in the fleet, on the replica that
+    // holds the resource's watch shard.
+    let fleet_watch = watch_cluster(
+        &config,
         cluster_backend.as_ref(),
+        &state_cipher,
+        runtime.session_store(),
     )
     .await?;
-    let cancel_pubsub = wrap_tenant_bus(wrap_state_bus(cancel_pubsub, &state_cipher), &tenant_seg);
-    // Durable backstop: mirror cancellations to the coordinator's KV
-    // so a subscriber that reconnects / restarts recovers events the
-    // at-most-once pub/sub path dropped. Inherits the coordinator KV (the
-    // same backbone the capability stores use); single-node / no-coordinator
-    // gets an in-process MemoryKv, which still recovers MemoryBus lag drops.
-    // The backstop KV is wrapped too, so recovered cancellations are
-    // sealed at rest like every other capability store.
-    let cancel_backstop_kv = wrap_tenant_kv(
-        wrap_state_kv(
-            default_capability_kv("cancellation", cluster_backend.as_ref()),
-            &state_cipher,
-        ),
-        &tenant_seg,
-    );
-    runtime.set_cancellation_bus(Arc::new(
-        crate::runtime::cancellation_bus::BusBackedCancellationBus::new_with_backstop(
-            cancel_pubsub,
-            cancel_backstop_kv,
-        )
-        // Opt-in per-principal subject partitioning so broker-native subject
-        // ACLs can fence cancel traffic. Validated at boot to require a
-        // wildcard-capable bus (redis/nats).
-        .with_principal_partitioning(
-            config
-                .mcp
-                .configurations
-                .cancellation
-                .partition_by_principal,
-        ),
-    ));
+    runtime.watch_engine.attach_cluster(fleet_watch).await;
 
     // Tool-call rate limiting (cluster-aware via NATS / Redis or
     // in-process token bucket) is now configured as a tool-gate

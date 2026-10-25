@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore};
+use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, KvPage};
 use parking_lot::Mutex;
 use zeroize::Zeroizing;
 
@@ -744,6 +744,38 @@ impl Inner {
         Ok(self.remove_record(key, &name)? && live)
     }
 
+    /// One page of the live records under `prefix` after `cursor`, in key
+    /// order; the cursor is the last key of the page.
+    fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, ClusterError> {
+        use std::ops::Bound;
+        let limit = limit.max(1);
+        let now = now_ms();
+        let start = match cursor {
+            Some(c) if c >= prefix => Bound::Excluded(c.to_owned()),
+            _ => Bound::Included(prefix.to_owned()),
+        };
+        let mut keys: Vec<String> = self
+            .index
+            .lock()
+            .entries
+            .range((start, Bound::Unbounded))
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .filter(|(_, entry)| entry.live(now))
+            .map(|(key, _)| key.clone())
+            .take(limit + 1)
+            .collect();
+        let more = keys.len() > limit;
+        keys.truncate(limit);
+        let next = if more { keys.last().cloned() } else { None };
+        let entries = self.read_live(keys, now, usize::MAX);
+        Ok(KvPage { entries, next })
+    }
+
     fn list_prefix(
         &self,
         prefix: &str,
@@ -759,6 +791,11 @@ impl Inner {
             .filter(|(_, entry)| entry.live(now))
             .map(|(key, _)| key.clone())
             .collect();
+        Ok(self.read_live(keys, now, limit))
+    }
+
+    /// The records of `keys` that still read as live, at most `limit`.
+    fn read_live(&self, keys: Vec<String>, now: u64, limit: usize) -> Vec<(String, Entry)> {
         let mut out = Vec::new();
         for key in keys {
             if out.len() >= limit {
@@ -783,7 +820,7 @@ impl Inner {
                 },
             ));
         }
-        Ok(out)
+        out
     }
 
     fn expire(&self, key: &str, ttl: Option<Duration>) -> Result<bool, ClusterError> {
@@ -862,6 +899,18 @@ impl KeyValueStore for FileStore {
     async fn delete(&self, key: &str) -> Result<bool, ClusterError> {
         let key = key.to_owned();
         self.run(move |inner| inner.delete(&key)).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, ClusterError> {
+        let prefix = prefix.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        self.run(move |inner| inner.list_page(&prefix, cursor.as_deref(), limit))
+            .await
     }
 
     async fn list_prefix(

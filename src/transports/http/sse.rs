@@ -381,6 +381,10 @@ pub(crate) fn delivery_to_sse_event(
 /// site; each site supplies its own `filter` (pass-through with
 /// replay tagging, backlog-dedupe, or `subscriptions/listen` target
 /// matching).
+///
+/// The stream ends when the session ends on this replica — terminated here
+/// or on another replica, or idle everywhere — so the client hears of the
+/// end at once rather than at its next request.
 pub(crate) async fn delivery_bus_sse<F>(
     runtime: &crate::runtime::GatewayRuntime,
     session_id: &str,
@@ -389,8 +393,14 @@ pub(crate) async fn delivery_bus_sse<F>(
 where
     F: FnMut(DeliveryMessage) -> Option<Result<Event, Infallible>> + Send + 'static,
 {
+    let lifetime = runtime.session_store().session_lifetime(session_id);
     let delivery_rx = runtime.subscribe_session_delivery(session_id).await;
-    ReceiverStream::new(delivery_rx).filter_map(filter)
+    let live = ReceiverStream::new(delivery_rx).filter_map(filter);
+    let ended: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = match lifetime {
+        Some(lifetime) => Box::pin(lifetime.ended()),
+        None => Box::pin(std::future::pending()),
+    };
+    futures::StreamExt::take_until(live, ended)
 }
 
 #[cfg(test)]

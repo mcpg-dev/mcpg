@@ -14,6 +14,7 @@ mod execution;
 pub(crate) mod expr;
 pub(crate) mod feature_flags;
 pub(crate) mod federation;
+pub mod fleet_semaphore;
 pub(crate) mod gateway_apps;
 mod handlers;
 pub mod idempotency;
@@ -35,6 +36,7 @@ pub use reapers::{pipeline_reaper, task_reaper};
 pub mod redact;
 pub mod safe_dns;
 mod seen_request_ids;
+pub(crate) mod session_fleet;
 pub mod shared_services;
 pub mod stores;
 pub use stores::{
@@ -57,6 +59,9 @@ pub mod subscriptions;
 mod types;
 mod util;
 pub mod watch_engine;
+#[cfg(test)]
+mod watch_fleet_tests;
+pub mod watch_shards;
 pub use types::*;
 pub(crate) use util::*;
 
@@ -113,7 +118,7 @@ use seen_request_ids::{
     RegisteredCancellation, SeenRequestIds, cancellation_requester_is_owner, resumer_owns_pipeline,
     session_owner_matches,
 };
-use session_store::{SessionAccessError, SessionStore};
+use session_store::{EndedSession, SessionAccessError, SessionStore};
 pub use session_store::{SessionSnapshot, SessionStoreConfig, SseEventRecord, StreamAccessError};
 use subscription_store::SubscriptionStore;
 
@@ -900,8 +905,17 @@ pub struct GatewayRuntime {
     /// that entry, it cancels the token so the registered in-flight
     /// pipeline/task execution can cooperatively abort at its next check
     /// point. The owner identity travels in each entry so a foreign
-    /// principal cannot cancel work it does not own.
+    /// principal cannot cancel work it does not own. A config reload hands
+    /// the registry to the next runtime, so the work in flight across the
+    /// reload stays cancellable.
     cancellation_tokens: Arc<dashmap::DashMap<String, RegisteredCancellation>>,
+    /// The bus this runtime tells and hears the ends of sessions on.
+    session_fleet: session_fleet::SessionFleet,
+    /// What this runtime hears the fleet through: the cancellation
+    /// subscriber and the listener for the ends of sessions. Started by
+    /// [`Self::start_cluster_listeners`], stopped when a reload retires the
+    /// runtime.
+    cluster_listeners: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Per-session completion rate limiter. `None` means disabled.
     /// Perf: DashMap avoids Mutex contention on the tools/call hot path.
     completion_limiter: dashmap::DashMap<String, (u64, std::time::Instant)>,
@@ -1473,8 +1487,17 @@ mod resume_cancel_ownership_tests {
         ))
     }
 
+    fn idle_end(session_id: &str, recorded: bool) -> EndedSession {
+        EndedSession {
+            session_id: session_id.to_owned(),
+            reason: session_store::SessionEndReason::IdleExpired,
+            recorded,
+            snapshot: None,
+        }
+    }
+
     #[test]
-    fn on_session_evicted_runs_cleanup_cascade() {
+    fn on_session_end_runs_cleanup_cascade() {
         // Idle eviction of a session whose client never sent DELETE must run
         // the same per-session cleanup as explicit terminate: release the
         // tenant quota slot (else the tenant hard-locks) and drop the
@@ -1495,7 +1518,7 @@ mod resume_cancel_ownership_tests {
 
         // The store holds no live session under this id, so the cascade runs.
         assert!(!runtime.session_store.contains_active_session(sid));
-        runtime.on_session_evicted(sid);
+        runtime.on_session_end(&idle_end(sid, true));
 
         assert!(
             !runtime.session_tenants.contains_key(sid),
@@ -1511,8 +1534,20 @@ mod resume_cancel_ownership_tests {
         );
     }
 
+    /// A replica that did not record the end drops what it keeps for the
+    /// session too: the replica that served it may not be the one that ended
+    /// it.
     #[test]
-    fn on_session_evicted_skips_reused_live_session() {
+    fn an_end_recorded_elsewhere_still_cleans_up_here() {
+        let runtime = test_runtime();
+        let sid = "ended-elsewhere";
+        let _ = runtime.record_client_request_id(Some(sid), false, &serde_json::json!("req-1"));
+        runtime.on_session_end(&idle_end(sid, false));
+        assert!(!runtime.seen_request_ids.contains_key(sid));
+    }
+
+    #[test]
+    fn on_session_end_skips_reused_live_session() {
         // If a live session now holds the evicted id (client re-created it, or
         // a deterministic-modern id was re-derived), its id-keyed state is
         // legitimate and must NOT be wiped.
@@ -1530,7 +1565,7 @@ mod resume_cancel_ownership_tests {
             .insert("tenant-b".to_owned(), 1);
 
         // A stale eviction for the same id arrives after re-creation.
-        runtime.on_session_evicted("reused-id");
+        runtime.on_session_end(&idle_end("reused-id", true));
 
         assert!(
             runtime.session_tenants.contains_key("reused-id"),

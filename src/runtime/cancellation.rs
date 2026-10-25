@@ -205,13 +205,17 @@ impl GatewayRuntime {
     /// Spawn a background task that subscribes to the cancellation bus and
     /// cancels any locally-registered token whose `target_id` matches an
     /// incoming event. Safe to call once per runtime — idempotence is the
-    /// caller's responsibility.
+    /// caller's responsibility ([`Self::start_cluster_listeners`]). The task
+    /// does not keep the runtime alive.
     pub fn spawn_cancellation_subscriber(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let runtime = Arc::clone(self);
+        let weak = Arc::downgrade(self);
         let bus = self.cancellation_bus.clone();
         tokio::spawn(async move {
             let mut rx = bus.subscribe().await;
             while let Some(event) = rx.recv().await {
+                let Some(runtime) = weak.upgrade() else {
+                    break;
+                };
                 let kind = event.kind.clone();
                 // Requests are filed session-scoped under their client
                 // JSON-RPC id; tasks under their globally-unique task id.

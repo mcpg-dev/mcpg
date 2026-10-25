@@ -37,6 +37,46 @@ impl GatewayRuntime {
         self.cancellation_bus = bus;
     }
 
+    /// Take over the in-flight cancellation registry of the runtime a reload
+    /// replaces, so a cancellation heard after the reload still reaches the
+    /// work that began before it.
+    pub(crate) fn adopt_cancellation_tokens(&mut self, previous: &GatewayRuntime) {
+        self.cancellation_tokens = Arc::clone(&previous.cancellation_tokens);
+    }
+
+    /// Install the bus this runtime tells and hears the ends of sessions on.
+    pub(crate) fn set_session_fleet(&mut self, fleet: session_fleet::SessionFleet) {
+        self.session_fleet = fleet;
+    }
+
+    /// Start hearing the fleet: the cancellation bus, and the ends of
+    /// sessions the other replicas record. A no-op while they run.
+    pub(crate) fn start_cluster_listeners(self: &Arc<Self>) {
+        let mut listeners = self
+            .cluster_listeners
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !listeners.is_empty() {
+            return;
+        }
+        listeners.push(self.spawn_cancellation_subscriber());
+        listeners.extend(self.session_fleet.listen(Arc::downgrade(self)));
+    }
+
+    /// Stop hearing the fleet: a runtime a reload retired acts on nothing
+    /// more, and its subscriptions end before its coordinator does.
+    pub(crate) fn stop_cluster_listeners(&self) {
+        let listeners = std::mem::take(
+            &mut *self
+                .cluster_listeners
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for listener in listeners {
+            listener.abort();
+        }
+    }
+
     /// The live federation engine, if any — used to carry upstream sessions
     /// across a config reload.
     pub(crate) fn federation_engine(&self) -> Option<Arc<federation::engine::FederationEngine>> {

@@ -372,6 +372,32 @@ impl KvBackedPipelineStore {
     fn pending_req_key(srv_req_id: &str) -> String {
         format!("pending_req:{srv_req_id}")
     }
+    /// The suspended pipeline a session's JSON-RPC id (rendered with
+    /// `Value::to_string`) belongs to: a key per suspension, holding the
+    /// pipeline id, living as long as a pipeline. Both parts are encoded,
+    /// so no key starts another's.
+    fn suspended_rpc_key(session_id: &str, rendered_rpc_id: &str) -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!(
+            "pipeline-rpc:{}:{}",
+            b64.encode(session_id),
+            b64.encode(rendered_rpc_id)
+        )
+    }
+
+    /// Every pipeline in the store.
+    async fn all_pipelines(
+        &self,
+    ) -> Result<Vec<PipelineExecutionState>, mcpg_cluster_api::ClusterError> {
+        Ok(mcpg_cluster_api::list_all(&*self.state, "pipeline:")
+            .await?
+            .into_iter()
+            .filter_map(|(_, value)| {
+                serde_json::from_slice::<PipelineExecutionState>(&value.bytes).ok()
+            })
+            .collect())
+    }
     fn delivery_key(session_id: &str, delivery_id: &str) -> String {
         format!("delivery:{session_id}:{delivery_id}")
     }
@@ -440,7 +466,23 @@ impl PipelineStore for KvBackedPipelineStore {
         Self::block(async {
             self.state
                 .put(&key, bytes::Bytes::from(bytes), Some(self.pipeline_ttl))
-                .await
+                .await?;
+            // Found by its JSON-RPC id while suspended; the lookup checks
+            // the pipeline itself, so the key needs no removal on resume.
+            if state.suspended_at.is_some() {
+                let rpc_key = Self::suspended_rpc_key(
+                    &state.session_id,
+                    &state.original_jsonrpc_id.to_string(),
+                );
+                self.state
+                    .put(
+                        &rpc_key,
+                        bytes::Bytes::from(state.pipeline_id.clone()),
+                        Some(self.pipeline_ttl),
+                    )
+                    .await?;
+            }
+            Ok::<(), mcpg_cluster_api::ClusterError>(())
         })
         .map_err(|e| anyhow::anyhow!("kv save_pipeline: {e}"))
     }
@@ -534,6 +576,19 @@ impl PipelineStore for KvBackedPipelineStore {
             self.state
                 .put(&key, bytes::Bytes::from(bytes), Some(self.pipeline_ttl))
                 .await?;
+            if current.suspended_at.is_some() {
+                let rpc_key = Self::suspended_rpc_key(
+                    &current.session_id,
+                    &current.original_jsonrpc_id.to_string(),
+                );
+                self.state
+                    .put(
+                        &rpc_key,
+                        bytes::Bytes::from(current.pipeline_id.clone()),
+                        Some(self.pipeline_ttl),
+                    )
+                    .await?;
+            }
             Ok::<bool, mcpg_cluster_api::ClusterError>(true)
         })
         .map_err(|e| anyhow::anyhow!("kv set_original_jsonrpc_id: {e}"))
@@ -697,15 +752,12 @@ impl PipelineStore for KvBackedPipelineStore {
 
     fn list_expired_pipelines(&self) -> anyhow::Result<Vec<String>> {
         Self::block(async {
-            let entries = self.state.list_prefix("pipeline:", 4096).await?;
             let now = Utc::now();
             let mut expired = Vec::new();
-            for (_, value) in entries {
-                if let Ok(state) = serde_json::from_slice::<PipelineExecutionState>(&value.bytes) {
-                    let elapsed = (now - state.created_at).num_milliseconds() as u64;
-                    if elapsed >= state.pipeline_timeout_ms {
-                        expired.push(state.pipeline_id);
-                    }
+            for state in self.all_pipelines().await? {
+                let elapsed = (now - state.created_at).num_milliseconds() as u64;
+                if elapsed >= state.pipeline_timeout_ms {
+                    expired.push(state.pipeline_id);
                 }
             }
             Ok::<Vec<String>, mcpg_cluster_api::ClusterError>(expired)
@@ -714,18 +766,10 @@ impl PipelineStore for KvBackedPipelineStore {
     }
 
     fn list_elicitation_timed_out(&self) -> anyhow::Result<Vec<(String, String, Value)>> {
-        // The `pipeline-claim:` marker shares the `pipeline:` namespace only
-        // by prefix accident — guard against decoding a claim marker as a
-        // pipeline by relying on serde (a `b"1"` marker fails to decode).
         Self::block(async {
-            let entries = self.state.list_prefix("pipeline:", 4096).await?;
             let now = Utc::now();
             let mut timed_out = Vec::new();
-            for (_, value) in entries {
-                let Ok(state) = serde_json::from_slice::<PipelineExecutionState>(&value.bytes)
-                else {
-                    continue;
-                };
+            for state in self.all_pipelines().await? {
                 let (Some(suspended_at), Some(elic_ms)) =
                     (state.suspended_at, state.elicitation_timeout_ms)
                 else {
@@ -753,25 +797,30 @@ impl PipelineStore for KvBackedPipelineStore {
         session_id: &str,
         original_jsonrpc_id: &str,
     ) -> anyhow::Result<Option<PipelineExecutionState>> {
+        // The cancel `target_id` is the JSON-RPC id rendered to string
+        // (`Value::to_string`); the key was written with the stored id
+        // rendered the same way, so a numeric / string id matches
+        // identically. The pipeline itself is checked: the key outlives a
+        // resume.
+        let rpc_key = Self::suspended_rpc_key(session_id, original_jsonrpc_id);
         Self::block(async {
-            let entries = self.state.list_prefix("pipeline:", 4096).await?;
-            for (_, value) in entries {
-                let Ok(state) = serde_json::from_slice::<PipelineExecutionState>(&value.bytes)
-                else {
-                    continue;
-                };
-                // The cancel `target_id` is the JSON-RPC id rendered to string
-                // (`Value::to_string`); compare against the stored id rendered
-                // the same way so a numeric / string id matches identically.
-                let rendered = state.original_jsonrpc_id.to_string();
-                if state.suspended_at.is_some()
-                    && state.session_id == session_id
-                    && rendered == original_jsonrpc_id
-                {
-                    return Ok(Some(state));
-                }
-            }
-            Ok::<Option<PipelineExecutionState>, mcpg_cluster_api::ClusterError>(None)
+            let Some(pointer) = self.state.get(&rpc_key).await? else {
+                return Ok(None);
+            };
+            let pipeline_id = String::from_utf8_lossy(&pointer.bytes).into_owned();
+            let Some(value) = self.state.get(&Self::pipeline_key(&pipeline_id)).await? else {
+                return Ok(None);
+            };
+            let Ok(state) = serde_json::from_slice::<PipelineExecutionState>(&value.bytes) else {
+                return Ok(None);
+            };
+            let rendered = state.original_jsonrpc_id.to_string();
+            let matches = state.suspended_at.is_some()
+                && state.session_id == session_id
+                && rendered == original_jsonrpc_id;
+            Ok::<Option<PipelineExecutionState>, mcpg_cluster_api::ClusterError>(
+                matches.then_some(state),
+            )
         })
         .map_err(|e| anyhow::anyhow!("kv find_suspended_by_jsonrpc_id: {e}"))
     }
@@ -1324,6 +1373,85 @@ mod tests {
                 .find_suspended_by_jsonrpc_id("sess-1", "42")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_resumed_pipeline_is_no_longer_found_by_its_jsonrpc_id() {
+        let store = KvBackedPipelineStore::new_in_memory();
+        let mut state = sample_pipeline_state();
+        state.suspended_at = Some(Utc::now());
+        store.save_pipeline(&state).unwrap();
+        state.suspended_at = None;
+        store.save_pipeline(&state).unwrap();
+        assert!(
+            store
+                .find_suspended_by_jsonrpc_id("sess-1", "42")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_new_jsonrpc_id_finds_the_suspended_pipeline() {
+        let store = KvBackedPipelineStore::new_in_memory();
+        let mut state = sample_pipeline_state();
+        state.suspended_at = Some(Utc::now());
+        store.save_pipeline(&state).unwrap();
+        assert!(
+            store
+                .set_original_jsonrpc_id_if_version(
+                    &state.pipeline_id,
+                    0,
+                    &serde_json::json!("r-7")
+                )
+                .unwrap()
+        );
+        let found = store
+            .find_suspended_by_jsonrpc_id("sess-1", "\"r-7\"")
+            .unwrap()
+            .expect("found by the new id");
+        assert_eq!(found.pipeline_id, "pipe-1");
+        assert!(
+            store
+                .find_suspended_by_jsonrpc_id("sess-1", "42")
+                .unwrap()
+                .is_none(),
+            "the old id no longer matches"
+        );
+    }
+
+    /// More pipelines than one listing page of the old 4096 cap: a lookup
+    /// and both sweeps still see every pipeline.
+    #[test]
+    fn lookups_and_sweeps_see_every_pipeline_of_a_large_store() {
+        let store = KvBackedPipelineStore::new_in_memory();
+        for i in 0..5_000 {
+            let mut state = sample_pipeline_state();
+            state.pipeline_id = format!("pipe-{i:05}");
+            state.session_id = format!("sess-{i:05}");
+            state.original_jsonrpc_id = serde_json::json!(i);
+            state.pipeline_timeout_ms = 999_999_999;
+            if i % 1_000 == 999 {
+                state.suspended_at = Some(Utc::now() - chrono::Duration::seconds(5));
+                state.elicitation_timeout_ms = Some(1);
+            }
+            store.save_pipeline(&state).unwrap();
+        }
+        let mut overdue = sample_pipeline_state();
+        overdue.pipeline_id = "pipe-overdue".to_owned();
+        overdue.pipeline_timeout_ms = 0;
+        store.save_pipeline(&overdue).unwrap();
+
+        let found = store
+            .find_suspended_by_jsonrpc_id("sess-04999", "4999")
+            .unwrap()
+            .expect("the last suspended pipeline is found");
+        assert_eq!(found.pipeline_id, "pipe-04999");
+        assert_eq!(store.list_elicitation_timed_out().unwrap().len(), 5);
+        assert_eq!(
+            store.list_expired_pipelines().unwrap(),
+            vec!["pipe-overdue"]
         );
     }
 }

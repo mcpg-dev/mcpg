@@ -30,7 +30,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use futures::stream::StreamExt;
-use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, Message, PubSub, Subscription};
+use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, KvPage, Message, PubSub, Subscription};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
@@ -209,6 +209,52 @@ impl FileKv {
         }
     }
 
+    /// Up to `limit` live entries under `prefix` after `cursor`, in
+    /// directory order, from one pass over the directory.
+    async fn live_entries(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Entry)>, ClusterError> {
+        let mut dir =
+            fs::read_dir(&self.kv_dir)
+                .await
+                .map_err(|e| ClusterError::BackendUnavailable {
+                    reason: format!("read_dir {}: {}", self.kv_dir.display(), e),
+                })?;
+        let mut out = Vec::new();
+        let now = current_unix_secs();
+        while out.len() < limit
+            && let Ok(Some(entry)) = dir.next_entry().await
+        {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path).await else {
+                continue;
+            };
+            let Ok(stored) = serde_json::from_slice::<StoredKv>(&bytes) else {
+                continue;
+            };
+            if !stored.key.starts_with(prefix)
+                || cursor.is_some_and(|c| stored.key.as_str() <= c)
+                || stored.expires_at_secs.is_some_and(|d| d <= now)
+            {
+                continue;
+            }
+            out.push((
+                stored.key,
+                Entry {
+                    bytes: Bytes::from(stored.payload),
+                    expires_at: stored.expires_at_secs.map(unix_secs_to_system),
+                },
+            ));
+        }
+        Ok(out)
+    }
+
     async fn sweep(&self) -> Result<(), ClusterError> {
         let mut dir =
             fs::read_dir(&self.kv_dir)
@@ -300,54 +346,35 @@ impl KeyValueStore for FileKv {
         self.delete_entry(key).await
     }
 
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, ClusterError> {
+        let live = self.live_entries(prefix, cursor, usize::MAX).await?;
+        Ok(KvPage::from_unordered(live, prefix, cursor, limit))
+    }
+
     async fn list_prefix(
         &self,
         prefix: &str,
         limit: usize,
     ) -> Result<Vec<(String, Entry)>, ClusterError> {
-        let mut dir =
-            fs::read_dir(&self.kv_dir)
-                .await
-                .map_err(|e| ClusterError::BackendUnavailable {
-                    reason: format!("read_dir {}: {}", self.kv_dir.display(), e),
-                })?;
-        let mut out = Vec::new();
-        let now = current_unix_secs();
-        while let Ok(Some(entry)) = dir.next_entry().await {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let Ok(bytes) = fs::read(&path).await else {
-                continue;
-            };
-            let Ok(stored) = serde_json::from_slice::<StoredKv>(&bytes) else {
-                continue;
-            };
-            if !stored.key.starts_with(prefix) {
-                continue;
-            }
-            if stored.expires_at_secs.is_some_and(|d| d <= now) {
-                continue;
-            }
-            out.push((
-                stored.key.clone(),
-                Entry {
-                    bytes: Bytes::from(stored.payload),
-                    expires_at: stored.expires_at_secs.map(unix_secs_to_system),
-                },
-            ));
-            if out.len() >= limit {
-                break;
-            }
-        }
-        Ok(out)
+        // One directory pass, not one per page.
+        self.live_entries(prefix, None, limit).await
     }
 
     async fn expire(&self, key: &str, ttl: Option<Duration>) -> Result<bool, ClusterError> {
         let Some(mut stored) = self.read_entry(key).await? else {
             return Ok(false);
         };
+        if stored
+            .expires_at_secs
+            .is_some_and(|d| d <= current_unix_secs())
+        {
+            return Ok(false);
+        }
         stored.expires_at_secs = ttl.map(|d| current_unix_secs() + d.as_secs().max(1));
         self.write_entry(&stored).await?;
         Ok(true)

@@ -357,6 +357,118 @@ pub(crate) fn wrap_tenant_bus(
     }
 }
 
+/// Whether the session store holds every replica's sessions. In a fleet, a
+/// `memory` or `file` session store is each replica's own.
+pub(crate) fn sessions_fleet_visible(config: &crate::config::AppConfig) -> bool {
+    config.cluster.is_single_node()
+        || !matches!(
+            config
+                .mcp
+                .configurations
+                .sessions
+                .store
+                .as_ref()
+                .map(|store| store.kind.as_str()),
+            Some("memory" | "file")
+        )
+}
+
+/// What the watch engine shares the watchers of the fleet through: the
+/// coordinator's shard locks and the watch bus in a fleet, every shard on a
+/// single node.
+pub(crate) async fn watch_cluster(
+    config: &crate::config::AppConfig,
+    coordinator: Option<&std::sync::Arc<dyn mcpg_cluster_api::ClusterBackend>>,
+    state_cipher: &StateEncryption,
+    session_store: &std::sync::Arc<dyn crate::runtime::session_store::SessionStore>,
+) -> anyhow::Result<crate::runtime::watch_engine::WatchCluster> {
+    let sessions = std::sync::Arc::clone(session_store);
+    let session_alive: crate::runtime::watch_engine::SessionLiveness =
+        std::sync::Arc::new(move |session_id: &str| sessions.session_alive(session_id));
+    let tenant_segment = config.cluster.tenant_segment.clone();
+    if config.cluster.is_single_node() {
+        return Ok(crate::runtime::watch_engine::WatchCluster {
+            backend: None,
+            bus: None,
+            tenant_segment,
+            session_alive: Some(session_alive),
+        });
+    }
+    let bus = resolve_capability_bus(None, "watch", coordinator).await?;
+    let bus = wrap_tenant_bus(wrap_state_bus(bus, state_cipher), &tenant_segment);
+    Ok(crate::runtime::watch_engine::WatchCluster {
+        backend: coordinator.cloned(),
+        bus: Some(bus),
+        tenant_segment,
+        session_alive: Some(session_alive),
+    })
+}
+
+/// What the replicas tell each other the ends of sessions through: the
+/// coordinator's bus in a fleet that shares its sessions, nothing on a single
+/// node or where each replica keeps sessions of its own.
+pub(crate) async fn session_fleet(
+    config: &crate::config::AppConfig,
+    coordinator: Option<&std::sync::Arc<dyn mcpg_cluster_api::ClusterBackend>>,
+    state_cipher: &StateEncryption,
+) -> anyhow::Result<crate::runtime::session_fleet::SessionFleet> {
+    if config.cluster.is_single_node() || !sessions_fleet_visible(config) {
+        return Ok(crate::runtime::session_fleet::SessionFleet::default());
+    }
+    let bus = resolve_capability_bus(None, "sessions", coordinator).await?;
+    let bus = wrap_tenant_bus(
+        wrap_state_bus(bus, state_cipher),
+        &config.cluster.tenant_segment,
+    );
+    Ok(crate::runtime::session_fleet::SessionFleet::new(bus))
+}
+
+/// The cancellation bus a runtime publishes on and hears from: the
+/// coordinator's bus (or the `cancellation.bus` override), with a durable
+/// backstop in the coordinator's store for what the bus drops.
+pub(crate) async fn cancellation_bus(
+    config: &crate::config::AppConfig,
+    coordinator: Option<&std::sync::Arc<dyn mcpg_cluster_api::ClusterBackend>>,
+    state_cipher: &StateEncryption,
+) -> anyhow::Result<std::sync::Arc<dyn crate::runtime::cancellation_bus::CancellationBus>> {
+    let tenant_segment = &config.cluster.tenant_segment;
+    let pubsub = resolve_capability_bus(
+        config.mcp.configurations.cancellation.bus.as_ref(),
+        "cancellation",
+        coordinator,
+    )
+    .await?;
+    let pubsub = wrap_tenant_bus(wrap_state_bus(pubsub, state_cipher), tenant_segment);
+    // Durable backstop: mirror cancellations to the coordinator's KV so a
+    // subscriber that reconnects / restarts recovers events the at-most-once
+    // pub/sub path dropped. Single-node / no-coordinator gets an in-process
+    // MemoryKv, which still recovers MemoryBus lag drops. Wrapped too, so
+    // recovered cancellations are sealed at rest like every other capability
+    // store.
+    let backstop = wrap_tenant_kv(
+        wrap_state_kv(
+            default_capability_kv("cancellation", coordinator),
+            state_cipher,
+        ),
+        tenant_segment,
+    );
+    Ok(std::sync::Arc::new(
+        crate::runtime::cancellation_bus::BusBackedCancellationBus::new_with_backstop(
+            pubsub, backstop,
+        )
+        // Opt-in per-principal subject partitioning so broker-native subject
+        // ACLs can fence cancel traffic. Validated at boot to require a
+        // wildcard-capable bus (redis/nats).
+        .with_principal_partitioning(
+            config
+                .mcp
+                .configurations
+                .cancellation
+                .partition_by_principal,
+        ),
+    ))
+}
+
 /// Default `KeyValueStore` for a capability with no
 /// `<capability>.store:` override. Inherits the cluster coordinator's
 /// own `key_value_store()` accessor when one is available (single-node,

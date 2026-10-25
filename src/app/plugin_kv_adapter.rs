@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore};
+use mcpg_cluster_api::{ClusterError, Entry, KeyValueStore, KvPage};
 use mcpg_plugin_protocol::store::{Store, StoreError, StoreRole, StoreValue};
 
 /// Role-fixed bridge from a plugin-registered `Store` to the
@@ -127,6 +127,57 @@ impl KeyValueStore for StoreToKvAdapter {
         Ok(existed)
     }
 
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, ClusterError> {
+        // The plugin store picks its own page size. A store page longer
+        // than `limit` is cut, and the cursor records how much of it was
+        // returned, so the next call reads the same store page on.
+        let limit = limit.max(1);
+        let at: AdapterCursor = match cursor {
+            None => AdapterCursor::default(),
+            Some(c) => serde_json::from_str(c).map_err(|_| ClusterError::Precondition {
+                reason: format!("plugin store list: `{c}` is not a cursor of this store"),
+            })?,
+        };
+        let page = self
+            .store
+            .list(self.role.clone(), prefix, at.store.clone())
+            .await
+            .map_err(map_store_error)?;
+        let mut items: Vec<(String, Entry)> = page
+            .items
+            .into_iter()
+            .skip(at.skip)
+            .map(|(k, v)| (k, store_value_to_entry(v)))
+            .collect();
+        let next = if items.len() > limit {
+            items.truncate(limit);
+            Some(AdapterCursor {
+                store: at.store,
+                skip: at.skip + limit,
+            })
+        } else {
+            page.next_cursor.map(|store| AdapterCursor {
+                store: Some(store),
+                skip: 0,
+            })
+        };
+        let next = next
+            .map(|c| serde_json::to_string(&c))
+            .transpose()
+            .map_err(|e| ClusterError::Internal {
+                reason: format!("plugin store list cursor: {e}"),
+            })?;
+        Ok(KvPage {
+            entries: items,
+            next,
+        })
+    }
+
     async fn list_prefix(
         &self,
         prefix: &str,
@@ -224,6 +275,17 @@ impl KeyValueStore for StoreToKvAdapter {
     }
 }
 
+/// Where a [`StoreToKvAdapter::list_page`] pass stands: the plugin store's
+/// cursor of the store page being read, and how many of its items were
+/// returned already.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct AdapterCursor {
+    #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
+    store: Option<String>,
+    #[serde(rename = "k", default)]
+    skip: usize,
+}
+
 fn store_value_to_entry(value: StoreValue) -> Entry {
     let expires_at = value.ttl.map(|d| SystemTime::now() + d);
     Entry {
@@ -308,6 +370,29 @@ mod tests {
         }
         let entries = kv.list_prefix("k/", 3).await.unwrap();
         assert_eq!(entries.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_page_cuts_a_store_page_and_resumes_it() {
+        let kv = StoreToKvAdapter::new(memory_store(), StoreRole::Session);
+        for i in 0..10 {
+            kv.put(&format!("k/{i}"), Bytes::from(format!("{i}")), None)
+                .await
+                .unwrap();
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..20 {
+            let page = kv.list_page("k/", cursor.as_deref(), 3).await.unwrap();
+            assert!(page.entries.len() <= 3);
+            seen.extend(page.entries.into_iter().map(|(k, _)| k));
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none(), "the pass must end");
+        assert_eq!(seen.len(), 10, "every key once the pass ends: {seen:?}");
     }
 
     #[tokio::test]

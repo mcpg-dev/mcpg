@@ -900,7 +900,17 @@ impl GatewayRuntime {
                             )
                             .await
                         {
-                            Ok(crate::runtime::quota_gate::QuotaDecision::Allow { permit }) => {
+                            Ok(crate::runtime::quota_gate::QuotaDecision::Allow {
+                                permit,
+                                warnings,
+                            }) => {
+                                emit_quota_warnings(
+                                    &self.plugin_registry,
+                                    request_context,
+                                    &params.name,
+                                    &warnings,
+                                )
+                                .await;
                                 permit
                             }
                             Ok(crate::runtime::quota_gate::QuotaDecision::Deny {
@@ -1598,6 +1608,7 @@ impl GatewayRuntime {
                             .map(|s| s.request_state_codec.clone());
                         let owner_principal_for_task =
                             request_context.identity.principal_id().map(str::to_owned);
+                        let usage_charger_for_task = self.usage_charger();
                         tokio::spawn(async move {
                             let _cleanup =
                                 scopeguard_cancellation(tokens_registry, task_id_for_cleanup);
@@ -1837,6 +1848,10 @@ impl GatewayRuntime {
                             } else {
                                 dispatcher.dispatch_tool_call(route_clone, &exec_req, runtime_snap)
                             };
+                            let mut result = result;
+                            usage_charger_for_task
+                                .charge(&exec_req.context, &tool_name_for_task, &mut result)
+                                .await;
 
                             // Record the per-call sample
                             // for the task-augmented dispatch path.
@@ -2481,6 +2496,9 @@ impl GatewayRuntime {
                                 snapshot,
                             )
                         };
+                        self.usage_charger()
+                            .charge(request_context, &params.name, &mut result)
+                            .await;
                         if may_offer_link
                             && let Some(elicitation) = request_context.connect_link.take_offered()
                             && let Some(response) = self.connect_link_response(
@@ -2884,5 +2902,173 @@ impl GatewayRuntime {
             },
             Err(error) => self.map_session_error_to_protocol_response(error, Some(request_id)),
         }
+    }
+}
+
+/// Emit `governance.quota.warn` for each budget a call moved past its
+/// `warn_at_pct`.
+#[cfg(feature = "governance-quotas")]
+async fn emit_quota_warnings(
+    registry: &mcpg_plugin_host::PluginRegistry,
+    request_context: &RequestContext,
+    tool_name: &str,
+    warnings: &[crate::runtime::quota_gate::QuotaWarning],
+) {
+    for warning in warnings {
+        metrics::counter!(
+            "mcpg_quota_warnings_total",
+            "measure" => warning.measure,
+            "policy_id" => warning.policy_id.clone(),
+        )
+        .increment(1);
+        let event = mcpg_plugin_host::audit_events::quota_warn_event(
+            plugin_identity_from_request(request_context),
+            request_context.request_id.as_str(),
+            tool_name,
+            &warning.policy_id,
+            warning.measure,
+            warning.used,
+            warning.cap,
+            warning.warn_at_pct,
+        )
+        .with_upstream_request_id(request_context.upstream_request_id.clone());
+        let _ = registry.emit_audit_event(&event).await;
+    }
+}
+
+/// Charges the usage a backend reported with a call's result to the call's
+/// budget; built before a dispatch so a background task can carry it.
+pub(crate) struct UsageCharger {
+    #[cfg(feature = "governance-quotas")]
+    gate: Option<Arc<crate::runtime::quota_gate::QuotaGate>>,
+    registry: Arc<mcpg_plugin_host::PluginRegistry>,
+}
+
+impl GatewayRuntime {
+    pub(crate) fn usage_charger(&self) -> UsageCharger {
+        UsageCharger {
+            #[cfg(feature = "governance-quotas")]
+            gate: self.quota_gate.clone(),
+            registry: Arc::clone(&self.plugin_registry),
+        }
+    }
+}
+
+impl UsageCharger {
+    /// Take the usage the backend reported out of `result` and charge it.
+    /// The usage never reaches the client; a failed charge is logged, as
+    /// the call has already run.
+    pub(crate) async fn charge(
+        &self,
+        request_context: &RequestContext,
+        tool_name: &str,
+        result: &mut crate::protocol::ToolCallResult,
+    ) {
+        let Some(usage) = crate::runtime::execution::take_reported_usage(result) else {
+            return;
+        };
+        #[cfg(feature = "governance-quotas")]
+        if let Some(gate) = &self.gate {
+            match gate
+                .charge_usage(
+                    tool_name,
+                    request_context.session_id.as_deref(),
+                    &request_context.identity,
+                    &usage,
+                )
+                .await
+            {
+                Ok(warnings) => {
+                    emit_quota_warnings(&self.registry, request_context, tool_name, &warnings)
+                        .await;
+                }
+                Err(error) => {
+                    metrics::counter!("mcpg_quota_charge_failures_total").increment(1);
+                    warn!(%error, tool = %tool_name, "budget charge failed; the call's usage is not counted");
+                }
+            }
+        }
+        #[cfg(not(feature = "governance-quotas"))]
+        let _ = (usage, &self.registry, request_context, tool_name);
+    }
+}
+
+#[cfg(all(test, feature = "governance-quotas"))]
+mod usage_charger_tests {
+    use super::*;
+    use crate::config::quotas::{BackendQuotasRef, BudgetPolicy, QuotasConfig};
+    use crate::runtime::quota_gate::{QuotaDecision, QuotaGate, QuotaStore};
+
+    /// The charge takes the reported usage out of the result the client
+    /// gets, and counts it against the call's budget.
+    #[tokio::test]
+    async fn the_charge_takes_the_usage_out_and_counts_it() {
+        let mut quotas = QuotasConfig::default();
+        quotas.budgets.push(BudgetPolicy {
+            id: "tokens".into(),
+            kind: "token_count".into(),
+            scope: "global".into(),
+            identity_claim: None,
+            cap_usd: None,
+            cap_token_count: Some(100),
+            cap_calls: None,
+            window: "24h".into(),
+            warn_at_pct: None,
+            on_exceeded: "deny".into(),
+            acknowledge_unenforced: false,
+        });
+        let mut refs = std::collections::HashMap::new();
+        refs.insert(
+            "llm.tool".to_owned(),
+            BackendQuotasRef {
+                budget: Some("tokens".into()),
+                ..Default::default()
+            },
+        );
+        let gate = Arc::new(QuotaGate::new(
+            &quotas,
+            refs,
+            QuotaStore::new(Arc::new(
+                crate::builtins::cluster_primitives::MemoryKv::new(),
+            )),
+            true,
+        ));
+        let charger = UsageCharger {
+            gate: Some(Arc::clone(&gate)),
+            registry: Arc::new(mcpg_plugin_host::PluginRegistry::new()),
+        };
+        let context = RequestContext::new(
+            crate::runtime::GatewayRequestId::new(),
+            None,
+            None,
+            None,
+            RequestIdentity::Anonymous {
+                source: "test".to_owned(),
+            },
+            crate::runtime::TransportKind::Http,
+        );
+        let mut result = crate::protocol::ToolCallResult {
+            content: Vec::new(),
+            structured_content: None,
+            is_error: false,
+            meta: Some(serde_json::json!({
+                "audit": { "backend_kind": "openai.chat" },
+                crate::runtime::execution::USAGE_META_KEY: { "input_tokens": 70, "output_tokens": 40 },
+            })),
+        };
+        charger.charge(&context, "llm.tool", &mut result).await;
+
+        let meta = result.meta.expect("meta");
+        assert!(
+            meta.get(crate::runtime::execution::USAGE_META_KEY)
+                .is_none()
+        );
+        assert!(meta.get("audit").is_some());
+        assert!(matches!(
+            gate.evaluate_for_tool("llm.tool", None, &context.identity)
+                .await
+                .unwrap(),
+            QuotaDecision::Deny { .. }
+        ));
     }
 }

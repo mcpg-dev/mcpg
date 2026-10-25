@@ -2194,3 +2194,158 @@ fn structured_retry_classification_is_authoritative_over_transport_words() {
         &rc
     ));
 }
+
+/// A backend whose payload carries the call's usage.
+struct UsageReportingBackend {
+    manifest: mcpg_plugin_protocol::PluginManifest,
+}
+
+#[mcpg_plugin_protocol::async_trait]
+impl mcpg_plugin_protocol::BackendPlugin for UsageReportingBackend {
+    fn manifest(&self) -> &mcpg_plugin_protocol::PluginManifest {
+        &self.manifest
+    }
+    fn kind(&self) -> &str {
+        "usage.chat"
+    }
+    async fn register_profile(
+        &self,
+        _profile_name: &str,
+        _spec: &serde_json::Value,
+        _host: std::sync::Arc<dyn mcpg_plugin_protocol::BackendHost>,
+    ) -> Result<(), mcpg_plugin_protocol::BackendError> {
+        Ok(())
+    }
+    async fn execute(
+        &self,
+        _profile_name: &str,
+        request: mcpg_plugin_protocol::BackendRequest,
+    ) -> Result<mcpg_plugin_protocol::BackendResponse, mcpg_plugin_protocol::BackendError> {
+        let usage = mcpg_plugin_protocol::BackendUsage {
+            input_tokens: 12,
+            output_tokens: 30,
+            cost_usd: Some(0.004),
+        };
+        let result = serde_json::json!({"text": "hi"});
+        // As a real backend does: the envelope only for a host that takes it.
+        let value = if mcpg_plugin_protocol::BackendUsage::accepted_by(&request.headers) {
+            usage.wrap(result)
+        } else {
+            result
+        };
+        Ok(mcpg_plugin_protocol::BackendResponse {
+            payload: serde_json::to_vec(&value).unwrap(),
+            truncated: false,
+        })
+    }
+}
+
+/// The usage a backend reports leaves the result the client sees and
+/// waits in `_meta` for the budget charge, which takes it out.
+#[tokio::test(flavor = "multi_thread")]
+async fn reported_usage_leaves_the_result_for_the_charge() {
+    let plugin = UsageReportingBackend {
+        manifest: mcpg_plugin_protocol::PluginManifest {
+            id: "test.usage".into(),
+            version: "0.1.0".into(),
+            name: "usage".into(),
+            plugin_class: mcpg_plugin_protocol::PluginClass::Backend,
+            protocol_version: "1.0".to_owned(),
+            license: None,
+            required_capabilities: vec![],
+            tags: Vec::new(),
+            provides: Vec::new(),
+            provides_schemes: Vec::new(),
+            module_path_prefix: String::new(),
+            backend_profile: None,
+        },
+    };
+    let mut result = execute_binding_plugin("usage.chat", "p", &sample_request(), &plugin, None);
+    assert_eq!(
+        result.structured_content,
+        Some(serde_json::json!({"text": "hi"}))
+    );
+    assert_eq!(
+        serde_json::to_value(&result.content[0]).unwrap()["text"],
+        "{\"text\":\"hi\"}",
+        "the text content is the result alone"
+    );
+
+    let usage = take_reported_usage(&mut result).expect("usage in _meta");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (12, 30));
+    assert_eq!(usage.cost_usd, Some(0.004));
+    let meta = result.meta.expect("audit meta stays");
+    assert!(meta.get(USAGE_META_KEY).is_none());
+    assert!(meta.get("audit").is_some());
+}
+
+#[test]
+fn a_payload_without_usage_is_served_as_sent() {
+    let payload = br#"{"text":"plain"}"#;
+    let (served, usage) = split_reported_usage(payload);
+    assert_eq!(&*served, payload);
+    assert!(usage.is_none());
+    let (served, usage) = split_reported_usage(b"not json");
+    assert_eq!(&*served, b"not json");
+    assert!(usage.is_none());
+}
+
+/// Progress never goes back for one session and token, and a session that
+/// ends takes its progress state along, leaving every other session's.
+#[tokio::test(flavor = "multi_thread")]
+async fn progress_never_goes_back_and_ends_with_its_session() {
+    let bus = Arc::new(RecordingDeliveryBus::default());
+    let mut dispatcher = ExecutionDispatcher::default();
+    dispatcher.set_delivery_bus(Arc::clone(&bus) as Arc<dyn DeliveryBus>);
+    let context = |session: &str| {
+        RequestContext::new(
+            GatewayRequestId::new(),
+            None,
+            Some(session.to_owned()),
+            None,
+            RequestIdentity::Anonymous {
+                source: "test".to_owned(),
+            },
+            TransportKind::Http,
+        )
+    };
+    let token = serde_json::json!("t");
+    dispatcher.emit_pipeline_progress(&context("a"), &token, 2.0, 3.0);
+    dispatcher.emit_pipeline_progress(&context("a"), &token, 1.0, 3.0);
+    dispatcher.emit_pipeline_progress(&context("b"), &token, 2.0, 3.0);
+    dispatcher.clear_progress_state_for_session("a");
+    dispatcher.emit_pipeline_progress(&context("a"), &token, 1.0, 3.0);
+    dispatcher.emit_pipeline_progress(&context("b"), &token, 1.0, 3.0);
+
+    let mut emitted = Vec::new();
+    for _ in 0..100 {
+        emitted = bus
+            .published
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(session, message)| {
+                (
+                    session.clone(),
+                    message.jsonrpc_message["params"]["progress"]
+                        .as_f64()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        if emitted.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    emitted.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    assert_eq!(
+        emitted,
+        vec![
+            ("a".to_owned(), 1.0),
+            ("a".to_owned(), 2.0),
+            ("b".to_owned(), 2.0),
+        ],
+        "a back step is dropped; the end of `a` resets `a` alone"
+    );
+}

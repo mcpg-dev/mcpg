@@ -3,7 +3,8 @@ use super::*;
 impl GatewayRuntime {
     /// returns Err when adding a session for `principal_id` would
     /// breach the per-tenant cap; otherwise records the new session and
-    /// returns Ok.
+    /// returns Ok. The cap counts the fleet when the session store keeps
+    /// a count every replica shares, else this replica's sessions.
     pub(crate) fn try_acquire_tenant_session(
         &self,
         session_id: &str,
@@ -13,6 +14,21 @@ impl GatewayRuntime {
             return Ok(());
         }
         let tenant = principal_id.unwrap_or("anonymous").to_owned();
+        match self
+            .session_store
+            .claim_tenant_slot(session_id, self.max_sessions_per_tenant)
+        {
+            Some(true) => return Ok(()),
+            Some(false) => {
+                metrics::counter!(
+                    "mcpg_tenant_session_quota_rejected_total",
+                    "tenant" => tenant,
+                )
+                .increment(1);
+                return Err(());
+            }
+            None => {}
+        }
         let mut n = self
             .tenant_session_counts
             .entry(tenant.clone())
@@ -467,36 +483,27 @@ impl GatewayRuntime {
         id
     }
 
-    /// Terminate a session and cascade cleanup across all subsystems:
-    /// 1. Remove from session store  2. Release tenant quota  3. Purge progress state
-    /// 4. Clear completion rate-limiter bucket  5. Drop resource subscriptions
-    /// 6. Forget request-id uniqueness tracker  7. Cancel non-terminal tasks
-    /// 8. Record session duration metric.
+    /// Terminate a session and clean up after it here, and — when this
+    /// replica records the end — everywhere: see
+    /// [`Self::finish_ended_session`].
     pub fn terminate_session(&self, session_id: &str) -> bool {
-        // Load session before termination to record duration
-        let session_snapshot = self
-            .session_store
-            .load_session(Some(session_id), false)
-            .ok();
-        let removed = self.session_store.terminate_session(session_id);
-        if removed {
-            self.cascade_session_cleanup(session_id, session_snapshot, "terminated");
-        }
-        removed
+        let Some(ended) = self.session_store.terminate_session(session_id) else {
+            return false;
+        };
+        self.finish_ended_session(&ended);
+        true
     }
 
-    /// Runtime-side per-session cleanup for a session whose store row has
-    /// ALREADY been removed — by explicit [`Self::terminate_session`] or by
-    /// idle eviction (via [`Self::on_session_evicted`]). Releases tenant
-    /// quota, prunes progress / completion-limiter / subscription / request-id
-    /// state, cancels non-terminal tasks, and records the duration metric +
-    /// audit. `reason` distinguishes the caller ("terminated" / "idle_expired").
-    pub(crate) fn cascade_session_cleanup(
-        &self,
-        session_id: &str,
-        session_snapshot: Option<SessionSnapshot>,
-        reason: &str,
-    ) {
+    /// The cleanup after a session ended, whose store copy and rows are
+    /// already gone. Every replica drops what it keeps for the session
+    /// itself: its tenant count, progress state, completion-limiter bucket,
+    /// request-id tracker, and its holds on the session's subscriptions. The
+    /// replica that recorded the end also does what the replicas share,
+    /// once: it removes the session's subscriptions, cancels its non-terminal
+    /// tasks, records the duration metric and the audit event, and tells the
+    /// other replicas.
+    pub(crate) fn finish_ended_session(&self, ended: &EndedSession) {
+        let session_id = ended.session_id.as_str();
         // decrement the tenant counter.
         self.release_tenant_session(session_id);
         // prune progress monotonicity state for this session.
@@ -504,18 +511,23 @@ impl GatewayRuntime {
             .clear_progress_state_for_session(session_id);
         // prune the completion rate-limit token bucket keyed by session_id.
         self.completion_limiter.remove(session_id);
-        // Clean up subscriptions for this session. Through the service, not
-        // the store: dropping the rows alone leaves the watch engine still
-        // counting this session as a subscriber, so its watcher keeps polling
-        // a resource nobody is listening to for the life of the process.
-        self.subscriptions().release_session(session_id);
         // drop the request-id uniqueness tracker so a new session reusing the
         // id starts with a clean id-space.
         self.forget_session_request_ids(session_id);
+        // Through the service, not the store: dropping the rows alone leaves
+        // the watch engine still counting this session as a subscriber, so its
+        // watcher keeps polling a resource nobody is listening to for the life
+        // of the process.
+        if !ended.recorded {
+            self.subscriptions().release_session_here(session_id);
+            return;
+        }
+        self.subscriptions().release_session(session_id);
 
         // non-terminal tasks owned by the session would otherwise linger until
         // their TTL; the session ending is a valid terminal signal. `cancel_task`
         // is a no-op on already-terminal tasks.
+        let reason = ended.reason.as_str();
         if let Ok((tasks, _)) = self.task_store.list_tasks(session_id, None, usize::MAX) {
             for task in tasks {
                 if matches!(
@@ -550,56 +562,82 @@ impl GatewayRuntime {
         }
 
         metrics::gauge!("mcpg_active_sessions").decrement(1.0);
-        if let Some(snapshot) = session_snapshot {
-            let duration = (Utc::now() - snapshot.created_at).num_seconds().max(0) as f64;
-            metrics::histogram!("mcpg_session_duration_seconds").record(duration);
-            info!(
-                session_id = %session_id,
-                duration_secs = duration,
-                reason = %reason,
-                "session ended"
-            );
-            // Audit: fire-and-forget through the async audit fan-out. Auditors
-            // join opened ↔ ended by `details.session_id`.
-            let registry = Arc::clone(&self.plugin_registry);
-            let session_id_owned = session_id.to_owned();
-            let client_name = snapshot.client_info.name.clone();
-            let reason_owned = reason.to_owned();
-            tokio::spawn(async move {
-                let event = mcpg_plugin_host::audit_events::session_terminated_event(
-                    &session_id_owned,
-                    duration,
-                    &reason_owned,
-                    Some(&client_name),
-                );
-                let _ = registry.emit_audit_event(&event).await;
-            });
+        if ended.reason == session_store::SessionEndReason::IdleExpired {
+            metrics::counter!("mcpg_sessions_idle_expired_total").increment(1);
         }
+        let Some(snapshot) = ended.snapshot.as_ref() else {
+            return;
+        };
+        self.session_fleet
+            .tell_ended(session_id, snapshot.created_at, ended.reason);
+        let duration = (Utc::now() - snapshot.created_at).num_seconds().max(0) as f64;
+        metrics::histogram!("mcpg_session_duration_seconds").record(duration);
+        info!(
+            session_id = %session_id,
+            duration_secs = duration,
+            reason = %reason,
+            "session ended"
+        );
+        // Audit: fire-and-forget through the async audit fan-out. Auditors
+        // join opened ↔ ended by `details.session_id`.
+        let registry = Arc::clone(&self.plugin_registry);
+        let session_id_owned = session_id.to_owned();
+        let client_name = snapshot.client_info.name.clone();
+        let reason_owned = reason.to_owned();
+        tokio::spawn(async move {
+            let event = mcpg_plugin_host::audit_events::session_terminated_event(
+                &session_id_owned,
+                duration,
+                &reason_owned,
+                Some(&client_name),
+            );
+            let _ = registry.emit_audit_event(&event).await;
+        });
     }
 
-    /// Cascade cleanup for a session the store dropped due to idle expiry
-    /// (delivered on the eviction channel installed by
-    /// [`Self::install_session_eviction_notifier`]). Guards the narrow reuse
-    /// window: if a live session now holds this id (a client re-created it, or
-    /// a deterministic-modern id was re-derived), its id-keyed state is
-    /// legitimate and must not be wiped.
-    pub(crate) fn on_session_evicted(&self, session_id: &str) {
-        if self.session_store.contains_active_session(session_id) {
+    /// Clean up after a session that ended without a call to
+    /// [`Self::terminate_session`] (delivered on the channel installed by
+    /// [`Self::install_session_end_notifier`], or told by another replica).
+    /// Guards the narrow reuse window: if a live session now holds this id (a
+    /// client re-created it, or a deterministic-modern id was re-derived), its
+    /// id-keyed state is legitimate and must not be wiped.
+    pub(crate) fn on_session_end(&self, ended: &EndedSession) {
+        if self
+            .session_store
+            .contains_active_session(&ended.session_id)
+        {
             return;
         }
-        metrics::counter!("mcpg_sessions_idle_expired_total").increment(1);
-        self.cascade_session_cleanup(session_id, None, "idle_expired");
+        self.finish_ended_session(ended);
     }
 
-    /// Register the store→runtime idle-eviction cascade channel's sender on the
-    /// session store (called once at boot). The store forwards every
-    /// idle-evicted session id, which the drain task feeds to
-    /// [`Self::on_session_evicted`].
-    pub(crate) fn install_session_eviction_notifier(
+    /// Another replica recorded the end of a session: drop this replica's
+    /// copy, end the session's streams here, and clean up after it.
+    pub(crate) fn on_session_ended_elsewhere(&self, event: &session_fleet::SessionEndedEvent) {
+        let snapshot = self
+            .session_store
+            .drop_ended_session(&event.session_id, event.created_at);
+        metrics::counter!(
+            "mcpg_sessions_ended_elsewhere_total",
+            "held" => if snapshot.is_some() { "true" } else { "false" },
+        )
+        .increment(1);
+        self.on_session_end(&EndedSession {
+            session_id: event.session_id.clone(),
+            reason: event.reason,
+            recorded: false,
+            snapshot,
+        });
+    }
+
+    /// Register the channel on which the session store tells of the sessions
+    /// that end without a call to [`Self::terminate_session`] (called once at
+    /// boot); the drain task feeds each to [`Self::on_session_end`].
+    pub(crate) fn install_session_end_notifier(
         &self,
-        notifier: tokio::sync::mpsc::UnboundedSender<String>,
+        notifier: tokio::sync::mpsc::UnboundedSender<EndedSession>,
     ) {
-        self.session_store.set_eviction_notifier(notifier);
+        self.session_store.set_end_notifier(notifier);
     }
 
     pub fn session_protocol_version(&self, session_id: &str) -> Option<String> {
