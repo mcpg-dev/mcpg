@@ -1164,6 +1164,7 @@ impl GatewayRuntime {
             apps_federate_upstream: false,
             events_config: crate::config::EventsConfig::default(),
             tunnel_federation: None,
+            list_page_size: crate::config::mcp::DEFAULT_LIST_PAGE_SIZE,
             federated_events: Arc::new(tokio::sync::watch::channel(Arc::default()).0),
             apps_policy: None,
             gateway_apps: std::collections::BTreeMap::new(),

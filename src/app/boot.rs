@@ -505,6 +505,7 @@ async fn build_with(
         &apps_cfg.registry,
     );
     runtime.set_tunnel_federation(config.gateway.server.tunnel_federation.as_ref());
+    runtime.set_list_page_size(config.mcp.list_page_size());
     runtime.set_license_state((&license).into());
 
     // Install the concrete `GatewayBackendHost` on the late-bound host

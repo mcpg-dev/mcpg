@@ -1429,9 +1429,7 @@ fn execute_binding_plugin(
 
     let profile_owned = profile.to_owned();
     let started = std::time::Instant::now();
-    let result = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(plugin.execute(&profile_owned, binding_request))
-    });
+    let result = run_async_in_sync_context(plugin, &profile_owned, binding_request);
     let duration_ms = started.elapsed().as_millis() as u64;
 
     // Every backend dispatch lands on the audit lane (today metered

@@ -84,6 +84,7 @@ The session store is held outside the runtime in `AppState` and is **not rebuilt
 | `nats.*`, `redis.*`, `kafka.*` | Connection-side config for binding-side clients. | Reconnects pick up the new params. |
 | `storage.providers[]`, `storage.default` | Content-store provider registry. | Existing content URIs keep resolving against the previous provider until next dispatch. |
 | `mcp.capabilities.*[].mcp_app_url` | Resource UI link (CEL-templatable). | Rendered per-request, so picked up immediately. |
+| `mcp.list_page_size` | Entries one page of `tools/list`, `prompts/list`, `resources/list` and `resources/templates/list` holds. | The next list request pages at the new size; a cursor issued before the reload resumes at its offset. |
 
 ---
 

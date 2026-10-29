@@ -764,6 +764,131 @@ async fn mcp_tools_list_returns_registry_descriptors() {
     assert!(body.contains("mcpg.runtime.snapshot"));
 }
 
+/// Five tools under `mcp.list_page_size: 2`: every `tools/list` page holds at
+/// most two, and following `nextCursor` reaches all five, on both wires.
+#[tokio::test]
+async fn a_tools_list_page_holds_the_configured_list_page_size() {
+    let names: Vec<String> = (0..5).map(|i| format!("paged-{i}")).collect();
+    let state = build_test_state_with_all_runtime_controls_mut(
+        false,
+        RuntimeDebugConfig::default(),
+        names
+            .iter()
+            .map(|name| test_command_binding(name))
+            .collect(),
+        ToolAccessPolicyConfig::default(),
+        |runtime| runtime.set_list_page_size(2),
+    );
+    install_protocol_registry_for_tests(&state);
+    let app = router(state, "/health", "/mcp");
+
+    let mut stateless = Vec::new();
+    let mut cursor: Option<String> = None;
+    for id in 1..=10 {
+        let mut params = serde_json::json!({ "_meta": modern_meta() });
+        if let Some(cursor) = &cursor {
+            params["cursor"] = cursor.clone().into();
+        }
+        let response = app
+            .clone()
+            .oneshot(stateless_only_post(
+                &[
+                    ("mcp-protocol-version", "2026-07-28"),
+                    ("mcp-method", "tools/list"),
+                    (SUBJECT_ID_HEADER, "user-1"),
+                ],
+                serde_json::json!({
+                    "jsonrpc": "2.0", "id": id, "method": "tools/list", "params": params
+                }),
+            ))
+            .await
+            .unwrap();
+        let result = response_json(response).await["result"].clone();
+        let tools = result["tools"].as_array().expect("a tools page").clone();
+        assert!(tools.len() <= 2, "a page of {}: {result}", tools.len());
+        stateless.extend(tools.iter().map(|t| t["name"].as_str().unwrap().to_owned()));
+        cursor = result["nextCursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none(), "the walk ends");
+    for name in &names {
+        assert!(stateless.contains(name), "{name} in {stateless:?}");
+    }
+
+    let (app, session_id) = initialize_session(app).await;
+    let mut legacy = Vec::new();
+    let mut cursor: Option<String> = None;
+    for id in 11..=20 {
+        let mut params = serde_json::json!({});
+        if let Some(cursor) = &cursor {
+            params["cursor"] = cursor.clone().into();
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+                    .header(
+                        PROTOCOL_VERSION_HEADER,
+                        crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                    )
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .header(SUBJECT_ID_HEADER, "user-1")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": id, "method": "tools/list", "params": params
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let message = extract_jsonrpc_from_sse(&response_text(response).await, id);
+        let tools = message["result"]["tools"]
+            .as_array()
+            .expect("a tools page")
+            .clone();
+        assert!(tools.len() <= 2, "a page of {}: {message}", tools.len());
+        legacy.extend(tools.iter().map(|t| t["name"].as_str().unwrap().to_owned()));
+        cursor = message["result"]["nextCursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert!(cursor.is_none(), "the walk ends");
+    assert_eq!(legacy, stateless, "both wires page the same list");
+}
+
+/// A reload applies `mcp.list_page_size`, and refuses a size out of range.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reload_applies_the_list_page_size() {
+    let state = build_test_state();
+    assert_eq!(
+        state.runtime.load().list_page_size(),
+        crate::config::mcp::DEFAULT_LIST_PAGE_SIZE
+    );
+    let base = "gateway:\n  server:\n    bind_address: \"127.0.0.1:0\"\n";
+    crate::app::reload_config_from_yaml(&state, &format!("{base}mcp:\n  list_page_size: 2\n"))
+        .await
+        .expect("reload");
+    assert_eq!(state.runtime.load().list_page_size(), 2);
+
+    crate::app::reload_config_from_yaml(&state, &format!("{base}mcp:\n  list_page_size: 0\n"))
+        .await
+        .expect_err("a page of 0 is refused");
+    assert_eq!(
+        state.runtime.load().list_page_size(),
+        2,
+        "the refused reload kept 2"
+    );
+}
+
 #[tokio::test]
 async fn mcp_prompts_list_returns_registry_descriptors() {
     let (app, session_id) = initialize_session(router(build_test_state(), "/health", "/mcp")).await;

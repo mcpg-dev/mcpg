@@ -298,8 +298,8 @@ async fn writer_loop(
 ) {
     // Hex-encoded SHA-256 of the most recently *durably persisted*
     // event. `None` before the first event (genesis). Advanced as each
-    // line is written within a batch, then rolled back if the batch's
-    // fsync fails so a retry re-derives from the last durable hash.
+    // line of a batch is encoded, then rolled back if the batch's write
+    // or fsync fails so a retry re-derives from the last durable hash.
     let mut last_hash: Option<String> = None;
     let mut open_id = open_file_id(&file).await;
 
@@ -323,6 +323,7 @@ async fn writer_loop(
         let mut write_replies: Vec<(oneshot::Sender<Result<AuditReceipt, AuditError>>, String)> =
             Vec::new();
         let mut flush_replies: Vec<oneshot::Sender<Result<(), AuditError>>> = Vec::new();
+        let mut lines: Vec<u8> = Vec::new();
 
         for cmd in batch {
             match cmd {
@@ -335,16 +336,10 @@ async fn writer_loop(
                         }
                     };
                     let durable_hash = sha256_hex(&bytes);
-                    let mut line = bytes;
-                    line.push(b'\n');
-                    if let Err(e) = file.write_all(&line).await {
-                        let _ = reply.send(Err(AuditError::WriteFailed {
-                            reason: format!("write audit event: {e}"),
-                        }));
-                        continue;
-                    }
+                    lines.extend_from_slice(&bytes);
+                    lines.push(b'\n');
                     // Chain advances for subsequent events in the batch;
-                    // made durable by the single fsync below.
+                    // made durable by the single write and fsync below.
                     last_hash = Some(durable_hash.clone());
                     write_replies.push((reply, durable_hash));
                 }
@@ -352,8 +347,16 @@ async fn writer_loop(
             }
         }
 
-        // One fsync for the whole batch — the group-commit payoff.
-        match file.sync_all().await {
+        // One write and one fsync for the whole batch — the group-commit
+        // payoff: each write of a tokio `File` is a blocking-pool hand-off.
+        let committed = match file.write_all(&lines).await {
+            Ok(()) => file
+                .sync_all()
+                .await
+                .map_err(|e| format!("fsync audit log: {e}")),
+            Err(e) => Err(format!("write audit log: {e}")),
+        };
+        match committed {
             Ok(()) => {
                 let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
                 for (reply, durable_hash) in write_replies {
@@ -367,12 +370,11 @@ async fn writer_loop(
                     let _ = reply.send(Ok(()));
                 }
             }
-            Err(e) => {
+            Err(reason) => {
                 // The batch is not durable. Roll the chain back to the
                 // last durable hash and fail every waiter (FailClosed-safe:
                 // no request proceeds without a durable audit trail).
                 last_hash = chain_before;
-                let reason = format!("fsync audit log: {e}");
                 for (reply, _) in write_replies {
                     let _ = reply.send(Err(AuditError::WriteFailed {
                         reason: reason.clone(),

@@ -1164,18 +1164,7 @@ impl KvBackedSessionStore {
     where
         F: std::future::Future<Output = T>,
     {
-        use tokio::runtime::{Handle, RuntimeFlavor};
-        match Handle::try_current() {
-            Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| h.block_on(fut))
-            }
-            // current_thread runtime (e.g. default `#[tokio::test]`) or no
-            // tokio context: fall back to a thread-local executor. Safe for
-            // primitives that don't require the tokio reactor (e.g. MemoryKv);
-            // real I/O backends (Redis, NATS) only run under multi-thread
-            // runtimes in production.
-            _ => futures::executor::block_on(fut),
-        }
+        super::block_on_store(fut)
     }
 
     /// How long a row lives after its last write.

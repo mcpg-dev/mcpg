@@ -97,10 +97,24 @@ pub struct McpConfig {
     /// own text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+
+    /// How many entries one page of `tools/list`, `prompts/list`,
+    /// `resources/list` and `resources/templates/list` holds, on every wire;
+    /// a client follows `nextCursor` for the rest. 1 to 1 000; unset is 100.
+    /// A client that reads only the first page sees only this many.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1_000))]
+    pub list_page_size: Option<usize>,
 }
 
 /// Longest `mcp.instructions` the gateway accepts, in bytes.
 pub const MAX_INSTRUCTIONS_BYTES: usize = 64 * 1024;
+
+/// Entries a list page holds when `mcp.list_page_size` is unset.
+pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
+
+/// Largest `mcp.list_page_size` the gateway accepts.
+pub const MAX_LIST_PAGE_SIZE: usize = 1_000;
 
 /// `mcp.server_info:` — the operator's `serverInfo` fields.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -193,7 +207,18 @@ impl McpConfig {
         self.validate_federations()?;
         self.validate_registries()?;
         self.validate_identity()?;
+        if let Some(size) = self.list_page_size
+            && !(1..=MAX_LIST_PAGE_SIZE).contains(&size)
+        {
+            anyhow::bail!("mcp.list_page_size is {size}; it must be 1 to {MAX_LIST_PAGE_SIZE}");
+        }
         Ok(())
+    }
+
+    /// Entries one page of a list holds: `list_page_size`, else
+    /// [`DEFAULT_LIST_PAGE_SIZE`].
+    pub fn list_page_size(&self) -> usize {
+        self.list_page_size.unwrap_or(DEFAULT_LIST_PAGE_SIZE)
     }
 
     /// Refuse a blank server name and instructions above
@@ -592,6 +617,30 @@ mod tests {
             ..Default::default()
         };
         fits.validate().expect("4 KiB of instructions is accepted");
+    }
+
+    #[test]
+    fn a_list_page_size_is_one_to_the_maximum() {
+        assert_eq!(
+            McpConfig::default().list_page_size(),
+            DEFAULT_LIST_PAGE_SIZE
+        );
+        for size in [0, MAX_LIST_PAGE_SIZE + 1] {
+            let config = McpConfig {
+                list_page_size: Some(size),
+                ..Default::default()
+            };
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("mcp.list_page_size"), "{err}");
+        }
+        for size in [1, 200, MAX_LIST_PAGE_SIZE] {
+            let config = McpConfig {
+                list_page_size: Some(size),
+                ..Default::default()
+            };
+            config.validate().expect("in range");
+            assert_eq!(config.list_page_size(), size);
+        }
     }
 
     #[test]

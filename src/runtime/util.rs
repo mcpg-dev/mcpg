@@ -8,9 +8,6 @@ pub(crate) struct CancellationCleanup {
     target_id: String,
 }
 
-/// Default page size for cursor-based list pagination.
-pub(crate) const DEFAULT_PAGE_SIZE: usize = 100;
-
 /// Bindings whose backend kind opts into dynamic `resources/list`
 /// enumeration via its manifest [`BackendProfile::dynamic_list`] flag. A
 /// kind that does not declare `dynamic_list` is skipped so the gateway does

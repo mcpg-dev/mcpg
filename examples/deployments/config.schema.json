@@ -5703,6 +5703,16 @@
             "null"
           ]
         },
+        "list_page_size": {
+          "description": "How many entries one page of `tools/list`, `prompts/list`, `resources/list` and `resources/templates/list` holds, on every wire; a client follows `nextCursor` for the rest. 1 to 1 000; unset is 100. A client that reads only the first page sees only this many.",
+          "format": "uint",
+          "maximum": 1000,
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "registries": {
           "default": [],
           "description": "MCP registries whose listed servers MCPG auto-federates: a background syncer crawls each registry's `/v0.1` API and materializes one federation per usable server, kept in sync as the registry changes. Default empty.",

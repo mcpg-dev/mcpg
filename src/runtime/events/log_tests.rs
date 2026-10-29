@@ -150,8 +150,10 @@ async fn a_row_or_head_of_a_newer_format_is_never_misread() {
     kv.put(&key, Bytes::from(r#"{"v":2,"seq":1,"shape":"new"}"#), None)
         .await
         .unwrap();
+    // Another process: the writer reads its own rows from memory.
+    let reader = log_over(&kv);
     assert_eq!(
-        log.read(SK, 0, 10).await.unwrap(),
+        reader.read(SK, 0, 10).await.unwrap(),
         vec![LogEntry::Unreadable { seq: 1 }]
     );
     kv.put(
@@ -166,6 +168,120 @@ async fn a_row_or_head_of_a_newer_format_is_never_misread() {
         Err(LogError::NewerFormat)
     ));
     assert!(matches!(log.head(SK).await, Err(LogError::NewerFormat)));
+}
+
+/// A store that counts the log rows it serves, each after a millisecond, so
+/// that concurrent readers overlap.
+#[derive(Debug, Default)]
+struct RowReadCountingKv {
+    inner: MemoryKv,
+    row_gets: std::sync::atomic::AtomicUsize,
+}
+
+type KvResult<T> = Result<T, ClusterError>;
+
+#[async_trait::async_trait]
+impl KeyValueStore for RowReadCountingKv {
+    async fn get(&self, key: &str) -> KvResult<Option<mcpg_cluster_api::Entry>> {
+        if key.starts_with("ev:log:") {
+            self.row_gets
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>) -> KvResult<()> {
+        self.inner.put(key, value, ttl).await
+    }
+
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> KvResult<bool> {
+        self.inner.put_if_absent(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> KvResult<bool> {
+        self.inner.delete(key).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> KvResult<mcpg_cluster_api::KvPage> {
+        self.inner.list_page(prefix, cursor, limit).await
+    }
+
+    async fn expire(&self, key: &str, ttl: Option<Duration>) -> KvResult<bool> {
+        self.inner.expire(key, ttl).await
+    }
+
+    async fn incr(&self, key: &str, delta: i64, ttl: Option<Duration>) -> KvResult<i64> {
+        self.inner.incr(key, delta, ttl).await
+    }
+}
+
+#[tokio::test]
+async fn the_streams_a_head_wakes_together_read_each_row_from_the_store_once() {
+    let kv = Arc::new(RowReadCountingKv::default());
+    let store: Arc<dyn KeyValueStore> = kv.clone();
+    let writer = EventLog::new(Arc::clone(&store), None, keys());
+    for n in 0..10 {
+        writer
+            .append(SK, occ(&format!("e{n}")), &retention(), lease(1))
+            .await
+            .unwrap();
+    }
+    // Another process, whose memory holds none of the rows.
+    let reader = EventLog::new(store, None, keys());
+    let before = kv.row_gets.load(std::sync::atomic::Ordering::SeqCst);
+    let reads = futures::future::join_all((0..16).map(|_| reader.read_rows(SK, 1, 10))).await;
+    for rows in reads {
+        assert_eq!(seqs(&rows.unwrap()), (1..=10).collect::<Vec<u64>>());
+    }
+    assert_eq!(
+        kv.row_gets.load(std::sync::atomic::Ordering::SeqCst) - before,
+        10,
+        "16 readers of the same rows read each from the store once"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_log_is_never_read_from_memory() {
+    let kv = store();
+    let reader = log_over(&kv);
+    let writer = log_over(&kv);
+    for id in ["a", "b"] {
+        writer
+            .append(SK, occ(id), &retention(), lease(1))
+            .await
+            .unwrap();
+    }
+    let before = reader.bounds(SK).await.unwrap();
+    assert_eq!(seqs(&reader.read_rows(SK, 1, 2).await.unwrap()), vec![1, 2]);
+    for key in [
+        format!("ev:head:{SK}"),
+        format!("ev:epoch:{SK}"),
+        format!("ev:log:{SK}:{:020}", 1),
+        format!("ev:log:{SK}:{:020}", 2),
+    ] {
+        kv.delete(&key).await.unwrap();
+    }
+    log_over(&kv)
+        .append(SK, occ("x"), &retention(), lease(2))
+        .await
+        .unwrap();
+    assert_ne!(reader.bounds(SK).await.unwrap().epoch, before.epoch);
+    let rows = reader.read_rows(SK, 1, 2).await.unwrap();
+    assert!(
+        matches!(&rows[..], [LogEntry::Row(row)] if matches!(&row.body, RowBody::Event(o) if o.event_id == "x")),
+        "{rows:?}"
+    );
 }
 
 #[tokio::test]

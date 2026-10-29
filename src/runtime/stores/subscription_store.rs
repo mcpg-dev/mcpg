@@ -465,13 +465,7 @@ impl KvBackedSubscriptionStore {
     where
         F: std::future::Future<Output = T>,
     {
-        use tokio::runtime::{Handle, RuntimeFlavor};
-        match Handle::try_current() {
-            Ok(h) if h.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| h.block_on(fut))
-            }
-            _ => futures::executor::block_on(fut),
-        }
+        super::block_on_store(fut)
     }
 
     fn write(

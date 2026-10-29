@@ -41,9 +41,21 @@ impl GatewayRuntime {
             &curated_tools,
             cursor,
             Some(&self.cursor_binding_key(request_context)),
+            self.list_page_size(),
         );
         self.hide_pap_operation_output_schemas(request_context, &mut page);
         (page, next_cursor)
+    }
+
+    /// Entries one page of a list holds: `mcp.list_page_size` of the config
+    /// this runtime was built from.
+    pub(crate) fn list_page_size(&self) -> usize {
+        self.list_page_size
+    }
+
+    /// Set the entries one page of a list holds.
+    pub fn set_list_page_size(&mut self, size: usize) {
+        self.list_page_size = size.max(1);
     }
 
     /// Enumerate the prompt catalog page for a request. Mirror of
@@ -77,6 +89,7 @@ impl GatewayRuntime {
             &all_prompts,
             cursor,
             Some(&self.cursor_binding_key(request_context)),
+            self.list_page_size(),
         )
     }
 
@@ -122,6 +135,7 @@ impl GatewayRuntime {
         cursor: Option<&str>,
     ) -> (Vec<crate::backends::ResourceDescriptor>, Option<String>) {
         let bind_key = self.cursor_binding_key(request_context);
+        let page_size = self.list_page_size();
         let mut all_resources = self.capability_registry.resources();
         // Gateway-authored apps are synthetic resources held
         // on the runtime, not in the capability registry — surface them
@@ -142,7 +156,8 @@ impl GatewayRuntime {
         let (mut page, outgoing_static, outgoing_dyn);
         match composite {
             None if cursor.is_none() => {
-                let (p, next_static) = paginate_list_bound(&all_resources, None, Some(&bind_key));
+                let (p, next_static) =
+                    paginate_list_bound(&all_resources, None, Some(&bind_key), page_size);
                 page = p;
                 let static_offset = next_static
                     .as_deref()
@@ -158,7 +173,8 @@ impl GatewayRuntime {
                 outgoing_dyn = remaining;
             }
             None => {
-                let (p, next_static) = paginate_list_bound(&all_resources, cursor, Some(&bind_key));
+                let (p, next_static) =
+                    paginate_list_bound(&all_resources, cursor, Some(&bind_key), page_size);
                 page = p;
                 outgoing_static = next_static
                     .as_deref()
@@ -173,6 +189,7 @@ impl GatewayRuntime {
                         &all_resources,
                         Some(&cursor_for_static),
                         Some(&bind_key),
+                        page_size,
                     );
                     page = p;
                     outgoing_static = next_static
@@ -236,6 +253,7 @@ impl GatewayRuntime {
             &all_templates,
             cursor,
             Some(&self.cursor_binding_key(request_context)),
+            self.list_page_size(),
         )
     }
 

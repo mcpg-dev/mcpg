@@ -22,14 +22,20 @@
 //! Readers never read past the head and read rows with point gets. Sequence
 //! numbers start at 1; head 0 is an empty log.
 //!
+//! A row never changes once written, so a process keeps the recent rows it
+//! wrote or read, and its readers read each from the store once. An inbox
+//! drain appends its rows under one hold of the log and moves the head after
+//! every [`HEAD_EVERY`] rows.
+//!
 //! Every value carries `v: 1`. A row with a higher version is unreadable and
 //! is reported as such, never guessed at.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
 use mcpg_cluster_api::{ClusterError, KeyValueStore, PubSub};
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
@@ -59,6 +65,58 @@ pub const DRAIN_BATCH: u64 = 256;
 /// How long the drainer waits for a reserved inbox slot to be written
 /// before it skips the slot.
 pub const INBOX_HOLE_GRACE: Duration = Duration::from_secs(30);
+/// Rows a drain appends before it moves the head, so readers see them.
+pub const HEAD_EVERY: usize = 32;
+/// Store operations a drain or a read runs at once.
+const PARALLEL_OPS: usize = 16;
+/// Recent rows of one log a process keeps for its readers, and their bytes.
+const CACHED_ROWS: usize = 1_024;
+const CACHED_ROW_BYTES: u64 = 1024 * 1024;
+/// How old the bounds one reader takes from another's read may be.
+const BOUNDS_FRESH: Duration = Duration::from_secs(2);
+
+/// The recent rows of one log, by sequence number.
+#[derive(Default)]
+struct RowCache {
+    rows: BTreeMap<u64, Arc<LogRow>>,
+    bytes: u64,
+    /// The epoch the rows belong to, once a read of the bounds saw it.
+    epoch: Option<u64>,
+}
+
+impl RowCache {
+    /// Forget every row when `epoch` is not theirs: a lost log gets another
+    /// epoch and numbers its rows from 1 again.
+    fn keep_epoch(&mut self, epoch: u64) {
+        if self.epoch != Some(epoch) {
+            self.rows.clear();
+            self.bytes = 0;
+            self.epoch = Some(epoch);
+        }
+    }
+
+    fn insert(&mut self, row: LogRow) {
+        let bytes = row.bytes.max(1);
+        if let Some(old) = self.rows.insert(row.seq, Arc::new(row)) {
+            self.bytes = self.bytes.saturating_sub(old.bytes.max(1));
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        while self.rows.len() > CACHED_ROWS || self.bytes > CACHED_ROW_BYTES {
+            let Some((_, oldest)) = self.rows.pop_first() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(oldest.bytes.max(1));
+        }
+    }
+
+    /// Forget the rows below `floor`, which retention removed.
+    fn drop_below(&mut self, floor: u64) {
+        let kept = self.rows.split_off(&floor);
+        for (_, row) in std::mem::replace(&mut self.rows, kept) {
+            self.bytes = self.bytes.saturating_sub(row.bytes.max(1));
+        }
+    }
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -510,6 +568,9 @@ pub struct EventLog {
     heads: Mutex<HashMap<String, watch::Sender<u64>>>,
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     holes: Mutex<HashMap<String, (u64, std::time::Instant)>>,
+    rows: Mutex<HashMap<String, RowCache>>,
+    /// The bounds last read of each log, and when.
+    bounds_seen: Mutex<HashMap<String, (LogBounds, Instant)>>,
 }
 
 impl std::fmt::Debug for EventLog {
@@ -531,7 +592,42 @@ impl EventLog {
             heads: Mutex::new(HashMap::new()),
             locks: Mutex::new(HashMap::new()),
             holes: Mutex::new(HashMap::new()),
+            rows: Mutex::new(HashMap::new()),
+            bounds_seen: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn cached_row(&self, sk: &str, seq: u64) -> Option<Arc<LogRow>> {
+        self.rows
+            .lock()
+            .get(sk)
+            .and_then(|cache| cache.rows.get(&seq).cloned())
+    }
+
+    /// Every row from `start` to `end` when memory holds them all.
+    fn cached_rows(&self, sk: &str, start: u64, end: u64) -> Option<Vec<LogEntry>> {
+        let rows: Vec<Arc<LogRow>> = {
+            let caches = self.rows.lock();
+            let cache = caches.get(sk)?;
+            cache
+                .rows
+                .range(start..=end)
+                .map(|(_, row)| Arc::clone(row))
+                .collect()
+        };
+        (rows.len() as u64 == (end - start).saturating_add(1)).then(|| {
+            rows.into_iter()
+                .map(|row| LogEntry::Row((*row).clone()))
+                .collect()
+        })
+    }
+
+    fn cache_row(&self, sk: &str, row: LogRow) {
+        self.rows
+            .lock()
+            .entry(sk.to_owned())
+            .or_default()
+            .insert(row);
     }
 
     /// The keys this log hashes with and seals cursors under.
@@ -596,15 +692,46 @@ impl EventLog {
         let epoch = self.epoch(sk).await?;
         let head = self.head(sk).await?.map_or(0, |h| h.seq);
         let floor = self.floor(sk).await?;
-        Ok(LogBounds { epoch, floor, head })
+        let bounds = LogBounds { epoch, floor, head };
+        self.rows
+            .lock()
+            .entry(sk.to_owned())
+            .or_default()
+            .keep_epoch(epoch);
+        self.bounds_seen
+            .lock()
+            .insert(sk.to_owned(), (bounds, Instant::now()));
+        Ok(bounds)
+    }
+
+    /// Bounds whose head is at least `head`: those this process read last,
+    /// when they reach it and are at most [`BOUNDS_FRESH`] old, else read
+    /// now. The streams of a log share one read of its bounds this way.
+    pub async fn bounds_since(&self, sk: &str, head: u64) -> Result<LogBounds, LogError> {
+        let seen = self.bounds_seen.lock().get(sk).copied();
+        match seen {
+            Some((bounds, at)) if bounds.head >= head && at.elapsed() <= BOUNDS_FRESH => Ok(bounds),
+            _ => self.bounds(sk).await,
+        }
     }
 
     /// The row at `seq`, if it is still there.
     pub async fn get(&self, sk: &str, seq: u64) -> Result<Option<LogEntry>, LogError> {
+        if let Some(row) = self.cached_row(sk, seq) {
+            return Ok(Some(LogEntry::Row((*row).clone())));
+        }
+        self.fetch(sk, seq).await
+    }
+
+    /// The row at `seq` as the store holds it.
+    async fn fetch(&self, sk: &str, seq: u64) -> Result<Option<LogEntry>, LogError> {
         match self.kv.get(&LogKeys::new(sk).row(seq)).await? {
             None => Ok(None),
             Some(entry) => Ok(Some(match decode::<LogRow>(&entry.bytes)? {
-                Some(row) => LogEntry::Row(row),
+                Some(row) => {
+                    self.cache_row(sk, row.clone());
+                    LogEntry::Row(row)
+                }
                 None => LogEntry::Unreadable { seq },
             })),
         }
@@ -617,15 +744,33 @@ impl EventLog {
         let floor = self.floor(sk).await?;
         let start = after.saturating_add(1).max(floor);
         let end = head.min(after.saturating_add(max as u64));
-        let mut out = Vec::new();
-        let mut seq = start;
-        while seq <= end {
-            if let Some(entry) = self.get(sk, seq).await? {
-                out.push(entry);
-            }
-            seq += 1;
+        self.read_rows(sk, start, end).await
+    }
+
+    /// The rows from `start` to `end`, both included, that are still there,
+    /// for a reader that read the bounds itself; [`PARALLEL_OPS`] at once.
+    /// One reader of a log reads the rows memory lacks at a time, so the
+    /// streams a head wakes together read each row from the store once.
+    pub async fn read_rows(
+        &self,
+        sk: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<LogEntry>, LogError> {
+        if start > end {
+            return Ok(Vec::new());
         }
-        Ok(out)
+        if let Some(rows) = self.cached_rows(sk, start, end) {
+            return Ok(rows);
+        }
+        let fill = self.lock_for(&format!("fill:{sk}"));
+        let _fill = fill.lock().await;
+        let rows: Vec<Option<LogEntry>> = futures::stream::iter(start..=end)
+            .map(|seq| self.get(sk, seq))
+            .buffered(PARALLEL_OPS)
+            .try_collect()
+            .await?;
+        Ok(rows.into_iter().flatten().collect())
     }
 
     /// Where a reader with `cursor` starts.
@@ -948,6 +1093,125 @@ impl EventLog {
         Ok(AppendOutcome::Appended { seq, bytes })
     }
 
+    /// Append `occurrences` in order, each as [`Self::append`] would, under
+    /// one hold of the log: their dedup markers read at once, the head read
+    /// once and moved after every [`HEAD_EVERY`] rows, the new markers
+    /// written at once once the head covers their rows. A failure leaves the
+    /// rows before it committed and marked, so a drain that runs the same
+    /// inbox rows again appends none of them twice.
+    pub async fn append_many(
+        &self,
+        sk: &str,
+        occurrences: Vec<StoredOccurrence>,
+        retention: &EventRetentionConfig,
+        lease: WriterLease,
+    ) -> Result<Vec<AppendOutcome>, LogError> {
+        if occurrences.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lock = self.lock_for(sk);
+        let _guard = lock.lock().await;
+        let keys = LogKeys::new(sk);
+        let eids: Vec<String> = occurrences
+            .iter()
+            .map(|occurrence| dedup_key(&self.keys, occurrence))
+            .collect();
+        let markers: Vec<String> = eids.iter().map(|eid| keys.eid(eid)).collect();
+        let seen: Vec<bool> = futures::stream::iter(markers)
+            .map(|key| async move { self.kv.get(&key).await.map(|found| found.is_some()) })
+            .buffered(PARALLEL_OPS)
+            .try_collect()
+            .await?;
+        let now = now_ms();
+        if lease.expires_at_ms <= now {
+            return Err(LogError::LeaseExpired);
+        }
+        let mut head = self.writer_head(&keys, lease, now).await?;
+        let mut in_batch = HashSet::new();
+        let mut outcomes = Vec::with_capacity(occurrences.len());
+        let mut unmarked: Vec<(String, u64)> = Vec::new();
+        let mut written = 0usize;
+        for ((occurrence, eid), seen) in occurrences.into_iter().zip(eids).zip(seen) {
+            if seen || !in_batch.insert(eid.clone()) {
+                metrics::counter!("mcpg_events_deduped_total").increment(1);
+                outcomes.push(AppendOutcome::Duplicate);
+                continue;
+            }
+            let row = if lease.expires_at_ms <= now_ms() {
+                Err(LogError::LeaseExpired)
+            } else {
+                self.write_row(
+                    &keys,
+                    &mut head,
+                    RowBody::Event(occurrence),
+                    retention,
+                    lease,
+                    now,
+                )
+                .await
+            };
+            let (seq, bytes) = match row {
+                Ok(row) => row,
+                Err(error) => {
+                    if written > 0 {
+                        // Best effort: the error below is what the caller acts on.
+                        let _ = self
+                            .commit_marked(&keys, &head, &mut unmarked, retention, lease)
+                            .await;
+                    }
+                    return Err(error);
+                }
+            };
+            metrics::counter!("mcpg_events_appended_total").increment(1);
+            outcomes.push(AppendOutcome::Appended { seq, bytes });
+            unmarked.push((eid, seq));
+            written += 1;
+            if unmarked.len() >= HEAD_EVERY {
+                self.commit_marked(&keys, &head, &mut unmarked, retention, lease)
+                    .await?;
+            }
+        }
+        if !unmarked.is_empty() {
+            self.commit_marked(&keys, &head, &mut unmarked, retention, lease)
+                .await?;
+        }
+        Ok(outcomes)
+    }
+
+    /// Commit `head`, then write the dedup markers of the rows it now
+    /// covers. Not past `lease`: an expired writer leaves its rows for the
+    /// next one to adopt.
+    async fn commit_marked(
+        &self,
+        keys: &LogKeys,
+        head: &HeadRecord,
+        unmarked: &mut Vec<(String, u64)>,
+        retention: &EventRetentionConfig,
+        lease: WriterLease,
+    ) -> Result<(), LogError> {
+        if lease.expires_at_ms <= now_ms() {
+            return Err(LogError::LeaseExpired);
+        }
+        self.commit_head(keys, head).await?;
+        let ttl = Some(row_ttl(retention));
+        let markers = std::mem::take(unmarked);
+        futures::stream::iter(markers)
+            .map(|(eid, seq)| async move {
+                let marker = encode(&DedupMarker {
+                    v: FORMAT_VERSION,
+                    seq,
+                })?;
+                self.kv
+                    .put_if_absent(&keys.eid(&eid), marker, ttl)
+                    .await
+                    .map_err(LogError::from)
+            })
+            .buffered(PARALLEL_OPS)
+            .try_collect::<Vec<bool>>()
+            .await?;
+        Ok(())
+    }
+
     /// Append a gap marker for the readers of `scope` to the log of `sk`.
     pub async fn append_gap(
         &self,
@@ -1002,13 +1266,43 @@ impl EventLog {
         if lease.expires_at_ms <= now {
             return Err(LogError::LeaseExpired);
         }
-        let mut head = self
+        let mut head = self.writer_head(keys, lease, now).await?;
+        let written = self
+            .write_row(keys, &mut head, body, retention, lease, now)
+            .await?;
+        self.commit_head(keys, &head).await?;
+        Ok(written)
+    }
+
+    /// The committed head for a writer under `lease`; `Deposed` when
+    /// another writer holds a newer fence.
+    async fn writer_head(
+        &self,
+        keys: &LogKeys,
+        lease: WriterLease,
+        now: u64,
+    ) -> Result<HeadRecord, LogError> {
+        let head = self
             .get_value::<HeadRecord>(&keys.head())
             .await?
             .unwrap_or_default();
         if head.fence > lease.fence && head.lease_expires_at_ms > now {
             return Err(LogError::Deposed);
         }
+        Ok(head)
+    }
+
+    /// Write `body` as the row after `head` and move `head` over it, in
+    /// memory only: [`Self::commit_head`] makes it the committed head.
+    async fn write_row(
+        &self,
+        keys: &LogKeys,
+        head: &mut HeadRecord,
+        body: RowBody,
+        retention: &EventRetentionConfig,
+        lease: WriterLease,
+        now: u64,
+    ) -> Result<(u64, u64), LogError> {
         let is_gap = matches!(&body, RowBody::Gap { scope, .. } if is_every_reader(scope));
         loop {
             let seq = head.seq + 1;
@@ -1035,14 +1329,14 @@ impl EventLog {
                 if is_gap {
                     head.last_gap_seq = seq;
                 }
-                self.kv.put(&keys.head(), encode(&head)?, None).await?;
-                self.announce_head(&keys.sk, seq);
-                return Ok((seq, row.bytes));
+                let bytes = row.bytes;
+                self.cache_row(&keys.sk, row);
+                return Ok((seq, bytes));
             }
             // The slot is taken: a writer appended it and stopped before
             // moving the head, or another writer is appending now. Adopt the
             // row and re-read the head before trying the next slot.
-            let taken = match self.get(&keys.sk, seq).await? {
+            let taken = match self.fetch(&keys.sk, seq).await? {
                 Some(LogEntry::Row(row)) => row.bytes,
                 _ => 0,
             };
@@ -1054,12 +1348,19 @@ impl EventLog {
                 return Err(LogError::Deposed);
             }
             if current.seq >= seq {
-                head = current;
+                *head = current;
             } else {
                 head.seq = seq;
                 head.bytes = head.bytes.saturating_add(taken);
             }
         }
+    }
+
+    /// Make `head` the committed head and tell the readers.
+    async fn commit_head(&self, keys: &LogKeys, head: &HeadRecord) -> Result<(), LogError> {
+        self.kv.put(&keys.head(), encode(head)?, None).await?;
+        self.announce_head(&keys.sk, head.seq);
+        Ok(())
     }
 
     /// Move inbox rows of `sk` into the log, in arrival order. `shape`
@@ -1091,12 +1392,24 @@ impl EventLog {
             });
         let written = self.inbox_written(&keys).await?;
         let end = written.min(drained.n.saturating_add(DRAIN_BATCH));
+        let first = drained.n + 1;
+        let fetched: Vec<Result<Option<InboxRow>, LogError>> =
+            futures::stream::iter((first..=end).map(|n| keys.inbox_row(n)))
+                .map(|key| async move { self.get_value::<InboxRow>(&key).await })
+                .buffered(PARALLEL_OPS)
+                .collect()
+                .await;
         let mut n = drained.n;
-        while n < end {
-            let next = n + 1;
-            match self.get_value::<InboxRow>(&keys.inbox_row(next)).await {
+        let mut events: Vec<InboxRow> = Vec::new();
+        let mut taken: Vec<u64> = Vec::new();
+        for (next, fetched) in (first..=end).zip(fetched) {
+            match fetched {
                 Ok(Some(row)) => {
+                    self.holes.lock().remove(sk);
                     if let Some(marker) = row.marker {
+                        // The events before the marker go first.
+                        self.append_events(sk, &mut events, retention, lease, &shape, pass)
+                            .await?;
                         let scope = RowScope {
                             audience: row.audience,
                             arguments: row.arguments,
@@ -1106,15 +1419,10 @@ impl EventLog {
                             InboxMarker::Ended { reason } => RowBody::Ended { reason, scope },
                         };
                         self.append_marker(sk, body, retention, lease).await?;
-                    } else if let Some(occurrence) = shape(row).await
-                        && let AppendOutcome::Appended { bytes, .. } =
-                            self.append(sk, occurrence, retention, lease).await?
-                    {
-                        pass.appended += 1;
-                        pass.bytes = pass.bytes.saturating_add(bytes);
+                    } else {
+                        events.push(row);
                     }
-                    self.kv.delete(&keys.inbox_row(next)).await?;
-                    self.holes.lock().remove(sk);
+                    taken.push(next);
                 }
                 Ok(None) => {
                     // Reserved but not yet written, or expired: wait out the
@@ -1137,7 +1445,7 @@ impl EventLog {
                 }
                 Err(LogError::Codec(_)) => {
                     metrics::counter!("mcpg_events_inbox_skipped_total").increment(1);
-                    self.kv.delete(&keys.inbox_row(next)).await?;
+                    taken.push(next);
                 }
                 Err(LogError::NewerFormat) => {
                     tracing::warn!(
@@ -1150,12 +1458,52 @@ impl EventLog {
             n = next;
             pass.consumed += 1;
         }
+        self.append_events(sk, &mut events, retention, lease, &shape, pass)
+            .await?;
+        futures::stream::iter(taken.into_iter().map(|n| keys.inbox_row(n)))
+            .map(|key| async move { self.kv.delete(&key).await })
+            .buffered(PARALLEL_OPS)
+            .try_collect::<Vec<bool>>()
+            .await?;
         drained.v = FORMAT_VERSION;
         drained.n = n;
         drained.at_ms = now_ms();
         self.kv
             .put(&keys.inbox_drained(), encode(&drained)?, None)
             .await?;
+        Ok(())
+    }
+
+    /// Shape the inbox `events` and append them in order; `shape` runs on
+    /// [`PARALLEL_OPS`] rows at once and drops a row by answering `None`.
+    async fn append_events<F, Fut>(
+        &self,
+        sk: &str,
+        events: &mut Vec<InboxRow>,
+        retention: &EventRetentionConfig,
+        lease: WriterLease,
+        shape: &F,
+        pass: &mut InboxDrain,
+    ) -> Result<(), LogError>
+    where
+        F: Fn(InboxRow) -> Fut,
+        Fut: std::future::Future<Output = Option<StoredOccurrence>>,
+    {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let shaped: Vec<Fut> = std::mem::take(events).into_iter().map(shape).collect();
+        let occurrences: Vec<StoredOccurrence> = futures::stream::iter(shaped)
+            .buffered(PARALLEL_OPS)
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
+        for outcome in self.append_many(sk, occurrences, retention, lease).await? {
+            if let AppendOutcome::Appended { bytes, .. } = outcome {
+                pass.appended += 1;
+                pass.bytes = pass.bytes.saturating_add(bytes);
+            }
+        }
         Ok(())
     }
 
@@ -1237,6 +1585,9 @@ impl EventLog {
             self.kv.put(&keys.head(), encode(&head)?, None).await?;
             for seq in evict {
                 self.kv.delete(&keys.row(seq)).await?;
+            }
+            if let Some(cache) = self.rows.lock().get_mut(sk) {
+                cache.drop_below(floor);
             }
             metrics::counter!("mcpg_events_evicted_total").increment(evicted);
         }

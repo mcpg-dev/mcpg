@@ -69,6 +69,11 @@ pub const OWNER_LEASE_TTL: Duration = Duration::from_secs(15);
 pub const OWNER_TICK: Duration = Duration::from_secs(2);
 /// Interval at which the owner drains inboxes nobody hinted about.
 pub const INBOX_POLL: Duration = Duration::from_secs(5);
+/// Longest one drain of the inboxes runs before the owner loop gets back to
+/// its tick, which renews the owner lease; the rest follows at once.
+pub const DRAIN_BUDGET: Duration = Duration::from_secs(2);
+/// Inbox drain passes one type gets per drain before the next type's turn.
+const DRAIN_PASSES_PER_TYPE: usize = 4;
 /// Interval of retention passes.
 pub const RETENTION_INTERVAL: Duration = Duration::from_secs(30);
 /// Interval at which the owner rebuilds its subscription index.
@@ -295,6 +300,8 @@ pub struct EventsCore {
     generation: AtomicU64,
     index: parking_lot::RwLock<SubscriptionIndex>,
     inbox_nudge: Notify,
+    /// The type the next inbox drain starts with, so no type waits on another's backlog.
+    drain_rotation: std::sync::atomic::AtomicUsize,
     owner: tokio::sync::Mutex<OwnerState>,
     loop_started: AtomicBool,
     /// Set by [`Self::stop`]: the owner loop takes no lease after it.
@@ -377,6 +384,7 @@ impl EventsCore {
             generation: AtomicU64::new(0),
             index: parking_lot::RwLock::new(SubscriptionIndex::default()),
             inbox_nudge: Notify::new(),
+            drain_rotation: std::sync::atomic::AtomicUsize::new(0),
             owner: tokio::sync::Mutex::new(OwnerState::default()),
             loop_started: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
@@ -1528,7 +1536,7 @@ impl EventsCore {
         owner.ingest_held = plan.ingest_held;
 
         if now.saturating_sub(owner.last_inbox_ms) >= INBOX_POLL.as_millis() as u64 {
-            self.drain_inboxes(&stores, &catalog, registry.as_deref(), lease, &config)
+            self.drain_inboxes(&stores, &catalog, registry.as_deref(), &config)
                 .await;
             owner.last_inbox_ms = now;
         }
@@ -1567,22 +1575,24 @@ impl EventsCore {
         let Some(stores) = self.stores.load_full() else {
             return;
         };
-        let lease = *self.lease_tx.borrow();
-        let Some(lease) = lease else {
+        if self.lease_tx.borrow().is_none() {
             return;
-        };
+        }
         let catalog = self.catalog.load_full();
         let registry = self.runtime().map(|r| r.load().plugin_registry_arc());
-        self.drain_inboxes(&stores, &catalog, registry.as_deref(), lease, &config)
+        self.drain_inboxes(&stores, &catalog, registry.as_deref(), &config)
             .await;
     }
 
+    /// Move the inbox rows of every inbound type into its log. Each pass
+    /// takes the lease the owner holds then, as a long drain outlives the one
+    /// it began under; after [`DRAIN_BUDGET`] it hands the rest to the owner
+    /// loop's next turn, after a tick that renews the lease.
     async fn drain_inboxes(
         &self,
         stores: &EventsStores,
         catalog: &EventCatalog,
         registry: Option<&mcpg_plugin_host::PluginRegistry>,
-        lease: WriterLease,
         config: &EventsConfig,
     ) {
         let plan = self.plan();
@@ -1590,7 +1600,20 @@ impl EventsCore {
             .runtime()
             .map(|runtime| runtime.load().tool_call_recorder.clone())
             .unwrap_or_default();
-        for ty in catalog.types() {
+        let deadline = std::time::Instant::now() + DRAIN_BUDGET;
+        let types = catalog.types();
+        let first = self
+            .drain_rotation
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_rem(types.len())
+            .unwrap_or(0);
+        let rotated: Vec<Arc<EventType>> = types[first..]
+            .iter()
+            .chain(&types[..first])
+            .cloned()
+            .collect();
+        let mut backlog = false;
+        for ty in &rotated {
             let fed_through_inbox = matches!(
                 ty.source,
                 SourceSpec::Inbound(_) | SourceSpec::Builtin(_) | SourceSpec::Federation { .. }
@@ -1598,8 +1621,9 @@ impl EventsCore {
             if !fed_through_inbox {
                 continue;
             }
-            let shape_row = |row: InboxRow| {
-                let ty = Arc::clone(ty);
+            let owned = Arc::clone(ty);
+            let shape_row = move |row: InboxRow| {
+                let ty = Arc::clone(&owned);
                 async move {
                     let raw = RawOccurrence {
                         event_id: row.event_id,
@@ -1624,7 +1648,11 @@ impl EventsCore {
                 }
             };
             let retention = plan.retention(&ty.retention);
-            loop {
+            for passes in 1..=DRAIN_PASSES_PER_TYPE {
+                let lease = *self.lease_tx.borrow();
+                let Some(lease) = lease else {
+                    return;
+                };
                 let mut pass = super::log::InboxDrain::default();
                 let drained = stores
                     .log
@@ -1632,14 +1660,25 @@ impl EventsCore {
                     .await;
                 meter_ingest(&usage, ty, pass.appended, pass.bytes);
                 match drained {
-                    Ok(()) if pass.consumed >= super::log::DRAIN_BATCH => {}
+                    Ok(()) if pass.consumed >= super::log::DRAIN_BATCH => {
+                        if passes == DRAIN_PASSES_PER_TYPE {
+                            backlog = true;
+                        }
+                    }
                     Ok(()) => break,
                     Err(error) => {
                         tracing::warn!(event = %ty.name, error = %error, "event inbox drain failed");
                         break;
                     }
                 }
+                if std::time::Instant::now() >= deadline {
+                    self.inbox_nudge.notify_one();
+                    return;
+                }
             }
+        }
+        if backlog {
+            self.inbox_nudge.notify_one();
         }
     }
 

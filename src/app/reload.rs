@@ -403,6 +403,7 @@ pub(crate) async fn reload_with_config(
         &new_apps_cfg.registry,
     );
     new_runtime.set_tunnel_federation(new_config.gateway.server.tunnel_federation.as_ref());
+    new_runtime.set_list_page_size(new_config.mcp.list_page_size());
     new_runtime.set_license_state((&license).into());
     // The cluster buses ride the new coordinator: the old one shuts down
     // with the old registry below. The work in flight across the swap stays

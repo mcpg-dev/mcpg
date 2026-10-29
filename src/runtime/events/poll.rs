@@ -645,6 +645,7 @@ impl EventsCore {
                 max_events: max_events as usize,
             },
             start,
+            None,
         )
         .await?;
         // The upstream of an imported type ended these arguments: the events
@@ -861,18 +862,23 @@ pub(crate) async fn resume_point(
 /// at `max_events`, [`MAX_POLL_BYTES`] or [`MAX_SCAN_ROWS`] rows read, and
 /// reports a gap where a lost log, rows retention dropped, a gap marker or
 /// a refused payload may have cost the reader events.
+///
+/// `head` is the head that woke a push reader: bounds this process read when
+/// the head had reached it serve, so the streams of one log share a read of
+/// them. A poll passes `None` and reads them now.
 pub(crate) async fn read_occurrences(
     stores: &EventsStores,
     runtime: &crate::runtime::GatewayRuntime,
     ty: &EventType,
     reader: &Reader<'_>,
     start: ResumePoint,
+    head: Option<u64>,
 ) -> Result<Read, EventsError> {
-    let bounds = stores
-        .log
-        .bounds(&ty.source_key)
-        .await
-        .map_err(store_fault)?;
+    let bounds = match head {
+        Some(head) => stores.log.bounds_since(&ty.source_key, head).await,
+        None => stores.log.bounds(&ty.source_key).await,
+    }
+    .map_err(store_fault)?;
     let mut read = Read {
         items: Vec::new(),
         epoch: bounds.epoch,
@@ -894,7 +900,11 @@ pub(crate) async fn read_occurrences(
         let batch = READ_BATCH.min(limit - read.after);
         let rows = stores
             .log
-            .read(&ty.source_key, read.after, batch as usize)
+            .read_rows(
+                &ty.source_key,
+                read.after.saturating_add(1).max(bounds.floor),
+                read.after + batch,
+            )
             .await
             .map_err(store_fault)?;
         if rows.is_empty() {

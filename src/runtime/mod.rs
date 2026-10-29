@@ -829,6 +829,8 @@ pub struct GatewayRuntime {
     /// `gateway.server.tunnel_federation`. `Some` lets `tunnel://<name>`
     /// federation upstreams resolve through the relay's federation ingress.
     tunnel_federation: Option<federation::engine::TunnelFederation>,
+    /// Entries one page of a list holds (`mcp.list_page_size`).
+    list_page_size: usize,
     /// The MCP Events types this runtime's federations imported, as the
     /// federation engine last published them; the events core serves them
     /// beside the configured types.

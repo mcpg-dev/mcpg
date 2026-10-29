@@ -58,12 +58,17 @@ pub(crate) async fn build_quota_gate(
     .await
     .context("governance.quotas.store: failed to resolve KV backend")?;
     // Seal quota state with the cluster state cipher when configured,
-    // + tenant-prefix (outermost) for broker-ACL fencing.
-    let kv = wrap_tenant_kv(
-        wrap_state_kv(kv, &build_state_cipher(&config.cluster)?),
+    // + tenant-prefix (outermost) for broker-ACL fencing. The counters stay
+    // plaintext under the cipher, so they are read and listed without it.
+    let sealed = wrap_tenant_kv(
+        wrap_state_kv(
+            std::sync::Arc::clone(&kv),
+            &build_state_cipher(&config.cluster)?,
+        ),
         &config.cluster.tenant_segment,
     );
-    let store = crate::runtime::quota_gate::QuotaStore::new(kv);
+    let counters = wrap_tenant_kv(kv, &config.cluster.tenant_segment);
+    let store = crate::runtime::quota_gate::QuotaStore::with_counters(sealed, counters);
     // The replicas of a fleet share the quota store unless it is each
     // replica's own.
     let fleet =

@@ -60,12 +60,7 @@ impl GatewayRuntime {
         {
             message.delivery_id = delivery_id;
         }
-        let session_id = session_id.to_owned();
-        let bus = &self.delivery_bus;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(bus.publish(&session_id, message))
-        })
-        .ok();
+        super::stores::block_on_store(self.delivery_bus.publish(session_id, message)).ok();
     }
 
     /// Deliver a terminal JSON-RPC error for a suspended pipeline to the
@@ -141,12 +136,7 @@ impl GatewayRuntime {
         {
             message.delivery_id = delivery_id;
         }
-        let session_id = session_id.to_owned();
-        let bus = &self.delivery_bus;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(bus.publish(&session_id, message))
-        })
-        .ok();
+        super::stores::block_on_store(self.delivery_bus.publish(session_id, message)).ok();
     }
 
     /// Emit a task-status notification to the session's delivery

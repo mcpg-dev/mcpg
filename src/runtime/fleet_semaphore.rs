@@ -1,34 +1,42 @@
 //! A counting semaphore that the replicas of a fleet share through the quota
 //! store.
 //!
-//! Each replica keeps one counter per scope, `quotas.concurrency.<scope>.<holder>`,
-//! of the permits it holds. An acquire adds one to its own counter, then sums
-//! the counters of the scope, and keeps the permit only when the sum is within
-//! the cap. That never admits more than the cap: of any set of acquires that
-//! hold permits at once, the one whose sum started last counted every other's
-//! increment, so it saw more than the cap if the set did. Under contention two
-//! acquires can both see the other and both give up; a caller in `queue` mode
-//! tries again. A refused acquire takes its increment back before it returns,
-//! so it does not count against the acquires after it.
+//! A scope with a cap of N has N slots in the store,
+//! `quotas.slots.<scope>.<N>.<i>`. An acquire takes a free one with
+//! `put_if_absent`, which exactly one writer wins, and a release deletes it.
+//! So the fleet never holds more than N permits, and a refused acquire writes
+//! nothing: no attempt can make another one look over the cap.
 //!
-//! A counter lives [`COUNTER_TTL`] after its last write, and its holder writes
-//! it again every [`REFRESH`] while it holds permits, so the permits of a
-//! replica that dies come back within the TTL.
+//! A slot lives [`SLOT_TTL`] after its last write, and its holder writes it
+//! again every [`REFRESH`] while it holds it, so the permits of a replica that
+//! dies come back within the TTL.
+//!
+//! A replica never needs more than N at once, so an acquire first takes a
+//! slot of a local semaphore of N, and only a local slot holder tries the
+//! store: a full replica refuses without a store operation. An acquire that
+//! finds every store slot taken refuses the next ones of the scope on this
+//! replica for [`FULL_HOLD`], or until a permit of the scope comes back here.
 
 #![cfg(feature = "governance-quotas")]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use mcpg_cluster_api::KeyValueStore;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
-/// How long a counter outlives its last write.
-pub const COUNTER_TTL: Duration = Duration::from_secs(30);
-/// How often a holder writes its counters again.
+/// How long a slot outlives its last write.
+pub const SLOT_TTL: Duration = Duration::from_secs(30);
+/// How often a holder writes its slots again.
 pub const REFRESH: Duration = Duration::from_secs(10);
-const KEY_PREFIX: &str = "quotas.concurrency.";
+/// How long an acquire that found the fleet full refuses the next ones of
+/// its scope here without the store.
+pub const FULL_HOLD: Duration = Duration::from_millis(20);
+const KEY_PREFIX: &str = "quotas.slots.";
 /// Back-off between two tries of a queued acquire, before jitter.
 const RETRY_MIN: Duration = Duration::from_millis(20);
 const RETRY_MAX: Duration = Duration::from_millis(250);
@@ -38,22 +46,32 @@ fn encode(scope: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(scope.as_bytes())
 }
 
+/// The store key of slot `index` of `scope` under the cap `max`.
+fn slot_key(scope: &str, max: u32, index: u32) -> String {
+    format!("{KEY_PREFIX}{}.{max}.{index}", encode(scope))
+}
+
 /// The fleet-wide semaphore of one quota store.
 pub struct FleetSemaphore {
     kv: Arc<dyn KeyValueStore>,
-    /// This semaphore's counter suffix; one per instance, so the permits of
-    /// a gate that a reload replaced keep their own counter until they end.
-    holder: String,
-    /// Permits held here, per own counter key.
-    held: DashMap<String, usize>,
+    /// The value of this semaphore's slots; one per instance, so the slots of
+    /// a gate that a reload replaced stay theirs until their permits end.
+    holder: Bytes,
+    /// The store slots held here.
+    held: DashMap<String, ()>,
+    /// The local slots of each scope and cap.
+    slots: DashMap<(String, u32), Arc<Semaphore>>,
+    /// When an acquire of a scope and cap last found every store slot taken.
+    full: DashMap<(String, u32), Instant>,
+    /// The slot the next acquire tries first, so acquires spread over them.
+    next: AtomicUsize,
     released: Notify,
 }
 
 impl std::fmt::Debug for FleetSemaphore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FleetSemaphore")
-            .field("holder", &self.holder)
-            .field("scopes", &self.held.len())
+            .field("held", &self.held.len())
             .finish()
     }
 }
@@ -63,8 +81,11 @@ impl FleetSemaphore {
     pub fn new(kv: Arc<dyn KeyValueStore>) -> Arc<Self> {
         let semaphore = Arc::new(Self {
             kv,
-            holder: uuid::Uuid::new_v4().simple().to_string(),
+            holder: Bytes::from(uuid::Uuid::new_v4().simple().to_string()),
             held: DashMap::new(),
+            slots: DashMap::new(),
+            full: DashMap::new(),
+            next: AtomicUsize::new(0),
             released: Notify::new(),
         });
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -73,36 +94,68 @@ impl FleetSemaphore {
         semaphore
     }
 
+    /// The local slots of `scope` under the cap `max`.
+    fn slots_of(&self, scope: &str, max: u32) -> Arc<Semaphore> {
+        Arc::clone(
+            self.slots
+                .entry((scope.to_owned(), max))
+                .or_insert_with(|| Arc::new(Semaphore::new(max as usize)))
+                .value(),
+        )
+    }
+
+    /// Whether an acquire of `scope` found the fleet full less than
+    /// [`FULL_HOLD`] ago.
+    fn recently_full(&self, scope: &str, max: u32) -> bool {
+        self.full
+            .get(&(scope.to_owned(), max))
+            .is_some_and(|at| at.elapsed() < FULL_HOLD)
+    }
+
     /// One permit of `scope` if fewer than `max` are held in the fleet.
     pub async fn try_acquire(
         self: &Arc<Self>,
         scope: &str,
         max: u32,
     ) -> Result<Option<FleetPermit>, mcpg_cluster_api::ClusterError> {
-        let prefix = format!("{KEY_PREFIX}{}.", encode(scope));
-        let own = format!("{prefix}{}", self.holder);
-        let mine = self.kv.incr(&own, 1, Some(COUNTER_TTL)).await?;
-        *self.held.entry(own.clone()).or_default() += 1;
-        // From here a drop gives the permit back, also on an error below.
-        let permit = FleetPermit {
-            semaphore: Arc::clone(self),
-            key: own,
+        let Ok(local) = self.slots_of(scope, max).try_acquire_owned() else {
+            // This replica holds or is taking `max` permits already.
+            return Ok(None);
         };
-        if mine > i64::from(max) {
-            permit.give_back().await;
+        if self.recently_full(scope, max) {
             return Ok(None);
         }
-        let total: i64 = mcpg_cluster_api::list_all(&*self.kv, &prefix)
-            .await?
-            .iter()
-            .filter_map(|(_, entry)| mcpg_cluster_api::parse_counter(&entry.bytes).ok())
-            .map(|count| count.max(0))
-            .sum();
-        if total > i64::from(max) {
-            permit.give_back().await;
-            return Ok(None);
+        Ok(self.take(scope, max, local).await?.ok())
+    }
+
+    /// Take a free store slot of `scope` for the holder of the local slot
+    /// `local`: the permit, or `local` back when every slot is taken.
+    async fn take(
+        self: &Arc<Self>,
+        scope: &str,
+        max: u32,
+        local: OwnedSemaphorePermit,
+    ) -> Result<Result<FleetPermit, OwnedSemaphorePermit>, mcpg_cluster_api::ClusterError> {
+        let first = self.next.fetch_add(1, Ordering::Relaxed);
+        for n in 0..max as usize {
+            let index = ((first + n) % max as usize) as u32;
+            let key = slot_key(scope, max, index);
+            if self
+                .kv
+                .put_if_absent(&key, self.holder.clone(), Some(SLOT_TTL))
+                .await?
+            {
+                self.held.insert(key.clone(), ());
+                return Ok(Ok(FleetPermit {
+                    semaphore: Arc::clone(self),
+                    key,
+                    scope: (scope.to_owned(), max),
+                    local: Some(local),
+                }));
+            }
         }
-        Ok(Some(permit))
+        self.full.insert((scope.to_owned(), max), Instant::now());
+        Ok(Err(local))
     }
 
     /// [`Self::try_acquire`], trying again until `timeout` has passed. A
@@ -115,14 +168,22 @@ impl FleetSemaphore {
         timeout: Duration,
     ) -> Result<Option<FleetPermit>, mcpg_cluster_api::ClusterError> {
         let deadline = Instant::now() + timeout;
+        let Ok(Ok(mut local)) =
+            tokio::time::timeout(timeout, self.slots_of(scope, max).acquire_owned()).await
+        else {
+            return Ok(None);
+        };
         let mut backoff = RETRY_MIN;
         loop {
             // Registered before the try, so a release during it is not missed.
             let released = self.released.notified();
             tokio::pin!(released);
             released.as_mut().enable();
-            if let Some(permit) = self.try_acquire(scope, max).await? {
-                return Ok(Some(permit));
+            if !self.recently_full(scope, max) {
+                local = match self.take(scope, max, local).await? {
+                    Ok(permit) => return Ok(Some(permit)),
+                    Err(local) => local,
+                };
             }
             let now = Instant::now();
             if now >= deadline {
@@ -137,43 +198,50 @@ impl FleetSemaphore {
         }
     }
 
-    /// Stop counting one permit of `key` as held here.
-    fn forget(&self, key: &str) {
-        if let Some(mut held) = self.held.get_mut(key) {
-            *held = held.saturating_sub(1);
-        }
-        self.held.remove_if(key, |_, held| *held == 0);
-    }
-
-    /// Take one permit off the counter `key` in the store.
-    async fn give_back_count(&self, key: &str) {
+    /// Free the store slot `key`. A slot that could not be freed is taken
+    /// until its TTL ends; that only refuses.
+    async fn free(&self, key: &str) {
         for attempt in 0..3u32 {
-            match self.kv.incr(key, -1, Some(COUNTER_TTL)).await {
-                Ok(_) => break,
+            match self.kv.delete(key).await {
+                Ok(_) => return,
                 Err(error) if attempt == 2 => {
-                    // The counter overstates this replica's permits until it
-                    // expires or is written again; that only denies.
-                    tracing::warn!(key, %error, "fleet concurrency permit not given back");
+                    tracing::warn!(key, %error, "fleet concurrency slot not freed; it ends with its TTL");
                 }
                 Err(_) => tokio::time::sleep(RETRY_MIN * (attempt + 1)).await,
             }
         }
     }
 
-    /// Give a held permit back and wake the waiters of this replica. A
-    /// refused acquire gives its count back without the wake, or a waiter
-    /// would wake itself on each of its own refusals.
-    fn release(self: &Arc<Self>, key: String) {
-        self.forget(&key);
+    /// Give a permit back: free its store slot, then its local slot, and wake
+    /// the waiters of this replica.
+    fn release(
+        self: &Arc<Self>,
+        key: String,
+        scope: (String, u32),
+        local: Option<OwnedSemaphorePermit>,
+    ) {
+        self.held.remove(&key);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            // The counter expires with its TTL; nothing refreshes it now.
+            // The slot ends with its TTL; nothing refreshes it now.
             return;
         };
         let semaphore = Arc::clone(self);
         handle.spawn(async move {
-            semaphore.give_back_count(&key).await;
+            semaphore.free(&key).await;
+            semaphore.full.remove(&scope);
+            drop(local);
             semaphore.released.notify_waiters();
         });
+    }
+
+    /// Drop the local slots of scopes that hold none now, and the marks of
+    /// scopes found full longer ago than [`FULL_HOLD`].
+    fn prune(&self) {
+        self.slots
+            .retain(|(_, max), slots| slots.available_permits() < *max as usize);
+        // A pass that races an acquire can leave two slot sets of one scope
+        // for a moment; the store's slots still hold the cap.
+        self.full.retain(|_, at| at.elapsed() < FULL_HOLD);
     }
 }
 
@@ -181,6 +249,9 @@ impl FleetSemaphore {
 pub struct FleetPermit {
     semaphore: Arc<FleetSemaphore>,
     key: String,
+    scope: (String, u32),
+    /// The local slot, freed after the store slot.
+    local: Option<OwnedSemaphorePermit>,
 }
 
 impl std::fmt::Debug for FleetPermit {
@@ -191,29 +262,19 @@ impl std::fmt::Debug for FleetPermit {
     }
 }
 
-impl FleetPermit {
-    /// Give a refused permit back, and return once the store has it: an
-    /// acquire that is refused must not count against the acquires after it.
-    async fn give_back(mut self) {
-        let key = std::mem::take(&mut self.key);
-        self.semaphore.forget(&key);
-        self.semaphore.give_back_count(&key).await;
-    }
-}
-
 impl Drop for FleetPermit {
     fn drop(&mut self) {
-        // Empty once `give_back` took the key.
-        if !self.key.is_empty() {
-            self.semaphore.release(std::mem::take(&mut self.key));
-        }
+        self.semaphore.release(
+            std::mem::take(&mut self.key),
+            std::mem::take(&mut self.scope),
+            self.local.take(),
+        );
     }
 }
 
-/// Write every counter this semaphore holds permits on again, so it does not
-/// expire under live permits. A counter found gone (the store lost it, or this
-/// replica could not reach it for a TTL) is written back with the permits
-/// held here.
+/// Write every slot this semaphore holds again, so it does not end under a
+/// live permit. A slot found gone (the store lost it, or this replica could
+/// not reach it for a TTL) is taken again when it is still free.
 async fn refresh(semaphore: Weak<FleetSemaphore>) {
     let mut tick = tokio::time::interval(REFRESH);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -223,28 +284,31 @@ async fn refresh(semaphore: Weak<FleetSemaphore>) {
         let Some(semaphore) = semaphore.upgrade() else {
             return;
         };
-        let held: Vec<(String, usize)> = semaphore
+        semaphore.prune();
+        let held: Vec<String> = semaphore
             .held
             .iter()
-            .filter(|entry| *entry.value() > 0)
-            .map(|entry| (entry.key().clone(), *entry.value()))
+            .map(|entry| entry.key().clone())
             .collect();
-        for (key, count) in held {
-            match semaphore.kv.expire(&key, Some(COUNTER_TTL)).await {
+        for key in held {
+            match semaphore.kv.expire(&key, Some(SLOT_TTL)).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    tracing::warn!(
-                        key,
-                        count,
-                        "fleet concurrency counter was gone; written again"
-                    );
-                    let _ = semaphore
+                    let taken = semaphore
                         .kv
-                        .incr(&key, count as i64, Some(COUNTER_TTL))
+                        .put_if_absent(&key, semaphore.holder.clone(), Some(SLOT_TTL))
                         .await;
+                    if matches!(taken, Ok(false)) {
+                        tracing::warn!(
+                            key,
+                            "fleet concurrency slot was gone and another holder has it; the fleet holds one permit over its cap until this one ends"
+                        );
+                    } else {
+                        tracing::warn!(key, "fleet concurrency slot was gone; written again");
+                    }
                 }
                 Err(error) => {
-                    tracing::debug!(key, %error, "fleet concurrency counter not refreshed; next pass");
+                    tracing::debug!(key, %error, "fleet concurrency slot not refreshed; next pass");
                 }
             }
         }
@@ -271,6 +335,183 @@ mod tests {
         Arc::new(MemoryKv::new())
     }
 
+    /// A store that takes `latency` for every operation, as a coordinator
+    /// over the network does, and counts the operations.
+    #[derive(Debug)]
+    struct SlowKv {
+        inner: MemoryKv,
+        latency: Duration,
+        ops: std::sync::atomic::AtomicU64,
+    }
+
+    impl SlowKv {
+        fn new(latency: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                inner: MemoryKv::new(),
+                latency,
+                ops: std::sync::atomic::AtomicU64::new(0),
+            })
+        }
+
+        async fn wait(&self) {
+            self.ops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.latency).await;
+        }
+
+        fn ops(&self) -> u64 {
+            self.ops.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    type KvResult<T> = Result<T, mcpg_cluster_api::ClusterError>;
+
+    #[async_trait::async_trait]
+    impl KeyValueStore for SlowKv {
+        async fn get(&self, key: &str) -> KvResult<Option<mcpg_cluster_api::Entry>> {
+            self.wait().await;
+            self.inner.get(key).await
+        }
+
+        async fn put(&self, key: &str, value: bytes::Bytes, ttl: Option<Duration>) -> KvResult<()> {
+            self.wait().await;
+            self.inner.put(key, value, ttl).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            ttl: Option<Duration>,
+        ) -> KvResult<bool> {
+            self.wait().await;
+            self.inner.put_if_absent(key, value, ttl).await
+        }
+
+        async fn delete(&self, key: &str) -> KvResult<bool> {
+            self.wait().await;
+            self.inner.delete(key).await
+        }
+
+        async fn list_page(
+            &self,
+            prefix: &str,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> KvResult<mcpg_cluster_api::KvPage> {
+            self.wait().await;
+            self.inner.list_page(prefix, cursor, limit).await
+        }
+
+        async fn expire(&self, key: &str, ttl: Option<Duration>) -> KvResult<bool> {
+            self.wait().await;
+            self.inner.expire(key, ttl).await
+        }
+
+        async fn incr(&self, key: &str, delta: i64, ttl: Option<Duration>) -> KvResult<i64> {
+            self.wait().await;
+            self.inner.incr(key, delta, ttl).await
+        }
+    }
+
+    /// Callers spread over `replicas` that each try again at once when
+    /// refused, holding an admitted permit for 10 ms, for one second over a
+    /// store with a network's latency: the calls admitted, and the most in
+    /// flight at once.
+    async fn hammer(replicas: &[Arc<FleetSemaphore>], callers: usize, cap: u32) -> (u32, i64) {
+        let in_flight = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut tasks = Vec::new();
+        for n in 0..callers {
+            let semaphore = Arc::clone(&replicas[n % replicas.len()]);
+            let (in_flight, peak) = (Arc::clone(&in_flight), Arc::clone(&peak));
+            tasks.push(tokio::spawn(async move {
+                use std::sync::atomic::Ordering::SeqCst;
+                let mut admitted = 0u32;
+                while Instant::now() < deadline {
+                    match semaphore.try_acquire("busy", cap).await.unwrap() {
+                        Some(permit) => {
+                            peak.fetch_max(in_flight.fetch_add(1, SeqCst) + 1, SeqCst);
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            in_flight.fetch_sub(1, SeqCst);
+                            drop(permit);
+                            admitted += 1;
+                        }
+                        None => tokio::time::sleep(Duration::from_micros(100)).await,
+                    }
+                }
+                admitted
+            }));
+        }
+        let mut admitted = 0;
+        for task in tasks {
+            admitted += task.await.unwrap();
+        }
+        (admitted, peak.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Many callers on one replica: it admits up to the cap, and never more.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_replica_is_not_starved_by_its_own_refusals() {
+        let store = SlowKv::new(Duration::from_millis(1));
+        let semaphore = FleetSemaphore::new(Arc::clone(&store) as Arc<dyn KeyValueStore>);
+        let (admitted, peak) = hammer(&[semaphore], 64, 4).await;
+        assert!(peak <= 4, "at most 4 in flight, saw {peak}");
+        // Four slots of 10 ms each, with a few ms of store work between
+        // holders: well over 200 in the second.
+        assert!(admitted > 200, "admitted {admitted}");
+    }
+
+    /// Many callers over four replicas: the fleet admits up to the cap, never
+    /// more, and keeps admitting while every replica is refused most of the
+    /// time.
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_fleet_is_not_starved_by_its_own_refusals() {
+        let store = SlowKv::new(Duration::from_millis(1));
+        let replicas: Vec<Arc<FleetSemaphore>> = (0..4)
+            .map(|_| FleetSemaphore::new(Arc::clone(&store) as Arc<dyn KeyValueStore>))
+            .collect();
+        let (admitted, peak) = hammer(&replicas, 64, 4).await;
+        assert!(peak <= 4, "at most 4 in flight in the fleet, saw {peak}");
+        assert!(admitted > 200, "admitted {admitted}");
+    }
+
+    /// An acquire on a replica that holds the cap is refused without a store
+    /// operation.
+    #[tokio::test]
+    async fn a_full_replica_refuses_without_the_store() {
+        let store = SlowKv::new(Duration::ZERO);
+        let semaphore = FleetSemaphore::new(Arc::clone(&store) as Arc<dyn KeyValueStore>);
+        let _first = semaphore.try_acquire("s", 2).await.unwrap().unwrap();
+        let _second = semaphore.try_acquire("s", 2).await.unwrap().unwrap();
+        let before = store.ops();
+        for _ in 0..10 {
+            assert!(semaphore.try_acquire("s", 2).await.unwrap().is_none());
+        }
+        assert_eq!(store.ops(), before);
+    }
+
+    /// A replica that found every slot taken refuses without the store for a
+    /// moment, then asks it again.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_fleet_is_refused_here_for_a_moment() {
+        let store = SlowKv::new(Duration::ZERO);
+        let kv = Arc::clone(&store) as Arc<dyn KeyValueStore>;
+        let a = FleetSemaphore::new(Arc::clone(&kv));
+        let b = FleetSemaphore::new(kv);
+        let _held = a.try_acquire("s", 1).await.unwrap().unwrap();
+        assert!(b.try_acquire("s", 1).await.unwrap().is_none());
+        let asked = store.ops();
+        assert!(b.try_acquire("s", 1).await.unwrap().is_none());
+        assert_eq!(store.ops(), asked, "refused here, without the store");
+        tokio::time::sleep(FULL_HOLD).await;
+        assert!(b.try_acquire("s", 1).await.unwrap().is_none());
+        assert!(
+            store.ops() > asked,
+            "after the hold the store decides again"
+        );
+    }
+
     #[tokio::test]
     async fn a_scope_admits_up_to_its_cap_across_replicas() {
         let kv = kv();
@@ -286,16 +527,17 @@ mod tests {
         );
 
         drop(second);
-        // The give-back is spawned.
+        // The release is spawned; then A's mark of a full fleet ends.
         for _ in 0..64 {
             tokio::task::yield_now().await;
         }
+        tokio::time::sleep(FULL_HOLD).await;
         let third = a.try_acquire("tool", 2).await.unwrap();
         assert!(third.is_some(), "a permit given back on B is free for A");
         drop(first);
     }
 
-    /// A scope key that is another's prefix does not share its count.
+    /// A scope key that is another's prefix does not share its slots.
     #[tokio::test]
     async fn scopes_that_share_a_prefix_count_apart() {
         let semaphore = FleetSemaphore::new(kv());
@@ -349,24 +591,17 @@ mod tests {
         assert!(admitted > 0, "the cap admits work");
     }
 
-    /// A refused acquire has taken its increment back when it returns: a
-    /// give-back left to a background task would still count here, as this
-    /// runtime runs no other task before the next statement.
+    /// A refused acquire writes nothing: the store holds the held slot only.
     #[tokio::test]
-    async fn a_refused_acquire_leaves_no_count_behind() {
+    async fn a_refused_acquire_writes_nothing() {
         let kv = kv();
         let a = FleetSemaphore::new(Arc::clone(&kv));
         let b = FleetSemaphore::new(Arc::clone(&kv));
         let _held = a.try_acquire("s", 1).await.unwrap().unwrap();
         assert!(b.try_acquire("s", 1).await.unwrap().is_none());
-        let counted: i64 =
-            mcpg_cluster_api::list_all(&*kv, &format!("{KEY_PREFIX}{}.", encode("s")))
-                .await
-                .unwrap()
-                .iter()
-                .filter_map(|(_, entry)| mcpg_cluster_api::parse_counter(&entry.bytes).ok())
-                .sum();
-        assert_eq!(counted, 1, "only the held permit counts");
+        let slots = mcpg_cluster_api::list_all(&*kv, KEY_PREFIX).await.unwrap();
+        assert_eq!(slots.len(), 1, "only the held permit's slot");
+        assert_eq!(slots[0].1.bytes, a.holder);
     }
 
     /// A queued acquire gets the permit a holder on the same replica gives
@@ -393,6 +628,30 @@ mod tests {
         assert!(got.is_some());
     }
 
+    /// A queued acquire gets the permit another replica gives back.
+    #[tokio::test]
+    async fn a_queued_acquire_takes_a_permit_given_back_elsewhere() {
+        let kv = kv();
+        let a = FleetSemaphore::new(Arc::clone(&kv));
+        let b = FleetSemaphore::new(kv);
+        let held = a.try_acquire("q", 1).await.unwrap().unwrap();
+        let waiter = {
+            let b = Arc::clone(&b);
+            tokio::spawn(async move {
+                b.acquire_within("q", 1, Duration::from_secs(5))
+                    .await
+                    .unwrap()
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(held);
+        let got = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("the waiter finds the slot")
+            .unwrap();
+        assert!(got.is_some());
+    }
+
     #[tokio::test]
     async fn a_queued_acquire_gives_up_at_its_timeout() {
         let semaphore = FleetSemaphore::new(kv());
@@ -406,20 +665,33 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(120));
     }
 
-    /// A holder's counter that the store lost is written back with the
-    /// permits the holder still has, on its next refresh.
+    /// A slot whose holder stopped writing it ends with its TTL, as the store
+    /// removes it, and another replica takes it then.
+    #[tokio::test]
+    async fn a_slot_the_store_removed_is_free_for_another_replica() {
+        let kv = kv();
+        let a = FleetSemaphore::new(Arc::clone(&kv));
+        let b = FleetSemaphore::new(Arc::clone(&kv));
+        let held = a.try_acquire("s", 1).await.unwrap().unwrap();
+        assert!(kv.delete(&slot_key("s", 1, 0)).await.unwrap());
+        assert!(b.try_acquire("s", 1).await.unwrap().is_some());
+        // A stops holding the slot without a store write.
+        std::mem::forget(held);
+    }
+
+    /// A held slot that the store lost is written again on the holder's next
+    /// refresh.
     #[tokio::test(start_paused = true)]
-    async fn a_lost_counter_is_written_back_while_permits_are_held() {
+    async fn a_lost_slot_is_written_again_while_its_permit_is_held() {
         let kv = kv();
         let live = FleetSemaphore::new(Arc::clone(&kv));
-        let _first = live.try_acquire("s", 5).await.unwrap().unwrap();
-        let _second = live.try_acquire("s", 5).await.unwrap().unwrap();
-        let own = format!("{KEY_PREFIX}{}.{}", encode("s"), live.holder);
-        assert!(kv.delete(&own).await.unwrap());
+        let _held = live.try_acquire("s", 1).await.unwrap().unwrap();
+        let key = slot_key("s", 1, 0);
+        assert!(kv.delete(&key).await.unwrap());
 
         tokio::time::sleep(REFRESH * 2 + Duration::from_millis(1)).await;
-        let entry = kv.get(&own).await.unwrap().expect("written back");
-        assert_eq!(mcpg_cluster_api::parse_counter(&entry.bytes).unwrap(), 2);
+        let entry = kv.get(&key).await.unwrap().expect("written again");
+        assert_eq!(entry.bytes, live.holder);
         assert!(entry.expires_at.is_some());
     }
 }

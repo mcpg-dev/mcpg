@@ -2849,10 +2849,24 @@ async fn tools_list_filters_tools_by_caller_identity() {
     );
 }
 
+/// One page at the default `mcp.list_page_size`.
+fn paginate_one_page<T: Clone>(
+    items: &[T],
+    cursor: Option<&str>,
+    bind_key: Option<&[u8]>,
+) -> (Vec<T>, Option<String>) {
+    super::paginate_list_bound(
+        items,
+        cursor,
+        bind_key,
+        crate::config::mcp::DEFAULT_LIST_PAGE_SIZE,
+    )
+}
+
 #[test]
 fn paginate_list_returns_all_when_small() {
     let items: Vec<i32> = (0..5).collect();
-    let (page, cursor) = super::paginate_list_bound(&items, None, None);
+    let (page, cursor) = paginate_one_page(&items, None, None);
     assert_eq!(page.len(), 5);
     assert!(cursor.is_none());
 }
@@ -2860,17 +2874,17 @@ fn paginate_list_returns_all_when_small() {
 #[test]
 fn paginate_list_paginates_large_set() {
     let items: Vec<i32> = (0..250).collect();
-    let (page1, cursor1) = super::paginate_list_bound(&items, None, None);
-    assert_eq!(page1.len(), super::DEFAULT_PAGE_SIZE);
+    let (page1, cursor1) = paginate_one_page(&items, None, None);
+    assert_eq!(page1.len(), crate::config::mcp::DEFAULT_LIST_PAGE_SIZE);
     assert_eq!(page1[0], 0);
     assert!(cursor1.is_some());
 
-    let (page2, cursor2) = super::paginate_list_bound(&items, cursor1.as_deref(), None);
-    assert_eq!(page2.len(), super::DEFAULT_PAGE_SIZE);
+    let (page2, cursor2) = paginate_one_page(&items, cursor1.as_deref(), None);
+    assert_eq!(page2.len(), crate::config::mcp::DEFAULT_LIST_PAGE_SIZE);
     assert_eq!(page2[0], 100);
     assert!(cursor2.is_some());
 
-    let (page3, cursor3) = super::paginate_list_bound(&items, cursor2.as_deref(), None);
+    let (page3, cursor3) = paginate_one_page(&items, cursor2.as_deref(), None);
     assert_eq!(page3.len(), 50);
     assert_eq!(page3[0], 200);
     assert!(cursor3.is_none());
@@ -2879,7 +2893,7 @@ fn paginate_list_paginates_large_set() {
 #[test]
 fn paginate_list_invalid_cursor_returns_first_page() {
     let items: Vec<i32> = (0..5).collect();
-    let (page, cursor) = super::paginate_list_bound(&items, Some("garbage_cursor"), None);
+    let (page, cursor) = paginate_one_page(&items, Some("garbage_cursor"), None);
     assert_eq!(page.len(), 5);
     assert!(cursor.is_none());
 }
@@ -2887,7 +2901,7 @@ fn paginate_list_invalid_cursor_returns_first_page() {
 #[test]
 fn paginate_list_empty_input() {
     let items: Vec<i32> = vec![];
-    let (page, cursor) = super::paginate_list_bound(&items, None, None);
+    let (page, cursor) = paginate_one_page(&items, None, None);
     assert!(page.is_empty());
     assert!(cursor.is_none());
 }
@@ -2897,9 +2911,9 @@ fn paginate_list_empty_input() {
 fn bound_cursor_roundtrips_for_same_session() {
     let items: Vec<i32> = (0..250).collect();
     let key = b"session-A-key";
-    let (_p1, c1) = super::paginate_list_bound(&items, None, Some(key));
+    let (_p1, c1) = paginate_one_page(&items, None, Some(key));
     assert!(c1.is_some());
-    let (p2, _) = super::paginate_list_bound(&items, c1.as_deref(), Some(key));
+    let (p2, _) = paginate_one_page(&items, c1.as_deref(), Some(key));
     assert_eq!(p2[0], 100);
 }
 
@@ -2923,8 +2937,8 @@ fn cursor_signing_key_is_shared_through_the_cluster_state_key() {
 
     let items: Vec<i32> = (0..250).collect();
     let bind = |key: [u8; 32]| hmac_sha256::HMAC::mac(b"anonymous", key).to_vec();
-    let (_page, next) = super::paginate_list_bound(&items, None, Some(&bind(key_a)));
-    let (page_two, _) = super::paginate_list_bound(&items, next.as_deref(), Some(&bind(key_b)));
+    let (_page, next) = paginate_one_page(&items, None, Some(&bind(key_a)));
+    let (page_two, _) = paginate_one_page(&items, next.as_deref(), Some(&bind(key_b)));
     assert_eq!(page_two[0], 100);
 
     unsafe { std::env::remove_var(var) };
@@ -2997,8 +3011,8 @@ fn bound_cursor_rejects_cross_session_replay() {
     let items: Vec<i32> = (0..250).collect();
     let key_a = b"session-A-key";
     let key_b = b"session-B-key";
-    let (_p1, c1) = super::paginate_list_bound(&items, None, Some(key_a));
-    let (replay_page, _) = super::paginate_list_bound(&items, c1.as_deref(), Some(key_b));
+    let (_p1, c1) = paginate_one_page(&items, None, Some(key_a));
+    let (replay_page, _) = paginate_one_page(&items, c1.as_deref(), Some(key_b));
     // Replay resets to offset 0 rather than advancing.
     assert_eq!(replay_page[0], 0);
 }
@@ -3008,9 +3022,9 @@ fn bound_cursor_rejects_cross_session_replay() {
 #[test]
 fn bound_cursor_rejects_unbound_input() {
     let items: Vec<i32> = (0..250).collect();
-    let (_p1, c1) = super::paginate_list_bound(&items, None, None);
+    let (_p1, c1) = paginate_one_page(&items, None, None);
     assert!(c1.is_some());
-    let (page, _) = super::paginate_list_bound(&items, c1.as_deref(), Some(b"key"));
+    let (page, _) = paginate_one_page(&items, c1.as_deref(), Some(b"key"));
     assert_eq!(page[0], 0, "mixed-mode cursor must restart");
 }
 

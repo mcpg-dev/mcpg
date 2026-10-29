@@ -365,7 +365,8 @@ impl Stream {
         let mut read_now = true;
         loop {
             if read_now {
-                if let Some(close) = self.drain().await {
+                let head = *head_rx.borrow_and_update();
+                if let Some(close) = self.drain(head).await {
                     return close;
                 }
                 read_now = false;
@@ -393,8 +394,9 @@ impl Stream {
         }
     }
 
-    /// Send what the log holds past the stream's position.
-    async fn drain(&mut self) -> Option<Close> {
+    /// Send what the log holds past the stream's position, at least up to
+    /// `head`, the head this stream last heard of.
+    async fn drain(&mut self, head: u64) -> Option<Close> {
         let core = self.core.upgrade()?;
         let runtime = core.runtime()?.load_full();
         // A held stream sends heartbeats only; the events wait in the log.
@@ -415,8 +417,15 @@ impl Stream {
                 after_seq: self.after,
                 truncated: false,
             };
-            let read = match read_occurrences(&self.stores, &runtime, &self.ty, &reader, start)
-                .await
+            let read = match read_occurrences(
+                &self.stores,
+                &runtime,
+                &self.ty,
+                &reader,
+                start,
+                Some(head),
+            )
+            .await
             {
                 Ok(read) => read,
                 Err(error) => {

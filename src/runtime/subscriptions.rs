@@ -380,13 +380,14 @@ impl SubscriptionService {
                 Some(existing) if existing.count > 0 => return,
                 Some(_) => {
                     holders.remove(&key);
+                    // Under the lock: an acquire that finds the key gone
+                    // writes its row after this delete, never before it.
+                    let _ = self.store.unsubscribe(&key.0, &key.1);
                 }
                 None => return,
             }
         }
-        let (session_id, uri) = key;
-        let _ = self.store.unsubscribe(&session_id, &uri);
-        self.watch.notify_unsubscribe(&uri).await;
+        self.watch.notify_unsubscribe(&key.1).await;
     }
 }
 
@@ -498,6 +499,98 @@ mod tests {
             service.store.subscribers_for("file:///a").is_empty(),
             "the last holder leaving must release the row"
         );
+    }
+
+    /// A store whose deletes take a while, as a coordinator's over the
+    /// network do.
+    #[derive(Debug)]
+    struct SlowDeleteKv {
+        inner: crate::builtins::cluster_primitives::MemoryKv,
+    }
+
+    type KvResult<T> = Result<T, mcpg_cluster_api::ClusterError>;
+
+    #[async_trait::async_trait]
+    impl mcpg_cluster_api::KeyValueStore for SlowDeleteKv {
+        async fn get(&self, key: &str) -> KvResult<Option<mcpg_cluster_api::Entry>> {
+            self.inner.get(key).await
+        }
+
+        async fn put(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            ttl: Option<std::time::Duration>,
+        ) -> KvResult<()> {
+            self.inner.put(key, value, ttl).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            value: bytes::Bytes,
+            ttl: Option<std::time::Duration>,
+        ) -> KvResult<bool> {
+            self.inner.put_if_absent(key, value, ttl).await
+        }
+
+        async fn delete(&self, key: &str) -> KvResult<bool> {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            self.inner.delete(key).await
+        }
+
+        async fn list_page(
+            &self,
+            prefix: &str,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> KvResult<mcpg_cluster_api::KvPage> {
+            self.inner.list_page(prefix, cursor, limit).await
+        }
+
+        async fn expire(&self, key: &str, ttl: Option<std::time::Duration>) -> KvResult<bool> {
+            self.inner.expire(key, ttl).await
+        }
+
+        async fn incr(
+            &self,
+            key: &str,
+            delta: i64,
+            ttl: Option<std::time::Duration>,
+        ) -> KvResult<i64> {
+            self.inner.incr(key, delta, ttl).await
+        }
+    }
+
+    /// A lease taken while the reaper deletes the key's row keeps a row: the
+    /// new row is written after the delete, never before it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lease_taken_while_the_reaper_deletes_keeps_its_row() {
+        let kv = Arc::new(SlowDeleteKv {
+            inner: crate::builtins::cluster_primitives::MemoryKv::new(),
+        });
+        let service = SubscriptionService::new(
+            Arc::new(KvBackedSubscriptionStore::new(kv, 100)),
+            WatchEngine::noop(),
+        );
+        let lease = service
+            .acquire("sess", "file:///a", None)
+            .await
+            .expect("lease");
+        drop(lease);
+        // The reaper takes the key down and starts its delete.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let revived = service
+            .acquire("sess", "file:///a", None)
+            .await
+            .expect("re-acquire");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            service.store.subscribers_for("file:///a").len(),
+            1,
+            "the new lease's row outlives the reaper's delete"
+        );
+        drop(revived);
     }
 
     /// A lease taken while a release is queued rejoins the existing row rather

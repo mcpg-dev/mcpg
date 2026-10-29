@@ -43,11 +43,11 @@
 //! cap, and the one call that crosses it can go over.
 //!
 //! A concurrency cap counts the fleet. In a fleet the permits are
-//! counted in the quota store
-//! ([`super::fleet_semaphore::FleetSemaphore`]: one counter per
-//! replica and scope, summed on acquire), so `max_concurrent` is
-//! the number of calls in flight across every replica; a replica
-//! that dies gives its permits back within the counter TTL. On a
+//! slots in the quota store ([`super::fleet_semaphore::FleetSemaphore`]:
+//! `max_concurrent` slots per scope, each taken by one acquire), so
+//! `max_concurrent` is the number of calls in flight across every
+//! replica; a replica that dies gives its slots back within the slot
+//! TTL. On a
 //! single node an in-process [`tokio::sync::Semaphore`] per scope
 //! is exact and costs no store call. `on_exceeded: queue` waits up
 //! to `queue_timeout_ms` for a permit in both cases.
@@ -165,14 +165,103 @@ impl std::fmt::Debug for ConcurrencyPermit {
 #[derive(Debug)]
 pub struct QuotaStore {
     kv: Arc<dyn KeyValueStore>,
+    /// The same keyspace without the state cipher, for the rate-limit and
+    /// budget counters: `incr` keeps them plaintext, and a sealed view
+    /// refuses to read one.
+    counters: Arc<dyn KeyValueStore>,
     locks: DashMap<String, Arc<Mutex<()>>>,
+    /// Refusals this replica knows to hold, so it refuses without the store.
+    refusals: Refusals,
+}
+
+/// How long a refused budget is refused here without asking the store
+/// again: a call the budget counted and gave back can make room.
+const BUDGET_REFUSAL_HOLD_MS: i64 = 1_000;
+/// How far past a full bucket's horizon a rate bucket may be before a
+/// consume brings it back. Refused consumes that have not given their token
+/// back yet move it by an interval each, far less than this.
+const TAT_REPAIR_SLACK_US: i64 = 60_000_000;
+/// Entries a refusal map keeps before it drops the ended ones.
+const REFUSALS_PRUNE_AT: usize = 4_096;
+
+/// Rate-limit buckets and budgets that refuse every call until a known
+/// time.
+#[derive(Debug, Default)]
+struct Refusals {
+    /// Per bucket key: the µs until which no consume fits, with the
+    /// bucket's emission interval and capacity it was worked out for.
+    buckets: DashMap<String, (i64, i64, i64)>,
+    /// Per budget base: the ms until which it refuses, and the measure.
+    budgets: DashMap<String, (i64, &'static str)>,
+}
+
+impl Refusals {
+    fn bucket_refuses(&self, key: &str, interval_us: i64, capacity_us: i64, now_us: i64) -> bool {
+        self.buckets.get(key).is_some_and(|refusal| {
+            let (until_us, interval, capacity) = *refusal;
+            until_us > now_us && interval == interval_us && capacity == capacity_us
+        })
+    }
+
+    fn refuse_bucket(
+        &self,
+        key: &str,
+        until_us: i64,
+        interval_us: i64,
+        capacity_us: i64,
+        now_us: i64,
+    ) {
+        if until_us <= now_us {
+            return;
+        }
+        // No longer than an empty bucket takes to fill, so a bucket another
+        // replica brought back is asked again soon.
+        let until_us = until_us.min(
+            now_us
+                .saturating_add(capacity_us)
+                .saturating_add(interval_us),
+        );
+        if self.buckets.len() >= REFUSALS_PRUNE_AT {
+            self.buckets.retain(|_, refusal| refusal.0 > now_us);
+        }
+        self.buckets
+            .insert(key.to_owned(), (until_us, interval_us, capacity_us));
+    }
+
+    fn budget_refuses(&self, base: &str, now_ms: i64) -> Option<&'static str> {
+        self.budgets
+            .get(base)
+            .filter(|refusal| refusal.0 > now_ms)
+            .map(|refusal| refusal.1)
+    }
+
+    fn refuse_budget(&self, base: &str, until_ms: i64, measure: &'static str, now_ms: i64) {
+        if until_ms <= now_ms {
+            return;
+        }
+        if self.budgets.len() >= REFUSALS_PRUNE_AT {
+            self.budgets.retain(|_, refusal| refusal.0 > now_ms);
+        }
+        self.budgets.insert(base.to_owned(), (until_ms, measure));
+    }
 }
 
 impl QuotaStore {
     pub fn new(kv: Arc<dyn KeyValueStore>) -> Arc<Self> {
+        Self::with_counters(Arc::clone(&kv), kv)
+    }
+
+    /// A store that keeps its sealed values in `kv` and its counters in
+    /// `counters`, the same keyspace without the state cipher.
+    pub fn with_counters(
+        kv: Arc<dyn KeyValueStore>,
+        counters: Arc<dyn KeyValueStore>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             kv,
+            counters,
             locks: DashMap::new(),
+            refusals: Refusals::default(),
         })
     }
 
@@ -234,6 +323,10 @@ fn emission_interval_us(rate_per_min: u32) -> i64 {
 /// racing a consume), never over-grant, and the clamp self-heals it
 /// within one refill interval.
 ///
+/// A refusal tells when the next consume can fit: TAT only grows while
+/// replicas consume, so until `TAT + interval - capacity` every consume is
+/// refused, and the replica refuses those without the store.
+///
 /// `key` is the operator-stable bucket key (typically
 /// `quotas.rate_limit.<policy_id>.<scope_key>`).
 /// `now_ms` is the wall-clock at evaluation time (passed in for
@@ -253,10 +346,22 @@ async fn consume_token_bucket(
     // every touch re-arms it.
     let ttl = Some(Duration::from_secs(3600));
 
+    let refused = || {
+        store
+            .refusals
+            .bucket_refuses(key, interval_us, capacity_us, now_us)
+    };
+    if refused() {
+        return Ok(false);
+    }
     let lock = store.lock_for(key);
     let _guard = lock.lock().await;
+    // A caller that waited for the lock behind a refused consume.
+    if refused() {
+        return Ok(false);
+    }
     let mut tat = store
-        .kv
+        .counters
         .incr(key, interval_us, ttl)
         .await
         .with_context(|| format!("quota_store: incr failed for `{key}`"))?;
@@ -265,10 +370,24 @@ async fn consume_token_bucket(
         // Fresh or idle bucket: burn the banked idle credit so refill
         // caps at capacity (TAT lands on now + one consume).
         tat = store
-            .kv
+            .counters
             .incr(key, behind, ttl)
             .await
             .with_context(|| format!("quota_store: incr clamp failed for `{key}`"))?;
+    }
+    // Two replicas that find the bucket idle at once each add what it
+    // lagged, which leaves it far past any consume: on a new key, about the
+    // clock's epoch, so it would refuse for good. Bring it back to this one.
+    if tat
+        > now_us
+            .saturating_add(capacity_us)
+            .saturating_add(TAT_REPAIR_SLACK_US)
+    {
+        tat = store
+            .counters
+            .incr(key, now_us + interval_us - tat, ttl)
+            .await
+            .with_context(|| format!("quota_store: incr repair failed for `{key}`"))?;
     }
     let allowed = tat <= now_us.saturating_add(capacity_us);
     if !allowed {
@@ -276,8 +395,19 @@ async fn consume_token_bucket(
         // the deny stands (one token stays burned until refill) rather
         // than flipping an already-made decision onto the gate's
         // fail-open/fail-closed error path.
-        if let Err(e) = store.kv.incr(key, -interval_us, ttl).await {
-            tracing::warn!(key, error = %e, "quota rate-limit refund failed; token stays burned");
+        match store.counters.incr(key, -interval_us, ttl).await {
+            Ok(after) => store.refusals.refuse_bucket(
+                key,
+                after
+                    .saturating_add(interval_us)
+                    .saturating_sub(capacity_us),
+                interval_us,
+                capacity_us,
+                now_us,
+            ),
+            Err(e) => {
+                tracing::warn!(key, error = %e, "quota rate-limit refund failed; token stays burned");
+            }
         }
     }
     Ok(allowed)
@@ -372,6 +502,8 @@ fn usd_to_micro(usd: f64) -> i64 {
 struct BudgetWindow {
     prefix: String,
     ttl: Duration,
+    /// When the window ends, in Unix ms.
+    ends_ms: i64,
 }
 
 impl BudgetWindow {
@@ -400,8 +532,9 @@ impl BudgetWindow {
                     {
                         let calls = format!("{base}.{start}.calls");
                         let ttl = Duration::from_millis((window_ms as u64).saturating_mul(2));
+                        // A counter: `add` adds to the stored digits.
                         let _ = store
-                            .kv
+                            .counters
                             .put_if_absent(&calls, Bytes::from(state.calls.to_string()), Some(ttl))
                             .await;
                     }
@@ -415,13 +548,14 @@ impl BudgetWindow {
         Ok(Self {
             prefix: format!("{base}.{start}"),
             ttl: Duration::from_millis((window_ms as u64).saturating_mul(2)),
+            ends_ms: start.saturating_add(window_ms),
         })
     }
 
     async fn read(&self, store: &QuotaStore, measure: &str) -> Result<i64> {
         let key = format!("{}.{measure}", self.prefix);
         match store
-            .kv
+            .counters
             .get(&key)
             .await
             .with_context(|| format!("quota_store: get failed for `{key}`"))?
@@ -434,7 +568,7 @@ impl BudgetWindow {
     async fn add(&self, store: &QuotaStore, measure: &str, delta: i64) -> Result<i64> {
         let key = format!("{}.{measure}", self.prefix);
         store
-            .kv
+            .counters
             .incr(&key, delta, Some(self.ttl))
             .await
             .with_context(|| format!("quota_store: incr failed for `{key}`"))
@@ -506,24 +640,36 @@ enum BudgetCheck {
 
 /// Pre-flight: deny when spent tokens or cost already reach their caps;
 /// count the call and deny (giving the count back) when that goes over
-/// `cap_calls`. Caps set together deny on the first one reached.
+/// `cap_calls`. Caps set together deny on the first one reached. A
+/// refused budget is refused here without the store for
+/// [`BUDGET_REFUSAL_HOLD_MS`], at most to the end of its window.
 async fn check_budget_pre_flight(
     store: &QuotaStore,
     base: &str,
     policy: &BudgetPolicy,
     now_ms: i64,
 ) -> Result<BudgetCheck> {
+    if let Some(measure) = store.refusals.budget_refuses(base, now_ms) {
+        return Ok(BudgetCheck::Denied(measure));
+    }
     let window_ms = window_to_ms(&policy.window).unwrap_or(86_400_000);
     let window = BudgetWindow::open(store, base, window_ms, now_ms).await?;
+    let refuse = |measure: &'static str| {
+        let until = now_ms
+            .saturating_add(BUDGET_REFUSAL_HOLD_MS)
+            .min(window.ends_ms);
+        store.refusals.refuse_budget(base, until, measure, now_ms);
+        BudgetCheck::Denied(measure)
+    };
     if let Some(cap) = policy.cap_token_count
         && window.read(store, "tokens").await? >= cap as i64
     {
-        return Ok(BudgetCheck::Denied("tokens"));
+        return Ok(refuse("tokens"));
     }
     if let Some(cap) = policy.cap_usd
         && window.read(store, "micro_usd").await? >= usd_to_micro(cap)
     {
-        return Ok(BudgetCheck::Denied("usd"));
+        return Ok(refuse("usd"));
     }
     let Some(cap) = policy.cap_calls else {
         return Ok(BudgetCheck::Allowed {
@@ -535,7 +681,7 @@ async fn check_budget_pre_flight(
     let calls = window.add(store, "calls", 1).await?;
     if calls > cap {
         window.give_back_call(store, &policy.id).await;
-        return Ok(BudgetCheck::Denied("calls"));
+        return Ok(refuse("calls"));
     }
     Ok(BudgetCheck::Allowed {
         warnings: crossing(policy, "calls", calls - 1, calls, cap, 1.0)
@@ -1066,6 +1212,169 @@ mod tests {
         QuotaStore::new(Arc::new(StubKv::default()))
     }
 
+    /// [`StubKv`] that counts the operations it serves.
+    #[derive(Debug, Default)]
+    struct CountingKv {
+        inner: StubKv,
+        ops: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingKv {
+        fn count(&self) {
+            self.ops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn ops(&self) -> u64 {
+            self.ops.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    type KvResult<T> = std::result::Result<T, mcpg_cluster_api::error::ClusterError>;
+
+    #[async_trait::async_trait]
+    impl mcpg_cluster_api::KeyValueStore for CountingKv {
+        async fn get(&self, key: &str) -> KvResult<Option<Entry>> {
+            self.count();
+            self.inner.get(key).await
+        }
+
+        async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>) -> KvResult<()> {
+            self.count();
+            self.inner.put(key, value, ttl).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            value: Bytes,
+            ttl: Option<Duration>,
+        ) -> KvResult<bool> {
+            self.count();
+            self.inner.put_if_absent(key, value, ttl).await
+        }
+
+        async fn delete(&self, key: &str) -> KvResult<bool> {
+            self.count();
+            self.inner.delete(key).await
+        }
+
+        async fn list_page(
+            &self,
+            prefix: &str,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> KvResult<mcpg_cluster_api::KvPage> {
+            self.count();
+            self.inner.list_page(prefix, cursor, limit).await
+        }
+
+        async fn expire(&self, key: &str, ttl: Option<Duration>) -> KvResult<bool> {
+            self.count();
+            self.inner.expire(key, ttl).await
+        }
+
+        async fn incr(&self, key: &str, delta: i64, ttl: Option<Duration>) -> KvResult<i64> {
+            self.count();
+            self.inner.incr(key, delta, ttl).await
+        }
+    }
+
+    /// A refused consume tells when the next one can fit; until then the
+    /// replica refuses without the store, and from then the store decides.
+    #[tokio::test]
+    async fn a_refused_bucket_skips_the_store_until_a_token_fits() {
+        let kv = Arc::new(CountingKv::default());
+        let s = QuotaStore::new(Arc::clone(&kv) as Arc<dyn KeyValueStore>);
+        let p = rate_limit_policy("p", 60, Some(1));
+        assert!(consume_token_bucket(&s, "k", &p, 0).await.unwrap());
+        assert!(!consume_token_bucket(&s, "k", &p, 0).await.unwrap());
+        let asked = kv.ops();
+        for t in [1, 500, 999] {
+            assert!(!consume_token_bucket(&s, "k", &p, t).await.unwrap());
+        }
+        assert_eq!(kv.ops(), asked, "refused here, without the store");
+        assert!(consume_token_bucket(&s, "k", &p, 1_000).await.unwrap());
+        assert!(kv.ops() > asked);
+        // Another rate for the same key does not read this refusal.
+        let faster = rate_limit_policy("p", 120, Some(1));
+        assert!(!consume_token_bucket(&s, "k", &p, 1_000).await.unwrap());
+        let asked = kv.ops();
+        consume_token_bucket(&s, "k", &faster, 1_001).await.unwrap();
+        assert!(kv.ops() > asked, "a reloaded policy asks the store");
+    }
+
+    /// Two replicas that find a new bucket idle at once each add the clock's
+    /// epoch to it; the next consume brings it back, and the rate holds.
+    #[tokio::test]
+    async fn a_bucket_two_racing_clamps_sent_far_ahead_is_brought_back() {
+        let s = store();
+        let p = rate_limit_policy("p", 60, Some(1));
+        let now_ms = 1_793_000_000_000;
+        s.counters.incr("k", 2 * now_ms * 1000, None).await.unwrap();
+        assert!(
+            consume_token_bucket(&s, "k", &p, now_ms).await.unwrap(),
+            "the next consume is admitted"
+        );
+        assert!(!consume_token_bucket(&s, "k", &p, now_ms).await.unwrap());
+        assert!(
+            consume_token_bucket(&s, "k", &p, now_ms + 1_000)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A refusal is held here no longer than an empty bucket takes to fill.
+    #[tokio::test]
+    async fn a_refusal_is_held_here_no_longer_than_the_bucket_takes_to_fill() {
+        let kv = Arc::new(CountingKv::default());
+        let s = QuotaStore::new(Arc::clone(&kv) as Arc<dyn KeyValueStore>);
+        let p = rate_limit_policy("p", 60, Some(1));
+        // 30 s ahead: refused, but too close for a repair.
+        s.counters.incr("k", 30_000_000, None).await.unwrap();
+        assert!(!consume_token_bucket(&s, "k", &p, 0).await.unwrap());
+        let asked = kv.ops();
+        assert!(!consume_token_bucket(&s, "k", &p, 1_999).await.unwrap());
+        assert_eq!(kv.ops(), asked, "refused here, without the store");
+        consume_token_bucket(&s, "k", &p, 2_000).await.unwrap();
+        assert!(
+            kv.ops() > asked,
+            "asked again once an empty bucket could have filled"
+        );
+    }
+
+    /// A refused budget is refused here without the store for a second, and
+    /// then the store decides again.
+    #[tokio::test]
+    async fn a_refused_budget_is_held_here_for_a_second() {
+        let kv = Arc::new(CountingKv::default());
+        let s = QuotaStore::new(Arc::clone(&kv) as Arc<dyn KeyValueStore>);
+        let policy = BudgetPolicy {
+            cap_calls: Some(1),
+            ..budget_policy("24h")
+        };
+        let now = Utc::now().timestamp_millis();
+        let check = |at| check_budget_pre_flight(&s, "b", &policy, at);
+        assert!(matches!(
+            check(now).await.unwrap(),
+            BudgetCheck::Allowed { .. }
+        ));
+        assert!(matches!(
+            check(now).await.unwrap(),
+            BudgetCheck::Denied("calls")
+        ));
+        let asked = kv.ops();
+        assert!(matches!(
+            check(now + 999).await.unwrap(),
+            BudgetCheck::Denied("calls")
+        ));
+        assert_eq!(kv.ops(), asked, "refused here, without the store");
+        assert!(matches!(
+            check(now + 1_000).await.unwrap(),
+            BudgetCheck::Denied("calls")
+        ));
+        assert!(kv.ops() > asked, "after the hold the store decides again");
+    }
+
     fn rate_limit_policy(id: &str, calls_per_minute: u32, burst: Option<u32>) -> RateLimitPolicy {
         RateLimitPolicy {
             id: id.into(),
@@ -1548,6 +1857,9 @@ mod tests {
         );
         drop(held);
         settle().await;
+        // B found the fleet full, so it refuses without the store until the
+        // hold ends.
+        tokio::time::sleep(super::super::fleet_semaphore::FULL_HOLD).await;
         assert!(matches!(
             call(&b).await,
             QuotaDecision::Allow {
@@ -1652,6 +1964,10 @@ mod tests {
     }
 
     fn budget_gate(policy: BudgetPolicy, kv: Arc<dyn KeyValueStore>) -> QuotaGate {
+        budget_gate_on(policy, QuotaStore::new(kv))
+    }
+
+    fn budget_gate_on(policy: BudgetPolicy, store: Arc<QuotaStore>) -> QuotaGate {
         let mut qc = QuotasConfig::default();
         qc.budgets.push(policy);
         let mut refs = HashMap::new();
@@ -1662,7 +1978,73 @@ mod tests {
                 ..Default::default()
             },
         );
-        QuotaGate::new(&qc, refs, QuotaStore::new(kv), true)
+        QuotaGate::new(&qc, refs, store, true)
+    }
+
+    /// The quota store of a gateway with a state key: its sealed values
+    /// under the cipher, its counters without it.
+    fn store_under_state_key(kv: &Arc<dyn KeyValueStore>) -> Arc<QuotaStore> {
+        let cipher = Arc::new(
+            mcpg_plugin_host::credential_cache_cipher::EventCipher::from_raw_key(
+                &[3u8; 32],
+                "k1".into(),
+            )
+            .unwrap(),
+        );
+        let sealed: Arc<dyn KeyValueStore> = Arc::new(
+            mcpg_plugin_host::cluster_encryption::EncryptingKeyValueStore::new(
+                Arc::clone(kv),
+                cipher,
+            ),
+        );
+        QuotaStore::with_counters(sealed, Arc::clone(kv))
+    }
+
+    /// A state key seals the store's values but not its counters, which a
+    /// sealed view refuses to read or list: the replicas still count one
+    /// another's permits and spend.
+    #[tokio::test]
+    async fn the_replicas_count_one_another_under_a_state_key() {
+        let kv = shared_kv();
+        let qc = one_permit("deny", 0);
+        let a = QuotaGate::new(&qc, HashMap::new(), store_under_state_key(&kv), true);
+        let b = QuotaGate::new(&qc, HashMap::new(), store_under_state_key(&kv), true);
+        let _held = call(&a).await;
+        assert!(
+            matches!(
+                call(&b).await,
+                QuotaDecision::Deny {
+                    kind: QuotaKind::Concurrency,
+                    ..
+                }
+            ),
+            "the permit A holds counts on B"
+        );
+
+        let kv = shared_kv();
+        let policy = BudgetPolicy {
+            kind: "token_count".into(),
+            cap_token_count: Some(1_000),
+            ..budget_policy("24h")
+        };
+        let a = budget_gate_on(policy.clone(), store_under_state_key(&kv));
+        let b = budget_gate_on(policy, store_under_state_key(&kv));
+        for _ in 0..2 {
+            assert!(matches!(budget_call(&a).await, QuotaDecision::Allow { .. }));
+            a.charge_usage("my-tool", None, &anonymous(), &used(400, 300, None))
+                .await
+                .unwrap();
+        }
+        assert!(
+            matches!(
+                budget_call(&b).await,
+                QuotaDecision::Deny {
+                    kind: QuotaKind::Budget,
+                    ..
+                }
+            ),
+            "the tokens A charged stop B"
+        );
     }
 
     fn anonymous() -> RequestIdentity {

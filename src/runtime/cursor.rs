@@ -9,6 +9,7 @@ pub(super) fn paginate_list_bound<T: Clone>(
     items: &[T],
     cursor: Option<&str>,
     bind_key: Option<&[u8]>,
+    page_size: usize,
 ) -> (Vec<T>, Option<String>) {
     let offset = cursor.and_then(|c| decode_cursor(c, bind_key)).unwrap_or(0);
 
@@ -16,7 +17,7 @@ pub(super) fn paginate_list_bound<T: Clone>(
         return (vec![], None);
     }
 
-    let end = (offset + DEFAULT_PAGE_SIZE).min(items.len());
+    let end = offset.saturating_add(page_size.max(1)).min(items.len());
     let page = items[offset..end].to_vec();
     let next_cursor = if end < items.len() {
         Some(encode_cursor(end, bind_key))
@@ -77,8 +78,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Wire-encoded composite cursor for `resources/list` pagination.
 ///
-/// On page 1 (incoming cursor is `None`): the gateway pages
-/// `DEFAULT_PAGE_SIZE` static resources AND fans out to every
+/// On page 1 (incoming cursor is `None`): the gateway pages one
+/// page (`mcp.list_page_size`) of static resources AND fans out to every
 /// dynamic provider's first page. The outgoing cursor records
 /// (a) where to resume the static walk, and (b) which dynamic
 /// providers reported a non-null `next_cursor` plus their
@@ -86,7 +87,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 ///
 /// On page N: each call walks EITHER more static resources OR
 /// one round of remaining dynamic providers, never both, so a
-/// single page response never exceeds `DEFAULT_PAGE_SIZE` items
+/// single page response never exceeds one page of items
 /// (the static cap) plus the dynamic-walk batch.
 ///
 /// HMAC-bound to the session via the same key derivation as the
