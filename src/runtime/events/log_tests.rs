@@ -615,6 +615,101 @@ const LIMITS: InboxLimits = InboxLimits {
     max_rows: 100,
 };
 
+/// A store that counts the steps of inbox counters, each after a few
+/// milliseconds so that concurrent writes overlap, and fails them on demand.
+#[derive(Debug, Default)]
+struct CounterStepKv {
+    inner: MemoryKv,
+    steps: std::sync::atomic::AtomicUsize,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+impl CounterStepKv {
+    fn steps(&self) -> usize {
+        self.steps.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl KeyValueStore for CounterStepKv {
+    async fn get(&self, key: &str) -> KvResult<Option<mcpg_cluster_api::Entry>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>) -> KvResult<()> {
+        self.inner.put(key, value, ttl).await
+    }
+
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Option<Duration>,
+    ) -> KvResult<bool> {
+        self.inner.put_if_absent(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> KvResult<bool> {
+        self.inner.delete(key).await
+    }
+
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> KvResult<mcpg_cluster_api::KvPage> {
+        self.inner.list_page(prefix, cursor, limit).await
+    }
+
+    async fn expire(&self, key: &str, ttl: Option<Duration>) -> KvResult<bool> {
+        self.inner.expire(key, ttl).await
+    }
+
+    async fn incr(&self, key: &str, delta: i64, ttl: Option<Duration>) -> KvResult<i64> {
+        if key.starts_with("ev:in:n:") && delta != 0 {
+            self.steps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ClusterError::BackendUnavailable {
+                    reason: "nats kv incr: timed out".into(),
+                });
+            }
+        }
+        self.inner.incr(key, delta, ttl).await
+    }
+}
+
+fn log_over_steps(kv: &Arc<CounterStepKv>) -> Arc<EventLog> {
+    Arc::new(EventLog::new(
+        Arc::clone(kv) as Arc<dyn KeyValueStore>,
+        None,
+        keys(),
+    ))
+}
+
+/// `count` inbox writes of `SK` at once, each its own task, and what each
+/// was answered, in the order they started.
+async fn write_at_once(
+    log: &Arc<EventLog>,
+    count: usize,
+    limits: InboxLimits,
+) -> Vec<Result<InboxOutcome, LogError>> {
+    let writes: Vec<_> = (0..count)
+        .map(|i| {
+            let log = Arc::clone(log);
+            tokio::spawn(
+                async move { log.inbox_put(SK, inbox_row(&format!("e{i}")), limits).await },
+            )
+        })
+        .collect();
+    let mut outcomes = Vec::with_capacity(count);
+    for write in writes {
+        outcomes.push(write.await.unwrap());
+    }
+    outcomes
+}
+
 async fn identity_shape(row: InboxRow) -> Option<StoredOccurrence> {
     Some(StoredOccurrence {
         event_id: row.event_id.unwrap_or_default(),
@@ -800,6 +895,101 @@ async fn a_reserved_slot_not_yet_written_holds_the_drain_back() {
     .unwrap();
     drain(&log, lease(1), identity_shape).await.unwrap();
     assert_eq!(seqs(&log.read(SK, 0, 10).await.unwrap()), vec![1, 2, 3]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbox_writes_that_arrive_together_share_counter_steps() {
+    let kv = Arc::new(CounterStepKv::default());
+    let log = log_over_steps(&kv);
+    let outcomes = write_at_once(&log, 64, LIMITS).await;
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, Ok(InboxOutcome::Accepted)))
+    );
+    assert!(
+        kv.steps() < 64,
+        "{} counter steps for 64 writes",
+        kv.steps()
+    );
+    assert_eq!(log.inbox_pending(SK).await.unwrap(), 64);
+    let drained = drain(&log, lease(1), identity_shape).await.unwrap();
+    assert_eq!(
+        (drained.consumed, drained.appended),
+        (64, 64),
+        "every slot holds one row"
+    );
+}
+
+#[tokio::test]
+async fn writes_past_the_room_of_one_turn_are_refused() {
+    let kv = Arc::new(CounterStepKv::default());
+    let log = log_over_steps(&kv);
+    let tight = InboxLimits {
+        ttl: Duration::from_secs(3_600),
+        max_rows: 5,
+    };
+    let outcomes = write_at_once(&log, 8, tight).await;
+    let accepted = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Ok(InboxOutcome::Accepted)))
+        .count();
+    let refused = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Ok(InboxOutcome::Full { .. })))
+        .count();
+    assert_eq!((accepted, refused), (5, 3));
+    assert_eq!(log.inbox_pending(SK).await.unwrap(), 5);
+}
+
+#[tokio::test]
+async fn a_counter_step_that_fails_reserves_no_slot_for_any_write_of_its_turn() {
+    let kv = Arc::new(CounterStepKv::default());
+    let log = log_over_steps(&kv);
+    kv.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    let outcomes = write_at_once(&log, 4, LIMITS).await;
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, Err(LogError::Store(_))))
+    );
+    assert_eq!(log.inbox_pending(SK).await.unwrap(), 0);
+    kv.failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        log.inbox_put(SK, inbox_row("a"), LIMITS).await.unwrap(),
+        InboxOutcome::Accepted
+    );
+    assert_eq!(
+        drain(&log, lease(1), identity_shape)
+            .await
+            .unwrap()
+            .consumed,
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_write_whose_sender_goes_away_still_fills_its_slot() {
+    let kv = Arc::new(CounterStepKv::default());
+    let log = log_over_steps(&kv);
+    let gone = {
+        let log = Arc::clone(&log);
+        tokio::spawn(async move { log.inbox_put(SK, inbox_row("gone"), LIMITS).await })
+    };
+    // The write asks for its slot; then its sender goes away.
+    tokio::task::yield_now().await;
+    gone.abort();
+    assert_eq!(
+        log.inbox_put(SK, inbox_row("after"), LIMITS).await.unwrap(),
+        InboxOutcome::Accepted
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let drained = drain(&log, lease(1), identity_shape).await.unwrap();
+    assert_eq!(
+        (drained.consumed, drained.appended),
+        (2, 2),
+        "no slot is left for the drain to wait out"
+    );
 }
 
 #[tokio::test]

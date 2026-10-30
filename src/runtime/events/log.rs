@@ -126,7 +126,7 @@ fn now_ms() -> u64 {
 }
 
 /// Why a log operation failed.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LogError {
     /// The store failed.
     Store(ClusterError),
@@ -394,6 +394,13 @@ pub struct InboxLimits {
     pub max_rows: u64,
 }
 
+/// An inbox write waiting in this process for its slot. The answer is the
+/// slot to write the row in, or `None` when the inbox refuses the row.
+struct SlotAsk {
+    limits: InboxLimits,
+    answer: tokio::sync::oneshot::Sender<Result<Option<u64>, LogError>>,
+}
+
 /// What an append did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppendOutcome {
@@ -560,6 +567,110 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<Option<T>, LogError> {
         .map_err(|e| LogError::Codec(e.to_string()))
 }
 
+/// The value under `key` in `kv`; a newer format is an error.
+async fn get_value_in<T: DeserializeOwned>(
+    kv: &dyn KeyValueStore,
+    key: &str,
+) -> Result<Option<T>, LogError> {
+    match kv.get(key).await? {
+        None => Ok(None),
+        Some(entry) => match decode(&entry.bytes)? {
+            Some(value) => Ok(Some(value)),
+            None => Err(LogError::NewerFormat),
+        },
+    }
+}
+
+/// Rows ever written to the inbox of `keys`. Read through `incr` by zero: a
+/// counter stays plaintext under state encryption, which a `get` through
+/// the encrypting store refuses.
+async fn inbox_written_in(kv: &dyn KeyValueStore, keys: &LogKeys) -> Result<u64, LogError> {
+    let n = kv.incr(&keys.inbox_counter(), 0, None).await?;
+    Ok(u64::try_from(n).unwrap_or(0))
+}
+
+/// The slot task of one log: each turn answers every inbox write waiting by
+/// then.
+async fn reserve_slots(
+    kv: Arc<dyn KeyValueStore>,
+    keys: LogKeys,
+    mut asks: tokio::sync::mpsc::UnboundedReceiver<SlotAsk>,
+) {
+    while let Some(first) = asks.recv().await {
+        let mut turn = vec![first];
+        while let Ok(ask) = asks.try_recv() {
+            turn.push(ask);
+        }
+        match reserve(kv.as_ref(), &keys, &turn).await {
+            Ok(slots) => {
+                for (ask, slot) in turn.into_iter().zip(slots) {
+                    let _ = ask.answer.send(Ok(slot));
+                }
+            }
+            Err(error) => {
+                for ask in turn {
+                    let _ = ask.answer.send(Err(error.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// The slots of one turn's `asks`, in their order: an ask takes a slot
+/// while the inbox has room under its limits and has been drained within
+/// its TTL, and `None` when not. One counter step reserves them all.
+async fn reserve(
+    kv: &dyn KeyValueStore,
+    keys: &LogKeys,
+    asks: &[SlotAsk],
+) -> Result<Vec<Option<u64>>, LogError> {
+    let now = now_ms();
+    let drained = match get_value_in::<InboxDrained>(kv, &keys.inbox_drained()).await? {
+        Some(drained) => drained,
+        None => {
+            let initial = InboxDrained {
+                v: FORMAT_VERSION,
+                n: 0,
+                at_ms: now,
+            };
+            kv.put_if_absent(&keys.inbox_drained(), encode(&initial)?, None)
+                .await?;
+            get_value_in(kv, &keys.inbox_drained())
+                .await?
+                .unwrap_or(initial)
+        }
+    };
+    let pending = inbox_written_in(kv, keys).await?.saturating_sub(drained.n);
+    let mut taken = 0u64;
+    let mut room = Vec::with_capacity(asks.len());
+    for ask in asks {
+        let ttl_ms = ask.limits.ttl.as_millis() as u64;
+        let stale = pending > 0 && now.saturating_sub(drained.at_ms) > ttl_ms;
+        let fits = !stale && pending.saturating_add(taken) < ask.limits.max_rows;
+        if fits {
+            taken += 1;
+        } else {
+            metrics::counter!("mcpg_events_inbox_full_total").increment(1);
+        }
+        room.push(fits);
+    }
+    if taken == 0 {
+        return Ok(vec![None; asks.len()]);
+    }
+    let step = i64::try_from(taken).map_err(|_| LogError::Codec("inbox step too large".into()))?;
+    let last = kv.incr(&keys.inbox_counter(), step, None).await?;
+    let last = u64::try_from(last).map_err(|_| LogError::Codec("negative inbox counter".into()))?;
+    let mut next = last.saturating_sub(taken) + 1;
+    let mut slots = Vec::with_capacity(asks.len());
+    for fits in room {
+        slots.push(fits.then_some(next));
+        if fits {
+            next += 1;
+        }
+    }
+    Ok(slots)
+}
+
 /// The event log over one `event-log` store.
 pub struct EventLog {
     kv: Arc<dyn KeyValueStore>,
@@ -571,6 +682,8 @@ pub struct EventLog {
     rows: Mutex<HashMap<String, RowCache>>,
     /// The bounds last read of each log, and when.
     bounds_seen: Mutex<HashMap<String, (LogBounds, Instant)>>,
+    /// Per log, the task that reserves the inbox slots of this process.
+    slots: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<SlotAsk>>>,
 }
 
 impl std::fmt::Debug for EventLog {
@@ -594,6 +707,7 @@ impl EventLog {
             holes: Mutex::new(HashMap::new()),
             rows: Mutex::new(HashMap::new()),
             bounds_seen: Mutex::new(HashMap::new()),
+            slots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -639,13 +753,7 @@ impl EventLog {
     /// operation: guessing at a head or a drain position could overwrite
     /// what a newer build wrote.
     async fn get_value<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>, LogError> {
-        match self.kv.get(key).await? {
-            None => Ok(None),
-            Some(entry) => match decode(&entry.bytes)? {
-                Some(value) => Ok(Some(value)),
-                None => Err(LogError::NewerFormat),
-            },
-        }
+        get_value_in(self.kv.as_ref(), key).await
     }
 
     /// The committed head, `None` for a log never written.
@@ -1016,47 +1124,68 @@ impl EventLog {
         limits: InboxLimits,
     ) -> Result<InboxOutcome, LogError> {
         let keys = LogKeys::new(sk);
-        let now = now_ms();
-        let drained = match self
-            .get_value::<InboxDrained>(&keys.inbox_drained())
-            .await?
-        {
-            Some(drained) => drained,
-            None => {
-                let initial = InboxDrained {
-                    v: FORMAT_VERSION,
-                    n: 0,
-                    at_ms: now,
-                };
-                self.kv
-                    .put_if_absent(&keys.inbox_drained(), encode(&initial)?, None)
-                    .await?;
-                self.get_value(&keys.inbox_drained())
-                    .await?
-                    .unwrap_or(initial)
+        let encoded = encode(&row)?;
+        let slot = self.ask_slot(sk, limits)?;
+        let (kv, bus, sk) = (Arc::clone(&self.kv), self.bus.clone(), sk.to_owned());
+        // Spawned: a sender that goes away while it waits must not leave a
+        // reserved slot unwritten, which holds the drain back for its grace.
+        let write = tokio::spawn(async move {
+            let Some(n) = slot
+                .await
+                .unwrap_or(Err(LogError::Store(ClusterError::Shutdown)))?
+            else {
+                return Ok(InboxOutcome::Full {
+                    retry_after: Duration::from_secs(60),
+                });
+            };
+            kv.put(&keys.inbox_row(n), encoded, Some(limits.ttl))
+                .await?;
+            if let Some(bus) = &bus {
+                let _ = bus
+                    .publish(INBOX_TOPIC, Bytes::copy_from_slice(sk.as_bytes()))
+                    .await;
             }
-        };
-        let written = self.inbox_written(&keys).await?;
-        let pending = written.saturating_sub(drained.n);
-        let ttl_ms = limits.ttl.as_millis() as u64;
-        let stale = pending > 0 && now.saturating_sub(drained.at_ms) > ttl_ms;
-        if pending >= limits.max_rows || stale {
-            metrics::counter!("mcpg_events_inbox_full_total").increment(1);
-            return Ok(InboxOutcome::Full {
-                retry_after: Duration::from_secs(60),
-            });
+            Ok(InboxOutcome::Accepted)
+        });
+        write
+            .await
+            .unwrap_or(Err(LogError::Store(ClusterError::Shutdown)))
+    }
+
+    /// Ask the slot task of `sk` for an inbox slot; the answer is the slot,
+    /// or `None` when the inbox refuses the row. The writes of one log in
+    /// this process take their slots from one task, which answers every
+    /// write waiting by its turn with one check of the bounds and one
+    /// counter step: the counter sees one writer per process, however many
+    /// writes arrive at once.
+    fn ask_slot(
+        &self,
+        sk: &str,
+        limits: InboxLimits,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<Option<u64>, LogError>>, LogError> {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let ask = SlotAsk { limits, answer };
+        if let Err(tokio::sync::mpsc::error::SendError(ask)) = self.slot_task(sk).send(ask) {
+            // The task ended with the runtime it ran on; a new one serves.
+            self.slots.lock().remove(sk);
+            self.slot_task(sk)
+                .send(ask)
+                .map_err(|_| LogError::Store(ClusterError::Shutdown))?;
         }
-        let n = self.kv.incr(&keys.inbox_counter(), 1, None).await?;
-        let n = u64::try_from(n).map_err(|_| LogError::Codec("negative inbox counter".into()))?;
-        self.kv
-            .put(&keys.inbox_row(n), encode(&row)?, Some(limits.ttl))
-            .await?;
-        if let Some(bus) = &self.bus {
-            let _ = bus
-                .publish(INBOX_TOPIC, Bytes::copy_from_slice(sk.as_bytes()))
-                .await;
-        }
-        Ok(InboxOutcome::Accepted)
+        Ok(answered)
+    }
+
+    /// The slot task of `sk`, started on first use.
+    fn slot_task(&self, sk: &str) -> tokio::sync::mpsc::UnboundedSender<SlotAsk> {
+        self.slots
+            .lock()
+            .entry(sk.to_owned())
+            .or_insert_with(|| {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(reserve_slots(Arc::clone(&self.kv), LogKeys::new(sk), rx));
+                tx
+            })
+            .clone()
     }
 
     // -----------------------------------------------------------------------
@@ -1542,12 +1671,9 @@ impl EventLog {
         Ok(written.saturating_sub(drained))
     }
 
-    /// Rows ever written to the inbox of `keys`. Read through `incr` by
-    /// zero: a counter stays plaintext under state encryption, which a `get`
-    /// through the encrypting store refuses.
+    /// Rows ever written to the inbox of `keys`.
     async fn inbox_written(&self, keys: &LogKeys) -> Result<u64, LogError> {
-        let n = self.kv.incr(&keys.inbox_counter(), 0, None).await?;
-        Ok(u64::try_from(n).unwrap_or(0))
+        inbox_written_in(self.kv.as_ref(), keys).await
     }
 
     /// Evict the oldest rows of `sk` past any retention bound and move the
