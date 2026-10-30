@@ -39,10 +39,17 @@ pub fn main() -> anyhow::Result<()> {
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_keep_alive(BLOCKING_THREAD_KEEP_ALIVE)
         .build()
         .context("cannot build the async runtime")?
         .block_on(run(args))
 }
+
+/// How long an idle blocking-pool thread waits for work before it exits.
+/// Idle threads take new work in turn, so under tokio's 10 s a fleet's
+/// periodic coordinator calls keep every thread of a burst, and its allocator
+/// cache, alive.
+const BLOCKING_THREAD_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(1);
 
 async fn run(args: Vec<String>) -> anyhow::Result<()> {
     // CLI extension dispatch: `mcpg plugin <subcommand> [args...]`

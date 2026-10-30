@@ -386,6 +386,36 @@ impl KeyValueStore for FileKv {
         delta: i64,
         ttl: Option<Duration>,
     ) -> Result<i64, ClusterError> {
+        self.update_counter(key, ttl, |current| {
+            current
+                .checked_add(delta)
+                .ok_or_else(mcpg_cluster_api::counter_overflow)
+        })
+        .await
+    }
+
+    async fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        self.update_counter(key, ttl, |current| {
+            mcpg_cluster_api::floor_add(current, floor, delta)
+        })
+        .await
+    }
+}
+
+impl FileKv {
+    /// Store `step(current)` as the counter under `key` and return it.
+    async fn update_counter(
+        &self,
+        key: &str,
+        ttl: Option<Duration>,
+        step: impl FnOnce(i64) -> Result<i64, ClusterError>,
+    ) -> Result<i64, ClusterError> {
         let _guard = self.incr_lock.lock().await;
         let now = current_unix_secs();
         let stored = self.read_entry(key).await?;
@@ -396,9 +426,7 @@ impl KeyValueStore for FileKv {
             Some(s) if live => mcpg_cluster_api::parse_counter(&s.payload)?,
             _ => 0,
         };
-        let next = current
-            .checked_add(delta)
-            .ok_or_else(mcpg_cluster_api::counter_overflow)?;
+        let next = step(current)?;
         let expires_at_secs = match ttl {
             Some(d) => Some(now + d.as_secs().max(1)),
             // ttl=None leaves a live entry's expiry untouched.

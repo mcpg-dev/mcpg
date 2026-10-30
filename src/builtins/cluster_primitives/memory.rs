@@ -215,9 +215,37 @@ impl KeyValueStore for MemoryKv {
         delta: i64,
         ttl: Option<Duration>,
     ) -> Result<i64, ClusterError> {
+        self.update_counter(key, ttl, |current| {
+            current
+                .checked_add(delta)
+                .ok_or_else(mcpg_cluster_api::counter_overflow)
+        })
+    }
+
+    async fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        self.update_counter(key, ttl, |current| {
+            mcpg_cluster_api::floor_add(current, floor, delta)
+        })
+    }
+}
+
+impl MemoryKv {
+    /// Store `step(current)` as the counter under `key` and return it.
+    fn update_counter(
+        &self,
+        key: &str,
+        ttl: Option<Duration>,
+        step: impl FnOnce(i64) -> Result<i64, ClusterError>,
+    ) -> Result<i64, ClusterError> {
         use dashmap::mapref::entry::Entry as DmEntry;
         let now = Instant::now();
-        // Read-add-write under the shard lock the `entry` API holds —
+        // Read-modify-write under the shard lock the `entry` API holds —
         // atomic against concurrent in-process callers. An expired
         // incumbent restarts the counter at 0.
         match self.inner.entry(key.to_owned()) {
@@ -228,9 +256,7 @@ impl KeyValueStore for MemoryKv {
                 } else {
                     0
                 };
-                let next = current
-                    .checked_add(delta)
-                    .ok_or_else(mcpg_cluster_api::counter_overflow)?;
+                let next = step(current)?;
                 let (expires_system, expires_instant) = if ttl.is_some() {
                     compute_deadline(ttl)
                 } else if live {
@@ -247,13 +273,14 @@ impl KeyValueStore for MemoryKv {
                 Ok(next)
             }
             DmEntry::Vacant(vac) => {
+                let next = step(0)?;
                 let (expires_system, expires_instant) = compute_deadline(ttl);
                 vac.insert(StoredEntry {
-                    bytes: Bytes::from(delta.to_string()),
+                    bytes: Bytes::from(next.to_string()),
                     expires_system,
                     expires_instant,
                 });
-                Ok(delta)
+                Ok(next)
             }
         }
     }

@@ -839,6 +839,32 @@ impl Inner {
     }
 
     fn incr(&self, key: &str, delta: i64, ttl: Option<Duration>) -> Result<i64, ClusterError> {
+        self.update_counter(key, ttl, |value| {
+            value
+                .checked_add(delta)
+                .ok_or_else(mcpg_cluster_api::counter_overflow)
+        })
+    }
+
+    fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        self.update_counter(key, ttl, |value| {
+            mcpg_cluster_api::floor_add(value, floor, delta)
+        })
+    }
+
+    /// Store `step(current)` as the counter under `key` and return it.
+    fn update_counter(
+        &self,
+        key: &str,
+        ttl: Option<Duration>,
+        step: impl FnOnce(i64) -> Result<i64, ClusterError>,
+    ) -> Result<i64, ClusterError> {
         let name = record_name(key);
         let lock = self.write_lock(&name);
         let _guard = self.write_locks[lock].lock();
@@ -853,9 +879,7 @@ impl Inner {
             Some(ref record) => mcpg_cluster_api::parse_counter(&record.value)?,
             None => 0,
         };
-        let next = value
-            .checked_add(delta)
-            .ok_or_else(mcpg_cluster_api::counter_overflow)?;
+        let next = step(value)?;
         let expires_ms = match ttl {
             Some(_) => expiry_ms(now, ttl),
             None => current.and_then(|record| record.expires_ms),
@@ -936,6 +960,18 @@ impl KeyValueStore for FileStore {
     ) -> Result<i64, ClusterError> {
         let key = key.to_owned();
         self.run(move |inner| inner.incr(&key, delta, ttl)).await
+    }
+
+    async fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        let key = key.to_owned();
+        self.run(move |inner| inner.incr_floor(&key, delta, floor, ttl))
+            .await
     }
 }
 

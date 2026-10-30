@@ -817,6 +817,56 @@ async fn a_deposed_writer_stops_draining_without_losing_rows() {
 }
 
 #[tokio::test]
+async fn rows_a_writer_could_not_mark_before_its_lease_ran_out_are_appended_once() {
+    let kv = store();
+    let log = log_over(&kv);
+    for id in ["x", "y", "z"] {
+        log.inbox_put(SK, inbox_row(id), LIMITS).await.unwrap();
+    }
+    // A writer appended the rows of x and y, and its lease ran out before it
+    // moved the head or marked them; the inbox still holds all three.
+    for (seq, id) in [(1u64, "x"), (2, "y")] {
+        let orphan = LogRow {
+            v: FORMAT_VERSION,
+            seq,
+            appended_at_ms: now_ms(),
+            bytes: 10,
+            body: RowBody::Event(occ(id)),
+        };
+        kv.put(
+            &format!("ev:log:{SK}:{seq:020}"),
+            Bytes::from(serde_json::to_vec(&orphan).unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let pass = drain(&log, lease(2), identity_shape).await.unwrap();
+    assert_eq!(pass.consumed, 3);
+    let ids: Vec<String> = log
+        .read(SK, 0, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| match e {
+            LogEntry::Row(LogRow {
+                body: RowBody::Event(o),
+                ..
+            }) => o.event_id,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(ids, ["x", "y", "z"], "each event once, in arrival order");
+    assert_eq!(
+        log.append(SK, occ("x"), &retention(), lease(2))
+            .await
+            .unwrap(),
+        AppendOutcome::Duplicate,
+        "an adopted row carries its marker"
+    );
+}
+
+#[tokio::test]
 async fn a_breaking_schema_change_moves_the_epoch_and_an_additive_one_does_not() {
     let kv = store();
     let log = log_over(&kv);

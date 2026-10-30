@@ -1336,10 +1336,11 @@ impl EventLog {
             // The slot is taken: a writer appended it and stopped before
             // moving the head, or another writer is appending now. Adopt the
             // row and re-read the head before trying the next slot.
-            let taken = match self.fetch(&keys.sk, seq).await? {
-                Some(LogEntry::Row(row)) => row.bytes,
-                _ => 0,
+            let adopted = match self.fetch(&keys.sk, seq).await? {
+                Some(LogEntry::Row(row)) => Some(row),
+                _ => None,
             };
+            let taken = adopted.as_ref().map_or(0, |row| row.bytes);
             let current = self
                 .get_value::<HeadRecord>(&keys.head())
                 .await?
@@ -1352,6 +1353,29 @@ impl EventLog {
             } else {
                 head.seq = seq;
                 head.bytes = head.bytes.saturating_add(taken);
+            }
+            // An adopted event gets its dedup marker: a writer whose lease ran
+            // out before it marked its rows leaves them unmarked. When the
+            // drain runs their inbox rows again, each finds its own row in the
+            // slot it reaches, and that row is this append.
+            if let Some(LogRow {
+                body: RowBody::Event(theirs),
+                ..
+            }) = &adopted
+            {
+                let eid = dedup_key(&self.keys, theirs);
+                let marker = encode(&DedupMarker {
+                    v: FORMAT_VERSION,
+                    seq,
+                })?;
+                self.kv
+                    .put_if_absent(&keys.eid(&eid), marker, Some(row_ttl(retention)))
+                    .await?;
+                if matches!(&body, RowBody::Event(own) if dedup_key(&self.keys, own) == eid) {
+                    head.fence = lease.fence;
+                    head.lease_expires_at_ms = lease.expires_at_ms;
+                    return Ok((seq, taken));
+                }
             }
         }
     }

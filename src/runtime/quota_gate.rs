@@ -305,23 +305,20 @@ fn emission_interval_us(rate_per_min: u32) -> i64 {
 ///
 /// The bucket is GCRA — the continuous-refill token bucket expressed
 /// as a single **theoretical-arrival-time (TAT) counter**, in µs since
-/// the Unix epoch, that only ever moves through the KV's atomic
-/// `incr`:
+/// the Unix epoch:
 ///
-/// 1. consume: `TAT += interval` (one atomic add = one token spent);
-/// 2. clamp: if the pre-add TAT was behind `now` (fresh or idle
-///    bucket), add the gap so the bucket refills to exactly full —
-///    the `min(capacity, …)` clamp of the classic formulation;
-/// 3. decide: allow iff the post-add TAT ≤ `now + capacity·interval`;
-/// 4. deny: refund the step-1 add, so the denied call spent nothing.
+/// 1. consume: `TAT = max(TAT, now) + interval`, one atomic step of the
+///    store ([`KeyValueStore::incr_floor`]) — a fresh or idle bucket starts
+///    from now, so its refill caps at capacity (the `min(capacity, …)`
+///    clamp of the classic formulation);
+/// 2. decide: allow iff the new TAT ≤ `now + capacity·interval`;
+/// 3. deny: refund the interval, so the denied call spent nothing.
 ///
-/// Because the spend itself is a single cross-replica-atomic add, two
-/// replicas can never grant the same token. The store's per-key mutex
-/// serializes local callers, making single-instance decisions exactly
-/// those of the mutex-held bucket this encodes; concurrent replicas
-/// contending at the boundary can transiently over-deny (a refund
-/// racing a consume), never over-grant, and the clamp self-heals it
-/// within one refill interval.
+/// Each step is one atomic operation on the shared counter, so replicas
+/// can never grant the same token, and a refund racing a consume can only
+/// over-deny. A store without `incr_floor` gets the raise and the add as
+/// two operations ([`clamped_consume`]): replicas that find an idle bucket
+/// at once then each count the time it lagged.
 ///
 /// A refusal tells when the next consume can fit: TAT only grows while
 /// replicas consume, so until `TAT + interval - capacity` every consume is
@@ -342,8 +339,8 @@ async fn consume_token_bucket(
         (capacity_for(policy.rate.calls_per_minute, policy.burst) * interval_us as f64) as i64;
     let now_us = now_ms.saturating_mul(1000);
     // Storage hygiene: an hour idle and the counter is gone; the next
-    // consume then starts from a full bucket via the clamp. Sliding —
-    // every touch re-arms it.
+    // consume then starts from a full bucket. Sliding — every touch
+    // re-arms it.
     let ttl = Some(Duration::from_secs(3600));
 
     let refused = || {
@@ -360,24 +357,23 @@ async fn consume_token_bucket(
     if refused() {
         return Ok(false);
     }
-    let mut tat = store
+    let mut tat = match store
         .counters
-        .incr(key, interval_us, ttl)
+        .incr_floor(key, interval_us, now_us, ttl)
         .await
-        .with_context(|| format!("quota_store: incr failed for `{key}`"))?;
-    let behind = now_us - (tat - interval_us);
-    if behind > 0 {
-        // Fresh or idle bucket: burn the banked idle credit so refill
-        // caps at capacity (TAT lands on now + one consume).
-        tat = store
-            .counters
-            .incr(key, behind, ttl)
-            .await
-            .with_context(|| format!("quota_store: incr clamp failed for `{key}`"))?;
-    }
-    // Two replicas that find the bucket idle at once each add what it
-    // lagged, which leaves it far past any consume: on a new key, about the
-    // clock's epoch, so it would refuse for good. Bring it back to this one.
+    {
+        Ok(tat) => tat,
+        Err(mcpg_cluster_api::ClusterError::Unsupported { .. }) => {
+            clamped_consume(store, key, interval_us, now_us, ttl).await?
+        }
+        Err(e) => {
+            return Err(anyhow::Error::from(e)
+                .context(format!("quota_store: incr_floor failed for `{key}`")));
+        }
+    };
+    // A bucket far past any consume — left by two-step clamps that counted
+    // the idle time twice (on a new key, about the clock's epoch) — would
+    // refuse for good. Bring it back to this one.
     if tat
         > now_us
             .saturating_add(capacity_us)
@@ -411,6 +407,34 @@ async fn consume_token_bucket(
         }
     }
     Ok(allowed)
+}
+
+/// The consume of [`consume_token_bucket`] on a store without
+/// `incr_floor`: add the interval, then, when the TAT before it was behind
+/// `now` (a fresh or idle bucket), add the gap so the bucket refills to
+/// exactly full. Two operations, so replicas that find an idle bucket at
+/// once each add the gap.
+async fn clamped_consume(
+    store: &QuotaStore,
+    key: &str,
+    interval_us: i64,
+    now_us: i64,
+    ttl: Option<Duration>,
+) -> Result<i64> {
+    let tat = store
+        .counters
+        .incr(key, interval_us, ttl)
+        .await
+        .with_context(|| format!("quota_store: incr failed for `{key}`"))?;
+    let behind = now_us - (tat - interval_us);
+    if behind <= 0 {
+        return Ok(tat);
+    }
+    store
+        .counters
+        .incr(key, behind, ttl)
+        .await
+        .with_context(|| format!("quota_store: incr clamp failed for `{key}`"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1230,23 @@ mod tests {
             m.insert(key.to_owned(), Bytes::from(next.to_string()));
             Ok(next)
         }
+
+        async fn incr_floor(
+            &self,
+            key: &str,
+            delta: i64,
+            floor: i64,
+            _ttl: Option<Duration>,
+        ) -> std::result::Result<i64, mcpg_cluster_api::error::ClusterError> {
+            let mut m = self.inner.lock().await;
+            let current = match m.get(key) {
+                Some(b) => mcpg_cluster_api::parse_counter(b)?,
+                None => 0,
+            };
+            let next = mcpg_cluster_api::floor_add(current, floor, delta)?;
+            m.insert(key.to_owned(), Bytes::from(next.to_string()));
+            Ok(next)
+        }
     }
 
     fn store() -> Arc<QuotaStore> {
@@ -1277,6 +1318,179 @@ mod tests {
             self.count();
             self.inner.incr(key, delta, ttl).await
         }
+
+        async fn incr_floor(
+            &self,
+            key: &str,
+            delta: i64,
+            floor: i64,
+            ttl: Option<Duration>,
+        ) -> KvResult<i64> {
+            self.count();
+            self.inner.incr_floor(key, delta, floor, ttl).await
+        }
+    }
+
+    /// A counter store whose first `PARTIES` counter calls all wait, after
+    /// they took effect, until every one of them has: what replicas that
+    /// consume an idle bucket at the same moment see.
+    #[derive(Debug)]
+    struct LockstepKv {
+        inner: StubKv,
+        arrived: std::sync::atomic::AtomicUsize,
+        barrier: tokio::sync::Barrier,
+        /// Answer `incr_floor` as a store without it.
+        without_floor: bool,
+    }
+
+    impl LockstepKv {
+        const PARTIES: usize = 4;
+
+        fn new(without_floor: bool) -> Self {
+            Self {
+                inner: StubKv::default(),
+                arrived: std::sync::atomic::AtomicUsize::new(0),
+                barrier: tokio::sync::Barrier::new(Self::PARTIES),
+                without_floor,
+            }
+        }
+
+        async fn lockstep(&self) {
+            if self
+                .arrived
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                < Self::PARTIES
+            {
+                self.barrier.wait().await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl mcpg_cluster_api::KeyValueStore for LockstepKv {
+        async fn get(&self, key: &str) -> KvResult<Option<Entry>> {
+            self.inner.get(key).await
+        }
+
+        async fn put(&self, key: &str, value: Bytes, ttl: Option<Duration>) -> KvResult<()> {
+            self.inner.put(key, value, ttl).await
+        }
+
+        async fn put_if_absent(
+            &self,
+            key: &str,
+            value: Bytes,
+            ttl: Option<Duration>,
+        ) -> KvResult<bool> {
+            self.inner.put_if_absent(key, value, ttl).await
+        }
+
+        async fn delete(&self, key: &str) -> KvResult<bool> {
+            self.inner.delete(key).await
+        }
+
+        async fn list_page(
+            &self,
+            prefix: &str,
+            cursor: Option<&str>,
+            limit: usize,
+        ) -> KvResult<mcpg_cluster_api::KvPage> {
+            self.inner.list_page(prefix, cursor, limit).await
+        }
+
+        async fn expire(&self, key: &str, ttl: Option<Duration>) -> KvResult<bool> {
+            self.inner.expire(key, ttl).await
+        }
+
+        async fn incr(&self, key: &str, delta: i64, ttl: Option<Duration>) -> KvResult<i64> {
+            let v = self.inner.incr(key, delta, ttl).await?;
+            self.lockstep().await;
+            Ok(v)
+        }
+
+        async fn incr_floor(
+            &self,
+            key: &str,
+            delta: i64,
+            floor: i64,
+            ttl: Option<Duration>,
+        ) -> KvResult<i64> {
+            if self.without_floor {
+                return Err(mcpg_cluster_api::ClusterError::Unsupported {
+                    reason: "test store without incr_floor".into(),
+                });
+            }
+            let v = self.inner.incr_floor(key, delta, floor, ttl).await?;
+            self.lockstep().await;
+            Ok(v)
+        }
+    }
+
+    /// Four replicas that consume an idle bucket at the same moment admit
+    /// exactly its burst at that moment, and exactly the rate after it.
+    #[tokio::test]
+    async fn replicas_that_find_an_idle_bucket_at_once_admit_exactly_its_burst() {
+        let kv = Arc::new(LockstepKv::new(false));
+        let replicas: Vec<Arc<QuotaStore>> = (0..LockstepKv::PARTIES)
+            .map(|_| QuotaStore::new(Arc::clone(&kv) as Arc<dyn KeyValueStore>))
+            .collect();
+        // 600/min, burst 10: one token every 100 ms, ten at once.
+        let p = rate_limit_policy("p", 600, Some(10));
+        let now_ms = 1_793_000_000_000;
+        let first = futures::future::join_all(
+            replicas
+                .iter()
+                .map(|r| consume_token_bucket(r, "k", &p, now_ms)),
+        )
+        .await;
+        let mut admitted = first.into_iter().filter(|r| *r.as_ref().unwrap()).count();
+        for i in 0..20 {
+            let r = &replicas[i % replicas.len()];
+            if consume_token_bucket(r, "k", &p, now_ms).await.unwrap() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 10, "the burst, no more and no fewer");
+        let mut later = 0;
+        for i in 0..20 {
+            let r = &replicas[i % replicas.len()];
+            if consume_token_bucket(r, "k", &p, now_ms + 1_000)
+                .await
+                .unwrap()
+            {
+                later += 1;
+            }
+        }
+        assert_eq!(later, 10, "a second later, a second's worth of tokens");
+    }
+
+    /// On a store without `incr_floor` one replica still gets the burst and
+    /// then the rate through the two-step consume.
+    #[tokio::test]
+    async fn a_store_without_incr_floor_keeps_the_two_step_consume() {
+        let kv = Arc::new(LockstepKv::new(true));
+        kv.arrived
+            .store(LockstepKv::PARTIES, std::sync::atomic::Ordering::SeqCst);
+        let s = QuotaStore::new(Arc::clone(&kv) as Arc<dyn KeyValueStore>);
+        let p = rate_limit_policy("p", 600, Some(10));
+        let now_ms = 1_793_000_000_000;
+        let mut admitted = 0;
+        for _ in 0..20 {
+            if consume_token_bucket(&s, "k", &p, now_ms).await.unwrap() {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 10);
+        assert!(
+            consume_token_bucket(&s, "k", &p, now_ms + 100)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !consume_token_bucket(&s, "k", &p, now_ms + 100)
+                .await
+                .unwrap()
+        );
     }
 
     /// A refused consume tells when the next one can fit; until then the
