@@ -934,6 +934,10 @@ mod tests {
         .await;
     }
 
+    /// Far past the 20 ms poll: on a busy host each `tokio::fs` call of the
+    /// tail task waits for a blocking-pool thread.
+    const DELIVERY_DEADLINE: Duration = Duration::from_secs(10);
+
     #[tokio::test]
     async fn bus_publish_and_subscribe_picks_up_new_lines() {
         let dir = tempfile::tempdir().unwrap();
@@ -959,7 +963,7 @@ mod tests {
         bus.publish("evt.alpha", Bytes::from_static(b"payload"))
             .await
             .unwrap();
-        let msg = tokio::time::timeout(Duration::from_millis(800), sub.next())
+        let msg = tokio::time::timeout(DELIVERY_DEADLINE, sub.next())
             .await
             .unwrap()
             .unwrap()
@@ -979,23 +983,25 @@ mod tests {
             topics_dir: topics_dir.clone(),
             poll_interval: Duration::from_millis(20),
         };
-        // Pre-write a garbage line to the same file the next
-        // `publish("evt.alpha", …)` will append to. Subscribe seeks
-        // to the current end (past the garbage), so the garbage
-        // line is *not* what we'll be exercising — but if the tail
-        // task panics on the malformed line during a re-read, the
-        // valid line that follows wouldn't make it through. The
-        // explicit-garbage scenario is exercised by the "skipped"
-        // branch in `spawn_tail_task`.
+        // Subscribe tails only files that exist, and starts at their end.
         let path = topics_dir.join("evt.alpha.ndjson");
-        fs::write(&path, b"this-is-not-json\nstill-not-json\n")
+        fs::write(&path, b"").await.unwrap();
+        let mut sub = bus.subscribe("evt.alpha", None).await.unwrap();
+        // The garbage lands after subscribe, so the tail reads it before
+        // the valid line.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
             .await
             .unwrap();
-        let mut sub = bus.subscribe("evt.alpha", None).await.unwrap();
+        file.write_all(b"this-is-not-json\nstill-not-json\n")
+            .await
+            .unwrap();
+        file.flush().await.unwrap();
         bus.publish("evt.alpha", Bytes::from_static(b"ok"))
             .await
             .unwrap();
-        let msg = tokio::time::timeout(Duration::from_millis(800), sub.next())
+        let msg = tokio::time::timeout(DELIVERY_DEADLINE, sub.next())
             .await
             .unwrap()
             .unwrap()

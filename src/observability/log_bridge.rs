@@ -201,6 +201,15 @@ async fn forward_records(
     use crate::observability::signal_router::CORE_PSEUDO_ID;
     while let Some(record) = rx.recv().await {
         let source = record.plugin_id.as_deref().unwrap_or(CORE_PSEUDO_ID);
+        // A native plugin's own event, forwarded by the host, can come from
+        // a log-sink plugin's background task, where the dispatch guard does
+        // not reach: fanned out, it would feed that sink its own output, or
+        // feed two sinks each other's. Those stay on the OS streams.
+        if record.target == mcpg_plugin_protocol::logs::PLUGIN_LOG_TARGET
+            && from_log_sink(source, &runtime.load().plugin_registry().log_sink_ids())
+        {
+            continue;
+        }
         // Gate (enabled + level floor) + sink redirection (mode =
         // inherit | replace | tee). The RouteDecision tells us
         // whether to drop, fall through to the global allow-list,
@@ -241,6 +250,16 @@ async fn forward_records(
             }
         }
     }
+}
+
+/// Whether `source`, a plugin entry's alias (`<plugin id>` or
+/// `<plugin id>:<entity>`), belongs to one of the log-sink plugins.
+fn from_log_sink(source: &str, sink_ids: &[String]) -> bool {
+    sink_ids.iter().any(|id| {
+        source
+            .strip_prefix(id.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+    })
 }
 
 /// Translate a single tracing `Event` into a `LogRecord`. Only
@@ -521,5 +540,38 @@ mod tests {
             vec!["normal".to_owned()],
             "only the log emitted outside a sink dispatch should enqueue"
         );
+    }
+
+    #[tokio::test]
+    async fn a_forwarded_plugin_event_is_attributed_to_its_plugin_entry() {
+        let records = emit_and_capture(|| {
+            tracing::warn!(
+                target: mcpg_plugin_protocol::logs::PLUGIN_LOG_TARGET,
+                plugin_id = "dev.mcpg.cluster.nats",
+                plugin_target = "mcpg_plugin_cluster_nats::kv",
+                "nats cluster: KV sweep failed"
+            );
+        })
+        .await;
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].target,
+            mcpg_plugin_protocol::logs::PLUGIN_LOG_TARGET
+        );
+        assert_eq!(
+            records[0].plugin_id.as_deref(),
+            Some("dev.mcpg.cluster.nats")
+        );
+        assert_eq!(records[0].message, "nats cluster: KV sweep failed");
+    }
+
+    #[test]
+    fn an_entry_of_a_log_sink_plugin_is_recognised_by_id_or_entity_alias() {
+        let sinks = vec!["dev.mcpg.observability.loki".to_owned()];
+        assert!(from_log_sink("dev.mcpg.observability.loki", &sinks));
+        assert!(from_log_sink("dev.mcpg.observability.loki:logs", &sinks));
+        assert!(!from_log_sink("dev.mcpg.observability.lokix", &sinks));
+        assert!(!from_log_sink("dev.mcpg.cluster.nats", &sinks));
+        assert!(!from_log_sink("dev.mcpg.cluster.nats", &[]));
     }
 }

@@ -172,10 +172,10 @@ async fn a_stream_opens_active_then_carries_each_event_and_heartbeats() {
     assert!(status.push_enabled);
     assert_eq!(status.open_streams, 1);
     drop(frames);
-    for _ in 0..50 {
-        if core.open_streams() == 0 {
-            break;
-        }
+    // The stream ends once its lease is released, a store write that a busy
+    // host can hold up for seconds.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while core.open_streams() != 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(core.open_streams(), 0, "a dropped stream ends");
@@ -214,9 +214,12 @@ async fn a_reconnect_with_the_last_cursor_loses_nothing() {
 #[tokio::test]
 async fn the_cap_refuses_one_stream_too_many_and_a_closed_stream_frees_its_slot() {
     let dir = tempfile::tempdir().unwrap();
+    // The file store expires in whole seconds, so the 2 s lease of a 1 s
+    // heartbeat can lapse after one second on a busy host and free its slot;
+    // the leases here must outlive the test.
     let state = boot(&yaml(
         dir.path(),
-        "{ enabled: true, heartbeat_interval_ms: 1000, max_streams_per_principal: 2 }",
+        "{ enabled: true, heartbeat_interval_ms: 30000, max_streams_per_principal: 2 }",
         ORDERS,
     ))
     .await;
