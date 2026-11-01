@@ -32,7 +32,7 @@ use base64::Engine as _;
 /// same broker instead of leaking one container per invocation.
 const NATS_CONTAINER: &str = "mcpg-dev-cluster-nats";
 /// Pinned image — the same one the cluster e2e suites run against.
-const NATS_IMAGE: &str = "nats:2.10-alpine";
+const NATS_IMAGE: &str = "nats:2.14-alpine";
 /// Env var the generated config names via `state_encryption_key_env`. The
 /// key bytes live in `state.key` in the harness dir, never in the config.
 const STATE_KEY_ENV: &str = "MCPG_DEV_CLUSTER_STATE_KEY";

@@ -717,6 +717,7 @@ async fn a_due_refresh_checks_the_idp_and_reads_the_new_claims() {
     idp.refreshes_with(json!({ "groups": ["engineering", "admins"] }))
         .await;
 
+    let refreshed_from = now_unix();
     let redemption = refresh(&server, &signed.refresh).await;
     let (_, access) = rotated(&redemption);
     let caller = caller_of(&server, &access);
@@ -727,7 +728,7 @@ async fn a_due_refresh_checks_the_idp_and_reads_the_new_claims() {
         Some(IDP_REFRESH_ROTATED),
         "the IdP's rotated refresh token is kept"
     );
-    assert!(after.last_refreshed >= now_unix() - 2);
+    assert!(after.last_refreshed >= refreshed_from);
     assert_eq!(after.generation, before.generation + 1);
     assert!(after.id_token.expose() != before.id_token.expose());
     let grant = grant_record(&server, &signed.gid).await.expect("kept");

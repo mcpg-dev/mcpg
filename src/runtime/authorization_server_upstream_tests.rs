@@ -1170,14 +1170,17 @@ async fn server_errors_rate_limits_and_timeouts_are_transient() {
         let err = login(&server).exchange_code("c1", "v").await.unwrap_err();
         assert!(err.is_transient(), "{status}: {err}");
     }
+    // The answer comes far after the 500 ms timeout, so the bound below holds
+    // on a starved machine too and still proves the timeout cut the wait.
     let idp =
-        token_endpoint_answering(token_response(json!({})).set_delay(Duration::from_secs(3))).await;
+        token_endpoint_answering(token_response(json!({})).set_delay(Duration::from_secs(60)))
+            .await;
     let server = endpoint_server(&idp, json!({ "timeout_ms": 500 }));
     let started = Instant::now();
     let err = login(&server).refresh("idp-refresh-1").await.unwrap_err();
     assert!(err.is_transient(), "{err}");
     assert!(err.to_string().contains("500 ms"), "{err}");
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(started.elapsed() < Duration::from_secs(30));
 }
 
 /// An OAuth error is read by its code; the IdP's description, which may

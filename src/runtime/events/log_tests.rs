@@ -577,16 +577,26 @@ async fn max_age_moves_the_start_forward_and_reports_it() {
             .await
             .unwrap();
     }
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let olds_written = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let new_from = std::time::Instant::now();
     log.append(SK, occ("new"), &retention(), lease(1))
         .await
         .unwrap();
     let epoch = log.epoch(SK).await.unwrap();
     let at_zero = log.seal_cursor(epoch, 0, 0, &scope());
-    // Wide margins on both sides, so a slow machine cannot move a row
-    // across the cutoff.
+    // The cutoff sits halfway between the old rows' least age and the new
+    // row's greatest age, measured just before the call: however late this
+    // line runs, the rows stay 1.5 s on either side of it.
+    let max_age = (olds_written.elapsed() + new_from.elapsed()) / 2;
     let resumed = log
-        .resume(SK, Some(&at_zero), &scope(), 0, Some(600))
+        .resume(
+            SK,
+            Some(&at_zero),
+            &scope(),
+            0,
+            Some(max_age.as_millis() as u64),
+        )
         .await
         .unwrap()
         .unwrap();
