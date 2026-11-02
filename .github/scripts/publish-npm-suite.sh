@@ -10,7 +10,8 @@
 # model-context-protocol-gateway launcher package.
 #
 #   VERSION       suite version; default: this repository's latest release
-#   NPM_DIST_TAG  dist-tag for publish (default: beta)
+#   NPM_DIST_TAG  dist-tag for publish (default: the version's channel —
+#                 `rc` for 0.1.0-rc.2, `latest` for 0.1.0)
 #   DRY_RUN       true (default) = assemble + `npm pack` only; false = publish
 #
 # Auth comes from the ambient npm config (NODE_AUTH_TOKEN via setup-node).
@@ -22,7 +23,7 @@ set -euo pipefail
 ORG="mcpg-dev"
 LAUNCHER="model-context-protocol-gateway"
 DRY_RUN="${DRY_RUN:-true}"
-NPM_DIST_TAG="${NPM_DIST_TAG:-beta}"
+NPM_DIST_TAG="${NPM_DIST_TAG:-}"
 OUT_DIR="${OUT_DIR:-$PWD/dist-npm}"
 
 # The PUBLIC suite: every member's source and releases are public. The
@@ -64,6 +65,21 @@ if [ -z "${VERSION:-}" ]; then
   VERSION="$(latest_release mcpg)"
 fi
 [ -n "$VERSION" ] || { echo "::error::publish-npm-suite: could not determine version"; exit 1; }
+if [ -z "$NPM_DIST_TAG" ]; then
+  case "$VERSION" in
+    *-*) NPM_DIST_TAG="${VERSION#*-}"; NPM_DIST_TAG="${NPM_DIST_TAG%%.*}" ;;
+    *)   NPM_DIST_TAG="latest" ;;
+  esac
+fi
+
+has_stable() { # <package> → 0 when npm lists a version without a prerelease part
+  # A single version prints as a string, an unknown package as an error object.
+  npm view "$1" versions --json 2>/dev/null \
+    | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+d=[d] if isinstance(d,str) else d if isinstance(d,list) else []
+sys.exit(0 if any("-" not in v for v in d) else 1)' 2>/dev/null
+}
 
 # Sibling binaries ride each repository's own latest release — the projects
 # version independently, and the packages record the suite (mcpg) version.
@@ -121,10 +137,15 @@ publish_one() { # <pkg-dir> <name>
       esac
     fi
     ( cd "$dir" && npm publish --tag "$NPM_DIST_TAG" --access public --provenance )
-    # Until a stable lane exists, `latest` deliberately tracks the newest
-    # published version — npm only auto-sets it on a first-ever publish.
-    npm dist-tag add "${name}@${VERSION}" latest
-    echo "[suite] published ${name}@${VERSION} (dist-tags ${NPM_DIST_TAG}, latest)"
+    # A prerelease takes `latest` only while the package has no stable
+    # version: `npm install <name>` must resolve the newest release until GA,
+    # and a stable release once one exists.
+    local tags="$NPM_DIST_TAG"
+    if [ "$NPM_DIST_TAG" != "latest" ] && ! has_stable "$name"; then
+      npm dist-tag add "${name}@${VERSION}" latest
+      tags="${tags}, latest"
+    fi
+    echo "[suite] published ${name}@${VERSION} (dist-tags ${tags})"
   else
     echo "[suite] DRY_RUN — packed ${name}@${VERSION}"
   fi
