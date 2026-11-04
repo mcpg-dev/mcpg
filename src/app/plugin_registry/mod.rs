@@ -458,6 +458,7 @@ pub(crate) async fn build_plugin_registry(
             })
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
+        let explicit_path = raw.get("path").is_some();
         let sink_config: crate::builtins::audit_local_file::LocalFileConfig =
             serde_json::from_value(raw).with_context(|| {
                 format!(
@@ -469,6 +470,7 @@ pub(crate) async fn build_plugin_registry(
         let plugin = crate::builtins::audit_local_file::LocalFileAuditSink::open_config(
             &sink_config,
             crate::runtime::node_name(),
+            explicit_path,
         )
         .with_context(|| format!("opening built-in audit log at {}", path.display()))?;
         info!(

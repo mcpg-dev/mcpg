@@ -2281,6 +2281,15 @@ The `poppy.json` document the gateway serves.
 | --- | --- | --- | --- |
 | `document` | any |  | The document, served as it is with `Cache-Control: max-age=300`. It needs `protocol_version` `0.x`, `organization.name` and `organization.domain`, and https URLs for `auth.issuer` and every `apis[].url`. PAP binds the document to the host that serves it, so publish it on the Company's own domain only. |
 
+### `PostgresUriMatch`
+
+Maps a `postgres_listen_notify` payload to the URIs it changes.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `payload_field` | string |  | A top-level field of the JSON payload (string or number). |
+| `uris` | array&lt;string&gt; |  | URI patterns; `{value}` is the payload field's value. A NOTIFY changes a watched URI equal to one of them. |
+
 ### `PromptArgumentConfig`
 
 | Field | Type | Default | Summary |
@@ -3208,6 +3217,7 @@ A proof of intent a callback endpoint may give.
 
 - **`postgres_listen_notify`** — Postgres LISTEN/NOTIFY watch — `dev.mcpg.watch.postgres_listen_notify` plugin holds one dedicated connection per watch and re-emits NOTIFY payloads. Far lower overhead than polling for change-feed-style sources.
   - `channel`: string
+  - `uri_match`: [`PostgresUriMatch`](#postgresurimatch) (optional)
   - `url`: string
 
 - **`plugin`** — Generic escape hatch — delegate to ANY loaded `watch_strategy` plugin by its `kind()` discriminator. Use this for custom watch plugins that have no dedicated typed variant above (e.g. the Twilio plugin's `twilio_inbound` strategy). The remaining fields flatten into the spec passed to the plugin's `watch()`, so the plugin owns and validates its own spec schema. As in every strategy, `${env.X}`, `${secret.X}` and secret provider URIs in its strings are resolved first.

@@ -227,6 +227,23 @@ struct SharedWriter {
     _lock: std::fs::File,
 }
 
+/// Another process holds the file's lock.
+#[derive(Debug)]
+pub struct AuditLogInUse(pub PathBuf);
+
+impl std::fmt::Display for AuditLogInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "audit log {} is in use by another process; give each replica its own \
+             file with `{{node}}` in the path",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for AuditLogInUse {}
+
 static WRITERS: LazyLock<Mutex<HashMap<PathBuf, Weak<SharedWriter>>>> =
     LazyLock::new(Default::default);
 
@@ -253,11 +270,9 @@ impl SharedWriter {
             .with_context(|| format!("opening audit log lock {}", lock_path.display()))?;
         match lock.try_lock() {
             Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => anyhow::bail!(
-                "audit log {} is in use by another process; give each replica its own \
-                 file with `{{node}}` in the path",
-                path.display()
-            ),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(AuditLogInUse(path).into());
+            }
             Err(std::fs::TryLockError::Error(e)) => {
                 return Err(e).with_context(|| format!("locking {}", lock_path.display()));
             }
@@ -489,8 +504,30 @@ impl LocalFileAuditSink {
     /// Open the file `config` names for `node`, with its rotation
     /// limits. Sync I/O — `build_plugin_registry` runs under either
     /// the multi-thread or the single-thread tokio runtime.
-    pub fn open_config(config: &LocalFileConfig, node: Option<&str>) -> anyhow::Result<Arc<Self>> {
-        Self::open_with(&config.resolved_path(node), config.rotation())
+    ///
+    /// A configured path (`explicit_path`) is exclusive. The default
+    /// path is not: several gateways started in one directory without a
+    /// `path` each fall back to `<stem>-<pid>.<ext>` beside it.
+    pub fn open_config(
+        config: &LocalFileConfig,
+        node: Option<&str>,
+        explicit_path: bool,
+    ) -> anyhow::Result<Arc<Self>> {
+        let path = config.resolved_path(node);
+        match Self::open_with(&path, config.rotation()) {
+            Err(e) if !explicit_path && e.downcast_ref::<AuditLogInUse>().is_some() => {
+                let (stem, ext) = stem_and_ext(&path);
+                let own = path.with_file_name(format!("{stem}-{}{ext}", std::process::id()));
+                tracing::warn!(
+                    default_path = %path.display(),
+                    audit_log_path = %own.display(),
+                    "the default audit log is in use by another process; this gateway \
+                     writes its own file. Set `path` (with `{{node}}`) for a stable location"
+                );
+                Self::open_with(&own, config.rotation())
+            }
+            other => other,
+        }
     }
 
     fn open_with(path: &Path, rotation: Rotation) -> anyhow::Result<Arc<Self>> {
@@ -1249,6 +1286,29 @@ mod tests {
         assert!(err.to_string().contains("{node}"), "{err}");
         drop(other);
         assert!(LocalFileAuditSink::open(&path).is_ok());
+    }
+
+    #[test]
+    fn only_the_default_path_falls_back_to_a_file_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let other = std::fs::File::create(dir.path().join("audit.log.lock")).unwrap();
+        other.try_lock().unwrap();
+        let config = LocalFileConfig {
+            path: path.to_string_lossy().into_owned(),
+            ..LocalFileConfig::default()
+        };
+
+        let err = LocalFileAuditSink::open_config(&config, None, true)
+            .err()
+            .expect("a configured path stays exclusive");
+        assert!(err.downcast_ref::<AuditLogInUse>().is_some(), "{err}");
+
+        let sink = LocalFileAuditSink::open_config(&config, None, false).expect("falls back");
+        assert_eq!(
+            sink.path().file_name().unwrap().to_str().unwrap(),
+            format!("audit-{}.log", std::process::id())
+        );
     }
 
     #[test]

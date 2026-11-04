@@ -7297,6 +7297,28 @@
       ],
       "type": "object"
     },
+    "PostgresUriMatch": {
+      "additionalProperties": false,
+      "description": "Maps a `postgres_listen_notify` payload to the URIs it changes.",
+      "properties": {
+        "payload_field": {
+          "description": "A top-level field of the JSON payload (string or number).",
+          "type": "string"
+        },
+        "uris": {
+          "description": "URI patterns; `{value}` is the payload field's value. A NOTIFY changes a watched URI equal to one of them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "payload_field",
+        "uris"
+      ],
+      "type": "object"
+    },
     "PromptArgumentConfig": {
       "properties": {
         "completions": {
@@ -10120,6 +10142,17 @@
             "type": {
               "const": "postgres_listen_notify",
               "type": "string"
+            },
+            "uri_match": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/PostgresUriMatch"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Which watched URI a NOTIFY changes. Absent: every NOTIFY changes every URI watched on the channel."
             },
             "url": {
               "description": "Postgres connection URL. `${env.X}`, `${secret.X}` and secret provider URIs are resolved before the spec reaches the plugin.",

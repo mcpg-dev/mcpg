@@ -3198,6 +3198,7 @@ fn build_watch_configs_maps_each_strategy_variant() {
         strategy: WatchStrategyConfig::PostgresListenNotify {
             url: "postgres://app@db/orders".into(),
             channel: "orders_changed".into(),
+            uri_match: None,
         },
         notification_filter: None,
     });
@@ -3290,12 +3291,53 @@ channel: orders_changed
 "#;
     let parsed: WatchStrategyConfig = serde_yaml::from_str(yaml).unwrap();
     match parsed {
-        WatchStrategyConfig::PostgresListenNotify { url, channel } => {
+        WatchStrategyConfig::PostgresListenNotify {
+            url,
+            channel,
+            uri_match,
+        } => {
             assert_eq!(url, "postgres://app@db/orders");
             assert_eq!(channel, "orders_changed");
+            assert!(uri_match.is_none());
         }
         other => panic!("expected PostgresListenNotify, got {other:?}"),
     }
+}
+
+#[test]
+fn the_short_postgres_listen_notify_form_passes_uri_match_to_the_plugin() {
+    use crate::config::{ResourceWatchConfig, WatchStrategyConfig};
+    let strategy: WatchStrategyConfig = serde_yaml::from_str(
+        r#"
+type: postgres_listen_notify
+url: postgres://app@db/orders
+channel: imd_refs
+uri_match: { payload_field: u, uris: ["{value}"] }
+"#,
+    )
+    .unwrap();
+    let watch = ResourceWatchConfig {
+        strategy,
+        notification_filter: None,
+    };
+    let config = super::watch_config_for(&watch, "instruction://ins_a@latest");
+    match config.strategy {
+        watch_engine::WatchStrategy::Plugin { kind, spec } => {
+            assert_eq!(kind, "postgres_listen_notify");
+            assert_eq!(
+                spec["uri_match"],
+                serde_json::json!({ "payload_field": "u", "uris": ["{value}"] })
+            );
+        }
+        other => panic!("expected Plugin, got {other:?}"),
+    }
+    assert!(
+        serde_yaml::from_str::<WatchStrategyConfig>(
+            "{ type: postgres_listen_notify, url: x, channel: c, uri_match: { field: u, uris: [x] } }"
+        )
+        .is_err(),
+        "a mistyped uri_match key is refused"
+    );
 }
 
 #[test]

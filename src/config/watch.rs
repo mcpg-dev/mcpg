@@ -98,6 +98,10 @@ pub enum WatchStrategyConfig {
         /// Channel name to LISTEN on (`NOTIFY <channel>, payload`).
         /// ASCII alphanumeric + underscore.
         channel: String,
+        /// Which watched URI a NOTIFY changes. Absent: every NOTIFY
+        /// changes every URI watched on the channel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri_match: Option<PostgresUriMatch>,
     },
     /// Generic escape hatch — delegate to ANY loaded `watch_strategy`
     /// plugin by its `kind()` discriminator. Use this for custom watch
@@ -117,6 +121,17 @@ pub enum WatchStrategyConfig {
         #[schemars(with = "serde_json::Value")]
         spec: serde_json::Map<String, serde_json::Value>,
     },
+}
+
+/// Maps a `postgres_listen_notify` payload to the URIs it changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresUriMatch {
+    /// A top-level field of the JSON payload (string or number).
+    pub payload_field: String,
+    /// URI patterns; `{value}` is the payload field's value. A NOTIFY
+    /// changes a watched URI equal to one of them.
+    pub uris: Vec<String>,
 }
 
 fn default_poll_interval_ms() -> u64 {

@@ -84,13 +84,18 @@ pub(crate) fn watch_config_for(
                 spec: serde_json::Value::Object(spec.clone()),
             }
         }
-        WatchStrategyConfig::PostgresListenNotify { url, channel } => {
+        WatchStrategyConfig::PostgresListenNotify {
+            url,
+            channel,
+            uri_match,
+        } => {
+            let mut spec = serde_json::json!({ "url": url, "channel": channel });
+            if let Some(m) = uri_match {
+                spec["uri_match"] = serde_json::json!(m);
+            }
             watch_engine::WatchStrategy::Plugin {
                 kind: "postgres_listen_notify".into(),
-                spec: serde_json::json!({
-                    "url": url,
-                    "channel": channel,
-                }),
+                spec,
             }
         }
         WatchStrategyConfig::Plugin { kind, spec } => watch_engine::WatchStrategy::Plugin {

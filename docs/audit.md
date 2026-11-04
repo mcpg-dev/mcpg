@@ -917,7 +917,9 @@ Other keys are refused at startup.
   `<path>.lock`. A second process on the same path (two replicas on one
   shared volume) fails at startup and names the fix: put `{node}` in the
   path. A config reload in one process shares the open writer, so the
-  chain stays linear.
+  chain stays linear. With no `path` set, the default `./mcpg-audit.log`
+  is not exclusive: a gateway that finds it locked logs a WARN and writes
+  `./mcpg-audit-<pid>.log` instead (several local gateways in one directory).
 - **Rotation.** The live file is renamed to `<stem>-<UTC
   timestamp>.<ext>` (for example `audit-gw-0-2026-11-04T00-12-03.481.jsonl`)
   and a fresh file is started. The rename is synced to the directory.
