@@ -518,11 +518,16 @@ pub(crate) async fn reload_with_config(
         // OLD registry handle and miss any newly-bound providers.
         // `host` (GatewayBackendHost) is passed so the backend
         // host-FFI slots also re-bind to the fresh registry.
-        let gateway_host_services =
-            std::sync::Arc::new(crate::app::host_services_impl::GatewayHostServices::new(
+        let gateway_host_services = std::sync::Arc::new(
+            crate::app::host_services_impl::GatewayHostServices::new(
                 new_runtime.plugin_registry_arc(),
                 host,
-            ));
+            )
+            .with_binding_owners(crate::app::host_services_impl::binding_owners(
+                &new_config,
+                &new_runtime.plugin_registry_arc(),
+            )),
+        );
         host_services_late.set(gateway_host_services);
     }
 

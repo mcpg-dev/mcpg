@@ -390,6 +390,17 @@ pub struct RequestContext {
     /// performs: it runs outside any MCP session and proposes nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pap_operation: Option<String>,
+    /// The caller's address: the first `X-Forwarded-For` hop when
+    /// `server.trust_proxy_ip` is set, else the transport peer. `None` for
+    /// a transport without a peer address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<std::net::IpAddr>,
+    /// The client a stateless request names in
+    /// `_meta["io.modelcontextprotocol/clientInfo"]`. A session-bound
+    /// request leaves it unset; [`Self::client`] then reads the session's
+    /// `initialize` client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<mcpg_plugin_protocol::ClientInfo>,
     // Per-request session-snapshot cache. The first `load_session_cached`
     // call populates the OnceLock; subsequent calls within the same
     // request lifecycle skip the SessionStore Mutex / Redis RTT.
@@ -426,8 +437,29 @@ impl RequestContext {
             connect_link: Arc::default(),
             personal_agent: None,
             pap_operation: None,
+            client_ip: None,
+            client: None,
             cached_session: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The MCP client that sent this request, as it named itself: the
+    /// stateless request's own `clientInfo`, else the `initialize`
+    /// `clientInfo` of the session this request already loaded. `None`
+    /// for a client that named none and for the synthetic stateless
+    /// session's placeholder.
+    pub fn client(&self) -> Option<mcpg_plugin_protocol::ClientInfo> {
+        if let Some(client) = &self.client {
+            return Some(client.clone());
+        }
+        let info = &self.cached_session.get()?.as_ref().ok()?.client_info;
+        if info.name.is_empty() || info.name == sessions::SYNTHETIC_CLIENT_NAME {
+            return None;
+        }
+        Some(mcpg_plugin_protocol::ClientInfo {
+            name: info.name.clone(),
+            version: (!info.version.is_empty()).then(|| info.version.clone()),
+        })
     }
 
     /// Bind this context to an ephemeral (row-less) session: the id is
@@ -534,6 +566,7 @@ impl RequestContext {
     /// change within a single request's lifetime. Avoids re-cloning
     /// roles/groups/scopes/attributes on every tools/call dispatch.
     fn cached_expr_request_context(&self) -> expr::ExprRequestContext {
+        let client = self.client();
         expr::ExprRequestContext {
             principal_id: self.identity.principal_id().map(str::to_owned),
             trust_level: match self.identity.trust_level() {
@@ -549,6 +582,8 @@ impl RequestContext {
                 TransportKind::Stdio => "stdio",
             }
             .to_owned(),
+            client_name: client.as_ref().map(|c| c.name.clone()),
+            client_version: client.and_then(|c| c.version),
             roles: self.identity.roles().to_vec(),
             groups: self.identity.groups().to_vec(),
             scopes: self.identity.scopes().to_vec(),

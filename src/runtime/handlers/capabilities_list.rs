@@ -553,12 +553,29 @@ impl GatewayRuntime {
                                         .to_owned(),
                                     surface: "resource".to_owned(),
                                 };
-                                let event =
+                                let event = crate::runtime::audit_with_client(
                                     mcpg_plugin_host::audit_events::resource_subscribe_event(
                                         &audit_ctx,
                                         &params.uri,
+                                    ),
+                                    request_context,
+                                );
+                                // Under `on_failure: fail_closed` a subscription
+                                // the audit trail lost is not kept.
+                                if let Err(failure) =
+                                    self.plugin_registry.emit_request_audit_event(&event).await
+                                {
+                                    self.subscriptions()
+                                        .unsubscribe_once(session_id, &params.uri)
+                                        .await;
+                                    return protocol_http_error(
+                                        200,
+                                        Some(request_id),
+                                        -32603,
+                                        format!("resources/subscribe refused: {failure}"),
+                                        None,
                                     );
-                                let _ = self.plugin_registry.emit_audit_event(&event).await;
+                                }
                                 ProtocolHttpResponse {
                                     http_status: 200,
                                     session_id_header: None,

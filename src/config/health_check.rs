@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct HealthCheckConfig {
     #[serde(default = "crate::config::default_true")]
     pub enabled: bool,
-    #[serde(default = "default_hc_interval_secs")]
+    /// Milliseconds between probe cycles. Default: 30000 (30 s).
+    #[serde(default = "default_hc_interval_ms")]
     pub interval_ms: u64,
     #[serde(default = "default_hc_timeout_ms")]
     pub timeout_ms: u64,
@@ -18,8 +19,8 @@ pub struct HealthCheckConfig {
     pub degraded_latency_threshold_ms: u64,
 }
 
-fn default_hc_interval_secs() -> u64 {
-    30
+fn default_hc_interval_ms() -> u64 {
+    30_000
 }
 fn default_hc_timeout_ms() -> u64 {
     2000
@@ -35,10 +36,28 @@ impl Default for HealthCheckConfig {
     fn default() -> Self {
         Self {
             enabled: crate::config::default_true(),
-            interval_ms: default_hc_interval_secs(),
+            interval_ms: default_hc_interval_ms(),
             timeout_ms: default_hc_timeout_ms(),
             unhealthy_threshold: default_hc_unhealthy_threshold(),
             degraded_latency_threshold_ms: default_hc_degraded_latency_ms(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HealthCheckConfig;
+
+    #[test]
+    fn default_interval_is_thirty_seconds_and_outlasts_the_probe_timeout() {
+        let cfg = HealthCheckConfig::default();
+        assert_eq!(cfg.interval_ms, 30_000);
+        assert!(cfg.interval_ms > cfg.timeout_ms);
+    }
+
+    #[test]
+    fn an_empty_block_takes_the_defaults() {
+        let cfg: HealthCheckConfig = serde_yaml::from_str("{}").expect("parse");
+        assert_eq!(cfg, HealthCheckConfig::default());
     }
 }

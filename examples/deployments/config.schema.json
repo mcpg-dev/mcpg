@@ -727,7 +727,7 @@
     },
     "AuditConfig": {
       "additionalProperties": false,
-      "description": "Top-level `audit:` block. A top-level peer (rather than nested under `observability:`), with an inner schema aligned to the OTel signal-triad sinks-list pattern (`logs` / `metrics` / `traces`). Spec §9.12 defines the semantics; the fields here are the Rust projection.\n\nAudit sinks fan out via `sinks: [{kind, config, level?}]`. The built-in `dev.mcpg.builtin.audit.local-file` activates only when its plugin id appears in `sinks[].kind` (there is no `disable_builtins` toggle — just omit the sink to disable it).",
+      "description": "`governance.audit:` block. Kept apart from `observability:`, with an inner schema aligned to the OTel signal-triad sinks-list pattern (`logs` / `metrics` / `traces`). Spec §9.12 defines the semantics; the fields here are the Rust projection.\n\nAudit sinks fan out via `sinks: [{kind, config, level?}]`. The built-in `dev.mcpg.builtin.audit.local-file` activates only when its plugin id appears in `sinks[].kind` (there is no `disable_builtins` toggle — just omit the sink to disable it).",
       "properties": {
         "emit_tool_call_allowed": {
           "default": true,
@@ -1314,7 +1314,7 @@
               "type": "null"
             }
           ],
-          "description": "Per-binding LLM response-cache override. Resolves via `resolve_kind(SlotClass::Cache, ...)` at boot:\n\n- `kind: in-process` (or alias `memory`) — fresh [`mcpg_backend_llm_shared::LruResponseCache`] sized by `config.max_bytes` (defaults to the gateway-wide `storage.response_cache` byte cap when omitted). Each binding that declares an in-process override gets its OWN cache instance — bindings don't share entries across overrides. - `kind: disabled` — explicit opt-out. `cache_get` / `cache_put` become no-ops for this binding regardless of the gateway-wide default. - Full plugin id / short alias — refused at boot today; the `ResponseCache` trait lives in `mcpg-backend-llm-shared`, not in `mcpg-plugin-protocol`, so plugins can't impl it yet. A future `ResponseCachePlugin` trait would make this arm live. - `kind: cluster` — refused; cluster coordinators don't advertise the response-cache role.\n\n`None` (default) inherits the gateway-wide `storage.response_cache:` (which itself can be `kind: disabled`)."
+          "description": "Per-binding LLM response-cache override. Resolves via `resolve_kind(SlotClass::Cache, ...)` at boot:\n\n- `kind: in-process` (or alias `memory`) — fresh [`mcpg_backend_llm_shared::LruResponseCache`] sized by `config.max_bytes` (defaults to the gateway-wide `storage.response_cache` byte cap when omitted). Each binding that declares an in-process override gets its OWN cache instance — bindings don't share entries across overrides. - `kind: disabled` — explicit opt-out. `cache_get` / `cache_put` become no-ops for this binding regardless of the gateway-wide default. - Full plugin id / short alias of a `cache` plugin (for example `dev.mcpg.cache.redis`) — the binding's entries live in that plugin under the namespace `response-cache.<binding name>`, so a Redis cache shares them across replicas. A plugin that is not a loaded `cache` plugin refuses boot. - `kind: cluster` — refused; cluster coordinators don't advertise the response-cache role.\n\n`None` (default) inherits the gateway-wide `storage.response_cache:` (which itself can be `kind: disabled`)."
         },
         "content_storage": {
           "description": "Content-store provider this binding routes through. Must match one of the `storage.providers: [{id, ...}]` entries declared at the top level. When unset, the binding falls back to the provider id named in `content_storage.default` (or the conventional `default` id when neither is set).",
@@ -4349,7 +4349,7 @@
             "health_check": {
               "degraded_latency_threshold_ms": 1000,
               "enabled": true,
-              "interval_ms": 30,
+              "interval_ms": 30000,
               "timeout_ms": 2000,
               "unhealthy_threshold": 3
             },
@@ -4494,7 +4494,8 @@
           "type": "boolean"
         },
         "interval_ms": {
-          "default": 30,
+          "default": 30000,
+          "description": "Milliseconds between probe cycles. Default: 30000 (30 s).",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -6185,13 +6186,8 @@
           "type": "boolean"
         },
         "sinks": {
-          "default": [
-            {
-              "config": {},
-              "kind": "dev.mcpg.observability.prometheus"
-            }
-          ],
-          "description": "Sink fan-out. Every entry's `kind:` is a plugin id (there is no `kind: prometheus` / `kind: otlp` shorthand). Default: one `dev.mcpg.observability.prometheus` sink at `/metrics`.",
+          "default": [],
+          "description": "Sink fan-out. Every entry's `kind:` is a plugin id (there is no `kind: prometheus` / `kind: otlp` shorthand), loaded from a `plugins[]` row. Default: none, so `/metrics` is not served until a `dev.mcpg.observability.prometheus` sink is listed.",
           "items": {
             "$ref": "#/definitions/SinkConfig"
           },
@@ -6386,12 +6382,7 @@
           ],
           "default": {
             "enabled": true,
-            "sinks": [
-              {
-                "config": {},
-                "kind": "dev.mcpg.observability.prometheus"
-              }
-            ]
+            "sinks": []
           },
           "description": "Metrics signal — gateway internals + plugin-emitted metric events fanned to the configured sink list."
         },
@@ -8197,7 +8188,7 @@
           "default": {
             "degraded_latency_threshold_ms": 1000,
             "enabled": true,
-            "interval_ms": 30,
+            "interval_ms": 30000,
             "timeout_ms": 2000,
             "unhealthy_threshold": 3
           },
@@ -10615,7 +10606,7 @@
           "health_check": {
             "degraded_latency_threshold_ms": 1000,
             "enabled": true,
-            "interval_ms": 30,
+            "interval_ms": 30000,
             "timeout_ms": 2000,
             "unhealthy_threshold": 3
           },
@@ -10917,12 +10908,7 @@
         },
         "metrics": {
           "enabled": true,
-          "sinks": [
-            {
-              "config": {},
-              "kind": "dev.mcpg.observability.prometheus"
-            }
-          ]
+          "sinks": []
         },
         "plugin_health_probe": {
           "enabled": true,

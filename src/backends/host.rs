@@ -562,6 +562,7 @@ impl BackendHost for GatewayBackendHost {
             // propagation is a future enhancement if a use case
             // emerges.
             idempotency: None,
+            client: None,
         };
 
         metrics::counter!(

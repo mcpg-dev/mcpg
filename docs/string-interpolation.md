@@ -31,7 +31,14 @@ backend:
 ### `${context.*}` fields
 
 `principal_id`, `trust_level`, `auth_provider`, `session_id`, `transport`,
-`roles` (list), `groups` (list), `scopes` (list), `attributes` (map).
+`client_name`, `client_version`, `roles` (list), `groups` (list), `scopes`
+(list), `attributes` (map).
+
+`client_name` and `client_version` are the MCP client as it named itself:
+the session's `initialize` `clientInfo`, or the stateless request's
+`_meta["io.modelcontextprotocol/clientInfo"]`. They are null when the client
+named none. A client chooses them freely, so record them (a header, an audit
+column); do not authorize on them.
 
 For ergonomics, the common ones are **also** exposed bare at the top level:
 `${principal_id}`, `${trust_level}`, etc. — handy in policy-style expressions.

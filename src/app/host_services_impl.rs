@@ -57,6 +57,11 @@ pub struct GatewayHostServices {
     /// credential resolution / response cache / revocation + rotation
     /// fan-out through the host-FFI slots.
     backend_host: Arc<dyn BackendHost>,
+    /// Binding name → alias of the backend plugin that serves it. A
+    /// plugin's response-cache call is keyed by the binding it names only
+    /// when it serves that binding, so it cannot reach another plugin's
+    /// entries.
+    binding_owners: std::collections::HashMap<String, String>,
 }
 
 impl GatewayHostServices {
@@ -64,6 +69,25 @@ impl GatewayHostServices {
         Self {
             registry,
             backend_host,
+            binding_owners: std::collections::HashMap::new(),
+        }
+    }
+
+    pub fn with_binding_owners(
+        mut self,
+        owners: std::collections::HashMap<String, String>,
+    ) -> Self {
+        self.binding_owners = owners;
+        self
+    }
+
+    /// The `initiating_backend` a cache call is keyed by: the claimed
+    /// binding when `alias` serves it, else the alias itself.
+    fn cache_owner<'a>(&self, alias: &'a str, binding: &'a str) -> &'a str {
+        if self.binding_owners.get(binding).map(String::as_str) == Some(alias) {
+            binding
+        } else {
+            alias
         }
     }
 
@@ -85,6 +109,29 @@ impl GatewayHostServices {
 /// that need one. The cdylib host-FFI carries only `alias` + identity at
 /// the `register_profile`/cache call site (no full dispatch context), so
 /// the synthesized ctx attributes to the plugin alias at depth 0.
+/// Binding name → alias of the backend plugin serving it, for every
+/// binding in the four capability lists whose kind a plugin serves.
+pub(crate) fn binding_owners(
+    config: &crate::config::AppConfig,
+    registry: &PluginRegistry,
+) -> std::collections::HashMap<String, String> {
+    let caps = &config.mcp.capabilities;
+    [
+        &caps.tools,
+        &caps.prompts,
+        &caps.resources,
+        &caps.resource_templates,
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|b| {
+        let kind = crate::backends::registry_lookup_kind(&b.backend)?;
+        let alias = registry.backend_alias(&kind)?;
+        Some((b.name.clone(), alias.to_owned()))
+    })
+    .collect()
+}
+
 fn synth_ctx(alias: &str, identity: Option<PluginIdentity>) -> BackendInvocationContext {
     BackendInvocationContext {
         parent_request_id: String::new(),
@@ -428,10 +475,23 @@ impl HostServices for GatewayHostServices {
     async fn cache_get(
         &self,
         alias: &str,
+        binding: &str,
         key: &str,
     ) -> Result<Option<bytes::Bytes>, BackendHostError> {
-        let ctx = synth_ctx(alias, None);
+        let ctx = synth_ctx(self.cache_owner(alias, binding), None);
         self.backend_host.cache_get(&ctx, key).await
+    }
+
+    async fn cache_put(
+        &self,
+        alias: &str,
+        binding: &str,
+        key: String,
+        value: bytes::Bytes,
+        ttl: std::time::Duration,
+    ) -> Result<(), BackendHostError> {
+        let ctx = synth_ctx(self.cache_owner(alias, binding), None);
+        self.backend_host.cache_put(&ctx, key, value, ttl).await
     }
 
     async fn fetch_content(
@@ -576,6 +636,35 @@ mod tests {
         // unwired no-op stub here (issue_credential never touches backend_host).
         let backend_host: Arc<dyn BackendHost> = mcpg_plugin_protocol::LateBoundBackendHost::new();
         GatewayHostServices::new(Arc::new(reg), backend_host)
+    }
+
+    #[test]
+    fn a_cache_call_is_keyed_by_a_binding_only_its_own_plugin_serves() {
+        let backend_host: Arc<dyn BackendHost> = mcpg_plugin_protocol::LateBoundBackendHost::new();
+        let svc = GatewayHostServices::new(Arc::new(PluginRegistry::new()), backend_host)
+            .with_binding_owners(
+                [
+                    (
+                        "ai.summarize".to_owned(),
+                        "dev.mcpg.backend.llm.openai".to_owned(),
+                    ),
+                    ("hr.lookup".to_owned(), "dev.mcpg.backend.sql".to_owned()),
+                ]
+                .into(),
+            );
+        assert_eq!(
+            svc.cache_owner("dev.mcpg.backend.llm.openai", "ai.summarize"),
+            "ai.summarize"
+        );
+        assert_eq!(
+            svc.cache_owner("dev.mcpg.backend.llm.openai", "hr.lookup"),
+            "dev.mcpg.backend.llm.openai",
+            "a plugin naming another plugin's binding is keyed by its own alias"
+        );
+        assert_eq!(
+            svc.cache_owner("dev.mcpg.backend.llm.openai", "no.such.binding"),
+            "dev.mcpg.backend.llm.openai"
+        );
     }
 
     #[tokio::test]

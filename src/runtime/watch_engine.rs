@@ -149,6 +149,9 @@ pub struct WatchSnapshot {
     /// Subscribers of the URI this replica serves; the watcher tells the
     /// subscribers of every replica.
     pub subscriber_count: usize,
+    /// Subscribers of the URI on every replica, from the shared
+    /// subscription store.
+    pub fleet_subscriber_count: usize,
     /// The watch shard of the URI, which this replica holds.
     pub shard: u32,
 }
@@ -822,6 +825,7 @@ impl EngineLoop {
                 uri: uri.clone(),
                 strategy: handle.strategy,
                 subscriber_count: self.local.get(uri).copied().unwrap_or(0),
+                fleet_subscriber_count: self.ctx.subscription_store.subscribers_for(uri).len(),
                 shard: shard_of(uri),
             })
             .collect();

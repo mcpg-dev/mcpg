@@ -1805,7 +1805,12 @@ fn config_with_tool_bindings(
 #[test]
 fn build_binding_cache_overrides_empty_when_no_cache_field() {
     let cfg = config_with_tool_bindings(vec![binding_with_cache("plain-tool", None)]);
-    let overrides = build_binding_cache_overrides(&cfg, &(64 * 1024 * 1024)).unwrap();
+    let overrides = build_binding_cache_overrides(
+        &cfg,
+        &(64 * 1024 * 1024),
+        &mut mcpg_plugin_host::PluginRegistry::new(),
+    )
+    .unwrap();
     assert!(overrides.is_empty());
 }
 
@@ -1815,7 +1820,12 @@ fn build_binding_cache_overrides_in_process_keyword_yields_cache() {
         "fast-tool",
         Some(kind_ref("in-process")),
     )]);
-    let overrides = build_binding_cache_overrides(&cfg, &(64 * 1024 * 1024)).unwrap();
+    let overrides = build_binding_cache_overrides(
+        &cfg,
+        &(64 * 1024 * 1024),
+        &mut mcpg_plugin_host::PluginRegistry::new(),
+    )
+    .unwrap();
     let entry = overrides
         .get("fast-tool")
         .expect("fast-tool override present");
@@ -1831,7 +1841,12 @@ fn build_binding_cache_overrides_in_process_honours_max_bytes_config() {
         }),
         ..binding_with_cache("sized-tool", None)
     }]);
-    let overrides = build_binding_cache_overrides(&cfg, &(64 * 1024 * 1024)).unwrap();
+    let overrides = build_binding_cache_overrides(
+        &cfg,
+        &(64 * 1024 * 1024),
+        &mut mcpg_plugin_host::PluginRegistry::new(),
+    )
+    .unwrap();
     let entry = overrides.get("sized-tool").unwrap();
     // Sanity: cache built; we don't introspect LruResponseCache size
     // here (the test would couple to LRU internals) — the helper
@@ -1847,7 +1862,12 @@ fn build_binding_cache_overrides_disabled_keyword_yields_none() {
         "no-cache-tool",
         Some(kind_ref("disabled")),
     )]);
-    let overrides = build_binding_cache_overrides(&cfg, &(64 * 1024 * 1024)).unwrap();
+    let overrides = build_binding_cache_overrides(
+        &cfg,
+        &(64 * 1024 * 1024),
+        &mut mcpg_plugin_host::PluginRegistry::new(),
+    )
+    .unwrap();
     let entry = overrides
         .get("no-cache-tool")
         .expect("no-cache-tool override present");
@@ -1857,18 +1877,137 @@ fn build_binding_cache_overrides_disabled_keyword_yields_none() {
     );
 }
 
+/// A `cache` plugin that serves any namespace from a map.
+struct MapCache {
+    manifest: mcpg_plugin_protocol::PluginManifest,
+    entries: std::sync::Mutex<std::collections::HashMap<(String, String), bytes::Bytes>>,
+}
+
+#[async_trait::async_trait]
+impl mcpg_plugin_protocol::cache::Cache for MapCache {
+    fn manifest(&self) -> &mcpg_plugin_protocol::PluginManifest {
+        &self.manifest
+    }
+    fn supported_namespaces(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn serves_any_namespace(&self) -> bool {
+        true
+    }
+    async fn get(&self, ns: &str, key: &str) -> Option<bytes::Bytes> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(&(ns.to_owned(), key.to_owned()))
+            .cloned()
+    }
+    async fn put(
+        &self,
+        ns: &str,
+        key: &str,
+        value: bytes::Bytes,
+        _ttl: std::time::Duration,
+    ) -> Result<(), mcpg_plugin_protocol::cache::CacheError> {
+        self.entries
+            .lock()
+            .unwrap()
+            .insert((ns.to_owned(), key.to_owned()), value);
+        Ok(())
+    }
+    async fn delete(&self, ns: &str, key: &str) {
+        self.entries
+            .lock()
+            .unwrap()
+            .remove(&(ns.to_owned(), key.to_owned()));
+    }
+    async fn clear(&self, _ns: &str) -> Result<(), mcpg_plugin_protocol::cache::CacheError> {
+        Ok(())
+    }
+    async fn incr(
+        &self,
+        _ns: &str,
+        _key: &str,
+        _by: i64,
+        _ttl: std::time::Duration,
+    ) -> Result<i64, mcpg_plugin_protocol::cache::CacheError> {
+        Err(mcpg_plugin_protocol::cache::CacheError::Unsupported { op: "incr".into() })
+    }
+}
+
+#[tokio::test]
+async fn build_binding_cache_overrides_backs_a_binding_with_a_cache_plugin() {
+    use mcpg_backend_llm_shared::CacheKey;
+    let mut cfg = config_with_tool_bindings(vec![binding_with_cache(
+        "plugin-cache-tool",
+        Some(kind_ref("dev.test.cache")),
+    )]);
+    cfg.plugins = vec![
+        serde_json::from_value(serde_json::json!({
+            "id": "dev.test.cache",
+            "class": "cache",
+            "source": { "path": "/unused/plugin.so" }
+        }))
+        .unwrap(),
+    ];
+    let plugin = std::sync::Arc::new(MapCache {
+        manifest: mcpg_plugin_protocol::PluginManifest {
+            id: "dev.test.cache".into(),
+            version: "0.1.0".into(),
+            name: "Test cache".into(),
+            plugin_class: mcpg_plugin_protocol::PluginClass::Cache,
+            protocol_version: "1.0".into(),
+            license: None,
+            required_capabilities: Vec::new(),
+            tags: Vec::new(),
+            provides: Vec::new(),
+            provides_schemes: Vec::new(),
+            module_path_prefix: "mcpg".into(),
+            backend_profile: None,
+        },
+        entries: Default::default(),
+    });
+    let mut registry = mcpg_plugin_host::PluginRegistry::new();
+    registry
+        .register_cache(plugin.clone(), mcpg_plugin_protocol::PluginTier::Native)
+        .unwrap();
+    let overrides =
+        build_binding_cache_overrides(&cfg, &(64 * 1024 * 1024), &mut registry).unwrap();
+    let cache = overrides
+        .get("plugin-cache-tool")
+        .cloned()
+        .flatten()
+        .expect("the binding has a plugin-backed cache");
+    let key = CacheKey::from_hash("k1");
+    cache
+        .put(
+            key.clone(),
+            bytes::Bytes::from_static(b"v1"),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+    assert_eq!(cache.get(&key).await.as_deref(), Some(b"v1".as_slice()));
+    assert!(
+        plugin.entries.lock().unwrap().contains_key(&(
+            "response-cache.plugin-cache-tool".to_owned(),
+            "k1".to_owned()
+        )),
+        "the entry is in the plugin under the binding's namespace"
+    );
+    assert_eq!(cache.stats().hits, 1);
+}
+
 #[test]
 fn build_binding_cache_overrides_refuses_plugin_id() {
     let cfg = config_with_tool_bindings(vec![binding_with_cache(
         "plugin-cache-tool",
         Some(kind_ref("dev.mcpg.cache.redis")),
     )]);
-    // The plugin id resolves to a plugin lookup, but no plugin
-    // is loaded under that id, so resolve_kind itself fails
-    // with a "no plugin loaded" message before we'd hit the
-    // bridge-not-implemented arm. Either error is acceptable
-    // — both refuse boot, which is the contract.
-    let res = build_binding_cache_overrides(&cfg, &(64 * 1024 * 1024));
+    // No plugin is loaded under that id, so the binding refuses boot.
+    let res = build_binding_cache_overrides(
+        &cfg,
+        &(64 * 1024 * 1024),
+        &mut mcpg_plugin_host::PluginRegistry::new(),
+    );
     let err = match res {
         Ok(_) => panic!("expected plugin id to fail resolution"),
         Err(e) => e,
@@ -1886,7 +2025,11 @@ fn build_binding_cache_overrides_refuses_kind_cluster() {
         "clustered-tool",
         Some(kind_ref("cluster")),
     )]);
-    let res = build_binding_cache_overrides(&cfg, &(64 * 1024 * 1024));
+    let res = build_binding_cache_overrides(
+        &cfg,
+        &(64 * 1024 * 1024),
+        &mut mcpg_plugin_host::PluginRegistry::new(),
+    );
     let err = match res {
         Ok(_) => panic!("expected kind: cluster to fail"),
         Err(e) => e,
@@ -1912,7 +2055,12 @@ fn build_binding_cache_overrides_walks_all_four_capability_lists() {
         "template-a",
         Some(kind_ref("in-process")),
     )];
-    let overrides = build_binding_cache_overrides(&cfg, &(64 * 1024 * 1024)).unwrap();
+    let overrides = build_binding_cache_overrides(
+        &cfg,
+        &(64 * 1024 * 1024),
+        &mut mcpg_plugin_host::PluginRegistry::new(),
+    )
+    .unwrap();
     assert_eq!(overrides.len(), 4);
     assert!(overrides["tool-a"].is_none());
     assert!(overrides["prompt-a"].is_some());
@@ -2258,6 +2406,7 @@ async fn openapi_expansion_end_to_end() {
         session_id: None,
         identity: None,
         idempotency: None,
+        client: None,
     };
     let resp = mcpg_plugin_protocol::BackendPlugin::execute(
         plugin.as_ref(),
@@ -2284,6 +2433,7 @@ async fn openapi_expansion_end_to_end() {
         session_id: None,
         identity: None,
         idempotency: None,
+        client: None,
     };
     let resp = mcpg_plugin_protocol::BackendPlugin::execute(
         plugin.as_ref(),

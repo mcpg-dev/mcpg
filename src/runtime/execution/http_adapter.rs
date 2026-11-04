@@ -80,6 +80,7 @@ pub(super) fn execute_http_request(
             .idempotency_hint
             .as_ref()
             .map(|h| h.to_plugin_hint()),
+        client: request.context.client(),
     };
 
     let profile_owned = profile.to_owned();

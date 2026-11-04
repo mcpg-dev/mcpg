@@ -1425,6 +1425,7 @@ fn execute_binding_plugin(
             .idempotency_hint
             .as_ref()
             .map(|h| h.to_plugin_hint()),
+        client: request.context.client(),
     };
 
     let profile_owned = profile.to_owned();
@@ -1586,6 +1587,7 @@ async fn execute_binding_plugin_streaming(
             .idempotency_hint
             .as_ref()
             .map(|h| h.to_plugin_hint()),
+        client: request.context.client(),
     };
 
     let session_id = match request.context.session_id.as_deref() {
@@ -2122,6 +2124,7 @@ fn execute_envelope_plugin(
             .idempotency_hint
             .as_ref()
             .map(|h| h.to_plugin_hint()),
+        client: request.context.client(),
     };
 
     let profile_owned = profile.to_owned();

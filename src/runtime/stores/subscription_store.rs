@@ -20,6 +20,20 @@ pub struct SubscriberIdentity {
     pub groups: Vec<String>,
     pub scopes: Vec<String>,
     pub attributes: BTreeMap<String, String>,
+    /// The MCP client that subscribed, as it named itself (unverified).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
+    /// `http` or `stdio`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    /// When the subscription was made (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribed_at: Option<String>,
+    /// The replica that took the subscription.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 impl SubscriberIdentity {
@@ -34,6 +48,7 @@ impl SubscriberIdentity {
         request_context: &crate::runtime::RequestContext,
     ) -> Self {
         let identity = &request_context.identity;
+        let client = request_context.client();
         Self {
             session_id: session_id.to_owned(),
             principal_id: identity.principal_id().map(str::to_owned),
@@ -42,6 +57,11 @@ impl SubscriberIdentity {
             groups: identity.groups().to_vec(),
             scopes: identity.scopes().to_vec(),
             attributes: identity.attributes().clone(),
+            client_name: client.as_ref().map(|c| c.name.clone()),
+            client_version: client.and_then(|c| c.version),
+            transport: Some(crate::runtime::transport_label(&request_context.transport).to_owned()),
+            subscribed_at: Some(chrono::Utc::now().to_rfc3339()),
+            node: crate::runtime::node_name().map(str::to_owned),
         }
     }
 }
@@ -564,7 +584,15 @@ impl SubscriptionStore for KvBackedSubscriptionStore {
             let prefix = uri_prefix(uri);
             let entries = match mcpg_cluster_api::list_all(&*self.state, &prefix).await {
                 Ok(e) => e,
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    tracing::warn!(
+                        prefix = %prefix,
+                        error = %e,
+                        "subscription store: listing failed; its subscribers are skipped"
+                    );
+                    metrics::counter!("mcpg_subscription_store_list_errors_total").increment(1);
+                    return Vec::new();
+                }
             };
             entries
                 .into_iter()
@@ -578,7 +606,15 @@ impl SubscriptionStore for KvBackedSubscriptionStore {
             let prefix = uri_prefix(uri);
             let entries = match mcpg_cluster_api::list_all(&*self.state, &prefix).await {
                 Ok(e) => e,
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    tracing::warn!(
+                        prefix = %prefix,
+                        error = %e,
+                        "subscription store: listing failed; its subscribers are skipped"
+                    );
+                    metrics::counter!("mcpg_subscription_store_list_errors_total").increment(1);
+                    return Vec::new();
+                }
             };
             entries
                 .into_iter()
@@ -595,7 +631,15 @@ impl SubscriptionStore for KvBackedSubscriptionStore {
             let prefix = session_prefix(session_id);
             let entries = match mcpg_cluster_api::list_all(&*self.state, &prefix).await {
                 Ok(e) => e,
-                Err(_) => return Vec::new(),
+                Err(e) => {
+                    tracing::warn!(
+                        prefix = %prefix,
+                        error = %e,
+                        "subscription store: listing failed; its subscribers are skipped"
+                    );
+                    metrics::counter!("mcpg_subscription_store_list_errors_total").increment(1);
+                    return Vec::new();
+                }
             };
             entries
                 .into_iter()
@@ -740,6 +784,11 @@ mod tests {
             groups: vec!["engineering".to_owned()],
             scopes: vec!["read".to_owned(), "write".to_owned()],
             attributes: BTreeMap::from([("tenant".to_owned(), "acme".to_owned())]),
+            client_name: Some("claude-code".to_owned()),
+            client_version: Some("2.1".to_owned()),
+            transport: Some("http".to_owned()),
+            subscribed_at: Some("2026-11-03T18:00:00+00:00".to_owned()),
+            node: Some("gw-0".to_owned()),
         };
         store
             .subscribe("sess-1", "file:///config.yaml", Some(identity.clone()))
@@ -759,6 +808,9 @@ mod tests {
             id.attributes.get("tenant").map(|s| s.as_str()),
             Some("acme")
         );
+        assert_eq!(id.client_name.as_deref(), Some("claude-code"));
+        assert_eq!(id.transport.as_deref(), Some("http"));
+        assert_eq!(id.node.as_deref(), Some("gw-0"));
     }
 
     #[test]

@@ -595,11 +595,16 @@ async fn build_with(
         // `host` (the GatewayBackendHost) is passed too so the
         // backend host-FFI slots (resolve_credentials / cache_get /
         // subscribe_*) reach the same services the static backends use.
-        let gateway_host_services =
-            std::sync::Arc::new(crate::app::host_services_impl::GatewayHostServices::new(
+        let gateway_host_services = std::sync::Arc::new(
+            crate::app::host_services_impl::GatewayHostServices::new(
                 runtime.plugin_registry_arc(),
                 host,
-            ));
+            )
+            .with_binding_owners(crate::app::host_services_impl::binding_owners(
+                &config,
+                &runtime.plugin_registry_arc(),
+            )),
+        );
         host_services_late.set(gateway_host_services);
     }
 

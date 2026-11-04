@@ -82,10 +82,11 @@ pub struct BackendConfig {
     /// - `kind: disabled` — explicit opt-out. `cache_get` / `cache_put`
     ///   become no-ops for this binding regardless of the gateway-wide
     ///   default.
-    /// - Full plugin id / short alias — refused at boot today; the
-    ///   `ResponseCache` trait lives in `mcpg-backend-llm-shared`, not
-    ///   in `mcpg-plugin-protocol`, so plugins can't impl it yet. A
-    ///   future `ResponseCachePlugin` trait would make this arm live.
+    /// - Full plugin id / short alias of a `cache` plugin (for example
+    ///   `dev.mcpg.cache.redis`) — the binding's entries live in that
+    ///   plugin under the namespace `response-cache.<binding name>`, so a
+    ///   Redis cache shares them across replicas. A plugin that is not a
+    ///   loaded `cache` plugin refuses boot.
     /// - `kind: cluster` — refused; cluster coordinators don't
     ///   advertise the response-cache role.
     ///

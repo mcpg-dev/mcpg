@@ -208,19 +208,20 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
     // Kept for the canonical-host exemption list below: the metrics endpoint is
     // scraped by address, not by the gateway's public name.
     let mut metrics_path: Option<String> = None;
-    if config.observability.is_metrics_on() {
-        // The route delegates rendering to the canonical Prometheus
-        // plugin via `MetricsSink::render_text_exposition`. Path comes
-        // from the first sink whose kind is the Prometheus plugin id
-        // (the gateway-side built-ins are stderr/stdout/file only).
-        // Defaults to `/metrics` when the operator didn't override it.
-        let path = config
-            .observability
-            .metrics
-            .sinks
-            .iter()
-            .find(|s| s.kind == crate::observability::PROMETHEUS_PLUGIN_ID)
-            .and_then(|s| s.config.get("path").and_then(|v| v.as_str()))
+    // The route delegates rendering to the Prometheus plugin via
+    // `MetricsSink::render_text_exposition`, so it exists only while a
+    // sink of that kind is listed. Its `config.path` overrides `/metrics`.
+    let prometheus_sink = config
+        .observability
+        .metrics
+        .sinks
+        .iter()
+        .find(|s| s.kind == crate::observability::PROMETHEUS_PLUGIN_ID);
+    if let (true, Some(sink)) = (config.observability.is_metrics_on(), prometheus_sink) {
+        let path = sink
+            .config
+            .get("path")
+            .and_then(|v| v.as_str())
             .unwrap_or("/metrics")
             .to_owned();
         router = router.route(&path, get(metrics_handler));
@@ -491,6 +492,102 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
 /// The span every request runs in, with the method and the path only. A
 /// query string can carry an authorization code or `state` (RFC 6749
 /// §10.5), so the URI is never recorded whole.
+/// Longest client name or version kept; the client chooses both.
+const MAX_CLIENT_FIELD_CHARS: usize = 128;
+
+/// The client a stateless request names in
+/// `params._meta["io.modelcontextprotocol/clientInfo"]`, with control
+/// characters dropped and each field bounded. `None` without a name.
+fn modern_request_client(body: &serde_json::Value) -> Option<mcpg_plugin_protocol::ClientInfo> {
+    let info = body
+        .get("params")?
+        .get("_meta")?
+        .get("io.modelcontextprotocol/clientInfo")?;
+    let clean = |v: &serde_json::Value| -> Option<String> {
+        let s: String = v
+            .as_str()?
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_CLIENT_FIELD_CHARS)
+            .collect();
+        let s = s.trim().to_owned();
+        (!s.is_empty()).then_some(s)
+    };
+    Some(mcpg_plugin_protocol::ClientInfo {
+        name: clean(info.get("name")?)?,
+        version: info.get("version").and_then(clean),
+    })
+}
+
+/// Writes one `mcpg.resource.updated_delivered` receipt for each
+/// `notifications/resources/updated` a stream hands its client, through
+/// the runtime current at that moment.
+#[derive(Clone)]
+struct UpdateReceipts {
+    /// Weak: a stream must not keep the runtime (and its delivery bus)
+    /// alive past the gateway's own handle.
+    runtime: std::sync::Weak<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>>,
+    actor: mcpg_plugin_protocol::PluginIdentity,
+    request_id: String,
+    client: Option<serde_json::Value>,
+}
+
+impl UpdateReceipts {
+    fn new(
+        runtime: &std::sync::Arc<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>>,
+        request_context: &crate::runtime::RequestContext,
+    ) -> Self {
+        // A stream's context may not have read its session yet; the
+        // session's `initialize` client is what `client()` falls back to.
+        let _ = request_context.load_session_cached(&**runtime.load().session_store(), false);
+        Self {
+            runtime: std::sync::Arc::downgrade(runtime),
+            actor: crate::runtime::plugin_identity_from_request(request_context),
+            request_id: request_context.request_id.as_str().to_owned(),
+            client: request_context
+                .client()
+                .map(|c| serde_json::json!({ "name": c.name, "version": c.version })),
+        }
+    }
+
+    fn record(&self, message: &Value, subscription_id: Option<&str>) {
+        if message.get("method").and_then(Value::as_str) != Some("notifications/resources/updated")
+        {
+            return;
+        }
+        let uri = message
+            .pointer("/params/uri")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        metrics::counter!("mcpg_resource_updates_delivered_total").increment(1);
+        let event = mcpg_plugin_protocol::audit::AuditEvent {
+            event_id: mcpg_plugin_host::audit_events::new_event_id(),
+            occurred_at: mcpg_plugin_host::audit_events::now_rfc3339_utc(),
+            actor: self.actor.clone(),
+            action: "mcpg.resource.updated_delivered".to_owned(),
+            resource: Some(format!("resource://{uri}")),
+            outcome: mcpg_plugin_protocol::audit::AuditOutcome::Success,
+            request_id: Some(self.request_id.clone()),
+            upstream_request_id: None,
+            node_id: None,
+            details: serde_json::json!({
+                "uri": uri,
+                "subscription_id": subscription_id,
+                "client": self.client,
+            }),
+            prev_event_hash: None,
+        };
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        let runtime = runtime.load_full();
+        tokio::spawn(async move {
+            let _ = runtime.plugin_registry().emit_audit_event(&event).await;
+        });
+    }
+}
+
 fn request_span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
     tracing::debug_span!("request", method = %req.method(), path = %req.uri().path())
 }
@@ -724,6 +821,11 @@ async fn mcp_handler(
         Ok(ctx) => ctx,
         Err(resp) => return refused_credential_response(resp, &config, &headers),
     };
+    request_context.client_ip = crate::transports::anon_limit::client_ip(
+        config.gateway.server.trust_proxy_ip,
+        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+        peer_ip,
+    );
 
     // The preflight first: a foreign `Origin` is a 403 (MCP Streamable
     // HTTP), whether or not the caller must authenticate.
@@ -1030,6 +1132,8 @@ async fn dispatch_modern(
     // session-bound caps, so suspending pipeline steps (elicitation /
     // sampling / roots) gate correctly on modern stateless traffic
     // where the synthetic session itself carries empty caps.
+    // The same `_meta` names the client of this one request.
+    stamped_context.client = modern_request_client(&body);
     if let Some(caps_value) = body
         .get("params")
         .and_then(|p| p.get("_meta"))
@@ -1666,6 +1770,7 @@ async fn modern_subscriptions_listen_handler(
         resource_subscriptions = Some(
             register_modern_resource_subscriptions(
                 &runtime,
+                &state.runtime,
                 sid,
                 &request_context,
                 &watched_resources,
@@ -1696,6 +1801,7 @@ async fn modern_subscriptions_listen_handler(
     // wire-facing subscriptionId above.
     let subscription_targets = std::sync::Arc::new(params.subscriptions);
     let sub_id_for_filter = subscription_id.clone();
+    let receipts = UpdateReceipts::new(&state.runtime, &request_context);
     let live: std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>,
     > = if let Some(ref sid) = session_id {
@@ -1713,6 +1819,7 @@ async fn modern_subscriptions_listen_handler(
                 if !subscriptions::subscription_matches(&subscription_targets, &method, &payload) {
                     return None;
                 }
+                receipts.record(&payload, Some(&sub_id_for_filter.to_string()));
                 subscriptions::inject_subscription_id_meta(&mut payload, &sub_id_for_filter);
                 Some(Ok(Event::default()
                     .event("message")
@@ -1928,12 +2035,14 @@ async fn mcp_get_handler(
                 let store = state.session_store.clone();
                 let sid_owned = sid.clone();
                 let filter_keys = std::sync::Arc::clone(&drained_keys);
+                let receipts = UpdateReceipts::new(&state.runtime, &request_context);
                 let live = delivery_bus_sse(&runtime, sid, move |msg| {
                     let key = delivery_dedupe_key(&msg);
                     if filter_keys.lock().expect("drained-keys lock").remove(&key) {
                         // Same delivery already emitted from the backlog drain.
                         None
                     } else {
+                        receipts.record(&msg.jsonrpc_message, None);
                         delivery_to_sse_event(&store, &sid_owned, msg)
                     }
                 })

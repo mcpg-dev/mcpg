@@ -1,5 +1,9 @@
 use super::*;
 
+/// The `clientInfo.name` of a session minted for stateless requests,
+/// which carry their own client per request.
+pub(crate) const SYNTHETIC_CLIENT_NAME: &str = "mcpg.stateless.synthetic";
+
 impl GatewayRuntime {
     /// returns Err when adding a session for `principal_id` would
     /// breach the per-tenant cap; otherwise records the new session and
@@ -202,12 +206,19 @@ impl GatewayRuntime {
         // continuity is a guarantee only cryptographic identity earns; a
         // header-asserted caller (only seen when the operator opted into
         // `server.trust_subject_header`) falls through to per-instance
-        // continuity below.
+        // continuity below. The client the request names joins the input,
+        // so two hosts on one credential hold two sessions (and two sets
+        // of subscriptions); a request naming no client keeps the
+        // principal's own session.
         if ctx.identity.trust_level() == RequestTrustLevel::Verified
             && let Some(principal_key) = ctx.identity.synthetic_principal_key()
             && let Some(key) = self.synthetic_session_key()
         {
-            let sid = Self::derive_synthetic_session_id(&key, &principal_key);
+            let input = match &ctx.client {
+                Some(client) => format!("{principal_key}\u{1f}client:{}", client.name),
+                None => principal_key,
+            };
+            let sid = Self::derive_synthetic_session_id(&key, &input);
             // Already operational on this replica or another (KV read-back)?
             if self.session_store.load_session(Some(&sid), false).is_ok() {
                 metrics::counter!("mcpg_modern_stateless_sessions_reused_total").increment(1);
@@ -405,7 +416,7 @@ impl GatewayRuntime {
                 .to_owned(),
             capabilities: Default::default(),
             client_info: crate::protocol::ImplementationInfo {
-                name: "mcpg.stateless.synthetic".to_owned(),
+                name: SYNTHETIC_CLIENT_NAME.to_owned(),
                 title: None,
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 description: Some(

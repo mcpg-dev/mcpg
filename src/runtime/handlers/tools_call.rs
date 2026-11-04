@@ -1050,11 +1050,12 @@ impl GatewayRuntime {
                         };
                         match self
                             .plugin_registry
-                            .evaluate_tool_gates_pre(
+                            .evaluate_tool_gates_pre_from(
                                 &plugin_ctx,
                                 params.arguments.as_ref().unwrap_or(&serde_json::json!({})),
                                 params.meta.as_ref(),
                                 request_context.upstream_request_id.as_deref(),
+                                request_context.client_ip,
                             )
                             .await
                         {

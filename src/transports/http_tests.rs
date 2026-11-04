@@ -3262,15 +3262,38 @@ async fn metrics_endpoint_returns_404_when_disabled() {
 }
 
 #[tokio::test]
+async fn metrics_endpoint_returns_404_without_a_prometheus_sink() {
+    // The default config lists no metrics sink, so no route is mounted.
+    let state = finish_app_state(AppConfig::default(), default_test_runtime());
+    let app = router(state, "/health", "/mcp");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn metrics_endpoint_returns_503_when_prometheus_plugin_absent() {
-    // The route is mounted because metrics is enabled (the AppConfig
-    // default), but the test runtime ships a bare `PluginRegistry::new()`
-    // with no Prometheus plugin registered. The handler should surface a
-    // 503 so operators notice the misconfiguration instead of silently
-    // serving an empty payload that would let a monitoring SLO miss the
-    // gap. End-to-end coverage of the 200 path lives in the gateway
-    // integration tests where the full plugin stack is wired.
-    let config = AppConfig::default(); // metrics.enabled defaults to true
+    // The sink is listed, so the route is mounted, but the test runtime's
+    // bare `PluginRegistry::new()` has no Prometheus plugin. A 503 makes
+    // the missing plugin visible instead of serving an empty payload.
+    let mut config = AppConfig::default();
+    config
+        .observability
+        .metrics
+        .sinks
+        .push(crate::config::SinkConfig {
+            kind: crate::observability::PROMETHEUS_PLUGIN_ID.to_owned(),
+            config: serde_json::json!({}),
+            level: None,
+        });
     let state = finish_app_state(config, default_test_runtime());
     let app = router(state, "/health", "/mcp");
     let response = app

@@ -89,6 +89,43 @@ impl EventsCore {
         details
     }
 
+    /// `mcpg.events.poll`, for a poll that returned events (a delivery
+    /// receipt) or that started from no cursor (where a consumer began):
+    /// the events by id, the cursor the consumer resumes from, and the
+    /// client. An empty poll from a cursor writes nothing.
+    pub(crate) async fn audit_poll(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        from_cursor: Option<&str>,
+        result: &mcpg_mcp_wire::v_2026_07_28::extensions::events::wire::PollEventsResult,
+    ) {
+        if result.events.is_empty() && from_cursor.is_some() {
+            return;
+        }
+        let event = crate::runtime::audit_with_client(
+            event(
+                plugin_identity_from_request(ctx),
+                "mcpg.events.poll",
+                name,
+                AuditOutcome::Success,
+                Some(ctx.request_id.as_str().to_owned()),
+                json!({
+                    "event": name,
+                    "started": from_cursor.is_none(),
+                    "delivered": result.events.len(),
+                    "first_event_id": result.events.first().map(|e| e.event_id.as_str()),
+                    "last_event_id": result.events.last().map(|e| e.event_id.as_str()),
+                    "cursor": result.cursor,
+                    "truncated": result.truncated,
+                    "has_more": result.has_more,
+                }),
+            ),
+            ctx,
+        );
+        self.emit(event).await;
+    }
+
     /// `mcpg.events.subscribe`: `outcome` is `created`, `refreshed` or
     /// `secret_rotated`.
     pub(crate) async fn audit_subscribe(

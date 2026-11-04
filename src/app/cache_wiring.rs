@@ -24,10 +24,13 @@ pub(crate) fn response_cache_default_max_bytes(config: &crate::config::AppConfig
 /// through to the gateway-wide cache from
 /// `storage.response_cache:`.
 ///
+/// A `kind:` that resolves to a `cache` plugin binds the namespace
+/// `response-cache.<binding>` to that plugin, so the binding's entries
+/// live in the plugin (shared across replicas for a Redis cache).
+///
 /// Refuses boot on:
-/// - `kind:` resolves to a Plugin (no plugin bridge for
-///   `ResponseCache` yet — the trait lives in
-///   `mcpg-backend-llm-shared`, not `mcpg-plugin-protocol`);
+/// - a plugin the registry cannot bind (not a registered `cache`
+///   plugin, or one that does not serve the namespace);
 /// - `kind: cluster` (cluster coordinators don't advertise the
 ///   response-cache role);
 /// - `kind: file` (no file-backed response cache implementation
@@ -38,6 +41,7 @@ pub(crate) fn response_cache_default_max_bytes(config: &crate::config::AppConfig
 pub(crate) fn build_binding_cache_overrides(
     config: &crate::config::AppConfig,
     default_max_bytes: &usize,
+    registry: &mut mcpg_plugin_host::PluginRegistry,
 ) -> Result<
     std::collections::HashMap<
         String,
@@ -100,16 +104,22 @@ pub(crate) fn build_binding_cache_overrides(
                         }
                     },
                     ResolvedKind::Plugin(plugin_id) => {
-                        anyhow::bail!(
-                            "binding `{}`: `cache: kind: {}` resolves to plugin \
-                         `{}`, but the LLM response cache trait is \
-                         gateway-side only — no plugin bridge exists yet. \
-                         Use `kind: in-process` or `kind: disabled` until a \
-                         `ResponseCachePlugin` trait lands.",
-                            binding.name,
-                            kref.kind,
-                            plugin_id,
-                        );
+                        let namespace = format!("response-cache.{}", binding.name);
+                        registry
+                            .bind_cache_namespace(namespace.clone(), &plugin_id)
+                            .with_context(|| {
+                                format!(
+                                    "binding `{}`: `cache: kind: {}` names plugin `{}`",
+                                    binding.name, kref.kind, plugin_id,
+                                )
+                            })?;
+                        let cache = registry
+                            .cache_for_namespace(&namespace)
+                            .context("a bound cache namespace has no cache")?;
+                        Some(
+                            std::sync::Arc::new(PluginResponseCache::new(namespace, cache))
+                                as std::sync::Arc<dyn mcpg_backend_llm_shared::ResponseCache>,
+                        )
                     }
                     ResolvedKind::Cluster => {
                         anyhow::bail!(
@@ -131,6 +141,95 @@ pub(crate) fn build_binding_cache_overrides(
         }
     }
     Ok(overrides)
+}
+
+/// A binding's response cache kept in a `cache` plugin, under one
+/// namespace. Item and byte counts live in the plugin, so `stats`
+/// reports only this gateway's hits and misses.
+pub(crate) struct PluginResponseCache {
+    namespace: String,
+    cache: std::sync::Arc<dyn mcpg_plugin_protocol::cache::Cache>,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+}
+
+impl PluginResponseCache {
+    pub(crate) fn new(
+        namespace: String,
+        cache: std::sync::Arc<dyn mcpg_plugin_protocol::cache::Cache>,
+    ) -> Self {
+        Self {
+            namespace,
+            cache,
+            hits: std::sync::atomic::AtomicU64::new(0),
+            misses: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl std::fmt::Debug for PluginResponseCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginResponseCache")
+            .field("namespace", &self.namespace)
+            .field("plugin", &self.cache.manifest().id)
+            .finish()
+    }
+}
+
+/// A `ResponseCache` TTL of zero means "no expiry"; a cache plugin
+/// expires a zero-TTL entry at once, so it gets this bound instead.
+const PLUGIN_CACHE_NO_EXPIRY_TTL: std::time::Duration = std::time::Duration::from_secs(86_400);
+
+#[async_trait::async_trait]
+impl mcpg_backend_llm_shared::ResponseCache for PluginResponseCache {
+    async fn get(&self, key: &mcpg_backend_llm_shared::CacheKey) -> Option<bytes::Bytes> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let got = self.cache.get(&self.namespace, key.as_str()).await;
+        if got.is_some() {
+            self.hits.fetch_add(1, Relaxed);
+        } else {
+            self.misses.fetch_add(1, Relaxed);
+        }
+        got
+    }
+
+    async fn put(
+        &self,
+        key: mcpg_backend_llm_shared::CacheKey,
+        value: bytes::Bytes,
+        ttl: std::time::Duration,
+    ) {
+        let ttl = if ttl.is_zero() {
+            PLUGIN_CACHE_NO_EXPIRY_TTL
+        } else {
+            ttl
+        };
+        if let Err(e) = self
+            .cache
+            .put(&self.namespace, key.as_str(), value, ttl)
+            .await
+        {
+            warn!(
+                namespace = %self.namespace,
+                plugin_id = %self.cache.manifest().id,
+                error = %e,
+                "response cache write to the cache plugin failed"
+            );
+        }
+    }
+
+    async fn invalidate(&self, key: &mcpg_backend_llm_shared::CacheKey) {
+        self.cache.delete(&self.namespace, key.as_str()).await;
+    }
+
+    fn stats(&self) -> mcpg_backend_llm_shared::CacheStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        mcpg_backend_llm_shared::CacheStats {
+            hits: self.hits.load(Relaxed),
+            misses: self.misses.load(Relaxed),
+            ..Default::default()
+        }
+    }
 }
 
 /// Construct the operator-configured LLM response cache.

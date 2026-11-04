@@ -54,6 +54,7 @@ backends together when one upstream call is not enough.
 | `context.principal_id` | Request time | `${context.principal_id}` |
 | `context.session_id` | Request time | `${context.session_id}` |
 | `context.transport` | Request time | `${context.transport}` |
+| `context.client_name` / `context.client_version` | Request time (the MCP client's self-reported `clientInfo`; unverified, may be null) | `${context.client_name}` |
 | `env.VAR_NAME` | Startup (evaluated once at config load) | `${env.NAMECOM_TOKEN}` |
 | `cred://<plugin_id>/<target>[#part]` | Request time (cached, auto-refreshed) | `cred://dev.mcpg.credential.oauth-client-credentials/analytics` |
 | `steps.<id>.output` | Pipeline | `${steps.fetch.output.count}` |

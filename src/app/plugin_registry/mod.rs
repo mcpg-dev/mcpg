@@ -120,6 +120,11 @@ pub(crate) async fn build_plugin_registry(
     withheld_backend_kinds: &std::collections::BTreeSet<String>,
 ) -> Result<PluginBundle> {
     let mut registry = mcpg_plugin_host::PluginRegistry::new();
+    registry.set_audit_node_id(crate::runtime::node_name().map(str::to_owned));
+    registry.set_audit_request_policy(match config.governance.audit.on_failure {
+        crate::config::AuditOnFailure::FailClosed => mcpg_plugin_host::AuditEmitPolicy::FailClosed,
+        crate::config::AuditOnFailure::FailOpen => mcpg_plugin_host::AuditEmitPolicy::FailOpen,
+    });
 
     // Secret rotation: accumulate every `scheme://...` URI
     // that `resolve_config_value` expanded across all binding +
@@ -435,29 +440,42 @@ pub(crate) async fn build_plugin_registry(
     if config.governance.audit.enabled
         && audit_sink_kinds.contains(crate::builtins::audit_local_file::PLUGIN_ID)
     {
-        let path = config
+        let raw = config
             .governance
             .audit
             .sinks
             .iter()
             .find(|s| s.kind == crate::builtins::audit_local_file::PLUGIN_ID)
-            .and_then(|s| s.config.get("path"))
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from)
+            .map(|s| &s.config)
+            .filter(|c| !c.is_null())
             .or_else(|| {
                 config
                     .plugins
                     .iter()
                     .find(|e| e.id == crate::builtins::audit_local_file::PLUGIN_ID)
-                    .and_then(|e| e.config.get("path"))
-                    .and_then(|v| v.as_str())
-                    .map(std::path::PathBuf::from)
+                    .map(|e| &e.config)
+                    .filter(|c| !c.is_null())
             })
-            .unwrap_or_else(|| std::path::PathBuf::from("./mcpg-audit.log"));
-        let plugin = crate::builtins::audit_local_file::LocalFileAuditSink::open(&path)
-            .with_context(|| format!("opening built-in audit log at {}", path.display()))?;
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let sink_config: crate::builtins::audit_local_file::LocalFileConfig =
+            serde_json::from_value(raw).with_context(|| {
+                format!(
+                    "invalid config for {}",
+                    crate::builtins::audit_local_file::PLUGIN_ID
+                )
+            })?;
+        let path = sink_config.resolved_path(crate::runtime::node_name());
+        let plugin = crate::builtins::audit_local_file::LocalFileAuditSink::open_config(
+            &sink_config,
+            crate::runtime::node_name(),
+        )
+        .with_context(|| format!("opening built-in audit log at {}", path.display()))?;
         info!(
-            audit_log_path = %path.display(),
+            audit_log_path = %plugin.path().display(),
+            max_size_mb = sink_config.max_size_mb,
+            max_backups = sink_config.max_backups,
+            max_age_days = sink_config.max_age_days,
             "opened built-in audit local-file sink"
         );
         mcpg_plugin_host::FirstPartyRegistrar::new(&mut registry).register(
@@ -706,6 +724,42 @@ pub(crate) async fn build_plugin_registry(
                      cdylib (source.oci or source.path).",
                     kind = config.cluster.kind,
                 );
+            }
+        }
+
+        // A plugin sink's `observability.<signal>.sinks[].config` is the
+        // config of the `plugins[]` row with the same id. A row that also
+        // carries its own different `config:` is ambiguous and fails boot.
+        // A Prometheus sink's `path` is the gateway's scrape route, not
+        // plugin config, so the plugin never sees it.
+        let observability = &config.observability;
+        for (signal, sink) in [
+            ("logs", &observability.logs.sinks),
+            ("metrics", &observability.metrics.sinks),
+            ("traces", &observability.traces.sinks),
+        ]
+        .into_iter()
+        .flat_map(|(signal, sinks)| sinks.iter().map(move |s| (signal, s)))
+        {
+            let mut plugin_config = sink.config.clone();
+            if sink.kind == crate::observability::PROMETHEUS_PLUGIN_ID
+                && let Some(map) = plugin_config.as_object_mut()
+            {
+                map.remove("path");
+            }
+            if plugin_config.is_null() || plugin_config == serde_json::json!({}) {
+                continue;
+            }
+            for entry in resolved_entries.iter_mut().filter(|e| e.id == sink.kind) {
+                if entry.config.is_null() || entry.config == serde_json::json!({}) {
+                    entry.config = plugin_config.clone();
+                } else if entry.config != plugin_config {
+                    anyhow::bail!(
+                        "observability.{signal}.sinks[kind={kind}] and the `plugins[]` row \
+                         '{kind}' both set a different `config:`. Keep it in one place.",
+                        kind = sink.kind,
+                    );
+                }
             }
         }
 
@@ -1331,6 +1385,23 @@ pub(crate) async fn build_plugin_registry(
             }
         }
 
+        // Auto-bind every URI scheme advertised by every registered
+        // secret-provider / config-provider plugin to its owning plugin
+        // id, before any binding below resolves its config refs: a
+        // `vault://` value in a binding needs the vault scheme bound.
+        // There is no operator override map; per-plugin
+        // `supported_schemes()` is the source of truth, and the registry's
+        // binding map is just a dispatch cache. Built-in env/file schemes
+        // were pre-bound above; the sweep is additive and skips any
+        // already-bound scheme. Refuses boot if two plugins claim the same
+        // scheme — operator must pick one or rename.
+        registry
+            .auto_bind_secret_provider_schemes()
+            .with_context(|| "auto-binding secret_provider schemes")?;
+        registry
+            .auto_bind_config_provider_schemes()
+            .with_context(|| "auto-binding config_provider schemes")?;
+
         // Capability expansion. Now that every plugin
         // (incl. the openapi backend, whose `make` parsed its `sources`)
         // is loaded, ask it which tools to auto-expose and synthesize an
@@ -1780,16 +1851,8 @@ pub(crate) async fn build_plugin_registry(
         info!(plugin_count = count, "plugin registry initialized");
     }
 
-    // Auto-bind every URI scheme advertised by every registered
-    // secret-provider / config-provider plugin to its owning plugin
-    // id. There is no `plugin_bindings.{secrets, configs}` operator
-    // override map; per-plugin `supported_schemes()` is the source of
-    // truth, and the registry's
-    // binding map is just a dispatch cache. Built-in env/file
-    // schemes were pre-bound above; the auto-bind sweep is
-    // additive and skips any already-bound scheme. Refuses boot if
-    // two plugins claim the same scheme — operator must pick one
-    // or rename.
+    // A config with no plugin entries skips the load block above, so the
+    // auto-bind sweep runs here too; it skips any scheme already bound.
     registry
         .auto_bind_secret_provider_schemes()
         .with_context(|| "auto-binding secret_provider schemes")?;
@@ -1949,8 +2012,11 @@ pub(crate) async fn build_plugin_registry(
 
     let content_stores = build_storages_registry(config, &registry).await?;
     let response_cache = build_response_cache(&config.storage.response_cache);
-    let response_cache_overrides =
-        build_binding_cache_overrides(config, &response_cache_default_max_bytes(config))?;
+    let response_cache_overrides = build_binding_cache_overrides(
+        config,
+        &response_cache_default_max_bytes(config),
+        &mut registry,
+    )?;
 
     // Build the runtime quota gate (rate
     // limits / budgets / concurrency) when the feature is on AND

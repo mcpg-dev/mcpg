@@ -259,9 +259,10 @@ pub struct MetricsConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Sink fan-out. Every entry's `kind:` is a plugin id (there is
-    /// no `kind: prometheus` / `kind: otlp` shorthand). Default: one
-    /// `dev.mcpg.observability.prometheus` sink at `/metrics`.
-    #[serde(default = "default_metrics_sinks")]
+    /// no `kind: prometheus` / `kind: otlp` shorthand), loaded from a
+    /// `plugins[]` row. Default: none, so `/metrics` is not served until
+    /// a `dev.mcpg.observability.prometheus` sink is listed.
+    #[serde(default)]
     pub sinks: Vec<SinkConfig>,
 }
 
@@ -269,7 +270,7 @@ impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            sinks: default_metrics_sinks(),
+            sinks: Vec::new(),
         }
     }
 }
@@ -286,17 +287,6 @@ impl MetricsConfig {
         }
         Ok(())
     }
-}
-
-fn default_metrics_sinks() -> Vec<SinkConfig> {
-    // Default to the Prometheus plugin id so a factory-fresh
-    // gateway boot produces a working `/metrics` endpoint without
-    // operator config.
-    vec![SinkConfig {
-        kind: "dev.mcpg.observability.prometheus".to_owned(),
-        config: serde_json::json!({}),
-        level: None,
-    }]
 }
 
 /// `observability.traces:` — the traces signal.

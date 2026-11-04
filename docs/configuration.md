@@ -517,7 +517,7 @@ A standard iframe permission. Serialized snake_case in config; maps to the camel
 
 ### `AuditConfig`
 
-Top-level `audit:` block. A top-level peer (rather than nested under `observability:`), with an inner schema aligned to the OTel signal-triad sinks-list pattern (`logs` / `metrics` / `traces`). Spec §9.12 defines the semantics; the fields here are the Rust projection.
+`governance.audit:` block. Kept apart from `observability:`, with an inner schema aligned to the OTel signal-triad sinks-list pattern (`logs` / `metrics` / `traces`). Spec §9.12 defines the semantics; the fields here are the Rust projection.
 
 Audit sinks fan out via `sinks: [{kind, config, level?}]`. The built-in `dev.mcpg.builtin.audit.local-file` activates only when its plugin id appears in `sinks[].kind` (there is no `disable_builtins` toggle — just omit the sink to disable it).
 
@@ -1552,7 +1552,7 @@ Every child defaults to its own zero-value: an empty `governance:` block is vali
 | --- | --- | --- | --- |
 | `degraded_latency_threshold_ms` | integer | `1000` |  |
 | `enabled` | boolean | `true` |  |
-| `interval_ms` | integer | `30` |  |
+| `interval_ms` | integer | `30000` | Milliseconds between probe cycles. Default: 30000 (30 s). |
 | `timeout_ms` | integer | `2000` |  |
 | `unhealthy_threshold` | integer | `3` |  |
 
@@ -1971,7 +1971,7 @@ Gateway internals (every `metrics::counter!()` / `gauge!()` / `histogram!()`) fl
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` | Master enable for the metrics signal. When `false`, no metric recorders are installed. |
-| `sinks` | array&lt;[`SinkConfig`](#sinkconfig)&gt; | (see type) | Sink fan-out. Every entry's `kind:` is a plugin id (there is no `kind: prometheus` / `kind: otlp` shorthand). Default: one `dev.mcpg.observability.prometheus` sink at `/metrics`. |
+| `sinks` | array&lt;[`SinkConfig`](#sinkconfig)&gt; | `[]` | Sink fan-out. Every entry's `kind:` is a plugin id (there is no `kind: prometheus` / `kind: otlp` shorthand), loaded from a `plugins[]` row. Default: none, so `/metrics` is not served until a `dev.mcpg.observability.prometheus` sink is listed. |
 
 ### `NamingConfig`
 

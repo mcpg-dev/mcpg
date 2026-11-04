@@ -221,6 +221,40 @@ pub(crate) async fn open_post_continuation_sse(
 /// unsubscribe each other.
 pub(crate) struct ResourceSubscriptionGuard {
     leases: Vec<crate::runtime::subscriptions::SubscriptionLease>,
+    /// The `mcpg.resource.unsubscribe` records the close of the stream
+    /// writes, one for each lease, through the runtime current then (the
+    /// swappable handle, so a stream keeps no reloaded-away registry).
+    on_close: Option<(
+        std::sync::Weak<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>>,
+        Vec<mcpg_plugin_protocol::audit::AuditEvent>,
+    )>,
+}
+
+impl Drop for ResourceSubscriptionGuard {
+    fn drop(&mut self) {
+        let Some((runtime, mut events)) = self.on_close.take() else {
+            return;
+        };
+        if events.is_empty() {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let Some(runtime) = runtime.upgrade() else {
+            return;
+        };
+        let runtime = runtime.load_full();
+        let now = mcpg_plugin_host::audit_events::now_rfc3339_utc();
+        for event in &mut events {
+            event.occurred_at = now.clone();
+        }
+        handle.spawn(async move {
+            for event in &events {
+                let _ = runtime.plugin_registry().emit_audit_event(event).await;
+            }
+        });
+    }
 }
 
 impl ResourceSubscriptionGuard {
@@ -246,6 +280,7 @@ impl ResourceSubscriptionGuard {
 /// are still legitimate, and the ack reports only what was established.
 pub(crate) async fn register_modern_resource_subscriptions(
     runtime: &std::sync::Arc<crate::runtime::GatewayRuntime>,
+    runtime_handle: &std::sync::Arc<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>>,
     session_id: &str,
     request_context: &crate::runtime::RequestContext,
     uris: &[String],
@@ -259,6 +294,7 @@ pub(crate) async fn register_modern_resource_subscriptions(
 
     let subscriptions = runtime.subscriptions();
     let mut leases = Vec::with_capacity(uris.len());
+    let mut close_events = Vec::with_capacity(uris.len());
     for uri in uris {
         let Some(route) = runtime.resolve_resource_route(uri) else {
             tracing::debug!(
@@ -308,16 +344,43 @@ pub(crate) async fn register_modern_resource_subscriptions(
                 transport: crate::runtime::transport_label(&request_context.transport).to_owned(),
                 surface: "resource".to_owned(),
             };
-            let event = mcpg_plugin_host::audit_events::resource_subscribe_event(&audit_ctx, uri)
-                .with_upstream_request_id(request_context.upstream_request_id.clone());
-            let _ = runtime.plugin_registry().emit_audit_event(&event).await;
+            let event = crate::runtime::audit_with_client(
+                mcpg_plugin_host::audit_events::resource_subscribe_event(&audit_ctx, uri)
+                    .with_upstream_request_id(request_context.upstream_request_id.clone()),
+                request_context,
+            );
+            // Under `on_failure: fail_closed` a target the audit trail lost
+            // is skipped: dropping the lease ends the subscription.
+            if let Err(failure) = runtime
+                .plugin_registry()
+                .emit_request_audit_event(&event)
+                .await
+            {
+                tracing::warn!(
+                    uri = %uri,
+                    error = %failure,
+                    "subscriptions/listen: skipping a resources/updated target whose audit record was lost"
+                );
+                continue;
+            }
+            let mut closed = crate::runtime::audit_with_client(
+                mcpg_plugin_host::audit_events::resource_unsubscribe_event(&audit_ctx, uri, true),
+                request_context,
+            );
+            if let Some(details) = closed.details.as_object_mut() {
+                details.insert("reason".to_owned(), serde_json::json!("stream_closed"));
+            }
+            close_events.push(closed);
             leases.push(lease);
         }
     }
     metrics::counter!("mcpg_subscriptions_listen_resources_registered_total")
         .increment(leases.len() as u64);
 
-    ResourceSubscriptionGuard { leases }
+    ResourceSubscriptionGuard {
+        leases,
+        on_close: Some((std::sync::Arc::downgrade(runtime_handle), close_events)),
+    }
 }
 
 /// default reconnect hint in milliseconds. Emitted on every

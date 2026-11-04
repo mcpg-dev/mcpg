@@ -106,7 +106,7 @@ pub struct AuditEvent {
     pub resource:        Option<String>,   // "tool://payments.charge", "session://abc-123", …
     pub outcome:         AuditOutcome,     // Success / Failure / Partial / Denied
     pub request_id:      Option<String>,   // correlate with the originating request
-    pub node_id:         Option<String>,   // gateway node that emitted (cluster only)
+    pub node_id:         Option<String>,   // replica that emitted: MCPG_NODE_ID, else HOSTNAME
     pub details:         serde_json::Value,// action-specific structured payload
     pub prev_event_hash: Option<String>,   // sink-side chain pointer (§Tamper detection)
 }
@@ -239,8 +239,10 @@ chain per call.
 | `mcpg.resource.read.success` | `resources/read` returned bytes | `resource://<uri>` | Success |
 | `mcpg.resource.read.denied` | `resources/read` was policy-rejected | `resource://<uri>` | Denied |
 | `mcpg.resource.read.not_found` | `resources/read` URI is unknown | `resource://<uri>` | Failure |
-| `mcpg.resource.subscribe` | `resources/subscribe` accepted | `resource://<uri>` | Success |
-| `mcpg.resource.unsubscribe` | `resources/unsubscribe` accepted | `resource://<uri>` | Success |
+| `mcpg.resource.subscribe` | `resources/subscribe` accepted, or a `subscriptions/listen` target established; `details.client` names the MCP client. Under `on_failure: fail_closed` a subscription whose record is lost is refused. | `resource://<uri>` | Success |
+| `mcpg.resource.unsubscribe` | `resources/unsubscribe` accepted, or a `subscriptions/listen` stream closed (`details.reason: stream_closed`) | `resource://<uri>` | Success |
+| `mcpg.resource.updated_delivered` | a stream handed a subscriber `notifications/resources/updated` (a delivery receipt; `details.client`, and `details.subscription_id` on the stateless wire) | `resource://<uri>` | Success |
+| `mcpg.events.poll` | an `events/poll` returned events (`details.delivered`, `first_event_id`, `last_event_id`, the resume `cursor`), or started from no cursor (`details.started`); `details.client` names the MCP client | `event://<name>` | Success |
 | `mcpg.prompt.get.success` | `prompts/get` returned a prompt | `prompt://<name>` | Success |
 | `mcpg.prompt.get.denied` | `prompts/get` was policy-rejected | `prompt://<name>` | Denied |
 | `mcpg.prompt.get.not_found` | `prompts/get` name is unknown | `prompt://<name>` | Failure |
@@ -489,11 +491,26 @@ governance:
 | `fail_closed` (default) | the registry's emit returns an enforcement error; the calling site (tool-gate chain, etc.) treats it as a Deny. Highest-strength compliance posture: a sink outage stops traffic. |
 | `fail_open` | failures are metered (`mcpg_audit_emits_total{outcome=fail}`) and logged; traffic continues. Use only in dev / CI. |
 
-The enforcement hookup uses
-`PluginRegistry::emit_audit_event_enforced(&event, policy)` at
-strict sites (see `tool-gate` chain emission for the canonical
-example). Sites that invoke `emit_audit_event(&event)` without
-the enforced wrapper are best-effort regardless of config.
+Under `fail_closed`, these records gate the operation they describe:
+
+| Record | When it is lost |
+|--------|-----------------|
+| `mcpg.tool.call.allowed` | The call does not run. The client gets JSON-RPC error `-32603` (HTTP 503). |
+| `mcpg.tool.call.completed` | The tool ran, but its result is not returned. The client gets `-32603` (HTTP 503). |
+| `mcpg.resource.subscribe` | The subscription is refused, or the listen target is skipped. |
+| Admin mutations, startup lifecycle | The admin call fails; startup halts. |
+
+A sink that stopped serving (disabled, quarantined, draining) counts as
+a lost record under `fail_closed`. Refusals are counted in
+`mcpg_tool_call_audit_refusals_total{action}`.
+
+Deny, challenge, quota and unknown-tool records do not gate: the call is
+refused either way, so they are best-effort under both policies.
+
+The enforcement hookup is
+`PluginRegistry::emit_request_audit_event(&event)`, which applies the
+configured policy. Sites that call `emit_audit_event(&event)` are
+best-effort regardless of config.
 
 ### Per-event sink redirection (Phase 6c-23 / 6c-26)
 
@@ -556,11 +573,12 @@ governance:
     sinks:
       - kind: dev.mcpg.builtin.audit.local-file   # built-in JSONL appender
         config:
-          path: /var/log/mcpg/audit.jsonl
-          format: json              # json | jsonl
-          # No rotation knob: the sink never rotates or size-caps
-          # `path`. Rotate it externally (logrotate); the sink
-          # follows the rotated path on its own. See "Retention".
+          # `{node}` is the node id (MCPG_NODE_ID, else the hostname):
+          # one file per replica. See "Retention".
+          path: /var/log/mcpg/audit-{node}.jsonl
+          max_size_mb: 100          # rotate past 100 MiB; 0 = rotate externally
+          max_backups: 0            # rotated files to keep; 0 = all
+          max_age_days: 0           # delete rotated files older than this; 0 = never
 
       # Off-node sink. Operators SHOULD register at least one for
       # production — single-node file persistence is not enough
@@ -882,12 +900,43 @@ authoritative legal advice):
 | GDPR | "as long as the underlying data" — variable |
 | ISO 27001 A.18.1.3 | "in line with retention policy" — variable |
 
-The built-in `dev.mcpg.builtin.audit.local-file` sink does not rotate,
-size-cap, or expire — operators pair it with `logrotate` or a similar
-tool, OR (recommended) route to an off-node sink that handles retention
-natively (S3 lifecycle, CloudTrail data retention, Datadog).
+The built-in `dev.mcpg.builtin.audit.local-file` sink follows the
+model of the Kubernetes API server's audit log: one file per replica,
+rotated by size, collected off the node.
 
-Rotation needs no `postrotate` hook and no signal. The sink holds one
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `path` | `./mcpg-audit.log` | File to append to. `{node}` is replaced by the node id (`MCPG_NODE_ID`, else `HOSTNAME`, else `/etc/hostname`), reduced to `[A-Za-z0-9._-]`. |
+| `max_size_mb` | `100` | Rotate before a write would take the file past this size. `0` turns built-in rotation off. |
+| `max_backups` | `0` | Rotated files to keep, newest first. `0` keeps all. |
+| `max_age_days` | `0` | Delete rotated files older than this. `0` keeps all. |
+
+Other keys are refused at startup.
+
+- **One writer per file.** The sink takes an exclusive lock on
+  `<path>.lock`. A second process on the same path (two replicas on one
+  shared volume) fails at startup and names the fix: put `{node}` in the
+  path. A config reload in one process shares the open writer, so the
+  chain stays linear.
+- **Rotation.** The live file is renamed to `<stem>-<UTC
+  timestamp>.<ext>` (for example `audit-gw-0-2026-11-04T00-12-03.481.jsonl`)
+  and a fresh file is started. The rename is synced to the directory.
+  Pruning runs after each rotation and touches only that file's backups.
+  Both pruning limits default to "keep all": deleting audit records is a
+  retention decision, so set them to match the table above.
+- **Restart.** The chain continues from the last complete line of the
+  live file, or of the newest backup when the live file is empty. A torn
+  last line, left by a crash mid-write, is closed with a newline. The
+  next record chains to the last complete line, so a verifier sees the
+  torn line as one corrupt record, not as a broken chain.
+- **Central query.** A per-node file is the record of last resort, not a
+  query surface. Ship the files with a log collector (Fluent Bit, Vector,
+  the OpenTelemetry Collector filelog receiver), or add an off-node sink
+  next to this one (`dev.mcpg.audit.http`, S3 WORM, CloudTrail, Datadog).
+  Every record carries `node_id`, so merged streams stay attributable.
+
+Set `max_size_mb: 0` to rotate with `logrotate` or a similar tool
+instead. External rotation needs no `postrotate` hook and no signal. The sink holds one
 long-lived append handle for throughput, and at each write batch checks
 whether the configured path still resolves to that same file; when it
 does not — `logrotate`'s default rename-then-create, or the file having

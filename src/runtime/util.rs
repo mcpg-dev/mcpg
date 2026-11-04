@@ -732,6 +732,37 @@ pub(crate) fn transport_label(t: &TransportKind) -> &'static str {
     }
 }
 
+/// `event` with the request's MCP client in `details.client`
+/// (`{name, version}`), when the client named itself.
+pub(crate) fn audit_with_client(
+    mut event: mcpg_plugin_protocol::audit::AuditEvent,
+    request_context: &RequestContext,
+) -> mcpg_plugin_protocol::audit::AuditEvent {
+    if let (Some(client), Some(details)) = (request_context.client(), event.details.as_object_mut())
+    {
+        details.insert(
+            "client".to_owned(),
+            serde_json::json!({ "name": client.name, "version": client.version }),
+        );
+    }
+    event
+}
+
+/// This replica's name for records and audit: `MCPG_NODE_ID`, else
+/// `HOSTNAME` (the pod name on Kubernetes), else `/etc/hostname`.
+pub(crate) fn node_name() -> Option<&'static str> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        ["MCPG_NODE_ID", "HOSTNAME"]
+            .iter()
+            .find_map(|var| std::env::var(var).ok())
+            .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    })
+    .as_deref()
+}
+
 impl Drop for CancellationCleanup {
     fn drop(&mut self) {
         self.registry.remove(&self.target_id);

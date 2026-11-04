@@ -1,4 +1,4 @@
-//! Top-level `audit:` block — compliance audit channel that fans
+//! `governance.audit:` block — compliance audit channel that fans
 //! out via the same `SinkConfig` schema as the observability
 //! triad.
 
@@ -8,11 +8,10 @@ use serde::{Deserialize, Serialize};
 use super::default_true;
 use super::observability::{SinkConfig, validate_sink_kind};
 
-/// Top-level `audit:` block. A top-level peer (rather than nested
-/// under `observability:`), with an inner schema aligned to the
-/// OTel signal-triad sinks-list pattern (`logs` / `metrics` /
-/// `traces`). Spec §9.12 defines the semantics; the fields here
-/// are the Rust projection.
+/// `governance.audit:` block. Kept apart from `observability:`, with
+/// an inner schema aligned to the OTel signal-triad sinks-list
+/// pattern (`logs` / `metrics` / `traces`). Spec §9.12 defines the
+/// semantics; the fields here are the Rust projection.
 ///
 /// Audit sinks fan out via `sinks: [{kind, config, level?}]`. The
 /// built-in `dev.mcpg.builtin.audit.local-file` activates only

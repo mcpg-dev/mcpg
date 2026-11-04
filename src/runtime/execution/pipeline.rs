@@ -1778,6 +1778,7 @@ pub(super) async fn execute_sql_await_step(
             .idempotency_hint
             .as_ref()
             .map(|h| h.to_plugin_hint()),
+        client: request.context.client(),
     };
 
     match plugin.execute(&cfg.backend, binding_request).await {

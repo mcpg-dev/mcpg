@@ -1492,6 +1492,7 @@ async fn plugin_exec(
         session_id: None,
         identity: None,
         idempotency: None,
+        client: None,
     };
     let resp = <SqlBackendPlugin as mcpg_plugin_protocol::BackendPlugin>::execute(
         plugin,

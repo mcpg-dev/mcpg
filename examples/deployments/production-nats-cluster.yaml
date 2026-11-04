@@ -82,7 +82,9 @@ governance:
     sinks:
       - kind: dev.mcpg.builtin.audit.local-file
         config:
-          path: "/var/log/mcpg/audit.log"
+          # One file per replica; ship them with a log collector.
+          path: "/var/log/mcpg/audit-{node}.log"
+          max_size_mb: 100
 
 # The gateway image carries no plugins: each entry below is a signed
 # artifact the gateway pulls and verifies at boot. Without the NATS or
