@@ -1,6 +1,6 @@
 [package]
 name = "mcpg"
-version = "0.1.0"
+version = "0.2.0"
 license = "Apache-2.0"
 edition = "2024"
 description = "MCPG gateway — the governed MCP endpoint. Binary: `mcpg`."
@@ -71,14 +71,14 @@ mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol
 mcpg-tunnel-proto = { git = "https://github.com/mcpg-dev/mcpg-tunnel-proto", tag = "v0.1.0-rc.1", version = "=0.1.0-rc.1" }
 mcpg-tunnel-agent = { git = "https://github.com/mcpg-dev/mcpg-tunnel-agent", tag = "v0.1.0-rc.1", version = "=0.1.0-rc.1" }
 mcpg-glob = { git = "https://github.com/mcpg-dev/mcpg-glob", tag = "v0.1.0-rc.1", version = "=0.1.0-rc.1" }
-mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-rc.5", version = "=0.1.0-rc.5" }
+mcpg-plugin-host = { git = "https://github.com/mcpg-dev/mcpg-plugin-host", tag = "v0.1.0-rc.8", version = "=0.1.0-rc.8" }
 # `static-firstparty` enables the `HostHandle::from_services` path used at
 # boot to install the unified host surface on statically linked first-party
 # plugins — the gateway never goes through the FFI vtable for its own
 # builtins.
-mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-rc.5", version = "=0.1.0-rc.5", features = ["static-firstparty"] }
+mcpg-plugin-sdk = { git = "https://github.com/mcpg-dev/mcpg-plugin-sdk", tag = "v0.1.0-rc.8", version = "=0.1.0-rc.8", features = ["static-firstparty"] }
 mcpg-plugin-storage-builtin = { git = "https://github.com/mcpg-dev/mcpg-plugin-storage-builtin", tag = "v0.1.0-rc.3", version = "=0.1.0-rc.3" }
-mcpg-plugin-storage-s3 = { git = "https://github.com/mcpg-dev/mcpg-plugin-storage-s3", tag = "v0.1.0-rc.5", version = "=0.1.0-rc.5", optional = true }
+mcpg-plugin-storage-s3 = { git = "https://github.com/mcpg-dev/mcpg-plugin-storage-s3", tag = "v0.1.0-rc.8", version = "=0.1.0-rc.8", optional = true }
 # The only backend linked into the binary: the mock fixture the quickstart
 # templates bind, so `mcpg config init` → boot → `tools/call` works with no
 # artefact to build. It carries no transport machinery (no client stack) and

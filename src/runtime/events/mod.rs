@@ -25,7 +25,7 @@
 //!   purge.
 
 pub mod admin;
-mod audit;
+pub(crate) mod audit;
 pub mod builtin;
 pub mod catalog;
 pub mod cursor;

@@ -125,6 +125,42 @@ struct DemandRow {
 struct StreamRow {
     v: u32,
     name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    presence: Option<PresenceRow>,
+}
+
+/// Who holds a stream or polls a type, for `GET /admin/v1/subscriptions`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresenceRow {
+    pub principal: mcpg_plugin_protocol::PluginIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<serde_json::Value>,
+    /// As the type's `audit.arguments` allows: `{ "arguments": … }`,
+    /// `{ "arguments_hash": … }` or empty.
+    #[serde(default)]
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    pub since_ms: u64,
+    pub refreshed_ms: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PollerRow {
+    v: u32,
+    name: String,
+    presence: PresenceRow,
+}
+
+/// One stream or poller as the store holds it.
+#[derive(Debug, Clone)]
+pub struct PresenceEntry {
+    /// The store key's tail: stable while the holder lives.
+    pub id: String,
+    pub name: String,
+    pub presence: Option<PresenceRow>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -147,6 +183,7 @@ const MAX_ARGUMENT_DEMAND: usize = 1_000;
 /// subscriptions of every type: each lists one kind of reader alone.
 const LEASE_PREFIX: &str = "ev:poll:l:";
 const STREAM_PREFIX: &str = "ev:push:p:";
+const POLLER_PREFIX: &str = "ev:poll:h:";
 const UPSTREAM_PREFIX: &str = "ev:fed:u:";
 
 fn encode<T: Serialize>(value: &T) -> Result<Bytes, StoreError> {
@@ -294,11 +331,13 @@ impl LeaseStore {
         principal_key: &str,
         stream_id: &str,
         name: &str,
+        presence: Option<&PresenceRow>,
         ttl: Duration,
     ) -> Result<(), StoreError> {
         let row = StreamRow {
             v: FORMAT_VERSION,
             name: name.to_owned(),
+            presence: presence.cloned(),
         };
         self.kv
             .put(
@@ -318,6 +357,65 @@ impl LeaseStore {
     /// The open streams of every principal, counted up to `limit`.
     pub async fn count_all_streams(&self, limit: usize) -> Result<usize, StoreError> {
         Ok(self.kv.list_prefix(STREAM_PREFIX, limit).await?.len())
+    }
+
+    /// Every open stream on the fleet, up to `limit`.
+    pub async fn list_streams(&self, limit: usize) -> Result<Vec<PresenceEntry>, StoreError> {
+        let mut out = Vec::new();
+        for (key, entry) in self.kv.list_prefix(STREAM_PREFIX, limit).await? {
+            let Ok(row) = decode::<StreamRow>(&entry.bytes) else {
+                continue;
+            };
+            let id = key.rsplit(':').next().unwrap_or_default().to_owned();
+            out.push(PresenceEntry {
+                id,
+                name: row.name,
+                presence: row.presence,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Hold poller `poller` (a keyed hash) of `name` for `ttl`.
+    pub async fn put_poller(
+        &self,
+        poller: &str,
+        name: &str,
+        presence: &PresenceRow,
+        ttl: Duration,
+    ) -> Result<(), StoreError> {
+        let row = PollerRow {
+            v: FORMAT_VERSION,
+            name: name.to_owned(),
+            presence: presence.clone(),
+        };
+        self.kv
+            .put(
+                &format!("{POLLER_PREFIX}{poller}"),
+                encode(&row)?,
+                Some(ttl),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Every poller with a live lease on the fleet, up to `limit`.
+    pub async fn list_pollers(&self, limit: usize) -> Result<Vec<PresenceEntry>, StoreError> {
+        let mut out = Vec::new();
+        for (key, entry) in self.kv.list_prefix(POLLER_PREFIX, limit).await? {
+            let Ok(row) = decode::<PollerRow>(&entry.bytes) else {
+                continue;
+            };
+            out.push(PresenceEntry {
+                id: key
+                    .strip_prefix(POLLER_PREFIX)
+                    .unwrap_or_default()
+                    .to_owned(),
+                name: row.name,
+                presence: Some(row.presence),
+            });
+        }
+        Ok(out)
     }
 
     fn upstream_key(&self, name: &str, key: &str) -> String {

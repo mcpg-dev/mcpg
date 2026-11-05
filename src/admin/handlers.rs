@@ -104,6 +104,27 @@ pub async fn list_watches(State(svc): State<SharedAdmin>) -> impl IntoResponse {
     }))
 }
 
+/// `GET /admin/v1/subscriptions` — the holders of a URI, a URI prefix or
+/// an event type, on every replica.
+pub async fn subscriptions_presence(
+    State(svc): State<SharedAdmin>,
+    axum::extract::Query(q): axum::extract::Query<crate::admin::presence::PresenceQuery>,
+) -> impl IntoResponse {
+    use crate::admin::presence::PresenceError;
+    let runtime = svc.runtime_snapshot();
+    match crate::admin::presence::subscriptions(&runtime, svc.events_core(), &q).await {
+        Ok(body) => (StatusCode::OK, Json(body)),
+        Err(PresenceError::BadQuery(message)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": message })),
+        ),
+        Err(PresenceError::Store(message)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": message })),
+        ),
+    }
+}
+
 /// Disable a registered plugin. The plugin stays loaded but is
 /// skipped during chain evaluation and binding / watch lookups
 /// until [`enable_plugin`] is called.

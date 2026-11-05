@@ -991,9 +991,41 @@ pub struct EventTypeConfig {
     #[serde(default)]
     pub always_on: bool,
 
+    /// What this type's `mcpg.events.poll` and `mcpg.events.stream_opened`
+    /// audit records carry.
+    #[serde(default)]
+    pub audit: EventTypeAuditConfig,
+
     /// Where occurrences come from: exactly one of `watch`, `inbound`,
     /// `resource` or `builtin`.
     pub source: EventSourceConfig,
+}
+
+/// `mcp.capabilities.events[].audit`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventTypeAuditConfig {
+    /// How a subscription's `arguments` appear in its audit records:
+    /// `hash` (default, `details.arguments_hash`), `raw`
+    /// (`details.arguments`; only for a type whose arguments are not
+    /// sensitive) or `none`.
+    pub arguments: AuditArguments,
+    /// Write a poll record at least this often (seconds) per poller,
+    /// even for a poll that returns no events, so a poller's presence is
+    /// visible. 0 (default): an empty poll from a cursor writes nothing.
+    pub poll_heartbeat_secs: u64,
+}
+
+/// See [`EventTypeAuditConfig::arguments`].
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditArguments {
+    #[default]
+    Hash,
+    Raw,
+    None,
 }
 
 impl EventTypeConfig {

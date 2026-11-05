@@ -3608,6 +3608,41 @@ fn audit_config_validates_required_with_empty_sinks() {
 }
 
 #[test]
+fn audit_sinks_take_gating_and_routing() {
+    let cfg: AuditConfig = serde_yaml::from_str(
+        r#"
+sinks:
+  - kind: dev.mcpg.builtin.audit.local-file
+  - kind: dev.mcpg.audit.http
+    gating: false
+    routing:
+      allow_actions: ["mcpg.resource.*", "mcpg.events.poll"]
+"#,
+    )
+    .unwrap();
+    cfg.validate().unwrap();
+    assert!(cfg.sinks[0].gating, "gating is the default");
+    assert!(!cfg.sinks[1].gating);
+    assert_eq!(cfg.sinks[1].routing.allow_actions.len(), 2);
+
+    let only_best_effort: AuditConfig =
+        serde_yaml::from_str("sinks: [{ kind: dev.mcpg.audit.http, gating: false }]").unwrap();
+    assert!(
+        only_best_effort
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("gating: true"),
+        "required needs an audit of record"
+    );
+    assert!(
+        serde_yaml::from_str::<AuditConfig>("sinks: [{ kind: x.y, routing: { allow: [\"a\"] } }]")
+            .is_err(),
+        "a mistyped routing key is refused"
+    );
+}
+
+#[test]
 fn audit_on_failure_serialises_snake_case() {
     assert_eq!(
         serde_json::to_string(&AuditOnFailure::FailClosed).unwrap(),

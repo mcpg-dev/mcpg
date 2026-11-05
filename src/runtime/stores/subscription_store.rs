@@ -34,6 +34,9 @@ pub struct SubscriberIdentity {
     /// The replica that took the subscription.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// The caller as an audit record's `actor` carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<mcpg_plugin_protocol::PluginIdentity>,
 }
 
 impl SubscriberIdentity {
@@ -62,6 +65,9 @@ impl SubscriberIdentity {
             transport: Some(crate::runtime::transport_label(&request_context.transport).to_owned()),
             subscribed_at: Some(chrono::Utc::now().to_rfc3339()),
             node: crate::runtime::node_name().map(str::to_owned),
+            principal: Some(crate::runtime::util::plugin_identity_from_request(
+                request_context,
+            )),
         }
     }
 }
@@ -789,6 +795,7 @@ mod tests {
             transport: Some("http".to_owned()),
             subscribed_at: Some("2026-11-03T18:00:00+00:00".to_owned()),
             node: Some("gw-0".to_owned()),
+            principal: None,
         };
         store
             .subscribe("sess-1", "file:///config.yaml", Some(identity.clone()))

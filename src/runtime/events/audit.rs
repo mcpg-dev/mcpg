@@ -1,9 +1,9 @@
 //! Audit records of the event surface.
 //!
-//! No record holds a callback URL, a secret or raw arguments: a callback is
-//! its origin plus a keyed hash of its path and query, arguments are a
-//! keyed hash of their canonical JSON, and a principal is its keyed hash
-//! where no identity is at hand.
+//! No record holds a callback URL or a secret: a callback is its origin
+//! plus a keyed hash of its path and query, and a principal is its keyed
+//! hash where no identity is at hand. Arguments are a keyed hash of their
+//! canonical JSON, unless the type's `audit.arguments` says `raw` or `none`.
 
 use mcpg_plugin_host::audit_events::{new_event_id, now_rfc3339_utc, system_identity};
 use mcpg_plugin_protocol::PluginIdentity;
@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use super::engine::EventsCore;
 use super::keys::EventsKeys;
 use super::subscriptions::SubscriptionRecord;
+use crate::config::events::AuditArguments;
 use crate::runtime::RequestContext;
 use crate::runtime::util::{plugin_identity_from_request, plugin_identity_from_request_identity};
 
@@ -39,6 +40,56 @@ pub fn arguments_hash(keys: &EventsKeys, record: &SubscriptionRecord) -> String 
             record.arguments.clone(),
         )),
     )
+}
+
+/// Pollers whose last heartbeat record a replica remembers before it
+/// prunes the ones past three intervals.
+const POLLERS_TRACKED: usize = 50_000;
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// `arguments` in the form `mode` names: `{arguments}`,
+/// `{arguments_hash}` or nothing.
+pub(crate) fn arguments_fields(
+    keys: Option<&EventsKeys>,
+    mode: AuditArguments,
+    arguments: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    match mode {
+        AuditArguments::None => {}
+        AuditArguments::Raw => {
+            out.insert("arguments".to_owned(), Value::Object(arguments.clone()));
+        }
+        AuditArguments::Hash => {
+            let hash = keys.map(|keys| {
+                keys.key_hash(
+                    "audit-arguments",
+                    &mcpg_mcp_wire::shared::canonical::canonical_value_bytes(&Value::Object(
+                        arguments.clone(),
+                    )),
+                )
+            });
+            out.insert("arguments_hash".to_owned(), json!(hash));
+        }
+    }
+    out
+}
+
+/// Add `arguments` to `details` in the form `mode` names.
+fn insert_arguments(
+    details: &mut Value,
+    keys: Option<&EventsKeys>,
+    mode: AuditArguments,
+    arguments: &serde_json::Map<String, Value>,
+) {
+    if let Some(details) = details.as_object_mut() {
+        details.extend(arguments_fields(keys, mode, arguments));
+    }
 }
 
 fn event(
@@ -91,18 +142,86 @@ impl EventsCore {
 
     /// `mcpg.events.poll`, for a poll that returned events (a delivery
     /// receipt) or that started from no cursor (where a consumer began):
-    /// the events by id, the cursor the consumer resumes from, and the
-    /// client. An empty poll from a cursor writes nothing.
+    /// the events by id, the cursor the consumer resumes from, the client
+    /// and the arguments as the type's `audit.arguments` says. An empty
+    /// poll from a cursor writes a record (`heartbeat: true`) only when the
+    /// type's `audit.poll_heartbeat_secs` has passed since this poller's
+    /// last record on this replica.
     pub(crate) async fn audit_poll(
         &self,
         ctx: &RequestContext,
         name: &str,
         from_cursor: Option<&str>,
+        arguments: &serde_json::Map<String, Value>,
         result: &mcpg_mcp_wire::v_2026_07_28::extensions::events::wire::PollEventsResult,
     ) {
-        if result.events.is_empty() && from_cursor.is_some() {
+        let audit = self
+            .catalog()
+            .get(name)
+            .map(|ty| ty.audit.clone())
+            .unwrap_or_default();
+        let stores = self.stores();
+        let keys = stores.as_deref().map(|s| &*s.keys);
+        let empty_from_cursor = result.events.is_empty() && from_cursor.is_some();
+        let heartbeat = std::time::Duration::from_secs(audit.poll_heartbeat_secs);
+        let mut is_heartbeat = false;
+        if audit.poll_heartbeat_secs > 0 {
+            let poller = self.poller_key(ctx, name, keys, arguments);
+            let now = std::time::Instant::now();
+            {
+                let mut seen = self.poll_audited.lock();
+                let due = seen
+                    .get(&poller)
+                    .is_none_or(|at| now.duration_since(*at) >= heartbeat);
+                if empty_from_cursor && !due {
+                    return;
+                }
+                is_heartbeat = empty_from_cursor;
+                if seen.len() >= POLLERS_TRACKED {
+                    let keep = heartbeat.saturating_mul(3);
+                    seen.retain(|_, at| now.duration_since(*at) < keep);
+                }
+                seen.insert(poller.clone(), now);
+            }
+            if let (Some(stores), Some(keys)) = (stores.as_deref(), keys) {
+                let at = now_epoch_ms();
+                let presence = super::poll::PresenceRow {
+                    principal: plugin_identity_from_request(ctx),
+                    client: ctx
+                        .client()
+                        .map(|c| json!({ "name": c.name, "version": c.version })),
+                    arguments: arguments_fields(Some(keys), audit.arguments, arguments),
+                    transport: Some(crate::runtime::transport_label(&ctx.transport).to_owned()),
+                    node: crate::runtime::node_name().map(str::to_owned),
+                    since_ms: at,
+                    refreshed_ms: at,
+                };
+                let id = keys.key_hash("poller", poller.as_bytes());
+                if let Err(error) = stores
+                    .leases
+                    .put_poller(&id, name, &presence, heartbeat.saturating_mul(3))
+                    .await
+                {
+                    tracing::debug!(%error, "poller lease not written");
+                }
+            }
+        } else if empty_from_cursor {
             return;
         }
+        let mut details = json!({
+            "event": name,
+            "started": from_cursor.is_none(),
+            "delivered": result.events.len(),
+            "first_event_id": result.events.first().map(|e| e.event_id.as_str()),
+            "last_event_id": result.events.last().map(|e| e.event_id.as_str()),
+            "cursor": result.cursor,
+            "truncated": result.truncated,
+            "has_more": result.has_more,
+        });
+        if is_heartbeat {
+            details["heartbeat"] = json!(true);
+        }
+        insert_arguments(&mut details, keys, audit.arguments, arguments);
         let event = crate::runtime::audit_with_client(
             event(
                 plugin_identity_from_request(ctx),
@@ -110,20 +229,34 @@ impl EventsCore {
                 name,
                 AuditOutcome::Success,
                 Some(ctx.request_id.as_str().to_owned()),
-                json!({
-                    "event": name,
-                    "started": from_cursor.is_none(),
-                    "delivered": result.events.len(),
-                    "first_event_id": result.events.first().map(|e| e.event_id.as_str()),
-                    "last_event_id": result.events.last().map(|e| e.event_id.as_str()),
-                    "cursor": result.cursor,
-                    "truncated": result.truncated,
-                    "has_more": result.has_more,
-                }),
+                details,
             ),
             ctx,
         );
         self.emit(event).await;
+    }
+
+    /// One poller: the type, the principal, the client and the arguments.
+    fn poller_key(
+        &self,
+        ctx: &RequestContext,
+        name: &str,
+        keys: Option<&EventsKeys>,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> String {
+        let principal = ctx.identity.synthetic_principal_key().unwrap_or_default();
+        let client = ctx.client().map(|c| c.name).unwrap_or_default();
+        let args = keys
+            .map(|keys| {
+                keys.key_hash(
+                    "audit-arguments",
+                    &mcpg_mcp_wire::shared::canonical::canonical_value_bytes(&Value::Object(
+                        arguments.clone(),
+                    )),
+                )
+            })
+            .unwrap_or_default();
+        format!("{name}\u{1f}{principal}\u{1f}{client}\u{1f}{args}")
     }
 
     /// `mcpg.events.subscribe`: `outcome` is `created`, `refreshed` or
@@ -259,43 +392,56 @@ impl EventsCore {
         stream_id: &str,
         arguments: &serde_json::Map<String, Value>,
     ) {
-        let arguments_hash = self.stores().map(|stores| {
-            stores.keys.key_hash(
-                "audit-arguments",
-                &mcpg_mcp_wire::shared::canonical::canonical_value_bytes(&Value::Object(
-                    arguments.clone(),
-                )),
-            )
-        });
-        self.emit(event(
-            plugin_identity_from_request(ctx),
-            "mcpg.events.stream_opened",
-            name,
-            AuditOutcome::Success,
-            Some(ctx.request_id.as_str().to_owned()),
-            json!({ "stream_id": stream_id, "arguments_hash": arguments_hash }),
+        let mode = self
+            .catalog()
+            .get(name)
+            .map(|ty| ty.audit.arguments)
+            .unwrap_or_default();
+        let stores = self.stores();
+        let mut details = json!({ "stream_id": stream_id });
+        insert_arguments(
+            &mut details,
+            stores.as_deref().map(|s| &*s.keys),
+            mode,
+            arguments,
+        );
+        self.emit(crate::runtime::audit_with_client(
+            event(
+                plugin_identity_from_request(ctx),
+                "mcpg.events.stream_opened",
+                name,
+                AuditOutcome::Success,
+                Some(ctx.request_id.as_str().to_owned()),
+                details,
+            ),
+            ctx,
         ))
         .await;
     }
 
     /// `mcpg.events.stream_closed`: an `events/stream` ended. `reason` is
     /// `client`, `server` or the termination reason; `events` is how many
-    /// it carried.
+    /// it carried; `client` is the one that opened it.
     pub(crate) async fn audit_stream_closed(
         &self,
         identity: &crate::runtime::RequestIdentity,
+        client: Option<&Value>,
         name: &str,
         stream_id: &str,
         reason: &str,
         events: u64,
     ) {
+        let mut details = json!({ "stream_id": stream_id, "reason": reason, "events": events });
+        if let Some(client) = client {
+            details["client"] = client.clone();
+        }
         self.emit(event(
             plugin_identity_from_request_identity(identity),
             "mcpg.events.stream_closed",
             name,
             AuditOutcome::Success,
             None,
-            json!({ "stream_id": stream_id, "reason": reason, "events": events }),
+            details,
         ))
         .await;
     }

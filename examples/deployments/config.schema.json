@@ -191,6 +191,13 @@
             "bearer_token_env": {
               "type": "string"
             },
+            "read_bearer_token_env": {
+              "description": "Env var of a second token that authenticates `GET` requests only: it reads (for example `/subscriptions`) and cannot change anything. Same length floor as the main token.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "type": {
               "const": "static_bearer",
               "type": "string"
@@ -725,6 +732,15 @@
       ],
       "type": "string"
     },
+    "AuditArguments": {
+      "description": "See [`EventTypeAuditConfig::arguments`].",
+      "enum": [
+        "hash",
+        "raw",
+        "none"
+      ],
+      "type": "string"
+    },
     "AuditConfig": {
       "additionalProperties": false,
       "description": "`governance.audit:` block. Kept apart from `observability:`, with an inner schema aligned to the OTel signal-triad sinks-list pattern (`logs` / `metrics` / `traces`). Spec §9.12 defines the semantics; the fields here are the Rust projection.\n\nAudit sinks fan out via `sinks: [{kind, config, level?}]`. The built-in `dev.mcpg.builtin.audit.local-file` activates only when its plugin id appears in `sinks[].kind` (there is no `disable_builtins` toggle — just omit the sink to disable it).",
@@ -762,12 +778,13 @@
           "default": [
             {
               "config": {},
+              "gating": true,
               "kind": "dev.mcpg.builtin.audit.local-file"
             }
           ],
           "description": "Audit-sink fan-out. Each entry's `kind:` is a plugin id resolved against the registered audit sinks at boot. The built-in `dev.mcpg.builtin.audit.local-file` is the canonical default — listed in [`AuditConfig::default`].",
           "items": {
-            "$ref": "#/definitions/SinkConfig"
+            "$ref": "#/definitions/AuditSinkConfig"
           },
           "type": "array"
         }
@@ -788,6 +805,65 @@
           "type": "string"
         }
       ]
+    },
+    "AuditSinkConfig": {
+      "additionalProperties": false,
+      "description": "One entry of `governance.audit.sinks`.",
+      "properties": {
+        "config": {
+          "default": null,
+          "description": "Sink-specific config object. Schema depends on `kind:`."
+        },
+        "gating": {
+          "default": true,
+          "description": "A gating sink (the default) is awaited: under `on_failure: fail_closed` a record it loses refuses the operation, and it satisfies `required`. `false` makes the sink best-effort: it gets each record in the background, never delays or refuses a request, and drops (and counts in `mcpg_audit_sink_dropped_total`) what it cannot keep up with.",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "Plugin id (or `plugins[]` alias) of the audit sink.",
+          "type": "string"
+        },
+        "level": {
+          "description": "Per-sink severity floor; parsed, not enforced.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "routing": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AuditSinkRouting"
+            }
+          ],
+          "description": "Which records this sink receives."
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "AuditSinkRouting": {
+      "additionalProperties": false,
+      "description": "Action filters of one audit sink. Patterns are globs over the record's `action` (`*` matches any run), e.g. `mcpg.resource.*`.",
+      "properties": {
+        "allow_actions": {
+          "description": "Only these actions; empty takes every action.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "deny_actions": {
+          "description": "Never these actions; wins over `allow_actions`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     },
     "AuthConfig": {
       "additionalProperties": false,
@@ -3114,6 +3190,29 @@
       ],
       "type": "object"
     },
+    "EventTypeAuditConfig": {
+      "additionalProperties": false,
+      "description": "`mcp.capabilities.events[].audit`.",
+      "properties": {
+        "arguments": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AuditArguments"
+            }
+          ],
+          "default": "hash",
+          "description": "How a subscription's `arguments` appear in its audit records: `hash` (default, `details.arguments_hash`), `raw` (`details.arguments`; only for a type whose arguments are not sensitive) or `none`."
+        },
+        "poll_heartbeat_secs": {
+          "default": 0,
+          "description": "Write a poll record at least this often (seconds) per poller, even for a poll that returns no events, so a poller's presence is visible. 0 (default): an empty poll from a cursor writes nothing.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "EventTypeConfig": {
       "additionalProperties": false,
       "description": "One event type the gateway offers (`mcp.capabilities.events[]`).\n\nA type binds exactly one `source`. Subscription `arguments` are a filter applied by `match`, never a parameter of the source.",
@@ -3131,6 +3230,18 @@
           ],
           "default": "shared",
           "description": "Whose credential reads the source. `shared` (default) reads with the gateway's own identity; per-subscriber visibility is then expressed in `match`."
+        },
+        "audit": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/EventTypeAuditConfig"
+            }
+          ],
+          "default": {
+            "arguments": "hash",
+            "poll_heartbeat_secs": 0
+          },
+          "description": "What this type's `mcpg.events.poll` and `mcpg.events.stream_opened` audit records carry."
         },
         "delivery": {
           "default": [
@@ -4426,6 +4537,7 @@
             "sinks": [
               {
                 "config": {},
+                "gating": true,
                 "kind": "dev.mcpg.builtin.audit.local-file"
               }
             ]
@@ -10695,6 +10807,7 @@
           "sinks": [
             {
               "config": {},
+              "gating": true,
               "kind": "dev.mcpg.builtin.audit.local-file"
             }
           ]

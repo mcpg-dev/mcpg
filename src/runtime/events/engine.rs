@@ -324,6 +324,9 @@ pub struct EventsCore {
     pub(super) heads: parking_lot::Mutex<HashMap<String, Weak<super::push::HeadWatch>>>,
     /// `events/stream` responses open on this replica.
     pub(super) open_streams: std::sync::atomic::AtomicUsize,
+    /// When this replica last wrote a poll record per poller, for
+    /// `audit.poll_heartbeat_secs`.
+    pub(super) poll_audited: parking_lot::Mutex<HashMap<String, std::time::Instant>>,
     /// Every type the config and the imports compile to; `catalog` is what
     /// of it the plan's type cap serves.
     compiled: ArcSwap<EventCatalog>,
@@ -398,6 +401,7 @@ impl EventsCore {
             demand_written: parking_lot::Mutex::new(HashMap::new()),
             heads: parking_lot::Mutex::new(HashMap::new()),
             open_streams: std::sync::atomic::AtomicUsize::new(0),
+            poll_audited: parking_lot::Mutex::new(HashMap::new()),
             compiled: ArcSwap::from_pointee(EventCatalog::empty()),
             types_limit: AtomicU64::new(0),
             catalog_version: AtomicU64::new(0),

@@ -765,6 +765,26 @@ pub(crate) async fn build_plugin_registry(
             }
         }
 
+        // A plugin audit sink's `governance.audit.sinks[].config` is the
+        // config of the `plugins[]` row with the same id, as for the
+        // observability sinks above.
+        for sink in &config.governance.audit.sinks {
+            if sink.config.is_null() || sink.config == serde_json::json!({}) {
+                continue;
+            }
+            for entry in resolved_entries.iter_mut().filter(|e| e.id == sink.kind) {
+                if entry.config.is_null() || entry.config == serde_json::json!({}) {
+                    entry.config = sink.config.clone();
+                } else if entry.config != sink.config {
+                    anyhow::bail!(
+                        "governance.audit.sinks[kind={kind}] and the `plugins[]` row \
+                         '{kind}' both set a different `config:`. Keep it in one place.",
+                        kind = sink.kind,
+                    );
+                }
+            }
+        }
+
         // Backend-plugin migration: kafka cdylib config injection.
         // Kafka connection params (`bootstrap_servers` / `group_id`)
         // live on the kafka *bindings* (`BackendImpl::Kafka`, validated
@@ -1946,6 +1966,18 @@ pub(crate) async fn build_plugin_registry(
     // its kind) without shipping their own; every registered sink is in
     // a non-serving state (disabled / failed); a typo in the
     // descriptor made the sink refuse registration.
+    if config.governance.audit.enabled {
+        for sink in &config.governance.audit.sinks {
+            let policy = mcpg_plugin_host::AuditSinkPolicy::new(
+                sink.gating,
+                sink.routing.allow_actions.clone(),
+                sink.routing.deny_actions.clone(),
+            );
+            if let Err(e) = registry.set_audit_sink_policy(&sink.kind, policy) {
+                warn!(error = %e, "audit sink policy not applied");
+            }
+        }
+    }
     if config.governance.audit.enabled
         && config.governance.audit.required
         && !registry.has_serving_audit_sink()

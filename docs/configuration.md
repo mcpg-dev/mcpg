@@ -330,6 +330,7 @@ Where the AAuth resource signing key comes from — exactly one source.
 
 - **`static_bearer`**
   - `bearer_token_env`: string
+  - `read_bearer_token_env`: string (optional)
 
 - **`trusted_header`** — Security: trusted-header mode requires a value match via `trusted_value_env`. Header-presence-only is insecure and generates warnings on every request.
   - `header_name`: string
@@ -515,6 +516,16 @@ A standard iframe permission. Serialized snake_case in config; maps to the camel
 - `geolocation`
 - `clipboard_write`
 
+### `AuditArguments`
+
+See [`EventTypeAuditConfig::arguments`].
+
+**Allowed values:**
+
+- `hash`
+- `raw`
+- `none`
+
 ### `AuditConfig`
 
 `governance.audit:` block. Kept apart from `observability:`, with an inner schema aligned to the OTel signal-triad sinks-list pattern (`logs` / `metrics` / `traces`). Spec §9.12 defines the semantics; the fields here are the Rust projection.
@@ -528,7 +539,7 @@ Audit sinks fan out via `sinks: [{kind, config, level?}]`. The built-in `dev.mcp
 | `enabled` | boolean | `true` | Master toggle for the audit channel. When `false`, no audit sinks are registered (built-in or plugin), no audit events are emitted, and `required` is ignored. Default `true`. Set `false` only for dev/test runs where compliance is out of scope. |
 | `on_failure` | [`AuditOnFailure`](#auditonfailure) | `"fail_closed"` | Policy for per-event emit failures. Today the fan-out is always best-effort at the registry level (failures are metricsed but don't block the request). This field is captured + validated so the operator's intent is durable; the runtime behavior hookup lands in a future improvement (the emit site needs to translate this into "return error from the tool-gate chain" on `fail_closed`). |
 | `required` | boolean | `true` | When `true` (default), the gateway REFUSES TO START unless at least one audit sink is serving traffic after plugin registration completes. Ignored when `enabled: false`. Operators explicitly set `false` only for dev / CI runs where compliance is not in scope. |
-| `sinks` | array&lt;[`SinkConfig`](#sinkconfig)&gt; | (see type) | Audit-sink fan-out. Each entry's `kind:` is a plugin id resolved against the registered audit sinks at boot. The built-in `dev.mcpg.builtin.audit.local-file` is the canonical default — listed in [`AuditConfig::default`]. |
+| `sinks` | array&lt;[`AuditSinkConfig`](#auditsinkconfig)&gt; | (see type) | Audit-sink fan-out. Each entry's `kind:` is a plugin id resolved against the registered audit sinks at boot. The built-in `dev.mcpg.builtin.audit.local-file` is the canonical default — listed in [`AuditConfig::default`]. |
 
 ### `AuditOnFailure`
 
@@ -539,6 +550,27 @@ Operator policy when an audit-sink `emit` fails.
 - **`fail_closed`** — (default) On emit failure, refuse to serve the triggering request. Compliance-safe: no action happens without a durable audit trail. Subtle: this can wedge the gateway if every registered sink is broken — operators should always configure at least one sink whose availability they actually monitor.
 
 - **`fail_open`** — On emit failure, log + continue. The triggering request completes even if the audit event does not persist. Dev / CI use only — a compliance auditor will not accept this as SOC2-clean.
+
+### `AuditSinkConfig`
+
+One entry of `governance.audit.sinks`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `config` | any |  | Sink-specific config object. Schema depends on `kind:`. |
+| `gating` | boolean | `true` | A gating sink (the default) is awaited: under `on_failure: fail_closed` a record it loses refuses the operation, and it satisfies `required`. `false` makes the sink best-effort: it gets each record in the background, never delays or refuses a request, and drops (and counts in `mcpg_audit_sink_dropped_total`) what it cannot keep up with. |
+| `kind` | string |  | Plugin id (or `plugins[]` alias) of the audit sink. |
+| `level` | string (optional) |  | Per-sink severity floor; parsed, not enforced. |
+| `routing` | [`AuditSinkRouting`](#auditsinkrouting) |  | Which records this sink receives. |
+
+### `AuditSinkRouting`
+
+Action filters of one audit sink. Patterns are globs over the record's `action` (`*` matches any run), e.g. `mcpg.resource.*`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `allow_actions` | array&lt;string&gt; |  | Only these actions; empty takes every action. |
+| `deny_actions` | array&lt;string&gt; |  | Never these actions; wins over `allow_actions`. |
 
 ### `AuthConfig`
 
@@ -1280,6 +1312,15 @@ An operator transform of occurrence data.
 | `expression` | string |  | The expression handed to the plugin. |
 | `plugin` | string |  | Id of a loaded transform plugin, for example `dev.mcpg.transform.jsonata`. |
 
+### `EventTypeAuditConfig`
+
+`mcp.capabilities.events[].audit`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `arguments` | [`AuditArguments`](#auditarguments) | `"hash"` | How a subscription's `arguments` appear in its audit records: `hash` (default, `details.arguments_hash`), `raw` (`details.arguments`; only for a type whose arguments are not sensitive) or `none`. |
+| `poll_heartbeat_secs` | integer | `0` | Write a poll record at least this often (seconds) per poller, even for a poll that returns no events, so a poller's presence is visible. 0 (default): an empty poll from a cursor writes nothing. |
+
 ### `EventTypeConfig`
 
 One event type the gateway offers (`mcp.capabilities.events[]`).
@@ -1290,6 +1331,7 @@ A type binds exactly one `source`. Subscription `arguments` are a filter applied
 | --- | --- | --- | --- |
 | `always_on` | boolean | `false` | Keep the source running with no subscriber, so the log covers periods without one. Default `false`: a source starts with the first subscription and stops `sources.linger_ms` after the last. |
 | `audience` | [`EventAudience`](#eventaudience) | `"shared"` | Whose credential reads the source. `shared` (default) reads with the gateway's own identity; per-subscriber visibility is then expressed in `match`. |
+| `audit` | [`EventTypeAuditConfig`](#eventtypeauditconfig) | (see type) | What this type's `mcpg.events.poll` and `mcpg.events.stream_opened` audit records carry. |
 | `delivery` | array&lt;[`EventDeliveryMode`](#eventdeliverymode)&gt; | (see type) | Delivery modes offered, intersected with the modes `mcp.configurations.events` enables. Default every mode. The intersection must not be empty. |
 | `description` | string (optional) |  | What an occurrence means, for the client. |
 | `input_schema` | any |  | JSON Schema of the subscription `arguments`. Omitted, a subscription carries no arguments. |

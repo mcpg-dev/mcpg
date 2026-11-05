@@ -22,7 +22,7 @@ use crate::config::AppConfig;
 pub use crate::config::events::BuiltinEventSource;
 use crate::config::events::{
     EventDeliveryMode, EventReplay, EventRetentionConfig, EventSource, EventTransformConfig,
-    EventTypeConfig,
+    EventTypeAuditConfig, EventTypeConfig,
 };
 pub use crate::config::events::{default_input_schema, default_payload_schema};
 use crate::runtime::RequestIdentity;
@@ -195,6 +195,7 @@ pub struct EventType {
     pub retention: EventRetentionConfig,
     pub replay: EventReplay,
     pub always_on: bool,
+    pub audit: EventTypeAuditConfig,
     pub source: SourceSpec,
     /// Key of this type's log and the scope of its cursors.
     pub source_key: String,
@@ -631,6 +632,7 @@ fn compile_federated(
         retention,
         replay: EventReplay::Log,
         always_on: false,
+        audit: EventTypeAuditConfig::default(),
         source: SourceSpec::Federation {
             federation: imported.federation.clone(),
             upstream_name: imported.upstream_name.clone(),
@@ -905,6 +907,7 @@ async fn compile(
         retention,
         replay: declared.replay,
         always_on: declared.always_on,
+        audit: declared.audit.clone(),
         source,
         source_key,
         descriptor_fingerprint: fingerprint(&descriptor),

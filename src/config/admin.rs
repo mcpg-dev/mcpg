@@ -36,6 +36,11 @@ impl Default for AdminConfig {
 pub enum AdminAuthConfig {
     StaticBearer {
         bearer_token_env: String,
+        /// Env var of a second token that authenticates `GET` requests
+        /// only: it reads (for example `/subscriptions`) and cannot change
+        /// anything. Same length floor as the main token.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        read_bearer_token_env: Option<String>,
     },
     /// Security: trusted-header mode requires a value match via
     /// `trusted_value_env`. Header-presence-only is insecure and
@@ -114,6 +119,7 @@ mod tests {
         assert!(
             AdminAuthConfig::StaticBearer {
                 bearer_token_env: "ADMIN_BEARER".into(),
+                read_bearer_token_env: None,
             }
             .is_authenticated()
         );

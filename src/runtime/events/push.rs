@@ -33,7 +33,7 @@ use super::dispatcher::credential_is_revoked;
 use super::engine::{EventsCore, EventsStores};
 use super::handler::policy_key;
 use super::log::{HEAD_TOPIC_PREFIX, ResumePoint};
-use super::poll::{ReadItem, Reader, read_occurrences, resume_point};
+use super::poll::{PresenceRow, ReadItem, Reader, read_occurrences, resume_point};
 use super::subscriptions::{CredentialSnapshot, TerminationReason};
 use super::webhook::{check_arguments, credential_snapshot, gate_error, subscriber_key};
 use crate::config::events::EventReplay;
@@ -135,6 +135,10 @@ struct Stream {
     ty: Arc<EventType>,
     catalog_version: u64,
     identity: RequestIdentity,
+    /// The MCP client that opened the stream, for its close record.
+    client: Option<Value>,
+    /// The stream's row in `GET /admin/v1/subscriptions`.
+    presence: PresenceRow,
     credential: CredentialSnapshot,
     principal_key: String,
     arguments: Map<String, Value>,
@@ -234,9 +238,31 @@ impl EventsCore {
         };
         let heartbeat = Duration::from_millis(push.heartbeat_interval_ms);
         let stream_id = uuid::Uuid::now_v7().to_string();
+        let opened_ms = now_ms();
+        let presence = PresenceRow {
+            principal: crate::runtime::util::plugin_identity_from_request(ctx),
+            client: ctx
+                .client()
+                .map(|c| serde_json::json!({ "name": c.name, "version": c.version })),
+            arguments: super::audit::arguments_fields(
+                Some(&stores.keys),
+                ty.audit.arguments,
+                &params.arguments,
+            ),
+            transport: Some(crate::runtime::transport_label(&ctx.transport).to_owned()),
+            node: crate::runtime::node_name().map(str::to_owned),
+            since_ms: opened_ms,
+            refreshed_ms: opened_ms,
+        };
         stores
             .leases
-            .put_stream(&principal_key, &stream_id, &ty.name, heartbeat * 2)
+            .put_stream(
+                &principal_key,
+                &stream_id,
+                &ty.name,
+                Some(&presence),
+                heartbeat * 2,
+            )
             .await
             .map_err(store_fault)?;
         self.note_lease_demand(
@@ -256,6 +282,10 @@ impl EventsCore {
             stores,
             catalog_version: self.catalog_version(),
             identity: ctx.identity.clone(),
+            client: ctx
+                .client()
+                .map(|c| serde_json::json!({ "name": c.name, "version": c.version })),
+            presence,
             credential: credential_snapshot(ctx),
             principal_key,
             arguments: params.arguments,
@@ -336,6 +366,7 @@ impl Stream {
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             core.audit_stream_closed(
                 &self.identity,
+                self.client.as_ref(),
                 &self.ty.name,
                 &self.stream_id,
                 reason,
@@ -524,10 +555,17 @@ impl Stream {
             }
         }
         let lease = self.heartbeat * 2;
+        self.presence.refreshed_ms = now_ms();
         if let Err(error) = self
             .stores
             .leases
-            .put_stream(&self.principal_key, &self.stream_id, &self.ty.name, lease)
+            .put_stream(
+                &self.principal_key,
+                &self.stream_id,
+                &self.ty.name,
+                Some(&self.presence),
+                lease,
+            )
             .await
         {
             tracing::debug!(error = %error, "stream lease renewal failed; the next one retries");

@@ -68,7 +68,7 @@ pub use access::{
 };
 pub use admin::{AdminAuthConfig, AdminConfig, DisclosureLevel};
 pub use approvals::ApprovalsConfig;
-pub use audit::{AuditConfig, AuditOnFailure};
+pub use audit::{AuditConfig, AuditOnFailure, AuditSinkConfig, AuditSinkRouting};
 pub(crate) use backend::default_cel_gate_error_message;
 pub use backend::{
     BackendAnnotationsConfig, BackendConfig, BackendGovernanceConfig, BackendIconConfig,

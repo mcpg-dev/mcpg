@@ -242,7 +242,8 @@ chain per call.
 | `mcpg.resource.subscribe` | `resources/subscribe` accepted, or a `subscriptions/listen` target established; `details.client` names the MCP client. Under `on_failure: fail_closed` a subscription whose record is lost is refused. | `resource://<uri>` | Success |
 | `mcpg.resource.unsubscribe` | `resources/unsubscribe` accepted, or a `subscriptions/listen` stream closed (`details.reason: stream_closed`) | `resource://<uri>` | Success |
 | `mcpg.resource.updated_delivered` | a stream handed a subscriber `notifications/resources/updated` (a delivery receipt; `details.client`, and `details.subscription_id` on the stateless wire) | `resource://<uri>` | Success |
-| `mcpg.events.poll` | an `events/poll` returned events (`details.delivered`, `first_event_id`, `last_event_id`, the resume `cursor`), or started from no cursor (`details.started`); `details.client` names the MCP client | `event://<name>` | Success |
+| `mcpg.events.poll` | an `events/poll` returned events (`details.delivered`, `first_event_id`, `last_event_id`, the resume `cursor`), or started from no cursor (`details.started`); `details.client` names the MCP client. With the type's `audit.poll_heartbeat_secs` set, an empty poll from a cursor also writes one record per interval per poller (`details.heartbeat: true`); without it, it writes nothing. The subscription arguments follow the type's `audit.arguments` (below) | `event://<name>` | Success |
+| `mcpg.events.stream_opened` / `mcpg.events.stream_closed` | an `events/stream` began or ended (`details.stream_id`; on close `reason` and `events`); `details.client` names the MCP client; on open the arguments follow `audit.arguments` | `event://<name>` | Success |
 | `mcpg.prompt.get.success` | `prompts/get` returned a prompt | `prompt://<name>` | Success |
 | `mcpg.prompt.get.denied` | `prompts/get` was policy-rejected | `prompt://<name>` | Denied |
 | `mcpg.prompt.get.not_found` | `prompts/get` name is unknown | `prompt://<name>` | Failure |
@@ -512,31 +513,49 @@ The enforcement hookup is
 configured policy. Sites that call `emit_audit_event(&event)` are
 best-effort regardless of config.
 
-### Per-event sink redirection (Phase 6c-23 / 6c-26)
+### Event-type audit (`mcp.capabilities.events[].audit`)
 
-Each sink can declare `routing` filters in the operator config so
-specific event families bypass sinks they don't belong on:
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `arguments` | `hash` | How the subscription `arguments` appear in `mcpg.events.poll` and `mcpg.events.stream_opened`: `hash` (`details.arguments_hash`, a keyed hash of the canonical JSON), `raw` (`details.arguments`) or `none`. Use `raw` only for a type whose arguments are not sensitive (ids, not filters over personal data). |
+| `poll_heartbeat_secs` | `0` | Write a poll record at least this often per poller (type, principal, client and arguments), even for an empty poll from a cursor, so an idle poller still shows as present. Counted per replica. `0`: an empty poll from a cursor writes nothing. |
+
+A consumer that is treated as offline after several missed intervals
+needs a heartbeat: without one, a poller that sees no events writes no
+records.
+
+### Per-sink gating and routing
+
+Each entry of `governance.audit.sinks` takes two more keys:
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `gating` | `true` | A gating sink is awaited. Under `on_failure: fail_closed` a record it loses refuses the operation, and it satisfies `required`. `false` makes the sink best-effort: it gets each record in the background, never delays or refuses a request, and is never the audit of record. When 1024 of its records are in flight, newer ones are dropped and counted in `mcpg_audit_sink_dropped_total{sink_id}`. |
+| `routing.allow_actions` | all | Glob patterns over the record's `action` (`*` matches any run). Only matching records reach the sink. |
+| `routing.deny_actions` | none | Glob patterns; a matching record never reaches the sink. Deny wins over allow. |
+
+`required: true` needs at least one gating sink. A sink that routing
+keeps a record from does not count for that record under `fail_closed`.
+
+A presence feed beside the audit of record, which an outage of its
+collector must never turn into refused calls:
 
 ```yaml
 governance:
   audit:
+    on_failure: fail_closed
     sinks:
-      - kind: dev.mcpg.builtin.audit.local-file
-        config: { path: /var/log/mcpg/audit.jsonl }
-      - kind: dev.acme.pci-vault           # PCI-segregated SIEM
-        config: { url: https://siem.acme.internal }
+      - kind: dev.mcpg.builtin.audit.local-file   # the audit of record
+        config: { path: /var/log/mcpg/audit-{node}.jsonl }
+      - kind: dev.mcpg.audit.http                 # best-effort feed
+        gating: false
         routing:
-          allow_actions: ["mcpg.payment.*"]    # only payment events
-      - kind: dev.acme.high-volume
-        config: { url: https://archive.acme.internal }
-        routing:
-          allow_actions: ["mcpg.ping.received", "mcpg.progress.notified"]
-          # high-volume bookends to a separate retention tier
+          allow_actions:
+            - "mcpg.resource.subscribe"
+            - "mcpg.resource.unsubscribe"
+            - "mcpg.resource.updated_delivered"
+            - "mcpg.events.poll"
 ```
-
-`allow_actions` matches the event's `action` field with simple glob
-semantics; `deny_actions` is the inverse filter for "everything
-except this list". When both are set, deny wins.
 
 ---
 

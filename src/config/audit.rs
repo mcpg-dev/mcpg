@@ -1,12 +1,55 @@
 //! `governance.audit:` block — compliance audit channel that fans
-//! out via the same `SinkConfig` schema as the observability
-//! triad.
+//! out to a list of sinks, each with its own gating and routing.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::default_true;
-use super::observability::{SinkConfig, validate_sink_kind};
+use super::observability::validate_sink_kind;
+
+/// One entry of `governance.audit.sinks`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSinkConfig {
+    /// Plugin id (or `plugins[]` alias) of the audit sink.
+    pub kind: String,
+    /// Sink-specific config object. Schema depends on `kind:`.
+    #[serde(default)]
+    pub config: serde_json::Value,
+    /// Per-sink severity floor; parsed, not enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    /// A gating sink (the default) is awaited: under `on_failure:
+    /// fail_closed` a record it loses refuses the operation, and it
+    /// satisfies `required`. `false` makes the sink best-effort: it gets
+    /// each record in the background, never delays or refuses a request,
+    /// and drops (and counts in `mcpg_audit_sink_dropped_total`) what it
+    /// cannot keep up with.
+    #[serde(default = "default_true")]
+    pub gating: bool,
+    /// Which records this sink receives.
+    #[serde(default, skip_serializing_if = "AuditSinkRouting::is_empty")]
+    pub routing: AuditSinkRouting,
+}
+
+/// Action filters of one audit sink. Patterns are globs over the
+/// record's `action` (`*` matches any run), e.g. `mcpg.resource.*`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSinkRouting {
+    /// Only these actions; empty takes every action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_actions: Vec<String>,
+    /// Never these actions; wins over `allow_actions`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_actions: Vec<String>,
+}
+
+impl AuditSinkRouting {
+    fn is_empty(&self) -> bool {
+        self.allow_actions.is_empty() && self.deny_actions.is_empty()
+    }
+}
 
 /// `governance.audit:` block. Kept apart from `observability:`, with
 /// an inner schema aligned to the OTel signal-triad sinks-list
@@ -72,7 +115,7 @@ pub struct AuditConfig {
     /// the canonical default — listed in
     /// [`AuditConfig::default`].
     #[serde(default = "default_audit_sinks")]
-    pub sinks: Vec<SinkConfig>,
+    pub sinks: Vec<AuditSinkConfig>,
 }
 
 impl Default for AuditConfig {
@@ -92,25 +135,41 @@ impl AuditConfig {
     pub fn validate(&self) -> Result<()> {
         for (i, sink) in self.sinks.iter().enumerate() {
             validate_sink_kind(&sink.kind, "audit", i)?;
+            let patterns = sink
+                .routing
+                .allow_actions
+                .iter()
+                .chain(&sink.routing.deny_actions);
+            if patterns.into_iter().any(|p| p.trim().is_empty()) {
+                anyhow::bail!("audit.sinks[{i}].routing: an action pattern must not be empty");
+            }
         }
         if self.enabled && self.required && self.sinks.is_empty() {
             return Err(anyhow::anyhow!(
                 "audit.sinks must not be empty when audit.enabled = true and audit.required = true"
             ));
         }
+        if self.enabled && self.required && !self.sinks.iter().any(|s| s.gating) {
+            anyhow::bail!(
+                "audit.required = true needs at least one sink with gating: true; \
+                 a non-gating sink is best-effort and cannot be the audit of record"
+            );
+        }
         Ok(())
     }
 }
 
-fn default_audit_sinks() -> Vec<SinkConfig> {
+fn default_audit_sinks() -> Vec<AuditSinkConfig> {
     // Default: the built-in local-file audit sink. Operators who
     // ship their own audit sink REPLACE this entry (the legacy
     // `disable_builtins: true` toggle is gone — list the kind to
     // enable, omit it to disable).
-    vec![SinkConfig {
+    vec![AuditSinkConfig {
         kind: "dev.mcpg.builtin.audit.local-file".to_owned(),
         config: serde_json::json!({}),
         level: None,
+        gating: true,
+        routing: AuditSinkRouting::default(),
     }]
 }
 

@@ -120,8 +120,9 @@ impl EventsHandler for EventsCore {
     ) -> Result<PollEventsResult, EventsError> {
         let name = params.name.clone();
         let from_cursor = params.cursor.clone();
+        let arguments = params.arguments.clone();
         let result = self.poll_events(ctx, params).await?;
-        self.audit_poll(ctx, &name, from_cursor.as_deref(), &result)
+        self.audit_poll(ctx, &name, from_cursor.as_deref(), &arguments, &result)
             .await;
         Ok(result)
     }

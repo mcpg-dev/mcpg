@@ -59,6 +59,11 @@ impl AdminService {
     }
 
     /// The events core, once the gateway installed one.
+    /// The runtime in force now.
+    pub fn runtime_snapshot(&self) -> Arc<GatewayRuntime> {
+        self.runtime.load_full()
+    }
+
     pub fn events_core(&self) -> Option<Arc<crate::runtime::events::EventsCore>> {
         self.runtime
             .load()

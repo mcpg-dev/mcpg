@@ -29,6 +29,7 @@ pub async fn admin_auth_middleware(
         AdminAuthConfig::Disabled => Ok(next.run(request).await),
         AdminAuthConfig::StaticBearer {
             ref bearer_token_env,
+            ref read_bearer_token_env,
         } => {
             let expected = std::env::var(bearer_token_env).map_err(|_| {
                 tracing::error!(
@@ -63,10 +64,20 @@ pub async fn admin_auth_middleware(
 
             // Security: constant-time comparison prevents timing attacks
             if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-                Ok(next.run(request).await)
-            } else {
-                Err(StatusCode::UNAUTHORIZED)
+                return Ok(next.run(request).await);
             }
+            if let Some(read_env) = read_bearer_token_env
+                && let Ok(read) = std::env::var(read_env)
+                && read.len() >= MIN_ADMIN_BEARER_LEN
+                && constant_time_eq(provided.as_bytes(), read.as_bytes())
+            {
+                return if request.method() == axum::http::Method::GET {
+                    Ok(next.run(request).await)
+                } else {
+                    Err(StatusCode::FORBIDDEN)
+                };
+            }
+            Err(StatusCode::UNAUTHORIZED)
         }
         AdminAuthConfig::TrustedHeader {
             ref header_name,
