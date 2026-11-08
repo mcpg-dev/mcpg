@@ -251,6 +251,10 @@ pub async fn run(state: AppState) -> Result<()> {
 
     // Spawn transport
     let admin_shutdown_rx = shutdown_rx.clone();
+    // The stdio client owns the session: when it closes stdin, the gateway
+    // shuts down as it would on SIGTERM.
+    let (stdio_closed_tx, mut stdio_closed) = tokio::sync::oneshot::channel::<()>();
+    let mut stdio_mode = false;
     let transport_handle =
         if let Some(tunnel_cfg) = config.gateway.server.tunnel.clone().filter(|t| t.enabled) {
             // Tunnel mode: dial an MCPG-Cloud relay and answer
@@ -270,7 +274,12 @@ pub async fn run(state: AppState) -> Result<()> {
                 TransportMode::Stdio => {
                     let state = state.clone();
                     let rx = shutdown_rx;
-                    tokio::spawn(async move { stdio::serve(state, rx).await })
+                    stdio_mode = true;
+                    tokio::spawn(async move {
+                        let served = stdio::serve(state, rx).await;
+                        let _ = stdio_closed_tx.send(());
+                        served
+                    })
                 }
             }
         };
@@ -372,6 +381,10 @@ pub async fn run(state: AppState) -> Result<()> {
                     info!("received SIGTERM");
                     break;
                 }
+                _ = &mut stdio_closed, if stdio_mode => {
+                    info!("stdio client closed stdin");
+                    break;
+                }
                 _ = sighup.recv() => {
                     info!("received SIGHUP — reloading config");
                     let prev_sha = state.config.load().canonical_sha256();
@@ -418,8 +431,10 @@ pub async fn run(state: AppState) -> Result<()> {
 
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await.ok();
-        info!("received SIGINT");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("received SIGINT"),
+            _ = &mut stdio_closed, if stdio_mode => info!("stdio client closed stdin"),
+        }
     }
 
     info!(

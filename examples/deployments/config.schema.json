@@ -10586,7 +10586,7 @@
       ]
     }
   },
-  "description": "Top-level gateway configuration. Loaded from YAML file and/or `MCPG_` environment variables via figment. Bindings live under `mcp.capabilities.{tools,prompts,resources,resource_templates}[]`. Each binding carries an explicit nested `backend:` block that picks the implementation, discriminated by `kind:` (`kind: http`, `kind: sql`, `kind: openai_chat`, …). Env-var expansion (`${env.X}`) happens at startup time via CEL.\n\n`deny_unknown_fields` is set so a typo at the root (or a stale renamed block left in an operator's YAML) fails parsing instead of silently parsing to defaults. The same strictness applies to every typed sub-config; this flag closes the gap at the root.",
+  "description": "Top-level gateway configuration. Loaded from YAML file and/or `MCPG_` environment variables via figment. Bindings live under `mcp.capabilities.{tools,prompts,resources,resource_templates}[]`. Each binding carries an explicit nested `backend:` block that picks the implementation, discriminated by `kind:` (`kind: http`, `kind: sql`, `kind: openai_chat`, …). Env-var expansion (`${env.X}`) happens at startup time via CEL.\n\n`deny_unknown_fields` is set so a typo at the root (or a stale renamed block left in an operator's YAML) fails parsing instead of silently parsing to defaults. The same strictness applies to every typed sub-config; this flag closes the gap at the root.\n\nTwo YAML conveniences are resolved before that check: merge keys (`<<: *anchor`) are applied, and a top-level key that starts with `x-` is set aside, so a file can keep shared anchors in an `x-` block (as in Compose files). Below the top level an `x-` key is an ordinary field name.",
   "properties": {
     "cloud": {
       "allOf": [

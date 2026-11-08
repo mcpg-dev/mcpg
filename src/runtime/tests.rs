@@ -3373,6 +3373,7 @@ fn extract_dynamic_list_bindings_picks_only_sql_resource_shapes() {
         cache: None,
         cost: None,
         auth: None,
+        sqlite: None,
     })
     .unwrap();
 

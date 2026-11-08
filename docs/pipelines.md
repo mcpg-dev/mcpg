@@ -49,8 +49,9 @@ variables:
 
 A backend step's own templates (`url`, headers, …) see `arguments` (the
 step's input) and `context`, not `steps`; an earlier step's output reaches
-a backend step through `input_transform`. The text of `log`, `progress`,
-`elicitation` and `sampling` steps is sent as written.
+a backend step through `input_transform`. An `elicitation` step's `message`
+is a template over `arguments`, `steps`, `context` and `tool_name`; the text
+of `log`, `progress` and `sampling` steps is sent as written.
 
 Each `steps` entry:
 ```json
@@ -281,12 +282,18 @@ Prompts the client for input.
 ```yaml
 - kind: elicitation
   id: "ask_user"
-  message: "Please confirm the operation:"
+  message: "Delete ${arguments.path}?"  # ${…} resolves against the pipeline context
   requested_schema:                     # Optional JSON Schema for expected response
     type: "object"
     properties:
       confirmed: { type: "boolean" }
 ```
+
+Each `${…}` in `message` is a CEL expression over `arguments`, `steps`,
+`context` and `tool_name`, resolved when the step runs, so the user sees what
+they are asked to approve. A `${cred://…}` reference is refused, and a
+message that cannot be rendered ends the pipeline with an error result
+before anything is asked. Text without `${` is sent as written.
 
 **Execution flow**:
 1. Pipeline state serialized to pipeline store

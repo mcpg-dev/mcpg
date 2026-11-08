@@ -1,6 +1,6 @@
 [package]
 name = "mcpg"
-version = "0.2.1"
+version = "0.3.0"
 license = "Apache-2.0"
 edition = "2024"
 description = "MCPG gateway — the governed MCP endpoint. Binary: `mcpg`."
@@ -198,7 +198,7 @@ libc = "0.2"
 # runtime's #[cfg(test)] fallback constructs them statically here. Dev-only
 # ⇒ the release `mcpg` binary links none of them (nor their client stacks,
 # e.g. sqlx). The exception is the mock fixture, a real dependency above.
-mcpg-plugin-backend-sql = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sql", tag = "v0.1.1", version = "=0.1.1" }
+mcpg-plugin-backend-sql = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sql", tag = "v0.2.0", version = "=0.2.0" }
 mcpg-plugin-backend-http = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-http", tag = "v0.1.1", version = "=0.1.1" }
 # The version req keeps this dev-dep in the published manifest as a git+tag
 # reference: the in-src runtime tests compile against the mock backend, so a
@@ -211,7 +211,7 @@ mcpg-plugin-backend-mssql = { git = "https://github.com/mcpg-dev/mcpg-plugin-bac
 mcpg-plugin-backend-amqp = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-amqp", tag = "v0.1.1", version = "=0.1.1" }
 mcpg-plugin-backend-email = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-email", tag = "v0.1.1", version = "=0.1.1" }
 mcpg-plugin-backend-sftp = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sftp", tag = "v0.1.1", version = "=0.1.1" }
-mcpg-plugin-backend-command = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-command", tag = "v0.1.1", version = "=0.1.1" }
+mcpg-plugin-backend-command = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-command", tag = "v0.2.0", version = "=0.2.0" }
 mcpg-plugin-backend-openapi = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-openapi", tag = "v0.1.1", version = "=0.1.1" }
 mcpg-plugin-transform-jsonata = { git = "https://github.com/mcpg-dev/mcpg-plugin-transform-jsonata", tag = "v0.1.1", version = "=0.1.1" }
 criterion = { version = "0.8", features = ["html_reports"] }

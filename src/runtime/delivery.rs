@@ -63,6 +63,87 @@ impl GatewayRuntime {
         super::stores::block_on_store(self.delivery_bus.publish(session_id, message)).ok();
     }
 
+    /// Run the post-dispatch tool-gate chain and the post-dispatch result
+    /// transforms on the result of a resumed tool pipeline, against the
+    /// context of the call that started it, as the first-round path does.
+    /// A post gate that does not allow the result turns it into an error
+    /// result: the caller is no longer waiting on a JSON-RPC error slot.
+    pub(crate) async fn finish_resumed_tool_pipeline(
+        &self,
+        origin: &PipelineOrigin,
+        tool_result: crate::protocol::ToolCallResult,
+    ) -> crate::protocol::ToolCallResult {
+        let has_gates = self.plugin_registry.has_tool_gate_plugins();
+        let has_transforms = self.plugin_registry.has_transform_plugins();
+        if !has_gates && !has_transforms && !self.plugin_registry.emits_tool_call_completed() {
+            return tool_result;
+        }
+        let plugin_ctx = mcpg_plugin_protocol::PluginContext {
+            request_id: origin.request_context.request_id.as_str().to_owned(),
+            session_id: origin.request_context.session_id.clone(),
+            tool_name: origin.tool_name.clone(),
+            identity: plugin_identity_from_request(&origin.request_context),
+            transport: transport_label(&origin.request_context.transport).to_owned(),
+            surface: "tool".to_owned(),
+        };
+        let execution_ms = (Utc::now() - origin.started_at).num_milliseconds().max(0) as u64;
+        let mut result_json =
+            serde_json::to_value(&tool_result).expect("tool call result serialized");
+        if has_gates || self.plugin_registry.emits_tool_call_completed() {
+            let gate_input = if has_gates {
+                result_json.clone()
+            } else {
+                Value::Null
+            };
+            match self
+                .plugin_registry
+                .evaluate_tool_gates_post(
+                    &plugin_ctx,
+                    &origin.arguments,
+                    &gate_input,
+                    execution_ms,
+                    origin.request_context.upstream_request_id.as_deref(),
+                )
+                .await
+            {
+                mcpg_plugin_protocol::GateDecision::Allow {
+                    modified_result, ..
+                } => {
+                    if let Some(modified) = modified_result {
+                        result_json = modified;
+                    }
+                }
+                mcpg_plugin_protocol::GateDecision::Deny { message, .. }
+                | mcpg_plugin_protocol::GateDecision::Challenge { message, .. } => {
+                    return post_gate_error_result(message);
+                }
+                mcpg_plugin_protocol::GateDecision::PendingApproval { approval_id, .. } => {
+                    warn!(
+                        tool_name = %origin.tool_name,
+                        approval_id = %approval_id,
+                        "post-dispatch tool gate returned PendingApproval on a resumed pipeline; treating as deny",
+                    );
+                    return post_gate_error_result(format!(
+                        "tool '{}' post-dispatch gate returned invalid PendingApproval decision",
+                        origin.tool_name
+                    ));
+                }
+            }
+        }
+        if has_transforms {
+            result_json = self
+                .plugin_registry
+                .apply_transforms_post(&plugin_ctx, &result_json)
+                .await;
+        }
+        serde_json::from_value(result_json).unwrap_or_else(|e| {
+            post_gate_error_result(format!(
+                "tool '{}' post-dispatch plugins produced a result that is not a tool result: {e}",
+                origin.tool_name
+            ))
+        })
+    }
+
     /// Deliver a terminal JSON-RPC error for a suspended pipeline to the
     /// original caller via the session's delivery path (the same carrier
     /// `deliver_deferred_tool_result` uses). Used when a suspended pipeline is
@@ -344,6 +425,7 @@ impl GatewayRuntime {
         // Capture the tool name before resume_pipeline consumes the state;
         // the Complete arm enforces the tool's outputSchema on the result.
         let pipeline_tool_name = pipeline_state.tool_name.clone();
+        let origin = PipelineOrigin::of(&pipeline_state);
         let outcome = self.execution_dispatcher.resume_pipeline(
             pipeline_state,
             step_result,
@@ -379,6 +461,11 @@ impl GatewayRuntime {
                     tool_result.content.push(crate::protocol::ToolContent::text(format!(
                         "tool '{pipeline_tool_name}' declared an outputSchema but returned non-conforming structuredContent: {validation_err}"
                     )));
+                }
+                if pipeline_surface == pipeline_store::PipelineSurface::Tool {
+                    tool_result = self
+                        .finish_resumed_tool_pipeline(&origin, tool_result)
+                        .await;
                 }
 
                 // task-augmented resume completes the owning task with
@@ -682,6 +769,7 @@ impl GatewayRuntime {
             is_error: false,
             duration_ms: 0,
         };
+        let origin = PipelineOrigin::of(&pipeline_state);
         let outcome = self.execution_dispatcher.resume_pipeline(
             pipeline_state,
             step_result,
@@ -716,6 +804,11 @@ impl GatewayRuntime {
                     tool_result.content.push(crate::protocol::ToolContent::text(format!(
                         "tool '{pipeline_tool_name}' declared an outputSchema but returned non-conforming structuredContent: {validation_err}"
                     )));
+                }
+                if pipeline_surface == pipeline_store::PipelineSurface::Tool {
+                    tool_result = self
+                        .finish_resumed_tool_pipeline(&origin, tool_result)
+                        .await;
                 }
                 if let Some(task_id) = related_task_id.as_deref() {
                     let status = if tool_result.is_error {
@@ -1093,5 +1186,34 @@ impl GatewayRuntime {
                 }
             }
         }
+    }
+}
+
+/// The call that started a suspended tool pipeline, captured before the
+/// resume consumes its stored state.
+pub(crate) struct PipelineOrigin {
+    pub(crate) request_context: RequestContext,
+    pub(crate) tool_name: String,
+    pub(crate) arguments: Value,
+    pub(crate) started_at: DateTime<Utc>,
+}
+
+impl PipelineOrigin {
+    pub(crate) fn of(state: &pipeline_store::PipelineExecutionState) -> Self {
+        Self {
+            request_context: state.request_context.clone(),
+            tool_name: state.tool_name.clone(),
+            arguments: state.original_args.clone(),
+            started_at: state.created_at,
+        }
+    }
+}
+
+fn post_gate_error_result(message: String) -> crate::protocol::ToolCallResult {
+    crate::protocol::ToolCallResult {
+        content: vec![crate::protocol::ToolContent::text(message)],
+        structured_content: None,
+        is_error: true,
+        meta: None,
     }
 }

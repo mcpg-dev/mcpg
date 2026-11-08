@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
@@ -19,13 +19,11 @@ use crate::runtime::{
     RequestIdentity, ResumeCursor, TransportKind, pipeline_store::DeliveryMessage,
 };
 
-/// Run the stdio transport. Reads from stdin, writes to stdout. Blocks until stdin closes.
+/// Run the stdio transport. Reads from stdin, writes to stdout. Returns when
+/// stdin closes or the gateway shuts down.
 pub async fn serve(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>) -> Result<()> {
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
-    let mut writer = stdout;
-    let mut line = String::new();
+    let mut lines = spawn_stdin_reader();
+    let mut writer = tokio::io::stdout();
     let mut session_id: Option<String> = None;
     // Delivery bus receiver for server-to-client push (set after session init).
     let mut delivery_rx: Option<mpsc::Receiver<DeliveryMessage>> = None;
@@ -33,17 +31,15 @@ pub async fn serve(state: AppState, mut shutdown: tokio::sync::watch::Receiver<(
     info!("stdio transport ready, reading from stdin");
 
     loop {
-        line.clear();
-
         // Read one line, or exit on shutdown / EOF / delivery bus message
         enum StdioEvent {
-            StdinLine(std::io::Result<usize>),
+            StdinLine(Option<std::io::Result<String>>),
             Shutdown,
             Delivery(DeliveryMessage),
         }
 
         let event = tokio::select! {
-            result = reader.read_line(&mut line) => StdioEvent::StdinLine(result),
+            next = lines.recv() => StdioEvent::StdinLine(next),
             _ = shutdown.changed() => StdioEvent::Shutdown,
             Some(msg) = async {
                 match delivery_rx.as_mut() {
@@ -53,7 +49,7 @@ pub async fn serve(state: AppState, mut shutdown: tokio::sync::watch::Receiver<(
             } => StdioEvent::Delivery(msg),
         };
 
-        match event {
+        let line = match event {
             StdioEvent::Shutdown => {
                 info!("stdio transport received shutdown signal");
                 break;
@@ -64,20 +60,16 @@ pub async fn serve(state: AppState, mut shutdown: tokio::sync::watch::Receiver<(
                 write_json_line(&mut writer, &msg.jsonrpc_message).await?;
                 continue;
             }
-            StdioEvent::StdinLine(result) => {
-                let bytes_read = match result {
-                    Ok(n) => n,
-                    Err(e) => {
-                        error!(error = %e, "stdin read error");
-                        break;
-                    }
-                };
-                if bytes_read == 0 {
-                    info!("stdin closed (EOF)");
-                    break;
-                }
+            StdioEvent::StdinLine(Some(Ok(line))) => line,
+            StdioEvent::StdinLine(Some(Err(e))) => {
+                error!(error = %e, "stdin read error");
+                break;
             }
-        }
+            StdioEvent::StdinLine(None) => {
+                info!("stdin closed (EOF)");
+                break;
+            }
+        };
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -199,6 +191,36 @@ pub async fn serve(state: AppState, mut shutdown: tokio::sync::watch::Receiver<(
 
     info!("stdio transport stopped");
     Ok(())
+}
+
+/// Read stdin line by line on a dedicated OS thread. A read on tokio's
+/// blocking pool cannot be cancelled, so it keeps the runtime from shutting
+/// down while the client holds stdin open; this thread ends with the process.
+fn spawn_stdin_reader() -> mpsc::Receiver<std::io::Result<String>> {
+    let (tx, rx) = mpsc::channel(64);
+    std::thread::Builder::new()
+        .name("mcpg-stdin".to_owned())
+        .spawn(move || {
+            use std::io::BufRead;
+            let mut stdin = std::io::stdin().lock();
+            loop {
+                let mut line = String::new();
+                match stdin.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.blocking_send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.blocking_send(Err(e));
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("spawn the stdin reader thread");
+    rx
 }
 
 async fn write_json_line(writer: &mut tokio::io::Stdout, value: &Value) -> Result<()> {

@@ -281,17 +281,21 @@ Legend:
   `ha://entity/{entity_id}`.
 - **Complexity**: M.
 
-### 25. macOS system (shortcuts + open + osascript)
+### 25. macOS computer use (osascript + screencapture)
 
-- **Example**: [`examples/25-macos-system/`](../examples/25-macos-system/) — runnable `config.yaml`.
-- **U**: macOS power users.
-- **Upstream**: local CLIs (`shortcuts`, `open`, `osascript`,
-  `pmset`, `caffeinate`, `screencapture`). Command bindings.
-- **Bindings**: ~18. run-shortcut (by name), open URL, open
-  file with app, run AppleScript (sandboxed via a restricted
-  path), display notification, set Do Not Disturb, capture
-  screenshot, list running apps, focus app.
-- **Complexity**: M.
+- **Example**: [`examples/25-macos-computer-use/`](../examples/25-macos-computer-use/) — runnable `config.yaml`.
+- **U**: computer-use agents that drive a Mac.
+- **Upstream**: `osascript` (JavaScript for Automation: CoreGraphics
+  events, System Events, the accessibility tree, app scripting),
+  `screencapture`, `sips`, `ps`, `kill`. Command bindings with
+  `result: tool_result`, over stdio.
+- **Bindings**: 31. Screenshots as image blocks, displays, mouse
+  move / click / drag / scroll, typing and shortcuts, clipboard,
+  apps, windows, accessibility tree search and actions, Terminal /
+  iTerm2 read and send, browser tabs / page text / JavaScript,
+  process list and signals. Terminal input, signals and page
+  JavaScript ask the user first through elicitation.
+- **Complexity**: L.
 
 ---
 

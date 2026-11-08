@@ -1,0 +1,1476 @@
+# MCPG — macOS computer-use MCP server
+#
+# One local MCP server that sees and drives the whole Mac desktop: screenshots,
+# displays, mouse, keyboard, clipboard, apps, windows, the accessibility (AX)
+# tree, Terminal.app / iTerm2 sessions, Safari / Chromium tabs and processes.
+#
+# Every tool is the stock command backend running /usr/bin/osascript (JXA)
+# with `result: tool_result`: the script prints the MCP tool result itself, so
+# a screenshot arrives as an image block. No extra binary or package.
+#
+#   Needs  : Apple silicon Mac (the plugins ship for darwin/arm64), macOS 13+.
+#   Run    : mcpg --stdio --config /path/to/config.yaml
+#            (the MCP client starts this command; see README.md)
+#
+# Security model
+#   * stdio only: no TCP port is opened. The caller is the process that started
+#     mcpg, so every tool sets minimum_trust: unauthenticated. Do NOT switch this
+#     file to HTTP: an anonymous local port that moves your mouse is a remote-
+#     control hole for every local process and web page.
+#   * Arguments never reach a shell or a script as code. Each tool's JXA script
+#     is fixed operator text; the call arguments arrive as one JSON document on
+#     stdin. The gateway checks them against input_schema, and every script
+#     checks them again (type, range, pattern, unknown keys).
+#   * terminal.send, process.signal and browser.eval show the user the exact
+#     text, process or script and ask first (MCP elicitation). A client without
+#     elicitation support gets an error, never a silent run. input.* can type
+#     anything the user can, so keep the MCP client's own per-call approval on.
+#   * Every call is written to an audit file and rate limited.
+#
+# Coordinates
+#   All input tools work in macOS global points (origin = top-left of the main
+#   display, y grows down). screen.screenshot returns scale, origin_x and
+#   origin_y; pass them back unchanged to an input tool and give x / y in
+#   screenshot pixels.
+#
+# A script never contains "${": the gateway would read it as a placeholder.
+
+gateway:
+  server:
+    transport: stdio
+    request_timeout_ms: 120000
+    session_idle_timeout_ms: 86400000
+  admin:
+    enabled: false
+
+plugins:
+  - id: dev.mcpg.backend.command
+    class: backend
+    source: { oci: "oci://ghcr.io/mcpg-dev/plugins/backend-command:protocol-1" }
+    ffi_limits:
+      # A screenshot is a base64 image in one payload; the default is 256 KiB.
+      max_payload_bytes: 33554432
+      data_timeout_ms: 90000
+
+  # Writes one JSON line before and one after every tool call.
+  # Create the directory first: mkdir -p ~/Library/Logs/mcpg
+  - id: dev.mcpg.audit
+    class: tool_gate
+    source: { oci: "oci://ghcr.io/mcpg-dev/plugins/audit:protocol-1" }
+    config:
+      # Never `stdout`: stdout is the MCP stdio channel.
+      sink: { kind: file, path: "${env.HOME}/Library/Logs/mcpg/computer-use-audit.jsonl" }
+      # true records what was typed, sent to terminals and run in browsers.
+      # It can include passwords you dictate to the agent; set false to keep
+      # only a SHA-256 digest of the arguments.
+      include_arguments: true
+      include_arguments_hash: true
+      include_results: false
+      include_result_summary: true
+
+  - id: dev.mcpg.rate-limit
+    class: tool_gate
+    source: { oci: "oci://ghcr.io/mcpg-dev/plugins/rate-limit:protocol-1" }
+    config:
+      default_limit: 600
+      default_window_ms: 60000
+      # Each rule is one bucket for every tool it matches.
+      rules:
+        - { tools: ["process.signal", "app.quit"], scope: global, limit: 10, window_ms: 60000 }
+        - { tools: ["terminal.send", "browser.eval"], scope: global, limit: 30, window_ms: 60000 }
+        - { tools: ["input.*"], scope: global, limit: 900, window_ms: 60000 }
+        - { tools: ["screen.screenshot", "ui.*"], scope: global, limit: 240, window_ms: 60000 }
+
+# Shared building blocks. A top-level `x-` key is not part of the config; it
+# only holds the anchors the tools below use.
+x-shared:
+  governance: &local
+    minimum_trust: unauthenticated
+
+  no_args: &no_args
+    type: object
+    properties: {}
+    additionalProperties: false
+
+  # `<<: *osa` in a backend block: run a JXA script, return its tool result.
+  osa: &osa
+    kind: command
+    command: /usr/bin/osascript
+    result: tool_result
+
+  # Properties of every tool that takes a screen point.
+  space: &space
+    scale: { type: number, description: "Points per screenshot pixel, from screen.screenshot. Default 1 (x/y are screen points)." }
+    origin_x: { type: number, description: "origin_x from screen.screenshot. Default 0." }
+    origin_y: { type: number, description: "origin_y from screen.screenshot. Default 0." }
+
+  allow_schema: &allow_schema
+    type: object
+    required: [allow]
+    properties:
+      allow: { type: boolean, title: "Allow this action" }
+
+  # The step after a confirmation; it fails closed.
+  confirm_gate: &confirm_gate
+    kind: cel_gate
+    id: confirmed
+    expression: 'steps.confirm.output.action == "accept" && steps.confirm.output.content.allow == true'
+    error_message: "The user did not allow this action."
+
+  # JXA helpers shared by every tool: -e PRELUDE -e <the tool's main(a)>.
+  # main(a) returns a value (sent as JSON text plus structuredContent) or
+  # { __mcpg_raw_result: <CallToolResult> }; a thrown error is an error result.
+  prelude: &prelude |
+    ObjC.import('Foundation');
+    ObjC.import('AppKit');
+    ObjC.import('CoreGraphics');
+    var SA = Application.currentApplication();
+    SA.includeStandardAdditions = true;
+    function fail(m) { throw new Error(m); }
+    function readArgs() {
+      var d = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+      var s = $.NSString.alloc.initWithDataEncoding(d, $.NSUTF8StringEncoding);
+      var t = (s && !s.isNil()) ? s.js : '';
+      if (!t || !t.trim()) return {};
+      var v = JSON.parse(t);
+      if (v === null || typeof v !== 'object' || Array.isArray(v)) fail('arguments must be a JSON object');
+      return v;
+    }
+    function js(o) {
+      if (o === undefined || o === null) return null;
+      if (typeof o.isNil === 'function' && o.isNil()) return null;
+      return (o.js !== undefined) ? o.js : o;
+    }
+    function has(a, k) { return Object.prototype.hasOwnProperty.call(a, k) && a[k] !== null && a[k] !== undefined; }
+    function onlyKeys(a, keys) {
+      Object.keys(a).forEach(function (k) { if (keys.indexOf(k) < 0) fail('unknown argument: ' + k); });
+    }
+    function argNum(a, k, def, min, max) {
+      if (!has(a, k)) { if (def === undefined) fail(k + ' is required'); return def; }
+      var v = a[k];
+      if (typeof v !== 'number' || !isFinite(v)) fail(k + ' must be a number');
+      if (v < min || v > max) fail(k + ' must be between ' + min + ' and ' + max);
+      return v;
+    }
+    function argInt(a, k, def, min, max) {
+      var v = argNum(a, k, def, min, max);
+      if (Math.floor(v) !== v) fail(k + ' must be an integer');
+      return v;
+    }
+    function argStr(a, k, def, maxLen, re) {
+      if (!has(a, k)) { if (def === undefined) fail(k + ' is required'); return def; }
+      var v = a[k];
+      if (typeof v !== 'string') fail(k + ' must be a string');
+      if (v.length > maxLen) fail(k + ' is longer than ' + maxLen + ' characters');
+      if (re && !re.test(v)) fail(k + ' has an invalid format');
+      return v;
+    }
+    function argBool(a, k, def) {
+      if (!has(a, k)) { if (def === undefined) fail(k + ' is required'); return def; }
+      if (typeof a[k] !== 'boolean') fail(k + ' must be true or false');
+      return a[k];
+    }
+    function argEnum(a, k, def, list) {
+      var v = argStr(a, k, def, 64);
+      if (list.indexOf(v) < 0) fail(k + ' must be one of: ' + list.join(', '));
+      return v;
+    }
+    function q(s) { return "'" + String(s).split("'").join("'\\''") + "'"; }
+    function sh(cmd) { return SA.doShellScript(cmd); }
+    function sleepMs(ms) { if (ms > 0) delay(ms / 1000); }
+    function tmpPath(ext) { return $.NSTemporaryDirectory().js + 'mcpg-cu-' + $.NSUUID.UUID.UUIDString.js + '.' + ext; }
+    function rm(p) { $.NSFileManager.defaultManager.removeItemAtPathError(p, null); }
+    function screens() {
+      var arr = $.NSScreen.screens, n = arr.count, out = [];
+      var h0 = arr.objectAtIndex(0).frame.size.height;
+      for (var i = 0; i < n; i++) {
+        var s = arr.objectAtIndex(i), f = s.frame, name = '';
+        try { name = js(s.localizedName) || ''; } catch (e) {}
+        out.push({ index: i + 1, main: i === 0, name: name,
+          x: f.origin.x, y: h0 - (f.origin.y + f.size.height),
+          width: f.size.width, height: f.size.height, backing_scale: s.backingScaleFactor });
+      }
+      return out;
+    }
+    function cursor() {
+      var p = $.NSEvent.mouseLocation, h0 = $.NSScreen.screens.objectAtIndex(0).frame.size.height;
+      return { x: Math.round(p.x), y: Math.round(h0 - p.y) };
+    }
+    function point(a, kx, ky) {
+      var sc = argNum(a, 'scale', 1, 0.01, 100);
+      var ox = argNum(a, 'origin_x', 0, -100000, 100000), oy = argNum(a, 'origin_y', 0, -100000, 100000);
+      return { x: ox + argNum(a, kx, undefined, -100000, 100000) * sc, y: oy + argNum(a, ky, undefined, -100000, 100000) * sc };
+    }
+    var MODS = { cmd: 0x100000, command: 0x100000, shift: 0x20000, option: 0x80000, alt: 0x80000, ctrl: 0x40000, control: 0x40000, fn: 0x800000 };
+    var USING = { cmd: 'command down', command: 'command down', shift: 'shift down', option: 'option down', alt: 'option down', ctrl: 'control down', control: 'control down' };
+    function argMods(a) {
+      if (!has(a, 'modifiers')) return [];
+      if (!Array.isArray(a.modifiers) || a.modifiers.length > 5) fail('modifiers must be an array of at most 5 names');
+      return a.modifiers.map(function (m) {
+        if (typeof m !== 'string' || !MODS.hasOwnProperty(m.toLowerCase())) fail('unknown modifier: ' + m);
+        return m.toLowerCase();
+      });
+    }
+    function modFlags(mods) { var f = 0; mods.forEach(function (m) { f = f | MODS[m]; }); return f; }
+    // [down, up, dragged, CGMouseButton]
+    var BUTTONS = { left: [1, 2, 6, 0], right: [3, 4, 7, 1], middle: [25, 26, 27, 2] };
+    function mouseEvent(type, p, button, flags, clickState) {
+      var e = $.CGEventCreateMouseEvent(null, type, { x: p.x, y: p.y }, button);
+      if (clickState) $.CGEventSetIntegerValueField(e, 1, clickState);
+      if (flags) $.CGEventSetFlags(e, flags);
+      $.CGEventPost(0, e);
+    }
+    function windowList(onScreenOnly) {
+      var raw = $.CGWindowListCopyWindowInfo(onScreenOnly ? 17 : 16, 0);
+      var arr = ObjC.deepUnwrap(ObjC.castRefToObject(raw)) || [];
+      return arr.map(function (w) {
+        var b = w.kCGWindowBounds || {};
+        return { id: w.kCGWindowNumber, pid: w.kCGWindowOwnerPID, app: w.kCGWindowOwnerName || '',
+          title: w.kCGWindowName || '', layer: w.kCGWindowLayer, on_screen: !!w.kCGWindowIsOnscreen,
+          bounds: { x: b.X, y: b.Y, width: b.Width, height: b.Height } };
+      });
+    }
+    function windowInfo(id) {
+      var l = windowList(false);
+      for (var i = 0; i < l.length; i++) if (l[i].id === id) return l[i];
+      return null;
+    }
+    function procByPid(pid) {
+      var p = Application('System Events').processes.whose({ unixId: pid });
+      if (!p.length) fail('no process with pid ' + pid + ' is visible to System Events');
+      return p[0];
+    }
+    function frontPid() { return $.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier; }
+    function axWindowFor(info) {
+      var proc = procByPid(info.pid), wins = proc.windows, n = wins.length;
+      if (!n) fail('the app has no accessible windows (check the Accessibility permission)');
+      var names = wins.name(), pos = wins.position(), best = -1;
+      for (var i = 0; i < n; i++) {
+        var samePos = pos[i] && Math.abs(pos[i][0] - info.bounds.x) < 2 && Math.abs(pos[i][1] - info.bounds.y) < 2;
+        if (samePos && names[i] === info.title) { best = i; break; }
+        if (best < 0 && (samePos || (info.title && names[i] === info.title))) best = i;
+      }
+      if (best < 0) fail('could not match window ' + info.id + ' to an accessibility window');
+      return { proc: proc, win: wins[best], index: best };
+    }
+    function findApp(a) {
+      var apps = $.NSWorkspace.sharedWorkspace.runningApplications, n = apps.count;
+      var pid = has(a, 'pid') ? argInt(a, 'pid', undefined, 1, 99999999) : null;
+      var bid = has(a, 'bundle_id') ? argStr(a, 'bundle_id', undefined, 255, /^[A-Za-z0-9.-]+$/) : null;
+      var name = has(a, 'name') ? argStr(a, 'name', undefined, 255) : null;
+      if (pid === null && bid === null && name === null) fail('give pid, bundle_id or name');
+      for (var i = 0; i < n; i++) {
+        var x = apps.objectAtIndex(i);
+        if (pid !== null && x.processIdentifier === pid) return x;
+        if (bid !== null && js(x.bundleIdentifier) === bid) return x;
+        if (name !== null && js(x.localizedName) === name) return x;
+      }
+      fail('no running app matches');
+    }
+    function appInfo(x) {
+      return { name: js(x.localizedName), bundle_id: js(x.bundleIdentifier), pid: x.processIdentifier,
+        active: !!x.isActive, hidden: !!x.isHidden };
+    }
+    // AX element paths: "w<N>" = window N of the app, "m<N>" = menu bar N, then "/<child index>" per level.
+    function resolvePath(proc, path) {
+      if (typeof path !== 'string' || !/^[wm][0-9]{1,3}(\/[0-9]{1,4}){0,40}$/.test(path)) fail('invalid element path: ' + path);
+      var parts = path.split('/'), head = parts[0];
+      var el = head[0] === 'w' ? proc.windows[parseInt(head.slice(1), 10)] : proc.menuBars[parseInt(head.slice(1), 10)];
+      for (var i = 1; i < parts.length; i++) el = el.uiElements[parseInt(parts[i], 10)];
+      return el;
+    }
+    function bulk(c, prop, n) {
+      try { var v = c[prop](); if (Array.isArray(v) && v.length === n) return v; } catch (e) {}
+      var out = [];
+      for (var i = 0; i < n; i++) { try { out.push(c[i][prop]()); } catch (e) { out.push(null); } }
+      return out;
+    }
+    function clip(s, n) {
+      if (s === null || s === undefined) return undefined;
+      if (typeof s !== 'string') s = String(s);
+      if (!s.length) return undefined;
+      return s.length > n ? s.slice(0, n) + '…' : s;
+    }
+    function walk(proc, roots, maxDepth, maxNodes, valueChars, visit) {
+      var queue = roots.map(function (r) { return { el: r.el, path: r.path, depth: 0 }; }), count = 0, truncated = false;
+      while (queue.length) {
+        var cur = queue.shift();
+        if (cur.depth >= maxDepth) continue;
+        var c = cur.el.uiElements, n = 0;
+        try { n = c.length; } catch (e) { n = 0; }
+        if (!n) continue;
+        var roles = bulk(c, 'role', n), subs = bulk(c, 'subrole', n), names = bulk(c, 'name', n);
+        var descs = bulk(c, 'description', n), vals = bulk(c, 'value', n), pos = bulk(c, 'position', n);
+        var sizes = bulk(c, 'size', n), foc = bulk(c, 'focused', n), en = bulk(c, 'enabled', n);
+        for (var i = 0; i < n; i++) {
+          if (count >= maxNodes) { truncated = true; queue = []; break; }
+          var node = { path: cur.path + '/' + i, depth: cur.depth + 1, role: roles[i] || undefined,
+            subrole: clip(subs[i], 60), title: clip(names[i], 200), description: clip(descs[i], 200),
+            value: clip(vals[i], valueChars) };
+          if (pos[i] && sizes[i]) { node.frame = { x: pos[i][0], y: pos[i][1], width: sizes[i][0], height: sizes[i][1] }; }
+          if (foc[i] === true) node.focused = true;
+          if (en[i] === false) node.enabled = false;
+          count++;
+          visit(node);
+          queue.push({ el: c[i], path: node.path, depth: cur.depth + 1 });
+        }
+      }
+      return { visited: count, truncated: truncated };
+    }
+    function appRoots(a, proc) {
+      if (has(a, 'root')) return [{ el: resolvePath(proc, a.root), path: a.root }];
+      var roots = [], nw = proc.windows.length;
+      var only = has(a, 'window_index') ? argInt(a, 'window_index', undefined, 0, 999) : null;
+      for (var i = 0; i < nw; i++) if (only === null || only === i) roots.push({ el: proc.windows[i], path: 'w' + i });
+      if (argBool(a, 'include_menu_bar', false) && proc.menuBars.length) roots.push({ el: proc.menuBars[0], path: 'm0' });
+      return roots;
+    }
+    function terminalTabs() {
+      var out = [];
+      try {
+        var T = Application('Terminal');
+        if (T.running()) {
+          T.windows().forEach(function (w) {
+            var tabs = []; try { tabs = w.tabs(); } catch (e) {}
+            tabs.forEach(function (t, ti) {
+              var o = { app: 'Terminal', window_id: w.id(), window_title: w.name(), tab: ti + 1, tty: t.tty() };
+              try { o.busy = t.busy(); o.processes = t.processes(); o.selected = t.selected(); } catch (e) {}
+              out.push({ info: o, ref: t, kind: 'terminal' });
+            });
+          });
+        }
+      } catch (e) {}
+      try {
+        var I = Application('com.googlecode.iterm2');
+        if (I.running()) {
+          I.windows().forEach(function (w) {
+            w.tabs().forEach(function (tb, ti) {
+              tb.sessions().forEach(function (s) {
+                var o = { app: 'iTerm2', window_id: w.id(), window_title: w.name(), tab: ti + 1, session_id: s.id(), tty: s.tty(), title: s.name() };
+                try { o.busy = s.isProcessing(); } catch (e) {}
+                try { o.at_shell_prompt = s.isAtShellPrompt(); } catch (e) {}
+                out.push({ info: o, ref: s, kind: 'iterm' });
+              });
+            });
+          });
+        }
+      } catch (e) {}
+      return out;
+    }
+    function findTerminal(a) {
+      var tty = argStr(a, 'tty', undefined, 64, /^\/dev\/ttys[0-9]{1,4}$/);
+      var all = terminalTabs();
+      for (var i = 0; i < all.length; i++) if (all[i].info.tty === tty) return all[i];
+      fail('no Terminal or iTerm2 session uses ' + tty + '; call terminal.list');
+    }
+    var BROWSERS = { safari: 'com.apple.Safari', chrome: 'com.google.Chrome', brave: 'com.brave.Browser', edge: 'com.microsoft.edgemac' };
+    function browserTab(a) {
+      var b = argEnum(a, 'browser', 'safari', Object.keys(BROWSERS));
+      var app = Application(BROWSERS[b]);
+      if (!app.running()) fail(b + ' is not running');
+      var wi = argInt(a, 'window_index', 1, 1, 999), w = app.windows[wi - 1];
+      var tab;
+      if (has(a, 'tab_index')) tab = w.tabs[argInt(a, 'tab_index', undefined, 1, 9999) - 1];
+      else tab = (b === 'safari') ? w.currentTab : w.activeTab;
+      return { name: b, app: app, tab: tab };
+    }
+    function runJs(bt, code) {
+      try {
+        if (bt.name === 'safari') return bt.app.doJavaScript(code, { in: bt.tab });
+        return bt.tab.execute({ javascript: code });
+      } catch (e) {
+        fail('the browser refused to run JavaScript (' + (e.message || e) + '). Turn on "Allow JavaScript from Apple Events" (Safari: Develop menu; Chrome: View > Developer).');
+      }
+    }
+    function run() {
+      try {
+        var r = main(readArgs());
+        if (r && r.__mcpg_raw_result) return JSON.stringify(r.__mcpg_raw_result);
+        var out = { content: [{ type: 'text', text: JSON.stringify(r) }] };
+        if (r !== null && typeof r === 'object' && !Array.isArray(r)) out.structuredContent = r;
+        return JSON.stringify(out);
+      } catch (e) {
+        return JSON.stringify({ isError: true, content: [{ type: 'text', text: String((e && e.message) || e) }] });
+      }
+    }
+
+mcp:
+  server_info:
+    name: dev.mcpg.examples.macos-computer-use
+    title: "macOS computer use"
+    description: "Screenshots, mouse, keyboard, windows, accessibility tree, terminals, browsers and processes of this Mac."
+  instructions: |
+    You control the user's real Mac. Work in a loop: observe, act, observe again.
+
+    Observe: desktop.status once, then screen.screenshot. Prefer ui.find / ui.tree
+    (the accessibility tree) to locate buttons and fields; it is exact and cheaper
+    than guessing from pixels. Use ui.action (AXPress) or ui.set_value on an element
+    path when you can, and the mouse only when the element is not accessible.
+
+    Coordinates: screen.screenshot returns scale, origin_x and origin_y. To click
+    something you see in the screenshot, pass x/y in screenshot pixels together
+    with those three numbers unchanged. Without them, x/y are global screen
+    points (top-left of the main display is 0,0).
+
+    After each action take a new screenshot (or desktop.wait first when an app is
+    loading). Element paths (w0/3/1) are valid only until the UI changes; pass
+    expect_role / expect_title so a stale path is refused.
+
+    Terminals: terminal.list, then terminal.read / terminal.send by tty.
+    process.signal, terminal.send and browser.eval ask the user to confirm.
+    Never type passwords or secrets unless the user typed them to you for that
+    purpose. Stop and ask when a dialog asks for credentials or payment.
+
+  capabilities:
+    tools:
+      # ------------------------------------------------------------ desktop
+      - name: desktop.status
+        title: "Desktop status"
+        description: "macOS version, displays (global point frames), cursor, frontmost app and whether the Screen Recording and Accessibility permissions are granted. Call this first."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema: *no_args
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 15000
+          max_output_bytes: 262144
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, []);
+                var perms = {};
+                try { perms.screen_recording = !!$.CGPreflightScreenCaptureAccess(); } catch (e) { perms.screen_recording = 'unknown'; }
+                try { perms.accessibility = !!Application('System Events').uiElementsEnabled(); } catch (e) { perms.accessibility = false; perms.automation_error = String(e.message || e); }
+                var f = $.NSWorkspace.sharedWorkspace.frontmostApplication;
+                return { macos: js($.NSProcessInfo.processInfo.operatingSystemVersionString),
+                  displays: screens(), cursor: cursor(), frontmost_app: f ? appInfo(f) : null, permissions: perms };
+              }
+
+      - name: desktop.wait
+        title: "Wait"
+        description: "Wait for 0–30000 ms, for example while an app loads, before the next screenshot."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          required: [ms]
+          properties:
+            ms: { type: integer, minimum: 0, maximum: 30000 }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 35000
+          max_output_bytes: 4096
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['ms']); var ms = argInt(a, 'ms', undefined, 0, 30000); sleepMs(ms); return { waited_ms: ms }; }"]
+
+      # ------------------------------------------------------------ screen
+      - name: screen.screenshot
+        title: "Screenshot"
+        description: "Capture a display (default: main), a region (global points) or one window (window_id from window.list). Returns the image plus scale/origin_x/origin_y for the input tools. Default JPEG with the long edge at most 1568 px."
+        annotations: { read_only: true, idempotent: false, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            display: { type: integer, minimum: 1, description: "Display index from desktop.status (1 = main)." }
+            region:
+              type: object
+              required: [x, y, width, height]
+              properties:
+                x: { type: integer }
+                y: { type: integer }
+                width: { type: integer, minimum: 1 }
+                height: { type: integer, minimum: 1 }
+              additionalProperties: false
+            window_id: { type: integer, minimum: 1 }
+            format: { type: string, enum: [jpeg, png], default: jpeg }
+            quality: { type: integer, minimum: 10, maximum: 100, default: 75 }
+            max_long_edge: { type: integer, minimum: 256, maximum: 4096, default: 1568 }
+            include_cursor: { type: boolean, default: true }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 30000
+          max_output_bytes: 16777216
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['display', 'region', 'window_id', 'format', 'quality', 'max_long_edge', 'include_cursor']);
+                var fmt = argEnum(a, 'format', 'jpeg', ['jpeg', 'png']);
+                var quality = argInt(a, 'quality', 75, 10, 100);
+                var maxEdge = argInt(a, 'max_long_edge', 1568, 256, 4096);
+                var scr = screens(), rect, cap = ['-x', '-t', fmt === 'png' ? 'png' : 'jpg'];
+                if (argBool(a, 'include_cursor', true)) cap.push('-C');
+                if (has(a, 'window_id')) {
+                  var wid = argInt(a, 'window_id', undefined, 1, 2147483647), w = windowInfo(wid);
+                  if (!w) fail('no window with id ' + wid + '; call window.list');
+                  rect = { x: w.bounds.x, y: w.bounds.y, width: w.bounds.width, height: w.bounds.height };
+                  cap.push('-o', '-l' + wid);
+                } else if (has(a, 'region')) {
+                  var r = a.region;
+                  if (typeof r !== 'object' || Array.isArray(r)) fail('region must be an object');
+                  onlyKeys(r, ['x', 'y', 'width', 'height']);
+                  rect = { x: argInt(r, 'x', undefined, -100000, 100000), y: argInt(r, 'y', undefined, -100000, 100000),
+                    width: argInt(r, 'width', undefined, 1, 100000), height: argInt(r, 'height', undefined, 1, 100000) };
+                  cap.push('-R' + [rect.x, rect.y, rect.width, rect.height].join(','));
+                } else {
+                  var s = scr[argInt(a, 'display', 1, 1, scr.length) - 1];
+                  rect = { x: s.x, y: s.y, width: s.width, height: s.height };
+                  cap.push('-R' + [rect.x, rect.y, rect.width, rect.height].join(','));
+                }
+                var ext = fmt === 'png' ? 'png' : 'jpg', raw = tmpPath(ext), outp = tmpPath(ext), b64;
+                var f = Math.min(1, maxEdge / Math.max(rect.width, rect.height));
+                var tw = Math.max(1, Math.round(rect.width * f)), th = Math.max(1, Math.round(rect.height * f));
+                try {
+                  sh('/usr/sbin/screencapture ' + cap.map(q).join(' ') + ' ' + q(raw));
+                  if (!$.NSFileManager.defaultManager.fileExistsAtPath(raw)) fail('screencapture wrote no image; grant Screen Recording to the app that starts mcpg');
+                  var sips = ['-z', String(th), String(tw)];
+                  if (fmt === 'jpeg') sips.push('-s', 'format', 'jpeg', '-s', 'formatOptions', String(quality));
+                  sh('/usr/bin/sips ' + sips.map(q).join(' ') + ' ' + q(raw) + ' --out ' + q(outp) + ' >/dev/null');
+                  var data = $.NSData.dataWithContentsOfFile(outp);
+                  if (!data || data.isNil()) fail('could not read the resized image');
+                  b64 = data.base64EncodedStringWithOptions(0).js;
+                } finally { rm(raw); rm(outp); }
+                var scale = Math.round((rect.width / tw) * 1e6) / 1e6;
+                var geo = { width: tw, height: th, scale: scale, origin_x: rect.x, origin_y: rect.y, cursor: cursor(), displays: scr };
+                var note = 'Screenshot ' + tw + 'x' + th + ' px. To act on pixel (px, py) pass x=px, y=py, scale=' + scale +
+                  ', origin_x=' + rect.x + ', origin_y=' + rect.y + '. Cursor at screen point ' + geo.cursor.x + ',' + geo.cursor.y + '.';
+                return { __mcpg_raw_result: {
+                  content: [{ type: 'image', data: b64, mimeType: fmt === 'png' ? 'image/png' : 'image/jpeg' },
+                    { type: 'text', text: note }],
+                  structuredContent: geo } };
+              }
+
+      # ------------------------------------------------------------ input
+      - name: input.mouse_move
+        title: "Move the mouse"
+        description: "Move the pointer to x/y (screenshot pixels with scale/origin, or global points)."
+        annotations: { read_only: false, destructive: false, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          required: [x, y]
+          properties:
+            x: { type: number }
+            y: { type: number }
+            <<: *space
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 4096
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['x', 'y', 'scale', 'origin_x', 'origin_y']); var p = point(a, 'x', 'y'); mouseEvent(5, p, 0, 0, 0); return { moved_to: p }; }"]
+
+      - name: input.click
+        title: "Click"
+        description: "Click at x/y (or at the cursor when x/y are omitted). button left|right|middle, clicks 1–3 (2 = double click), optional modifiers [cmd, shift, option, ctrl]."
+        annotations: { read_only: false, destructive: true, idempotent: false, open_world: true }
+        input_schema:
+          type: object
+          properties:
+            x: { type: number }
+            y: { type: number }
+            button: { type: string, enum: [left, right, middle], default: left }
+            clicks: { type: integer, minimum: 1, maximum: 3, default: 1 }
+            modifiers: { type: array, items: { type: string, enum: [cmd, shift, option, ctrl, fn] }, maxItems: 5 }
+            <<: *space
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 4096
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['x', 'y', 'button', 'clicks', 'modifiers', 'scale', 'origin_x', 'origin_y']);
+                if (has(a, 'x') !== has(a, 'y')) fail('give both x and y, or neither');
+                var p = has(a, 'x') ? point(a, 'x', 'y') : cursor();
+                var name = argEnum(a, 'button', 'left', ['left', 'right', 'middle']), b = BUTTONS[name];
+                var n = argInt(a, 'clicks', 1, 1, 3), flags = modFlags(argMods(a));
+                mouseEvent(5, p, 0, 0, 0);
+                sleepMs(40);
+                for (var i = 1; i <= n; i++) {
+                  mouseEvent(b[0], p, b[3], flags, i);
+                  sleepMs(15);
+                  mouseEvent(b[1], p, b[3], flags, i);
+                  if (i < n) sleepMs(60);
+                }
+                return { clicked_at: p, button: name, clicks: n };
+              }
+
+      - name: input.drag
+        title: "Drag"
+        description: "Press at from_x/from_y, move to to_x/to_y over duration_ms, release. Same coordinate rules as input.click."
+        annotations: { read_only: false, destructive: true, idempotent: false, open_world: true }
+        input_schema:
+          type: object
+          required: [from_x, from_y, to_x, to_y]
+          properties:
+            from_x: { type: number }
+            from_y: { type: number }
+            to_x: { type: number }
+            to_y: { type: number }
+            button: { type: string, enum: [left, right, middle], default: left }
+            duration_ms: { type: integer, minimum: 0, maximum: 10000, default: 400 }
+            modifiers: { type: array, items: { type: string, enum: [cmd, shift, option, ctrl, fn] }, maxItems: 5 }
+            <<: *space
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 20000
+          max_output_bytes: 4096
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['from_x', 'from_y', 'to_x', 'to_y', 'button', 'duration_ms', 'modifiers', 'scale', 'origin_x', 'origin_y']);
+                var p0 = point(a, 'from_x', 'from_y'), p1 = point(a, 'to_x', 'to_y');
+                var b = BUTTONS[argEnum(a, 'button', 'left', ['left', 'right', 'middle'])];
+                var dur = argInt(a, 'duration_ms', 400, 0, 10000), flags = modFlags(argMods(a));
+                var steps = Math.max(2, Math.min(100, Math.round(dur / 16)));
+                mouseEvent(5, p0, 0, 0, 0);
+                sleepMs(40);
+                mouseEvent(b[0], p0, b[3], flags, 1);
+                for (var i = 1; i <= steps; i++) {
+                  var t = i / steps;
+                  mouseEvent(b[2], { x: p0.x + (p1.x - p0.x) * t, y: p0.y + (p1.y - p0.y) * t }, b[3], flags, 0);
+                  sleepMs(dur / steps);
+                }
+                mouseEvent(b[1], p1, b[3], flags, 1);
+                return { from: p0, to: p1 };
+              }
+
+      - name: input.scroll
+        title: "Scroll"
+        description: "Scroll at x/y (or at the cursor). delta_y > 0 scrolls down, delta_x > 0 scrolls right; unit line (default) or pixel."
+        annotations: { read_only: false, destructive: false, idempotent: false, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            x: { type: number }
+            y: { type: number }
+            delta_x: { type: integer, minimum: -1000, maximum: 1000, default: 0 }
+            delta_y: { type: integer, minimum: -1000, maximum: 1000, default: 0 }
+            unit: { type: string, enum: [line, pixel], default: line }
+            <<: *space
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 4096
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['x', 'y', 'delta_x', 'delta_y', 'unit', 'scale', 'origin_x', 'origin_y']);
+                if (has(a, 'x') !== has(a, 'y')) fail('give both x and y, or neither');
+                if (has(a, 'x')) { mouseEvent(5, point(a, 'x', 'y'), 0, 0, 0); sleepMs(40); }
+                var dx = argInt(a, 'delta_x', 0, -1000, 1000), dy = argInt(a, 'delta_y', 0, -1000, 1000);
+                var unit = argEnum(a, 'unit', 'line', ['line', 'pixel']);
+                if (typeof $.CGEventCreateScrollWheelEvent2 !== 'function') fail('this macOS does not expose CGEventCreateScrollWheelEvent2 to JXA; use input.key page_down instead');
+                var e = $.CGEventCreateScrollWheelEvent2(null, unit === 'pixel' ? 0 : 1, 2, -dy, -dx, 0);
+                $.CGEventPost(0, e);
+                return { delta_x: dx, delta_y: dy, unit: unit, at: cursor() };
+              }
+
+      - name: input.type_text
+        title: "Type text"
+        description: "Type text into the focused field of the frontmost app. method auto (default) uses keystrokes for short ASCII and the clipboard (Cmd+V, then restores it) for long or non-ASCII text."
+        annotations: { read_only: false, destructive: true, idempotent: false, open_world: true }
+        input_schema:
+          type: object
+          required: [text]
+          properties:
+            text: { type: string, maxLength: 20000 }
+            method: { type: string, enum: [auto, keystroke, paste], default: auto }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 60000
+          max_output_bytes: 4096
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['text', 'method']);
+                var text = argStr(a, 'text', undefined, 20000);
+                var method = argEnum(a, 'method', 'auto', ['auto', 'keystroke', 'paste']);
+                if (method === 'auto') method = (/^[\x20-\x7e\n\t]*$/.test(text) && text.length <= 400) ? 'keystroke' : 'paste';
+                var se = Application('System Events');
+                if (method === 'keystroke') {
+                  var lines = text.split('\n');
+                  for (var i = 0; i < lines.length; i++) {
+                    if (lines[i].length) se.keystroke(lines[i]);
+                    if (i < lines.length - 1) se.keyCode(36);
+                  }
+                } else {
+                  var pb = $.NSPasteboard.generalPasteboard, T = 'public.utf8-plain-text';
+                  var saved = js(pb.stringForType(T));
+                  pb.clearContents;
+                  pb.setStringForType($(text), T);
+                  se.keystroke('v', { using: ['command down'] });
+                  sleepMs(350);
+                  pb.clearContents;
+                  if (saved !== null) pb.setStringForType($(saved), T);
+                }
+                return { typed_chars: text.length, method: method };
+              }
+
+      - name: input.key
+        title: "Press a key or shortcut"
+        description: "Press a key or combination, e.g. enter, escape, tab, up, page_down, f5, cmd+c, cmd+shift+t, ctrl+c. repeat 1–50."
+        annotations: { read_only: false, destructive: true, idempotent: false, open_world: true }
+        input_schema:
+          type: object
+          required: [keys]
+          properties:
+            keys: { type: string, maxLength: 64 }
+            repeat: { type: integer, minimum: 1, maximum: 50, default: 1 }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 15000
+          max_output_bytes: 4096
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              var KEYS = { enter: 36, 'return': 36, tab: 48, space: 49, backspace: 51, 'delete': 51, escape: 53, esc: 53,
+                forward_delete: 117, home: 115, end: 119, page_up: 116, page_down: 121, left: 123, right: 124, down: 125, up: 126,
+                f1: 122, f2: 120, f3: 99, f4: 118, f5: 96, f6: 97, f7: 98, f8: 100, f9: 101, f10: 109, f11: 103, f12: 111 };
+              function main(a) {
+                onlyKeys(a, ['keys', 'repeat']);
+                var combo = argStr(a, 'keys', undefined, 64, /^[\x21-\x7e]+$/);
+                var n = argInt(a, 'repeat', 1, 1, 50);
+                var parts = combo.split('+'), key = parts.pop();
+                if (key === '' && parts.length && parts[parts.length - 1] === '') { parts.pop(); key = '+'; }
+                var using = parts.map(function (m) {
+                  var u = USING[m.toLowerCase()];
+                  if (!u) fail('unknown modifier: ' + m);
+                  return u;
+                });
+                var code = KEYS[key.toLowerCase()];
+                if (code === undefined && key.length !== 1) fail('unknown key: ' + key);
+                var se = Application('System Events');
+                for (var i = 0; i < n; i++) {
+                  if (code !== undefined) se.keyCode(code, { using: using });
+                  else se.keystroke(key, { using: using });
+                  if (n > 1) sleepMs(30);
+                }
+                return { pressed: combo, repeat: n };
+              }
+
+      # ------------------------------------------------------------ clipboard
+      - name: clipboard.read
+        title: "Read the clipboard"
+        description: "Return the plain-text clipboard content (at most max_chars) and the pasteboard types present."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            max_chars: { type: integer, minimum: 1, maximum: 1000000, default: 100000 }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 4194304
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['max_chars']); var n = argInt(a, 'max_chars', 100000, 1, 1000000); var pb = $.NSPasteboard.generalPasteboard; var t = js(pb.stringForType('public.utf8-plain-text')); var types = ObjC.deepUnwrap(pb.types) || []; return { text: t === null ? null : t.slice(0, n), truncated: t !== null && t.length > n, types: types }; }"]
+
+      - name: clipboard.write
+        title: "Write the clipboard"
+        description: "Replace the clipboard with plain text."
+        annotations: { read_only: false, destructive: true, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          required: [text]
+          properties:
+            text: { type: string, maxLength: 1000000 }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 4096
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['text']); var t = argStr(a, 'text', undefined, 1000000); var pb = $.NSPasteboard.generalPasteboard; pb.clearContents; pb.setStringForType($(t), 'public.utf8-plain-text'); return { written_chars: t.length }; }"]
+
+      # ------------------------------------------------------------ apps
+      - name: app.list
+        title: "List running apps"
+        description: "Running apps with a Dock presence (name, bundle_id, pid, active, hidden). include_background: true adds agents and helpers."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            include_background: { type: boolean, default: false }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 1048576
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['include_background']); var all = argBool(a, 'include_background', false); var apps = $.NSWorkspace.sharedWorkspace.runningApplications, out = []; for (var i = 0; i < apps.count; i++) { var x = apps.objectAtIndex(i); if (all || x.activationPolicy === 0) out.push(appInfo(x)); } return { apps: out }; }"]
+
+      - name: app.activate
+        title: "Bring an app to the front"
+        description: "Activate a running app by pid, bundle_id or exact name."
+        annotations: { read_only: false, destructive: false, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            pid: { type: integer, minimum: 1 }
+            bundle_id: { type: string }
+            name: { type: string }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 4096
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['pid', 'bundle_id', 'name']); var x = findApp(a); var bid = js(x.bundleIdentifier); if (bid) { Application(bid).activate(); } else { x.activateWithOptions(3); } sleepMs(150); return appInfo(x); }"]
+
+      - name: app.launch
+        title: "Launch an app"
+        description: "Open an app by bundle_id (preferred, e.g. com.apple.Safari) or by name (e.g. Calculator). Activates it if it already runs."
+        annotations: { read_only: false, destructive: false, idempotent: true, open_world: true }
+        input_schema:
+          type: object
+          properties:
+            bundle_id: { type: string, pattern: "^[A-Za-z0-9.-]+$" }
+            name: { type: string, maxLength: 128 }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 35000
+          max_output_bytes: 4096
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['bundle_id', 'name']); if (has(a, 'bundle_id')) { var b = argStr(a, 'bundle_id', undefined, 255, /^[A-Za-z0-9.-]+$/); sh('/usr/bin/open -b ' + q(b)); return { launched: b }; } if (!has(a, 'name')) fail('give bundle_id or name'); var n = argStr(a, 'name', undefined, 128, /^[^\\n\\r\\/]+$/); sh('/usr/bin/open -a ' + q(n)); return { launched: n }; }"]
+
+      - name: app.quit
+        title: "Quit an app"
+        description: "Ask a running app to quit normally (it may show a save dialog). To force a quit use process.signal."
+        annotations: { read_only: false, destructive: true, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            pid: { type: integer, minimum: 1 }
+            bundle_id: { type: string }
+            name: { type: string }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 4096
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['pid', 'bundle_id', 'name']); var x = findApp(a), info = appInfo(x); if (info.bundle_id === 'com.apple.finder' || info.bundle_id === 'com.apple.loginwindow') fail('refusing to quit ' + info.name); info.quit_requested = !!x.terminate; return info; }"]
+
+      # ------------------------------------------------------------ windows
+      - name: window.list
+        title: "List windows"
+        description: "Normal app windows, front to back: id (for screen.screenshot window_id), app, pid, title, bounds in global points. Titles need Screen Recording."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            app: { type: string, description: "Only windows of this app name." }
+            include_offscreen: { type: boolean, default: false }
+            include_all_layers: { type: boolean, default: false, description: "Also menu-bar items, panels and overlays." }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 2097152
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['app', 'include_offscreen', 'include_all_layers']); var app = has(a, 'app') ? argStr(a, 'app', undefined, 255) : null; var layers = argBool(a, 'include_all_layers', false); var l = windowList(!argBool(a, 'include_offscreen', false)).filter(function (w) { return (layers || w.layer === 0) && (app === null || w.app === app); }); return { windows: l }; }"]
+
+      - name: window.focus
+        title: "Focus a window"
+        description: "Raise one window (id from window.list) and bring its app to the front."
+        annotations: { read_only: false, destructive: false, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          required: [window_id]
+          properties:
+            window_id: { type: integer, minimum: 1 }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 4096
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['window_id']); var info = windowInfo(argInt(a, 'window_id', undefined, 1, 2147483647)); if (!info) fail('no such window; call window.list'); var m = axWindowFor(info); m.win.actions['AXRaise'].perform(); m.proc.frontmost = true; return { focused: info.id, app: info.app, title: info.title, ax_path: 'w' + m.index }; }"]
+
+      - name: window.set_bounds
+        title: "Move or resize a window"
+        description: "Set a window's position and/or size in global points."
+        annotations: { read_only: false, destructive: false, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          required: [window_id]
+          properties:
+            window_id: { type: integer, minimum: 1 }
+            x: { type: integer }
+            y: { type: integer }
+            width: { type: integer, minimum: 50 }
+            height: { type: integer, minimum: 50 }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 10000
+          max_output_bytes: 4096
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['window_id', 'x', 'y', 'width', 'height']);
+                var info = windowInfo(argInt(a, 'window_id', undefined, 1, 2147483647));
+                if (!info) fail('no such window; call window.list');
+                if (has(a, 'x') !== has(a, 'y')) fail('give both x and y');
+                if (has(a, 'width') !== has(a, 'height')) fail('give both width and height');
+                if (!has(a, 'x') && !has(a, 'width')) fail('nothing to change');
+                var m = axWindowFor(info);
+                if (has(a, 'x')) m.win.position = [argInt(a, 'x', undefined, -100000, 100000), argInt(a, 'y', undefined, -100000, 100000)];
+                if (has(a, 'width')) m.win.size = [argInt(a, 'width', undefined, 50, 100000), argInt(a, 'height', undefined, 50, 100000)];
+                var p = m.win.position(), s = m.win.size();
+                return { window_id: info.id, bounds: { x: p[0], y: p[1], width: s[0], height: s[1] } };
+              }
+
+      # ------------------------------------------------------------ accessibility
+      - name: ui.tree
+        title: "Accessibility tree"
+        description: "Breadth-first accessibility tree of an app (default: frontmost): role, title, description, value, frame (global points), focused. Each node has a path (w0/3/1) for ui.action / ui.set_value. Bounded by max_depth and max_nodes."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            pid: { type: integer, minimum: 1, description: "Default: the frontmost app." }
+            window_index: { type: integer, minimum: 0, description: "Only this window (w<N>)." }
+            root: { type: string, description: "Start below this element path instead." }
+            include_menu_bar: { type: boolean, default: false }
+            max_depth: { type: integer, minimum: 1, maximum: 40, default: 10 }
+            max_nodes: { type: integer, minimum: 1, maximum: 3000, default: 400 }
+            value_chars: { type: integer, minimum: 0, maximum: 5000, default: 200 }
+            web_accessibility: { type: boolean, default: false, description: "Ask Chromium/Electron apps to expose web content (AXManualAccessibility)." }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 75000
+          max_output_bytes: 8388608
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['pid', 'window_index', 'root', 'include_menu_bar', 'max_depth', 'max_nodes', 'value_chars', 'web_accessibility']);
+                var pid = has(a, 'pid') ? argInt(a, 'pid', undefined, 1, 99999999) : frontPid();
+                var proc = procByPid(pid);
+                if (argBool(a, 'web_accessibility', false)) { try { proc.attributes['AXManualAccessibility'].value = true; sleepMs(300); } catch (e) {} }
+                var nodes = [];
+                var roots = appRoots(a, proc);
+                roots.forEach(function (r) {
+                  var top = { path: r.path, depth: 0 };
+                  try { top.role = r.el.role(); top.title = clip(r.el.name(), 200); var p = r.el.position(), s = r.el.size(); top.frame = { x: p[0], y: p[1], width: s[0], height: s[1] }; } catch (e) {}
+                  nodes.push(top);
+                });
+                var st = walk(proc, roots, argInt(a, 'max_depth', 10, 1, 40), argInt(a, 'max_nodes', 400, 1, 3000), argInt(a, 'value_chars', 200, 0, 5000), function (n) { nodes.push(n); });
+                return { pid: pid, app: proc.name(), nodes: nodes, truncated: st.truncated };
+              }
+
+      - name: ui.find
+        title: "Find accessibility elements"
+        description: "Search an app's accessibility tree for elements whose role matches and/or whose title, description or value contains text (case-insensitive). Returns paths and frames."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            pid: { type: integer, minimum: 1 }
+            text: { type: string, maxLength: 500 }
+            role: { type: string, maxLength: 64, description: "e.g. AXButton, AXTextField, AXLink, AXMenuItem" }
+            window_index: { type: integer, minimum: 0 }
+            root: { type: string }
+            include_menu_bar: { type: boolean, default: false }
+            max_depth: { type: integer, minimum: 1, maximum: 40, default: 15 }
+            max_nodes: { type: integer, minimum: 1, maximum: 5000, default: 1500 }
+            max_results: { type: integer, minimum: 1, maximum: 200, default: 20 }
+            web_accessibility: { type: boolean, default: false }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 75000
+          max_output_bytes: 2097152
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['pid', 'text', 'role', 'window_index', 'root', 'include_menu_bar', 'max_depth', 'max_nodes', 'max_results', 'web_accessibility']);
+                var text = has(a, 'text') ? argStr(a, 'text', undefined, 500).toLowerCase() : null;
+                var role = has(a, 'role') ? argStr(a, 'role', undefined, 64, /^AX[A-Za-z]+$/) : null;
+                if (text === null && role === null) fail('give text and/or role');
+                var pid = has(a, 'pid') ? argInt(a, 'pid', undefined, 1, 99999999) : frontPid();
+                var proc = procByPid(pid);
+                if (argBool(a, 'web_accessibility', false)) { try { proc.attributes['AXManualAccessibility'].value = true; sleepMs(300); } catch (e) {} }
+                var maxRes = argInt(a, 'max_results', 20, 1, 200), hits = [];
+                var st = walk(proc, appRoots(a, proc), argInt(a, 'max_depth', 15, 1, 40), argInt(a, 'max_nodes', 1500, 1, 5000), 300, function (n) {
+                  if (hits.length >= maxRes) return;
+                  if (role !== null && n.role !== role) return;
+                  if (text !== null) {
+                    var hay = [n.title, n.description, n.value].filter(function (x) { return x; }).join(' ').toLowerCase();
+                    if (hay.indexOf(text) < 0) return;
+                  }
+                  hits.push(n);
+                });
+                return { pid: pid, app: proc.name(), matches: hits, searched_nodes: st.visited, truncated: st.truncated };
+              }
+
+      - name: ui.action
+        title: "Perform an accessibility action"
+        description: "Perform an AX action on an element path from ui.tree / ui.find: AXPress (click a button, link, checkbox, menu item), AXShowMenu, AXIncrement, AXDecrement, AXConfirm, AXCancel, AXRaise, AXPick, or focus. Pass expect_role / expect_title so a stale path is refused."
+        annotations: { read_only: false, destructive: true, idempotent: false, open_world: true }
+        input_schema:
+          type: object
+          required: [path, action]
+          properties:
+            pid: { type: integer, minimum: 1 }
+            path: { type: string }
+            action: { type: string, enum: [AXPress, AXShowMenu, AXIncrement, AXDecrement, AXConfirm, AXCancel, AXRaise, AXPick, focus] }
+            expect_role: { type: string }
+            expect_title: { type: string }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 15000
+          max_output_bytes: 65536
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['pid', 'path', 'action', 'expect_role', 'expect_title']);
+                var pid = has(a, 'pid') ? argInt(a, 'pid', undefined, 1, 99999999) : frontPid();
+                var action = argEnum(a, 'action', undefined, ['AXPress', 'AXShowMenu', 'AXIncrement', 'AXDecrement', 'AXConfirm', 'AXCancel', 'AXRaise', 'AXPick', 'focus']);
+                var el = resolvePath(procByPid(pid), argStr(a, 'path', undefined, 300));
+                var role, title;
+                try { role = el.role(); } catch (e) { fail('element ' + a.path + ' no longer exists; call ui.find again'); }
+                try { title = el.name(); } catch (e) { title = null; }
+                if (has(a, 'expect_role') && role !== a.expect_role) fail('element ' + a.path + ' is now ' + role + ', not ' + a.expect_role + '; call ui.find again');
+                if (has(a, 'expect_title') && title !== a.expect_title) fail('element ' + a.path + ' title is now ' + JSON.stringify(title) + '; call ui.find again');
+                if (action === 'focus') { el.focused = true; }
+                else {
+                  var names = [];
+                  try { names = el.actions.name(); } catch (e) {}
+                  if (names.indexOf(action) < 0) fail(role + ' does not support ' + action + '; it supports: ' + names.join(', '));
+                  el.actions[action].perform();
+                }
+                return { path: a.path, role: role, title: title, performed: action };
+              }
+
+      - name: ui.set_value
+        title: "Set an element's value"
+        description: "Set the AXValue of a text field, text area, slider or similar element (path from ui.find). Faster and exact compared to typing."
+        annotations: { read_only: false, destructive: true, idempotent: true, open_world: true }
+        input_schema:
+          type: object
+          required: [path, value]
+          properties:
+            pid: { type: integer, minimum: 1 }
+            path: { type: string }
+            value: { type: string, maxLength: 100000 }
+            expect_role: { type: string }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 15000
+          max_output_bytes: 65536
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['pid', 'path', 'value', 'expect_role']);
+                var pid = has(a, 'pid') ? argInt(a, 'pid', undefined, 1, 99999999) : frontPid();
+                var el = resolvePath(procByPid(pid), argStr(a, 'path', undefined, 300));
+                var v = argStr(a, 'value', undefined, 100000), role;
+                try { role = el.role(); } catch (e) { fail('element ' + a.path + ' no longer exists; call ui.find again'); }
+                if (has(a, 'expect_role') && role !== a.expect_role) fail('element ' + a.path + ' is now ' + role + ', not ' + a.expect_role);
+                try { el.focused = true; } catch (e) {}
+                el.value = v;
+                var now = null;
+                try { now = el.value(); } catch (e) {}
+                return { path: a.path, role: role, value_set: now === v };
+              }
+
+      # ------------------------------------------------------------ terminals
+      - name: terminal.list
+        title: "List terminal sessions"
+        description: "Terminal.app tabs and iTerm2 sessions: tty (the id for terminal.read / terminal.send), window, title, busy, running processes. Does not launch either app."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema: *no_args
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 15000
+          max_output_bytes: 1048576
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, []); return { sessions: terminalTabs().map(function (t) { return t.info; }) }; }"]
+
+      - name: terminal.read
+        title: "Read a terminal"
+        description: "Text of a terminal session by tty: the visible screen (default) or the full scrollback (Terminal.app history), last max_lines lines."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          required: [tty]
+          properties:
+            tty: { type: string, pattern: "^/dev/ttys[0-9]{1,4}$" }
+            source: { type: string, enum: [visible, scrollback], default: visible }
+            max_lines: { type: integer, minimum: 1, maximum: 20000, default: 200 }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 15000
+          max_output_bytes: 8388608
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['tty', 'source', 'max_lines']);
+                var t = findTerminal(a), src = argEnum(a, 'source', 'visible', ['visible', 'scrollback']);
+                var n = argInt(a, 'max_lines', 200, 1, 20000), text;
+                if (t.kind === 'terminal') text = src === 'scrollback' ? t.ref.history() : t.ref.contents();
+                else text = t.ref.contents();
+                var lines = String(text || '').replace(/\s+$/, '').split('\n');
+                var total = lines.length;
+                return { session: t.info, source: src, total_lines: total, truncated: total > n, text: lines.slice(Math.max(0, total - n)).join('\n') };
+              }
+
+      - name: terminal.send
+        title: "Send input to a terminal"
+        description: "Send text to a terminal session by tty; submit true (default) presses Return. Refuses a busy session (a program other than the shell is running) unless allow_busy is true. Shows the user the text and asks first."
+        annotations: { read_only: false, destructive: true, idempotent: false, open_world: true }
+        input_schema:
+          type: object
+          required: [tty, text]
+          properties:
+            tty: { type: string, pattern: "^/dev/ttys[0-9]{1,4}$" }
+            text: { type: string, maxLength: 10000 }
+            submit: { type: boolean, default: true }
+            allow_busy: { type: boolean, default: false }
+          additionalProperties: false
+        governance: *local
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 300000
+          steps:
+            - kind: elicitation
+              id: confirm
+              message: "An AI agent wants to type this into the terminal ${arguments.tty}:\n\n${arguments.text}\n\nAllow it?"
+              requested_schema: *allow_schema
+            - *confirm_gate
+            - <<: *osa
+              id: run
+              timeout_ms: 15000
+              max_output_bytes: 65536
+              args:
+                - -l
+                - JavaScript
+                - -e
+                - *prelude
+                - -e
+                - |
+                  function main(a) {
+                    onlyKeys(a, ['tty', 'text', 'submit', 'allow_busy']);
+                    var t = findTerminal(a), text = argStr(a, 'text', undefined, 10000);
+                    var submit = argBool(a, 'submit', true);
+                    if (t.info.busy === true && !argBool(a, 'allow_busy', false)) fail(t.info.tty + ' is busy (' + (t.info.processes || []).join(', ') + '); pass allow_busy: true to send anyway');
+                    if (t.kind === 'terminal') {
+                      if (!submit) fail('Terminal.app can only send a full line; focus the tab and use input.type_text');
+                      Application('Terminal').doScript(text, { in: t.ref });
+                    } else {
+                      t.ref.write({ text: text, newline: submit });
+                    }
+                    return { tty: t.info.tty, app: t.info.app, sent_chars: text.length, submitted: submit };
+                  }
+
+      # ------------------------------------------------------------ browsers
+      - name: browser.tabs
+        title: "List browser tabs"
+        description: "Title and URL of every tab in Safari and the Chromium browsers (Chrome, Brave, Edge) that are running. Does not launch a browser."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema: *no_args
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 15000
+          max_output_bytes: 2097152
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, []);
+                var out = [];
+                Object.keys(BROWSERS).forEach(function (b) {
+                  try {
+                    var app = Application(BROWSERS[b]);
+                    if (!app.running()) return;
+                    app.windows().forEach(function (w, wi) {
+                      var active = -1;
+                      try { active = b === 'safari' ? w.currentTab().index() : w.activeTabIndex(); } catch (e) {}
+                      var tabs = [];
+                      try { tabs = w.tabs(); } catch (e) {}
+                      tabs.forEach(function (t, ti) {
+                        var o = { browser: b, window_index: wi + 1, tab_index: ti + 1, active: ti + 1 === active };
+                        try { o.title = b === 'safari' ? t.name() : t.title(); o.url = t.url(); } catch (e) {}
+                        out.push(o);
+                      });
+                    });
+                  } catch (e) {}
+                });
+                return { tabs: out };
+              }
+
+      - name: browser.read_page
+        title: "Read a web page"
+        description: "Title, URL, visible text (and optionally links) of a browser tab (default: active tab of the front window). Needs 'Allow JavaScript from Apple Events' in the browser."
+        annotations: { read_only: true, idempotent: true, open_world: true }
+        input_schema:
+          type: object
+          properties:
+            browser: { type: string, enum: [safari, chrome, brave, edge], default: safari }
+            window_index: { type: integer, minimum: 1, default: 1 }
+            tab_index: { type: integer, minimum: 1 }
+            max_chars: { type: integer, minimum: 100, maximum: 500000, default: 30000 }
+            include_links: { type: boolean, default: false }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 25000
+          max_output_bytes: 8388608
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['browser', 'window_index', 'tab_index', 'max_chars', 'include_links']);
+                var bt = browserTab(a), n = argInt(a, 'max_chars', 30000, 100, 500000), links = argBool(a, 'include_links', false);
+                var code = '(function(){var t=document.body?document.body.innerText:"";var r={title:document.title,url:location.href,total_chars:t.length,text:t.slice(0,' + n + ')};' +
+                  (links ? 'r.links=Array.prototype.slice.call(document.links,0,500).map(function(l){return {text:(l.innerText||"").trim().slice(0,120),href:l.href};});' : '') +
+                  'return JSON.stringify(r);})()';
+                var r = JSON.parse(runJs(bt, code));
+                r.truncated = r.total_chars > n;
+                return r;
+              }
+
+      - name: browser.open_url
+        title: "Open a URL"
+        description: "Open an http(s) URL in the given browser (default: the system default browser)."
+        annotations: { read_only: false, destructive: false, idempotent: false, open_world: true }
+        input_schema:
+          type: object
+          required: [url]
+          properties:
+            url: { type: string, pattern: "^https?://", maxLength: 8192 }
+            browser: { type: string, enum: [default, safari, chrome, brave, edge], default: default }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 15000
+          max_output_bytes: 4096
+          args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['url', 'browser']); var u = argStr(a, 'url', undefined, 8192, /^https?:\\/\\/[^\\s]+$/); var b = argEnum(a, 'browser', 'default', ['default'].concat(Object.keys(BROWSERS))); sh('/usr/bin/open ' + (b === 'default' ? '' : '-b ' + q(BROWSERS[b]) + ' ') + q(u)); return { opened: u, browser: b }; }"]
+
+      - name: browser.eval
+        title: "Run JavaScript in a tab"
+        description: "Run JavaScript in a browser tab and return the value of its last expression (strings are returned as-is; return JSON.stringify(...) for objects). Shows the user the script and asks first. Needs 'Allow JavaScript from Apple Events'."
+        annotations: { read_only: false, destructive: true, idempotent: false, open_world: true }
+        input_schema:
+          type: object
+          required: [script]
+          properties:
+            script: { type: string, maxLength: 50000 }
+            browser: { type: string, enum: [safari, chrome, brave, edge], default: safari }
+            window_index: { type: integer, minimum: 1, default: 1 }
+            tab_index: { type: integer, minimum: 1 }
+          additionalProperties: false
+        governance: *local
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 300000
+          steps:
+            - kind: elicitation
+              id: confirm
+              message: "An AI agent wants to run this JavaScript in a browser tab:\n\n${arguments.script}\n\nAllow it?"
+              requested_schema: *allow_schema
+            - *confirm_gate
+            - <<: *osa
+              id: run
+              timeout_ms: 25000
+              max_output_bytes: 4194304
+              args: [-l, JavaScript, -e, *prelude, -e, "function main(a) { onlyKeys(a, ['script', 'browser', 'window_index', 'tab_index']); var s = argStr(a, 'script', undefined, 50000); var v = runJs(browserTab(a), s); return { value: v === undefined ? null : v }; }"]
+
+      # ------------------------------------------------------------ processes
+      - name: process.list
+        title: "List processes"
+        description: "Processes with pid, ppid, user id, CPU %, memory %, RSS KiB, elapsed time, state and executable. Filter by name, sort by cpu|memory|pid. include_args adds full command lines (they can contain secrets)."
+        annotations: { read_only: true, idempotent: true, open_world: false }
+        input_schema:
+          type: object
+          properties:
+            name_contains: { type: string, maxLength: 200 }
+            only_mine: { type: boolean, default: false }
+            sort_by: { type: string, enum: [cpu, memory, pid], default: cpu }
+            limit: { type: integer, minimum: 1, maximum: 5000, default: 50 }
+            include_args: { type: boolean, default: false }
+          additionalProperties: false
+        governance: *local
+        backend:
+          <<: *osa
+          timeout_ms: 15000
+          max_output_bytes: 8388608
+          args:
+            - -l
+            - JavaScript
+            - -e
+            - *prelude
+            - -e
+            - |
+              function main(a) {
+                onlyKeys(a, ['name_contains', 'only_mine', 'sort_by', 'limit', 'include_args']);
+                var filt = has(a, 'name_contains') ? argStr(a, 'name_contains', undefined, 200).toLowerCase() : null;
+                var mine = argBool(a, 'only_mine', false), sort = argEnum(a, 'sort_by', 'cpu', ['cpu', 'memory', 'pid']);
+                var limit = argInt(a, 'limit', 50, 1, 5000), withArgs = argBool(a, 'include_args', false);
+                var uid = parseInt(sh('/usr/bin/id -u'), 10);
+                var rows = sh('/bin/ps -axww -o pid=,ppid=,uid=,pcpu=,pmem=,rss=,etime=,stat=,comm=').split('\r').join('\n').split('\n');
+                var argMap = {};
+                if (withArgs) sh('/bin/ps -axww -o pid=,args=').split('\r').join('\n').split('\n').forEach(function (l) {
+                  var m = /^\s*([0-9]+)\s+(.*)$/.exec(l); if (m) argMap[m[1]] = m[2];
+                });
+                var out = [];
+                rows.forEach(function (l) {
+                  var m = /^\s*([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9]+)\s+(\S+)\s+(\S+)\s+(.*)$/.exec(l);
+                  if (!m) return;
+                  var exe = m[9], name = exe.split('/').pop();
+                  if (mine && parseInt(m[3], 10) !== uid) return;
+                  if (filt !== null && name.toLowerCase().indexOf(filt) < 0 && exe.toLowerCase().indexOf(filt) < 0) return;
+                  var p = { pid: +m[1], ppid: +m[2], uid: +m[3], cpu: +m[4], mem: +m[5], rss_kib: +m[6], elapsed: m[7], state: m[8], name: name, executable: exe };
+                  if (withArgs) p.args = argMap[m[1]] || null;
+                  out.push(p);
+                });
+                out.sort(function (x, y) { return sort === 'pid' ? x.pid - y.pid : sort === 'memory' ? y.rss_kib - x.rss_kib : y.cpu - x.cpu; });
+                return { total: out.length, processes: out.slice(0, limit) };
+              }
+
+      - name: process.signal
+        title: "Signal a process"
+        description: "Send TERM (default), INT, HUP, QUIT, KILL, STOP or CONT to a process you own. Refuses pid 1 and the processes that run this server and its client. Shows the user the process and signal and asks first."
+        annotations: { read_only: false, destructive: true, idempotent: false, open_world: false }
+        input_schema:
+          type: object
+          required: [pid]
+          properties:
+            pid: { type: integer, minimum: 2 }
+            signal: { type: string, enum: [TERM, INT, HUP, QUIT, KILL, STOP, CONT], default: TERM }
+          additionalProperties: false
+        governance: *local
+        backend:
+          kind: pipeline
+          pipeline_timeout_ms: 300000
+          steps:
+            - kind: elicitation
+              id: confirm
+              message: "An AI agent wants to send SIG${has(arguments.signal) ? arguments.signal : 'TERM'} to process ${arguments.pid}. Allow it?"
+              requested_schema: *allow_schema
+            - *confirm_gate
+            - <<: *osa
+              id: run
+              timeout_ms: 15000
+              max_output_bytes: 65536
+              args:
+                - -l
+                - JavaScript
+                - -e
+                - *prelude
+                - -e
+                - |
+                  function main(a) {
+                    onlyKeys(a, ['pid', 'signal']);
+                    var pid = argInt(a, 'pid', undefined, 2, 99999999);
+                    var sig = argEnum(a, 'signal', 'TERM', ['TERM', 'INT', 'HUP', 'QUIT', 'KILL', 'STOP', 'CONT']);
+                    var cur = $.NSProcessInfo.processInfo.processIdentifier;
+                    for (var i = 0; i < 64 && cur > 1; i++) {
+                      if (cur === pid) fail('refusing to signal pid ' + pid + ': it runs this MCP server or its client');
+                      cur = parseInt(sh('/bin/ps -o ppid= -p ' + cur), 10);
+                    }
+                    var name;
+                    try { name = sh('/bin/ps -o comm= -p ' + pid); } catch (e) { fail('no process with pid ' + pid); }
+                    sh('/bin/kill -s ' + sig + ' ' + pid);
+                    return { pid: pid, executable: name, signal: sig };
+                  }

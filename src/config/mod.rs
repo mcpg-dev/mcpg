@@ -185,6 +185,11 @@ fn env_key_root(key: &str) -> String {
 /// instead of silently parsing to defaults. The same strictness
 /// applies to every typed sub-config; this flag closes the gap at
 /// the root.
+///
+/// Two YAML conveniences are resolved before that check: merge keys
+/// (`<<: *anchor`) are applied, and a top-level key that starts with `x-`
+/// is set aside, so a file can keep shared anchors in an `x-` block (as in
+/// Compose files). Below the top level an `x-` key is an ordinary field name.
 // Eq is not derived: the sampling pipeline step carries an f64 temperature field.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema, Default)]
 #[serde(deny_unknown_fields)]
@@ -476,9 +481,19 @@ impl AppConfig {
                     if !path.exists() {
                         return Err(anyhow::anyhow!("config file not found: {}", path.display()));
                     }
-                    figment.merge(Yaml::file(path))
+                    let text = std::fs::read_to_string(path)
+                        .with_context(|| format!("failed to read {}", path.display()))?;
+                    match prepare_yaml_layer(&text)
+                        .with_context(|| format!("in {}", path.display()))?
+                    {
+                        Some(prepared) => figment.merge(Yaml::string(&prepared)),
+                        None => figment.merge(Yaml::file(path)),
+                    }
                 }
-                ConfigSource::Inline { yaml, .. } => figment.merge(Yaml::string(yaml)),
+                ConfigSource::Inline { yaml, .. } => match prepare_yaml_layer(yaml)? {
+                    Some(prepared) => figment.merge(Yaml::string(&prepared)),
+                    None => figment.merge(Yaml::string(yaml)),
+                },
             };
         }
         // The `MCPG_` env prefix is shared by the whole tool family — the CP
@@ -575,8 +590,9 @@ impl AppConfig {
 
     /// Parse and validate a YAML config string (for admin config:validate endpoint).
     pub fn load_from_yaml_str(yaml: &str) -> Result<Self> {
-        let config: AppConfig =
-            serde_yaml::from_str(yaml).context("failed to parse YAML config")?;
+        let prepared = prepare_yaml_layer(yaml)?;
+        let config: AppConfig = serde_yaml::from_str(prepared.as_deref().unwrap_or(yaml))
+            .context("failed to parse YAML config")?;
         config.validate()?;
         Ok(config)
     }
@@ -589,7 +605,10 @@ impl AppConfig {
     pub fn load_from_yaml_strs(yamls: &[&str]) -> Result<Self> {
         let mut figment = Figment::from(Serialized::defaults(AppConfig::default()));
         for yaml in yamls {
-            figment = figment.merge(Yaml::string(yaml));
+            figment = match prepare_yaml_layer(yaml)? {
+                Some(prepared) => figment.merge(Yaml::string(&prepared)),
+                None => figment.merge(Yaml::string(yaml)),
+            };
         }
         let config: AppConfig = figment.extract().context("failed to merge YAML configs")?;
         config.validate()?;
@@ -1392,6 +1411,37 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+/// Resolve the YAML conveniences a config layer may use before the strict
+/// schema sees it: merge keys (`<<: *anchor`) are applied, and top-level keys
+/// that start with `x-` (holders for shared anchors, as in Compose files) are
+/// dropped. Returns `None` when the layer uses neither, or does not parse (the
+/// loader then reports the syntax error itself), so it loads as written.
+fn prepare_yaml_layer(text: &str) -> Result<Option<String>> {
+    let Ok(mut doc) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+        return Ok(None);
+    };
+    let mut changed = false;
+    if let Some(top) = doc.as_mapping_mut() {
+        let before = top.len();
+        top.retain(|key, _| !key.as_str().is_some_and(|k| k.starts_with("x-")));
+        changed = top.len() != before;
+    }
+    let mut merged = doc.clone();
+    merged
+        .apply_merge()
+        .context("failed to apply YAML merge keys (<<)")?;
+    if merged != doc {
+        doc = merged;
+        changed = true;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    serde_yaml::to_string(&doc)
+        .map(Some)
+        .context("failed to re-serialise the YAML config")
 }
 
 /// Recursively rewrite a JSON value into canonical form: object keys

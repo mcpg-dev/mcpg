@@ -5856,6 +5856,217 @@ async fn pipeline_elicitation_upgrades_post_to_sse_on_suspension() {
     assert_eq!(final_result["id"], 99);
 }
 
+/// A post-dispatch gate that records each call it sees and stamps the result.
+struct ResultStampGate {
+    manifest: mcpg_plugin_protocol::PluginManifest,
+    seen: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
+}
+
+#[mcpg_plugin_protocol::async_trait]
+impl mcpg_plugin_protocol::ToolGatePlugin for ResultStampGate {
+    fn manifest(&self) -> &mcpg_plugin_protocol::PluginManifest {
+        &self.manifest
+    }
+
+    async fn evaluate_pre_dispatch(
+        &self,
+        _ctx: &mcpg_plugin_protocol::PluginContext,
+        _arguments: &Value,
+        _meta: Option<&Value>,
+        _config: &Value,
+    ) -> mcpg_plugin_protocol::GateDecision {
+        mcpg_plugin_protocol::GateDecision::allow()
+    }
+
+    async fn evaluate_post_dispatch(
+        &self,
+        ctx: &mcpg_plugin_protocol::PluginContext,
+        arguments: &Value,
+        result: &Value,
+        _execution_duration_ms: u64,
+        _config: &Value,
+    ) -> mcpg_plugin_protocol::GateDecision {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((ctx.tool_name.clone(), arguments.clone()));
+        let mut stamped = result.clone();
+        if let Some(content) = stamped["content"].as_array_mut() {
+            content.push(serde_json::json!({ "type": "text", "text": "stamped by the post gate" }));
+        }
+        mcpg_plugin_protocol::GateDecision::Allow {
+            modified_arguments: None,
+            modified_result: Some(stamped),
+            metadata: None,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resumed_pipeline_runs_the_post_dispatch_gates() {
+    use crate::config::{
+        MockBackendConfig, PipelineBackendConfig, PipelineElicitationStepConfig, PipelineStepConfig,
+    };
+
+    let mut binding = test_command_binding("pipeline.confirmed");
+    binding.backend = BackendImpl::from_typed(
+        "pipeline",
+        PipelineBackendConfig {
+            pipeline_timeout_ms: 30000,
+            steps: vec![
+                PipelineStepConfig::Elicitation(PipelineElicitationStepConfig {
+                    id: "confirm".to_owned(),
+                    message: "Send ${arguments.text}?".to_owned(),
+                    mode: Default::default(),
+                    requested_schema: None,
+                    url: None,
+                    elicitation_id: None,
+                    presentation_hint: None,
+                    meta: None,
+                    timeout_ms: 30000,
+                    correlation_token: None,
+                    skip_if_unsupported: false,
+                }),
+                PipelineStepConfig::backend_from_typed(
+                    "run".to_owned(),
+                    "mock",
+                    MockBackendConfig {
+                        response: serde_json::json!({ "sent": true }),
+                        delay_ms: 0,
+                        error: false,
+                        error_message: None,
+                        passthrough: false,
+                    },
+                    None,
+                ),
+            ],
+        },
+    );
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let gate_seen = seen.clone();
+    let state = build_test_state_with_all_runtime_controls_mut(
+        false,
+        RuntimeDebugConfig {
+            default_allow_private_backends: true,
+            ..RuntimeDebugConfig::default()
+        },
+        vec![binding],
+        ToolAccessPolicyConfig::default(),
+        move |runtime| {
+            let mut registry = mcpg_plugin_host::PluginRegistry::new();
+            registry
+                .register_tool_gate(
+                    Box::new(ResultStampGate {
+                        manifest: mcpg_plugin_protocol::PluginManifest {
+                            id: "test.gate.result-stamp".to_owned(),
+                            version: "0.1.0".to_owned(),
+                            name: "Result stamp gate".to_owned(),
+                            plugin_class: mcpg_plugin_protocol::PluginClass::ToolGate,
+                            protocol_version: mcpg_plugin_protocol::PROTOCOL_VERSION.to_owned(),
+                            license: None,
+                            required_capabilities: Vec::new(),
+                            tags: Vec::new(),
+                            provides: Vec::new(),
+                            provides_schemes: Vec::new(),
+                            module_path_prefix: module_path!()
+                                .split("::")
+                                .next()
+                                .unwrap_or("")
+                                .to_owned(),
+                            backend_profile: None,
+                        },
+                        seen: gate_seen,
+                    }),
+                    mcpg_plugin_protocol::PluginTier::Native,
+                    serde_json::json!({}),
+                )
+                .expect("register the gate");
+            runtime.replace_gate_registry_for_test(Arc::new(registry));
+        },
+    );
+    let runtime = state.runtime.load_full();
+    let (app, session_id) = initialize_session(router(state, "/health", "/mcp")).await;
+
+    let (app, response) = mcp_request(
+        app,
+        &session_id,
+        7,
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "pipeline.confirmed",
+            "arguments": { "text": "ls -la" }
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let server_request = sse_response_text(response)
+        .await
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .find(|value| value["method"] == "elicitation/create")
+        .expect("the pipeline asks the client");
+    assert_eq!(server_request["params"]["message"], "Send ls -la?");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "no post gate runs while the pipeline waits"
+    );
+
+    let answer = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": server_request["id"],
+        "result": { "action": "accept", "content": {} }
+    });
+    let resumed = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+                .header(
+                    PROTOCOL_VERSION_HEADER,
+                    crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                )
+                .header(SESSION_ID_HEADER, &session_id)
+                .header(
+                    header::HeaderName::from_static(SUBJECT_ID_HEADER),
+                    "conformance-user",
+                )
+                .body(Body::from(answer.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("resume response");
+    assert_eq!(resumed.status(), StatusCode::ACCEPTED);
+
+    let deliveries = runtime.take_pending_deliveries(&session_id);
+    let result = &deliveries
+        .iter()
+        .find(|d| d.kind == crate::runtime::pipeline_store::DeliveryKind::DeferredToolResult)
+        .expect("a deferred tool result")
+        .jsonrpc_message["result"];
+    let texts: Vec<&str> = result["content"]
+        .as_array()
+        .expect("content")
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    assert!(
+        texts.contains(&"stamped by the post gate"),
+        "the post gate's result reaches the client: {result}"
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(
+            "pipeline.confirmed".to_owned(),
+            serde_json::json!({ "text": "ls -la" })
+        )],
+        "the post gate ran once, with the original call's tool and arguments"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipeline_resume_by_foreign_principal_is_rejected() {
     use crate::config::{

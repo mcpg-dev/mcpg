@@ -10,6 +10,8 @@ Top-level gateway configuration. Loaded from YAML file and/or `MCPG_` environmen
 
 `deny_unknown_fields` is set so a typo at the root (or a stale renamed block left in an operator's YAML) fails parsing instead of silently parsing to defaults. The same strictness applies to every typed sub-config; this flag closes the gap at the root.
 
+Two YAML conveniences are resolved before that check: merge keys (`<<: *anchor`) are applied, and a top-level key that starts with `x-` is set aside, so a file can keep shared anchors in an `x-` block (as in Compose files). Below the top level an `x-` key is an ordinary field name.
+
 ## Operator workflow
 
 The four config-tooling binaries cover the operator's full loop — pick a starting point, drill into a field, validate, boot:

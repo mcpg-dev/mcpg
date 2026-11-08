@@ -82,6 +82,53 @@ fn load_sources_merges_a_file_then_an_inline_overlay() {
     assert_eq!(cfg.gateway.server.request_timeout_ms, 1000);
 }
 
+const ANCHORED_LAYER: &str = "\
+x-shared:
+  server: &server
+    bind_address: \"127.0.0.1:18811\"
+    request_timeout_ms: 1234
+    mcp_path: /mcp
+gateway:
+  server:
+    <<: *server
+    mcp_path: /desktop
+";
+
+#[test]
+fn a_layer_may_hold_anchors_under_x_keys_and_use_merge_keys() {
+    let _env = env_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("anchored.yaml");
+    fs::write(&path, ANCHORED_LAYER).unwrap();
+    let from_file = AppConfig::load_sources(&[ConfigSource::File(path)]).expect("file layer");
+    let from_str = AppConfig::load_from_yaml_strs(&[ANCHORED_LAYER]).expect("string layer");
+    let validated = AppConfig::load_from_yaml_str(ANCHORED_LAYER).expect("single string");
+    for cfg in [&from_file, &from_str, &validated] {
+        assert_eq!(cfg.gateway.server.bind_address, "127.0.0.1:18811");
+        assert_eq!(cfg.gateway.server.request_timeout_ms, 1234);
+        // A key the mapping sets itself wins over the merged one.
+        assert_eq!(cfg.gateway.server.mcp_path, "/desktop");
+    }
+}
+
+#[test]
+fn only_x_prefixed_top_level_keys_are_set_aside() {
+    let _env = env_guard();
+    let err = AppConfig::load_from_yaml_strs(&["shared:\n  a: 1\n"]).expect_err("unknown key");
+    assert!(format!("{err:#}").contains("shared"), "{err:#}");
+    let err = AppConfig::load_from_yaml_strs(&["gateway:\n  x-note: 1\n"])
+        .expect_err("x- below the top level is still a field");
+    assert!(format!("{err:#}").contains("x-note"), "{err:#}");
+}
+
+#[test]
+fn a_scalar_merge_value_is_an_error() {
+    let _env = env_guard();
+    let err = AppConfig::load_from_yaml_strs(&["gateway:\n  server:\n    <<: 3\n"])
+        .expect_err("scalar merge");
+    assert!(format!("{err:#}").contains("merge"), "{err:#}");
+}
+
 #[test]
 fn load_sources_reports_a_missing_file_layer() {
     let _env = env_guard();

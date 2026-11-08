@@ -167,9 +167,29 @@ impl ExecutionDispatcher {
                 });
             }
 
+            // Update expression context with current step results
+            pipeline_expr_ctx.steps = Some(completed_steps_to_value(&state.completed_steps));
+            pipeline_expr_ctx.arguments = args.clone();
+
             // Handle elicitation/sampling steps → suspend
             match &step {
                 crate::config::PipelineStepConfig::Elicitation(elicitation) => {
+                    let message = match render_elicitation_message(
+                        &elicitation.message,
+                        &pipeline_expr_ctx,
+                    ) {
+                        Ok(message) => message,
+                        Err(e) => {
+                            return PipelineOutcome::Complete(ToolCallResult {
+                                content: vec![ToolContent::text(format!(
+                                    "elicitation step '{step_id}' message could not be rendered: {e}"
+                                ))],
+                                structured_content: None,
+                                is_error: true,
+                                meta: None,
+                            });
+                        }
+                    };
                     let server_request_id = elicitation
                         .correlation_token
                         .clone()
@@ -226,7 +246,7 @@ impl ExecutionDispatcher {
                         method: "elicitation/create".to_owned(),
                         params: serde_json::to_value(ElicitationCreateParams {
                             mode: mode_string.clone(),
-                            message: elicitation.message.clone(),
+                            message,
                             requested_schema: elicitation.requested_schema.clone(),
                             elicitation_id,
                             url,
@@ -729,10 +749,6 @@ impl ExecutionDispatcher {
                 }
                 _ => {}
             }
-
-            // Update expression context with current step results
-            pipeline_expr_ctx.steps = Some(completed_steps_to_value(&state.completed_steps));
-            pipeline_expr_ctx.arguments = args.clone();
 
             // Non-suspending steps: execute synchronously
             let step_start = std::time::Instant::now();
@@ -1445,6 +1461,22 @@ pub(super) fn execute_pipeline_mock_step(
     }
 }
 
+/// An elicitation `message` is a template: each `${…}` resolves against the
+/// pipeline context (`arguments`, `steps`, `context`, `tool_name`) when the
+/// step runs, so the user sees what they are asked to approve. Text with no
+/// placeholder is sent as written.
+pub(super) fn render_elicitation_message(
+    template: &str,
+    expr_ctx: &super::expr::ExprContext,
+) -> Result<String, String> {
+    if !template.contains("${") {
+        return Ok(template.to_owned());
+    }
+    super::expr::DynamicValue::<String>::parse(template)
+        .and_then(|value| value.resolve(expr_ctx))
+        .map_err(|e| e.to_string())
+}
+
 pub(super) fn execute_transform_step(
     expression: &str,
     expr_ctx: &super::expr::ExprContext,
@@ -1924,4 +1956,48 @@ pub(super) fn early_cancel_check(
 
 pub(super) fn token_cancelled(token: Option<&tokio_util::sync::CancellationToken>) -> bool {
     token.map(|t| t.is_cancelled()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod elicitation_message_tests {
+    use super::*;
+
+    fn ctx() -> super::super::expr::ExprContext {
+        super::super::expr::ExprContext {
+            arguments: serde_json::json!({ "tty": "/dev/ttys003", "text": "rm -rf build" }),
+            tool_name: "terminal.send".to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn text_without_a_placeholder_is_sent_as_written() {
+        assert_eq!(
+            render_elicitation_message("Allow it?", &ctx()).unwrap(),
+            "Allow it?"
+        );
+    }
+
+    #[test]
+    fn placeholders_show_the_call_arguments() {
+        let rendered = render_elicitation_message(
+            "Send ${arguments.text} to ${arguments.tty} (${tool_name})?",
+            &ctx(),
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            "Send rm -rf build to /dev/ttys003 (terminal.send)?"
+        );
+    }
+
+    #[test]
+    fn a_credential_reference_is_refused() {
+        assert!(render_elicitation_message("token ${cred://vault/x}", &ctx()).is_err());
+    }
+
+    #[test]
+    fn a_malformed_placeholder_is_an_error() {
+        assert!(render_elicitation_message("Send ${arguments.}?", &ctx()).is_err());
+    }
 }

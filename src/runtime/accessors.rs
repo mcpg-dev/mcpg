@@ -265,6 +265,16 @@ impl GatewayRuntime {
         &self.plugin_registry
     }
 
+    /// Replace the registry the gate and transform chains read. Backends
+    /// keep dispatching through the execution dispatcher's own handle.
+    #[cfg(test)]
+    pub(crate) fn replace_gate_registry_for_test(
+        &mut self,
+        registry: Arc<mcpg_plugin_host::PluginRegistry>,
+    ) {
+        self.plugin_registry = registry;
+    }
+
     /// Shared handle to the credential cache. Held here so the
     /// (deferred) credential-resolver call site at request
     /// dispatch time can reach it via `&self`. Today exercised

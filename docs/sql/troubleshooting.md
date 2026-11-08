@@ -372,6 +372,32 @@ configure `wal_autocheckpoint` to a smaller page count.
 
 ---
 
+## SQLite extension refused
+
+**Symptom:** a binding with `sqlite.extensions` fails to register
+with `invalid binding spec: sqlite extension '<path>': …`, or it
+registered but its calls end in a pool timeout.
+
+**At registration** the error names the check that failed:
+
+| Message contains | Fix |
+|---|---|
+| `loading SQLite extensions is off` | Set `MCPG_SQLITE_EXTENSION_DIRS` in the gateway's environment (not in its config). |
+| `is not an absolute path` | Every `MCPG_SQLITE_EXTENSION_DIRS` entry must be absolute. |
+| `is not inside a directory that MCPG_SQLITE_EXTENSION_DIRS approves` | Move the file into an approved directory. A symbolic link counts as its target. |
+| `is owned by uid …` / `writable by group or others` | Give the file and every directory above it to root (or the gateway's user), without group or other write. |
+| `sha256 is …, but the binding pins …` | Pin the file's real `sha256sum`, or deploy the file you meant to pin. |
+| `loading '<path>': …` | SQLite's own reason: the entry point is missing, or the file is for another OS, CPU or C library. |
+
+**After registration** a changed file makes every new connection
+fail its check; callers see only the pool timeout. The reason is
+in the gateway log at `warn` level, target `mcpg::sql::sqlite_ext`
+(`refused a new SQLite connection`). Replace extensions as
+[the plugin README](https://github.com/mcpg-dev/mcpg-plugin-backend-sql#replace-an-extension)
+describes: a new file, a new pin, a restart.
+
+---
+
 ## Stream cursor verification fails
 
 **Symptom:** clients calling a `row_mode: stream` tool get
