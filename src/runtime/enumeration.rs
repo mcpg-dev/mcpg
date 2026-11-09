@@ -109,6 +109,9 @@ impl GatewayRuntime {
     /// Per-caller visibility for a listed resource: gated under the route a
     /// `resources/read` of that exact URI takes.
     fn resource_is_visible(&self, request_context: &RequestContext, uri: &str) -> bool {
+        if self.serves_skill_file(uri) {
+            return self.skill_resource_is_visible(request_context, uri);
+        }
         let route = self.resolve_resource_route(uri);
         let route = route
             .as_ref()
@@ -144,6 +147,13 @@ impl GatewayRuntime {
         // read via resolve_resource_route) so the list never double-lists.
         for app in self.gateway_apps.values() {
             let descriptor = app.to_descriptor();
+            if !all_resources.iter().any(|r| r.uri == descriptor.uri) {
+                all_resources.push(descriptor);
+            }
+        }
+        // Each skill's `SKILL.md`, for clients that do not speak the
+        // Skills extension.
+        for descriptor in self.skill_resource_descriptors() {
             if !all_resources.iter().any(|r| r.uri == descriptor.uri) {
                 all_resources.push(descriptor);
             }

@@ -402,6 +402,10 @@ pub(crate) async fn reload_with_config(
         new_apps_policy,
         &new_apps_cfg.registry,
     );
+    new_runtime.set_skills(crate::runtime::skills::SkillCatalog::load(
+        &new_config.mcp.skills,
+        config_dir.as_deref(),
+    )?);
     new_runtime.set_tunnel_federation(new_config.gateway.server.tunnel_federation.as_ref());
     new_runtime.set_list_page_size(new_config.mcp.list_page_size());
     new_runtime.set_license_state((&license).into());

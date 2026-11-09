@@ -5902,6 +5902,110 @@ impl mcpg_plugin_protocol::ToolGatePlugin for ResultStampGate {
     }
 }
 
+type SeenPostCalls = Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+/// A test state whose only tool gate is a [`ResultStampGate`], and the
+/// list of post-dispatch calls that gate sees.
+fn build_state_with_result_stamp_gate(bindings: Vec<BackendConfig>) -> (AppState, SeenPostCalls) {
+    let seen: SeenPostCalls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let gate_seen = seen.clone();
+    let state = build_test_state_with_all_runtime_controls_mut(
+        false,
+        RuntimeDebugConfig {
+            default_allow_private_backends: true,
+            ..RuntimeDebugConfig::default()
+        },
+        bindings,
+        ToolAccessPolicyConfig::default(),
+        move |runtime| {
+            let mut registry = mcpg_plugin_host::PluginRegistry::new();
+            registry
+                .register_tool_gate(
+                    Box::new(ResultStampGate {
+                        manifest: mcpg_plugin_protocol::PluginManifest {
+                            id: "test.gate.result-stamp".to_owned(),
+                            version: "0.1.0".to_owned(),
+                            name: "Result stamp gate".to_owned(),
+                            plugin_class: mcpg_plugin_protocol::PluginClass::ToolGate,
+                            protocol_version: mcpg_plugin_protocol::PROTOCOL_VERSION.to_owned(),
+                            license: None,
+                            required_capabilities: Vec::new(),
+                            tags: Vec::new(),
+                            provides: Vec::new(),
+                            provides_schemes: Vec::new(),
+                            module_path_prefix: module_path!()
+                                .split("::")
+                                .next()
+                                .unwrap_or("")
+                                .to_owned(),
+                            backend_profile: None,
+                        },
+                        seen: gate_seen,
+                    }),
+                    mcpg_plugin_protocol::PluginTier::Native,
+                    serde_json::json!({}),
+                )
+                .expect("register the gate");
+            runtime.replace_gate_registry_for_test(Arc::new(registry));
+        },
+    );
+    (state, seen)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_refused_by_the_input_schema_runs_the_post_dispatch_gates() {
+    let mut binding = test_command_binding("schema.checked");
+    binding.input_schema = Some(serde_json::json!({
+        "type": "object",
+        "properties": { "count": { "type": "integer" } },
+        "required": ["count"]
+    }));
+    let (state, seen) = build_state_with_result_stamp_gate(vec![binding]);
+    let (app, session_id) = initialize_session(router(state, "/health", "/mcp")).await;
+
+    let (_, response) = mcp_request(
+        app,
+        &session_id,
+        8,
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "schema.checked",
+            "arguments": { "count": "three" }
+        })),
+    )
+    .await;
+    let jsonrpc = extract_jsonrpc_response(response, 8).await;
+    let result = &jsonrpc["result"];
+    assert_eq!(
+        result["isError"], true,
+        "the refusal is a tool error: {jsonrpc}"
+    );
+    let texts: Vec<&str> = result["content"]
+        .as_array()
+        .expect("content")
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.starts_with("Input validation failed for tool 'schema.checked'")),
+        "the refusal reason reaches the client: {result}"
+    );
+    assert!(
+        texts.contains(&"stamped by the post gate"),
+        "the post gate's result reaches the client: {result}"
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(
+            "schema.checked".to_owned(),
+            serde_json::json!({ "count": "three" })
+        )],
+        "the post gate ran once, with the refused call's tool and arguments"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resumed_pipeline_runs_the_post_dispatch_gates() {
     use crate::config::{
@@ -5943,48 +6047,7 @@ async fn a_resumed_pipeline_runs_the_post_dispatch_gates() {
         },
     );
 
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let gate_seen = seen.clone();
-    let state = build_test_state_with_all_runtime_controls_mut(
-        false,
-        RuntimeDebugConfig {
-            default_allow_private_backends: true,
-            ..RuntimeDebugConfig::default()
-        },
-        vec![binding],
-        ToolAccessPolicyConfig::default(),
-        move |runtime| {
-            let mut registry = mcpg_plugin_host::PluginRegistry::new();
-            registry
-                .register_tool_gate(
-                    Box::new(ResultStampGate {
-                        manifest: mcpg_plugin_protocol::PluginManifest {
-                            id: "test.gate.result-stamp".to_owned(),
-                            version: "0.1.0".to_owned(),
-                            name: "Result stamp gate".to_owned(),
-                            plugin_class: mcpg_plugin_protocol::PluginClass::ToolGate,
-                            protocol_version: mcpg_plugin_protocol::PROTOCOL_VERSION.to_owned(),
-                            license: None,
-                            required_capabilities: Vec::new(),
-                            tags: Vec::new(),
-                            provides: Vec::new(),
-                            provides_schemes: Vec::new(),
-                            module_path_prefix: module_path!()
-                                .split("::")
-                                .next()
-                                .unwrap_or("")
-                                .to_owned(),
-                            backend_profile: None,
-                        },
-                        seen: gate_seen,
-                    }),
-                    mcpg_plugin_protocol::PluginTier::Native,
-                    serde_json::json!({}),
-                )
-                .expect("register the gate");
-            runtime.replace_gate_registry_for_test(Arc::new(registry));
-        },
-    );
+    let (state, seen) = build_state_with_result_stamp_gate(vec![binding]);
     let runtime = state.runtime.load_full();
     let (app, session_id) = initialize_session(router(state, "/health", "/mcp")).await;
 
@@ -14449,3 +14512,6 @@ async fn modern_discover_advertises_idempotency_like_initialize() {
 
 #[path = "http/personal_agent_operations_tests.rs"]
 mod personal_agent_operations;
+
+#[path = "http/skills_tests.rs"]
+mod skills;

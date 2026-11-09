@@ -1204,27 +1204,31 @@ impl GatewayRuntime {
                             validation_stage = "pre_dispatch",
                             "tool input validation returned as tool execution error"
                         );
-                        let tool_result = serde_json::json!({
-                            "content": [{
-                                "type": "text",
-                                "text": format!(
-                                    "Input validation failed for tool '{}': {}. Inspect the tool's inputSchema via tools/list and retry.",
-                                    params.name, validation_error,
-                                ),
-                            }],
-                            "isError": true,
-                        });
-                        return ProtocolHttpResponse {
-                            http_status: 200,
-                            session_id_header: None,
-                            response: ProtocolResponse::JsonRpcSuccess(
-                                crate::protocol::JsonRpcSuccess {
-                                    jsonrpc: "2.0",
-                                    id: request_id,
-                                    result: tool_result,
-                                },
-                            ),
+                        // The pre-dispatch gates already ran, so the result
+                        // goes through the post-dispatch chain too: an audit
+                        // trail that holds a pre record also gets its post record.
+                        let refused = crate::protocol::ToolCallResult {
+                            content: vec![crate::protocol::ToolContent::text(format!(
+                                "Input validation failed for tool '{}': {}. Inspect the tool's inputSchema via tools/list and retry.",
+                                params.name, validation_error,
+                            ))],
+                            structured_content: None,
+                            is_error: true,
+                            meta: None,
                         };
+                        let refused_args =
+                            params.arguments.clone().unwrap_or(serde_json::json!({}));
+                        return self
+                            .finalize_tool_result(
+                                request_context,
+                                request_id,
+                                &params.name,
+                                &refused_args,
+                                refused,
+                                0,
+                                &plugin_gate_meta,
+                            )
+                            .await;
                     }
                     let backend = binding_type_label(&route);
 
@@ -1288,27 +1292,30 @@ impl GatewayRuntime {
                             validation_stage = "post_mutation",
                             "rewritten tool arguments failed inputSchema validation"
                         );
-                        let tool_result = serde_json::json!({
-                            "content": [{
-                                "type": "text",
-                                "text": format!(
-                                    "Input validation failed for tool '{}' after a gate/transform plugin rewrote its arguments: {}.",
-                                    params.name, validation_error,
-                                ),
-                            }],
-                            "isError": true,
-                        });
-                        return ProtocolHttpResponse {
-                            http_status: 200,
-                            session_id_header: None,
-                            response: ProtocolResponse::JsonRpcSuccess(
-                                crate::protocol::JsonRpcSuccess {
-                                    jsonrpc: "2.0",
-                                    id: request_id,
-                                    result: tool_result,
-                                },
-                            ),
+                        let refused = crate::protocol::ToolCallResult {
+                            content: vec![crate::protocol::ToolContent::text(format!(
+                                "Input validation failed for tool '{}' after a gate/transform plugin rewrote its arguments: {}.",
+                                params.name, validation_error,
+                            ))],
+                            structured_content: None,
+                            is_error: true,
+                            meta: None,
                         };
+                        let refused_args = execution_request
+                            .arguments
+                            .clone()
+                            .unwrap_or(serde_json::json!({}));
+                        return self
+                            .finalize_tool_result(
+                                request_context,
+                                request_id,
+                                &params.name,
+                                &refused_args,
+                                refused,
+                                0,
+                                &plugin_gate_meta,
+                            )
+                            .await;
                     }
 
                     let binding_start = std::time::Instant::now();

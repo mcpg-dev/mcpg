@@ -38,6 +38,7 @@ pub mod safe_dns;
 mod seen_request_ids;
 pub(crate) mod session_fleet;
 pub mod shared_services;
+pub mod skills;
 pub mod stores;
 pub use stores::{
     content_store_registry, pipeline_store, request_state_store, session_store, subscription_store,
@@ -726,6 +727,7 @@ impl GatewayOperation {
             GatewayOperation::Protocol(ProtocolOperation::Logging(
                 LoggingOperation::SetLevel { .. },
             )) => "protocol.logging.set_level",
+            GatewayOperation::Protocol(ProtocolOperation::Skills(_)) => "protocol.skills",
             GatewayOperation::Protocol(ProtocolOperation::ServerRequestResponse { .. }) => {
                 "protocol.server_request_response"
             }
@@ -855,6 +857,10 @@ pub struct GatewayRuntime {
     /// UI-enabled tools. Mirrors
     /// `apps.federate_upstream` (inherits `enabled`).
     apps_federate_upstream: bool,
+    /// The skills `mcp.skills` serves over the Skills extension. `None`
+    /// when no source is configured: the extension is then not declared
+    /// and its methods are unknown.
+    skills: Option<Arc<skills::SkillCatalog>>,
     /// `mcp.configurations.events` of the config this runtime was built
     /// from. Read per request by `server/discover` and the `events/*`
     /// arms, so a reload that turns events on or off takes effect at
@@ -1333,6 +1339,10 @@ impl GatewayRuntime {
             }
             ProtocolOperation::Tasks(operation) => {
                 self.handle_tasks_operation(operation, request_context)
+                    .await
+            }
+            ProtocolOperation::Skills(operation) => {
+                self.handle_skills_operation(operation, request_context, skills::SkillsWire::Legacy)
                     .await
             }
             ProtocolOperation::Logging(LoggingOperation::SetLevel { request_id, params }) => {

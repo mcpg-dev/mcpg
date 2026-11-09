@@ -144,9 +144,11 @@ impl GatewayRuntime {
     /// backend result takes — outputSchema enforcement, the post-dispatch
     /// tool_gate chain (DLP/redaction/masking), the post transform chain,
     /// and the pre-chain metadata merge — then build the 200 response.
-    /// Used by the pre-dispatch cache short-circuit so a plugin-supplied
+    /// Used for results that never reach a backend: a plugin-supplied
     /// cached result is constrained exactly like genuine backend output
-    /// (cached values are untrusted within the gateway trust boundary).
+    /// (cached values are untrusted within the gateway trust boundary),
+    /// and an inputSchema refusal gets the post records its pre records
+    /// promised.
     pub(crate) async fn finalize_tool_result(
         &self,
         request_context: &RequestContext,

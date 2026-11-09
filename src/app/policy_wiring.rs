@@ -299,6 +299,24 @@ pub(crate) fn build_tool_access_policy_config(config: &AppConfig) -> ToolAccessP
         }
     }
 
+    // Every skill file and folder is checked under one key, so the floor of
+    // `mcp.skills.governance` replaces the default floor for all of them.
+    let skills = &config.mcp.skills;
+    if skills.is_enabled() {
+        rules.push(ToolTrustRule {
+            tool_name: crate::runtime::policy::SKILLS_POLICY_KEY.to_owned(),
+            minimum_trust: map_trust_level(
+                skills
+                    .governance
+                    .minimum_trust
+                    .unwrap_or(config.governance.policy.tool_access.default_minimum_trust),
+            ),
+            cel_allow_if: skills.governance.allow_if.clone(),
+            required_scopes: skills.governance.required_scopes.clone(),
+            surface: Some(PolicySurface::Resource),
+        });
+    }
+
     ToolAccessPolicyConfig {
         default_minimum_trust: map_trust_level(
             config.governance.policy.tool_access.default_minimum_trust,

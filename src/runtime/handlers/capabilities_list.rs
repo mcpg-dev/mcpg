@@ -342,6 +342,12 @@ impl GatewayRuntime {
                                 )
                                 .await;
                         }
+                        if let Some(response) = self
+                            .read_skill_file(&params.uri, &request_id, request_context)
+                            .await
+                        {
+                            return response;
+                        }
                         match self.resolve_resource_route(&params.uri) {
                             Some(route) => {
                                 // surface-aware gate for resources/read.

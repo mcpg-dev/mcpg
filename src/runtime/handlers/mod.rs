@@ -3,6 +3,7 @@ mod completion;
 mod connect_link;
 mod lifecycle;
 mod pap_operations;
+mod skills;
 mod tasks;
 mod tools_call;
 

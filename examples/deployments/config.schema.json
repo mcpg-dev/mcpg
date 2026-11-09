@@ -5854,6 +5854,14 @@
           ],
           "default": {},
           "description": "How the server presents itself to clients: `serverInfo` in `server/discover` and in the `initialize` result. Every field is optional; an unset field keeps MCPG's own value. `version` is always the gateway's."
+        },
+        "skills": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/SkillsConfig"
+            }
+          ],
+          "description": "Agent Skills served over the MCP Skills extension (`io.modelcontextprotocol/skills`): folders with a `SKILL.md`, listed with `skills/list` and read with `resources/read`. Unset serves none."
         }
       },
       "type": "object"
@@ -8762,6 +8770,60 @@
           "type": "string"
         }
       ]
+    },
+    "SkillSourceConfig": {
+      "additionalProperties": false,
+      "description": "One folder of skills under `mcp.skills.sources`.",
+      "properties": {
+        "path": {
+          "description": "The folder. A relative path resolves against the folder of the last config file, or the working directory when the config came from no file. Files and folders whose names start with `.` are not served. Symbolic links are followed (a Kubernetes ConfigMap mount is made of them); a broken link or a link loop is refused.",
+          "type": "string"
+        },
+        "prefix": {
+          "description": "A path the skills of this source are served under, such as `acme/billing`: its folder `refunds/` is then `skill://acme/billing/refunds/SKILL.md`. Segments are separated by `/` and use letters, digits, `-`, `.`, `_` and `~`. Unset serves the skills at the root of the `skill://` namespace.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "SkillsConfig": {
+      "additionalProperties": false,
+      "description": "`mcp.skills:` — Agent Skills the gateway serves to clients over the MCP Skills extension (`io.modelcontextprotocol/skills`).\n\nA skill is a folder with a `SKILL.md` at its root, whose YAML frontmatter holds at least `name` (equal to the folder's name) and `description`. Each folder of a source that holds a `SKILL.md` is one skill, served as `skill://<prefix>/<folder path>/SKILL.md` together with every other file of that folder. Clients find the skills with `skills/list` and `skills/get`, read each file with `resources/read`, and list a folder with `resources/directory/read`.\n\nThe files are read once, when the gateway starts or reloads its config, and served from memory, so each file's digest always matches its bytes. Reads go through the same access rules as any other resource.",
+      "properties": {
+        "directory_read": {
+          "default": true,
+          "description": "Serve `resources/directory/read` and declare `directoryRead: true`. Default `true`.",
+          "type": "boolean"
+        },
+        "governance": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/BackendGovernanceConfig"
+            }
+          ],
+          "description": "Who may list and read the skills: the same block a binding takes. Applies to every skill file and folder, beside any `governance.policy.tool_access` rule filed under its URI. Unset `minimum_trust` takes `default_minimum_trust`."
+        },
+        "list_as_resources": {
+          "default": true,
+          "description": "Also list each skill's `SKILL.md` in `resources/list`, for clients that do not speak the extension. Default `true`.",
+          "type": "boolean"
+        },
+        "sources": {
+          "default": [],
+          "description": "The folders skills are served from. Empty (the default) serves no skills and does not declare the extension.",
+          "items": {
+            "$ref": "#/definitions/SkillSourceConfig"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     },
     "StateKeyConfig": {
       "additionalProperties": false,

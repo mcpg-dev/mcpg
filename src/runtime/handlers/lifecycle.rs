@@ -117,6 +117,14 @@ impl GatewayRuntime {
                             apps.clone(),
                         );
                     }
+                    // SEP-2640 Skills — declared while `mcp.skills` serves
+                    // any source.
+                    if let Some(skills) = self.skills_capability() {
+                        map.insert(
+                            crate::protocol::shared::skills::EXTENSION_ID.to_owned(),
+                            skills,
+                        );
+                    }
                     // Enterprise-Managed Authorization is an HTTP-transport
                     // auth flow; stdio carries no bearer.
                     if self.ema_authorization_server.is_some()

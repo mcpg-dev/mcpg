@@ -27,6 +27,11 @@
 #     anything the user can, so keep the MCP client's own per-call approval on.
 #   * Every call is written to an audit file and rate limited.
 #
+# Skills
+#   ./skills holds six Agent Skills that teach an agent to use these tools
+#   (start with computer-use). The gateway serves them over the MCP Skills
+#   extension; see mcp.skills below.
+#
 # Coordinates
 #   All input tools work in macOS global points (origin = top-left of the main
 #   display, y grows down). screen.screenshot returns scale, origin_x and
@@ -402,6 +407,12 @@ mcp:
   instructions: |
     You control the user's real Mac. Work in a loop: observe, act, observe again.
 
+    This server also serves skills (step-by-step guides) for these tools. Before
+    your first desktop action, read skill://macos/computer-use/SKILL.md; it says
+    which of the others to read: skill://macos/screen-coordinates/SKILL.md,
+    skill://macos/ui-automation/SKILL.md, skill://macos/terminal-sessions/SKILL.md,
+    skill://macos/browser-tasks/SKILL.md and skill://macos/macos-permissions/SKILL.md.
+
     Observe: desktop.status once, then screen.screenshot. Prefer ui.find / ui.tree
     (the accessibility tree) to locate buttons and fields; it is exact and cheaper
     than guessing from pixels. Use ui.action (AXPress) or ui.set_value on an element
@@ -420,6 +431,18 @@ mcp:
     process.signal, terminal.send and browser.eval ask the user to confirm.
     Never type passwords or secrets unless the user typed them to you for that
     purpose. Stop and ask when a dialog asks for credentials or payment.
+
+  # Agent Skills over the MCP Skills extension (io.modelcontextprotocol/skills):
+  # each folder of ./skills with a SKILL.md is served as
+  # skill://macos/<folder>/SKILL.md with its other files, through skills/list,
+  # skills/get, resources/read and resources/directory/read. The files are read
+  # at start and on reload, and served from memory.
+  skills:
+    sources:
+      - path: skills
+        prefix: macos
+    # The stdio caller is anonymous, as for every tool here.
+    governance: *local
 
   capabilities:
     tools:

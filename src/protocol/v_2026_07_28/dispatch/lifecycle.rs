@@ -106,6 +106,15 @@ pub(crate) fn build_discover_result(
         );
     }
 
+    // SEP-2640 Skills, from the live runtime: a reload that adds or drops
+    // every source changes it.
+    if let Some(skills) = live.and_then(|rt| rt.skills_capability()) {
+        extensions.insert(
+            crate::protocol::shared::skills::EXTENSION_ID.to_owned(),
+            skills,
+        );
+    }
+
     // `dev.mcpg/idempotency`, advertised exactly as legacy `initialize`
     // advertises it: only while the operator enabled the extension.
     if let Some(idempotency) = live.and_then(|rt| rt.idempotency_capability()) {

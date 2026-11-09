@@ -394,6 +394,8 @@ impl GatewayRuntime {
     pub fn has_live_resources(&self) -> bool {
         !self.capability_registry.resources().is_empty()
             || !self.capability_registry.resource_templates().is_empty()
+            // A server declaring the Skills extension declares `resources`.
+            || self.skills.is_some()
     }
 
     pub fn has_live_completions(&self) -> bool {

@@ -504,6 +504,16 @@ async fn build_with(
         apps_policy,
         &apps_cfg.registry,
     );
+    // SEP-2640 Skills: relative sources resolve against the last config
+    // file's folder, as `schemas[].file` does.
+    let skills_dir = config_sources.iter().rev().find_map(|s| match s {
+        crate::config::ConfigSource::File(p) => p.parent(),
+        crate::config::ConfigSource::Inline { .. } => None,
+    });
+    runtime.set_skills(crate::runtime::skills::SkillCatalog::load(
+        &config.mcp.skills,
+        skills_dir,
+    )?);
     runtime.set_tunnel_federation(config.gateway.server.tunnel_federation.as_ref());
     runtime.set_list_page_size(config.mcp.list_page_size());
     runtime.set_license_state((&license).into());

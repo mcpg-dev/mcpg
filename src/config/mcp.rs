@@ -105,6 +105,16 @@ pub struct McpConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 1_000))]
     pub list_page_size: Option<usize>,
+
+    /// Agent Skills served over the MCP Skills extension
+    /// (`io.modelcontextprotocol/skills`): folders with a `SKILL.md`,
+    /// listed with `skills/list` and read with `resources/read`. Unset
+    /// serves none.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::config::skills::SkillsConfig::is_default"
+    )]
+    pub skills: crate::config::skills::SkillsConfig,
 }
 
 /// Longest `mcp.instructions` the gateway accepts, in bytes.
@@ -207,6 +217,7 @@ impl McpConfig {
         self.validate_federations()?;
         self.validate_registries()?;
         self.validate_identity()?;
+        self.skills.validate()?;
         if let Some(size) = self.list_page_size
             && !(1..=MAX_LIST_PAGE_SIZE).contains(&size)
         {

@@ -1937,6 +1937,7 @@ Two children that mirror MCP's own vocabulary: - `capabilities:` — what the se
 | `registries` | array&lt;[`McpRegistryConfig`](#mcpregistryconfig)&gt; | `[]` | MCP registries whose listed servers MCPG auto-federates: a background syncer crawls each registry's `/v0.1` API and materializes one federation per usable server, kept in sync as the registry changes. Default empty. |
 | `registry` | [`ServedRegistryConfig`](#servedregistryconfig) | (see type) | The registry MCPG *serves* (contrast `registries`, the registries MCPG *consumes*): a v0.1 MCP-Registry view of this gateway — one entry describing the governed catalog — so registry-driven clients (e.g. Copilot's allowed-registry policy) can discover MCPG as their approved server. Off by default. |
 | `server_info` | [`McpServerInfoConfig`](#mcpserverinfoconfig) | `{}` | How the server presents itself to clients: `serverInfo` in `server/discover` and in the `initialize` result. Every field is optional; an unset field keeps MCPG's own value. `version` is always the gateway's. |
+| `skills` | [`SkillsConfig`](#skillsconfig) |  | Agent Skills served over the MCP Skills extension (`io.modelcontextprotocol/skills`): folders with a `SKILL.md`, listed with `skills/list` and read with `resources/read`. Unset serves none. |
 
 ### `McpConfigurationsConfig`
 
@@ -2761,6 +2762,30 @@ How to route events for a per-plugin signal toggle. Operator schema: `mode: inhe
 - **`replace`** — Route admitted events ONLY to the per-plugin `sinks` list. Skips the global sink fan-out entirely. Used for compliance carve-outs (audit logs stay inside the SIEM).
 
 - **`tee`** — Tee — admitted events flow to BOTH the global sink list AND the per-plugin `sinks` list. Useful when an operator wants to keep default routing but additionally mirror a noisy plugin's events to a debugging sink.
+
+### `SkillSourceConfig`
+
+One folder of skills under `mcp.skills.sources`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `path` | string |  | The folder. A relative path resolves against the folder of the last config file, or the working directory when the config came from no file. Files and folders whose names start with `.` are not served. Symbolic links are followed (a Kubernetes ConfigMap mount is made of them); a broken link or a link loop is refused. |
+| `prefix` | string (optional) |  | A path the skills of this source are served under, such as `acme/billing`: its folder `refunds/` is then `skill://acme/billing/refunds/SKILL.md`. Segments are separated by `/` and use letters, digits, `-`, `.`, `_` and `~`. Unset serves the skills at the root of the `skill://` namespace. |
+
+### `SkillsConfig`
+
+`mcp.skills:` — Agent Skills the gateway serves to clients over the MCP Skills extension (`io.modelcontextprotocol/skills`).
+
+A skill is a folder with a `SKILL.md` at its root, whose YAML frontmatter holds at least `name` (equal to the folder's name) and `description`. Each folder of a source that holds a `SKILL.md` is one skill, served as `skill://<prefix>/<folder path>/SKILL.md` together with every other file of that folder. Clients find the skills with `skills/list` and `skills/get`, read each file with `resources/read`, and list a folder with `resources/directory/read`.
+
+The files are read once, when the gateway starts or reloads its config, and served from memory, so each file's digest always matches its bytes. Reads go through the same access rules as any other resource.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `directory_read` | boolean | `true` | Serve `resources/directory/read` and declare `directoryRead: true`. Default `true`. |
+| `governance` | [`BackendGovernanceConfig`](#backendgovernanceconfig) |  | Who may list and read the skills: the same block a binding takes. Applies to every skill file and folder, beside any `governance.policy.tool_access` rule filed under its URI. Unset `minimum_trust` takes `default_minimum_trust`. |
+| `list_as_resources` | boolean | `true` | Also list each skill's `SKILL.md` in `resources/list`, for clients that do not speak the extension. Default `true`. |
+| `sources` | array&lt;[`SkillSourceConfig`](#skillsourceconfig)&gt; | `[]` | The folders skills are served from. Empty (the default) serves no skills and does not declare the extension. |
 
 ### `StateKeyConfig`
 

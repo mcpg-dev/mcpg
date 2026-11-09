@@ -435,6 +435,18 @@ impl ProtocolHandler for Handler {
             ProtocolOperation::EventsExtension(op) => {
                 dispatch_events_extension(ctx, services, op).await
             }
+            ProtocolOperation::SkillsExtension(op) => {
+                let Some(runtime_handle) = services.runtime() else {
+                    return handler_internal_error(
+                        Some(op.request_id().clone()),
+                        "gateway runtime is shutting down",
+                    );
+                };
+                runtime_handle
+                    .load()
+                    .handle_skills_operation(op, ctx, crate::runtime::skills::SkillsWire::Modern)
+                    .await
+            }
         }
     }
 }

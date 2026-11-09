@@ -21,6 +21,10 @@ use crate::runtime::{RequestContext, RequestTrustLevel};
 /// Where the router sends a request, as far as the gate needs to know: the
 /// federation that serves it, and a name other than the one the caller
 /// used that a rule for the served capability can be filed under.
+/// The name the `mcp.skills.governance` rule is filed under. No binding,
+/// tool or URI can take it: a binding name has no space.
+pub(crate) const SKILLS_POLICY_KEY: &str = "mcp skills";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PolicyRoute<'a> {
     federation: Option<&'a str>,
@@ -98,6 +102,17 @@ impl<'a> PolicyRoute<'a> {
 
     pub(crate) fn for_prompt(route: &'a PromptRoute) -> Self {
         Self::served_by(route.federation()).on(PolicySurface::Prompt)
+    }
+
+    /// A skill file or folder: held to the `mcp.skills.governance` rule
+    /// filed under [`SKILLS_POLICY_KEY`] and to any rule filed under its URI.
+    pub(crate) const fn for_skill() -> Self {
+        Self {
+            federation: None,
+            listed_as: Some(SKILLS_POLICY_KEY),
+            surface: Some(PolicySurface::Resource),
+            arguments: None,
+        }
     }
 
     /// A read may name its resource by another spelling of the URI, or by a

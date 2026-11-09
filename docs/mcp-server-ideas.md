@@ -295,6 +295,10 @@ Legend:
   iTerm2 read and send, browser tabs / page text / JavaScript,
   process list and signals. Terminal input, signals and page
   JavaScript ask the user first through elicitation.
+- **Skills**: six Agent Skills (`mcp.skills`, served as
+  `skill://macos/…` over the MCP Skills extension) teach the
+  observe–act–verify loop, coordinates, the accessibility tree,
+  terminals, browsers and macOS permissions.
 - **Complexity**: L.
 
 ---

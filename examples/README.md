@@ -52,7 +52,7 @@ cargo run -p mcpg -- --config examples/01-namecom-dns/config.yaml
 | 22 | [`22-stripe`](22-stripe/) | Stripe REST | Indie / SaaS founder | L |
 | 23 | [`23-shopify`](23-shopify/) | Shopify Admin | Shop owner | L |
 | 24 | [`24-home-assistant`](24-home-assistant/) | Home Assistant REST | Smart-home owner | M |
-| 25 | [`25-macos-computer-use`](25-macos-computer-use/) | `osascript` (JXA), `screencapture` | Computer-use agents on a Mac | L |
+| 25 | [`25-macos-computer-use`](25-macos-computer-use/) | `osascript` (JXA), `screencapture`, Agent Skills | Computer-use agents on a Mac | L |
 | 26 | [`26-sql-sqlite-todos`](26-sql-sqlite-todos/) | Local SQLite file | SQL binding intro | S |
 | 27 | [`27-sql-dynamic-resource-listings`](27-sql-dynamic-resource-listings/) | Local SQLite file | Dynamic `resources/list` (P2.3) | M |
 | 28 | [`28-sql-pipeline-tx`](28-sql-pipeline-tx/) | Local SQLite file | `sql_tx` pipeline container (P4.1) | M |

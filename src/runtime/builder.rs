@@ -1162,6 +1162,7 @@ impl GatewayRuntime {
             idempotency_store: idempotency::noop_idempotency_store(),
             apps_capability: None,
             apps_federate_upstream: false,
+            skills: None,
             events_config: crate::config::EventsConfig::default(),
             tunnel_federation: None,
             list_page_size: crate::config::mcp::DEFAULT_LIST_PAGE_SIZE,

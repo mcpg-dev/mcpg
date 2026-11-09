@@ -23,6 +23,27 @@ only; Apple silicon.
 text, process or script and ask first (MCP elicitation). A client without
 elicitation support gets an error and nothing runs.
 
+## Skills
+
+The server also delivers six [Agent Skills](https://agentskills.io) that teach
+an agent how to use these tools well. They live in [`skills/`](skills/) and are
+served over the MCP Skills extension (`io.modelcontextprotocol/skills`) by
+`mcp.skills` in `config.yaml`:
+
+| Skill | URI | Teaches |
+|---|---|---|
+| `computer-use` | `skill://macos/computer-use/SKILL.md` | The observe–act–verify loop, safety rules, which skill to read next |
+| `screen-coordinates` | `skill://macos/screen-coordinates/SKILL.md` | Screenshots, `scale` / `origin`, several displays |
+| `ui-automation` | `skill://macos/ui-automation/SKILL.md` | The accessibility tree first: `ui.find`, `ui.action`, `ui.set_value` |
+| `terminal-sessions` | `skill://macos/terminal-sessions/SKILL.md` | Reading and sending to Terminal.app / iTerm2 safely |
+| `browser-tasks` | `skill://macos/browser-tasks/SKILL.md` | Tabs, page text, URLs, short page scripts |
+| `macos-permissions` | `skill://macos/macos-permissions/SKILL.md` | Screen Recording, Accessibility, Automation, error messages |
+
+A client that speaks the extension finds them with `skills/list`; any other
+client sees each `SKILL.md` in `resources/list`, and `mcp.instructions` tells
+the model to read `computer-use` first. Edit a skill and reload the gateway
+(send `SIGHUP`, or restart the MCP client) to serve the new text.
+
 ## Run
 
 ```bash

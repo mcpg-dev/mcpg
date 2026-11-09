@@ -53,6 +53,7 @@ pub mod secret_scan;
 pub mod secrets;
 pub mod sender_constraint;
 pub mod server;
+pub mod skills;
 pub mod source;
 pub mod storage;
 pub mod store_override;
