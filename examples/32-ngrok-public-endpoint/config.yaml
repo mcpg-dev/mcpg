@@ -1,0 +1,73 @@
+# =============================================================================
+# A gateway with a public HTTPS URL through ngrok — no inbound port.
+# =============================================================================
+# The dev.mcpg.transport.ngrok plugin dials out to ngrok and hands every
+# request to the gateway's own HTTP router, so identity, OAuth discovery,
+# rate limits and SSE work as on the HTTP listener. The local listener stays
+# on 127.0.0.1 only; ngrok is the only way in from outside.
+#
+#   export NGROK_AUTHTOKEN=<token from the ngrok dashboard>
+#   mcpg --config examples/32-ngrok-public-endpoint/config.yaml
+#
+# The log line `extra transport started ... listen=https://<name>.ngrok-free.app`
+# names the URL; give MCP clients `<that URL>/mcp`.
+
+gateway:
+  server:
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+    transports:
+      - kind: dev.mcpg.transport.ngrok
+        config:
+          authtoken: ${env.NGROK_AUTHTOKEN}
+          # A reserved domain keeps the URL stable across restarts:
+          # domain: tools.example.ngrok.app
+          #
+          # Runs at ngrok's edge before the gateway sees a request. This one
+          # lets through only Anthropic's API network (claude.ai connectors);
+          # remove it to accept any client.
+          traffic_policy: |
+            on_http_request:
+              - expressions: ["!('com.anthropic.api' in conn.client_ip.categories)"]
+                actions:
+                  - type: deny
+                    config: { status_code: 403 }
+
+plugins:
+  - id: dev.mcpg.transport.ngrok
+    kind: native
+    class: transport
+    source: { oci: "oci://ghcr.io/mcpg-dev/plugins/transport-ngrok:protocol-1" }
+    # The grant is fail-closed: every capability the descriptor requires must
+    # be listed here or the plugin is refused at load.
+    granted_capabilities: [network_outbound, transport_listen]
+
+mcp:
+  capabilities:
+    tools:
+      - name: weather.current
+        title: "Current weather"
+        description: "Current temperature and wind at a latitude and longitude (Open-Meteo, no key)."
+        annotations: { read_only: true, idempotent: true, open_world: true }
+        input_schema:
+          type: object
+          required: [latitude, longitude]
+          properties:
+            latitude: { type: number, minimum: -90, maximum: 90 }
+            longitude: { type: number, minimum: -180, maximum: 180 }
+          additionalProperties: false
+        # The edge policy above is the only filter in this sample, so the
+        # tool admits callers without an identity. Put an identity provider
+        # in front of anything that is not public data.
+        governance:
+          minimum_trust: unauthenticated
+        backend:
+          kind: http
+          url: "https://api.open-meteo.com/v1/forecast?latitude=${arguments.latitude}&longitude=${arguments.longitude}&current=temperature_2m,wind_speed_10m"
+          method: get
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 65536

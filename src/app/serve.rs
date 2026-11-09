@@ -227,25 +227,41 @@ pub async fn run(state: AppState) -> Result<()> {
     // the resolved transport gets a `GatewayMessageDispatcher`
     // wired to the same `state.runtime` ArcSwap the primary
     // listener uses, so reloads propagate to extra transports
-    // without restarting them. Failure to start refuses boot
-    // — operators see the bind / config error directly.
+    // without restarting them. An `http`-wire transport instead hands
+    // whole requests to the gateway's own router. Failure to start
+    // refuses boot — operators see the bind / config error directly.
     let server = &config.gateway.server;
-    if !server.legacy_wire {
-        let stdio = server.transport == TransportMode::Stdio
-            && !server.tunnel.as_ref().is_some_and(|t| t.enabled);
-        if stdio || !server.transports.is_empty() {
-            anyhow::bail!(
-                "gateway.server.legacy_wire: false serves only 2026-07-28, over HTTP; the \
-                 stdio transport and the gateway.server.transports entries speak 2025-11-25"
-            );
-        }
+    if !server.legacy_wire
+        && server.transport == TransportMode::Stdio
+        && !server.tunnel.as_ref().is_some_and(|t| t.enabled)
+    {
+        anyhow::bail!(
+            "gateway.server.legacy_wire: false serves only 2026-07-28, over HTTP; the \
+             stdio transport speaks 2025-11-25"
+        );
     }
+    let extra_context = if server.transports.is_empty() {
+        ExtraTransportContext::default()
+    } else {
+        let router = http::router(state.clone(), &server.health_path, &server.mcp_path);
+        ExtraTransportContext {
+            http_server: Some(crate::transports::ingress::GatewayHttpIngress::new(router)),
+            public_url: state
+                .runtime
+                .load()
+                .shared_services
+                .load_full()
+                .map(|services| std::sync::Arc::clone(&services.tunnel_public_url)),
+            legacy_wire: server.legacy_wire,
+        }
+    };
     let extra_transport_handles = start_extra_transports(
         &config.gateway.server.transports,
         &config.plugins,
         &config.cluster.kind,
         state.runtime.clone(),
         &state.runtime.load().plugin_registry_arc(),
+        &extra_context,
     )
     .await?;
 
@@ -622,10 +638,35 @@ pub async fn run(state: AppState) -> Result<()> {
     Ok(())
 }
 
+/// What `http`-wire transports need from the gateway, and the wire rule
+/// for `messages`-wire ones.
+pub(crate) struct ExtraTransportContext {
+    /// Serves `http`-wire requests; `None` refuses every `http`-wire entry.
+    pub http_server: Option<std::sync::Arc<dyn mcpg_plugin_protocol::transport::HttpIngressServer>>,
+    /// Receives the first `http`-wire transport's public URL (the base for
+    /// webhook callbacks) while no other public address is known.
+    pub public_url: Option<std::sync::Arc<arc_swap::ArcSwapOption<String>>>,
+    /// `gateway.server.legacy_wire`. When false, `messages`-wire entries are
+    /// refused: they speak only 2025-11-25.
+    pub legacy_wire: bool,
+}
+
+impl Default for ExtraTransportContext {
+    fn default() -> Self {
+        Self {
+            http_server: None,
+            public_url: None,
+            legacy_wire: true,
+        }
+    }
+}
+
 /// Start every plugin-supplied transport declared in
 /// `gateway.server.transports[]`. Each entry's `kind:` resolves
-/// to a registered Transport plugin via the registry; the plugin's
-/// `start(listener_config, dispatcher)` runs to bind a listener.
+/// to a registered Transport plugin via the registry. A `messages`-wire
+/// plugin's `start(listener_config, dispatcher)` binds its listener; an
+/// `http`-wire plugin's `start_http(listener_config, server)` opens its
+/// ingress and hands each request to the gateway router.
 /// Returns the collected `TransportHandle` vec — the caller stores
 /// it for the duration of the gateway run; closing each handle on
 /// shutdown is wired into the same drain path that handles the
@@ -638,14 +679,17 @@ pub async fn run(state: AppState) -> Result<()> {
 /// - kind that resolves to `cluster` (transport is not a cluster
 ///   role);
 /// - plugin id that isn't loaded;
-/// - any `start()` failure (bind, invalid config, etc.).
+/// - a `messages`-wire plugin while `legacy_wire` is false;
+/// - any start failure (bind, invalid config, etc.).
 pub(crate) async fn start_extra_transports(
     transports_cfg: &[crate::config::wiring::KindRef],
     plugins: &[crate::config::PluginEntryConfig],
     cluster_kind: &str,
     runtime_swap: std::sync::Arc<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>>,
     plugin_registry: &mcpg_plugin_host::PluginRegistry,
+    context: &ExtraTransportContext,
 ) -> Result<Vec<Box<dyn mcpg_plugin_protocol::transport::TransportHandle>>> {
+    use mcpg_plugin_protocol::transport::TransportWire;
     if transports_cfg.is_empty() {
         return Ok(Vec::new());
     }
@@ -694,19 +738,50 @@ pub(crate) async fn start_extra_transports(
                 kref.kind
             )
         })?;
-        let handle = transport
-            .start(&kref.config, std::sync::Arc::clone(&dispatcher))
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "gateway.server.transports[]: plugin `{plugin_id}` failed \
-                     to start: {e}"
-                )
-            })?;
+        let wire = transport.wire();
+        let started = match wire {
+            TransportWire::Messages => {
+                if !context.legacy_wire {
+                    anyhow::bail!(
+                        "gateway.server.transports[]: plugin `{plugin_id}` hands the \
+                         gateway JSON-RPC messages, which speak only 2025-11-25; \
+                         gateway.server.legacy_wire: false serves only 2026-07-28"
+                    );
+                }
+                transport
+                    .start(&kref.config, std::sync::Arc::clone(&dispatcher))
+                    .await
+            }
+            TransportWire::Http => {
+                let Some(server) = &context.http_server else {
+                    anyhow::bail!(
+                        "gateway.server.transports[]: plugin `{plugin_id}` hands the \
+                         gateway HTTP requests, but no gateway router is available"
+                    );
+                };
+                transport
+                    .start_http(&kref.config, std::sync::Arc::clone(server))
+                    .await
+            }
+        };
+        let handle = started.map_err(|e| {
+            anyhow::anyhow!(
+                "gateway.server.transports[]: plugin `{plugin_id}` failed \
+                 to start: {e}"
+            )
+        })?;
         let listen = handle.listen_address().await.unwrap_or_default();
+        if wire == TransportWire::Http
+            && (listen.starts_with("https://") || listen.starts_with("http://"))
+            && let Some(slot) = &context.public_url
+            && slot.load().is_none()
+        {
+            slot.store(Some(std::sync::Arc::new(listen.clone())));
+        }
         info!(
             kind = %kref.kind,
             plugin_id = %plugin_id,
+            wire = wire.as_str(),
             listen = %listen,
             "extra transport started"
         );

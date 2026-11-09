@@ -7,6 +7,7 @@
 pub mod anon_limit;
 pub mod http;
 pub mod http_route;
+pub mod ingress;
 pub mod stdio;
 pub mod tls;
 pub mod tunnel;

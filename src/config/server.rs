@@ -228,7 +228,9 @@ pub struct ServerConfig {
     /// (`data.supported` is `["2026-07-28"]`), a POST that carries
     /// `Mcp-Session-Id` is refused with HTTP 400 and `-32600`, GET and DELETE
     /// answer 405, and `server/discover` lists only `2026-07-28`. The stdio
-    /// transport speaks `2025-11-25`, so it refuses to start with `false`.
+    /// transport and `messages`-wire entries of `transports` speak
+    /// `2025-11-25`, so they refuse to start with `false`; `http`-wire
+    /// entries go through the HTTP router and follow this setting.
     #[serde(default = "crate::config::default_true")]
     pub legacy_wire: bool,
     /// After boot (plugins loaded, config-origin `env://` / `${env.X}`
@@ -272,16 +274,17 @@ pub struct ServerConfig {
     /// keyword (today only `dev.mcpg.builtin.transport.memory`
     /// is wired; `builtin-http` / `builtin-stdio` map to the
     /// in-tree HTTP / stdio paths and don't need a list entry)
-    /// or a registered Transport plugin id. The plugin's
-    /// `Transport::start(config, dispatcher)` runs once per
-    /// list entry; transports that fail to start halt the
+    /// or a registered Transport plugin id. Each entry starts once,
+    /// with its `config`; transports that fail to start halt the
     /// boot. Empty list = no extra transports beyond the
     /// primary listener — today's default.
     ///
-    /// Beyond the primary HTTP/stdio listener, additional
-    /// transport plugins (websocket, grpc, custom RPC) ship as
-    /// cdylibs under `plugins[]` and are wired to a session loop
-    /// via this list.
+    /// A `messages`-wire plugin (websocket, grpc, custom RPC) gets
+    /// the JSON-RPC dispatcher and speaks `2025-11-25`. An
+    /// `http`-wire plugin (a tunnel such as
+    /// `dev.mcpg.transport.ngrok`) hands whole HTTP requests to the
+    /// gateway's own router, and its listen URL becomes the public
+    /// address for webhook callbacks while no other is set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transports: Vec<crate::config::wiring::KindRef>,
     /// Allow outbound connections to private/loopback/link-local IPs.

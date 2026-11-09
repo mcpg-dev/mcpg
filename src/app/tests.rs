@@ -1,4 +1,4 @@
-use super::serve::start_extra_transports;
+use super::serve::{ExtraTransportContext, start_extra_transports};
 use super::*;
 use crate::config::ToolAccessPolicyConfig as ToolAccessPolicyConfigYaml;
 use crate::config::{
@@ -1664,9 +1664,16 @@ fn empty_runtime_swap() -> std::sync::Arc<arc_swap::ArcSwap<crate::runtime::Gate
 async fn start_extra_transports_empty_returns_empty() {
     let reg = registry_with_memory_transport();
     let swap = empty_runtime_swap();
-    let handles = start_extra_transports(&[], &[], "single_node", swap, &reg)
-        .await
-        .unwrap();
+    let handles = start_extra_transports(
+        &[],
+        &[],
+        "single_node",
+        swap,
+        &reg,
+        &ExtraTransportContext::default(),
+    )
+    .await
+    .unwrap();
     assert!(handles.is_empty());
 }
 
@@ -1681,6 +1688,7 @@ async fn start_extra_transports_starts_memory_plugin_by_id() {
         "single_node",
         swap,
         &reg,
+        &ExtraTransportContext::default(),
     )
     .await
     .unwrap();
@@ -1695,8 +1703,15 @@ async fn start_extra_transports_starts_memory_plugin_by_id() {
 async fn start_extra_transports_refuses_builtin_keyword() {
     let reg = registry_with_memory_transport();
     let swap = empty_runtime_swap();
-    let res =
-        start_extra_transports(&[kind_ref("builtin-http")], &[], "single_node", swap, &reg).await;
+    let res = start_extra_transports(
+        &[kind_ref("builtin-http")],
+        &[],
+        "single_node",
+        swap,
+        &reg,
+        &ExtraTransportContext::default(),
+    )
+    .await;
     let err = match res {
         Ok(_) => panic!("expected start_extra_transports to fail"),
         Err(e) => e,
@@ -1718,6 +1733,7 @@ async fn start_extra_transports_refuses_unknown_plugin_id() {
         "single_node",
         swap,
         &reg,
+        &ExtraTransportContext::default(),
     )
     .await;
     let err = match res {
@@ -1735,7 +1751,15 @@ async fn start_extra_transports_refuses_unknown_plugin_id() {
 async fn start_extra_transports_refuses_kind_cluster() {
     let reg = registry_with_memory_transport();
     let swap = empty_runtime_swap();
-    let res = start_extra_transports(&[kind_ref("cluster")], &[], "single_node", swap, &reg).await;
+    let res = start_extra_transports(
+        &[kind_ref("cluster")],
+        &[],
+        "single_node",
+        swap,
+        &reg,
+        &ExtraTransportContext::default(),
+    )
+    .await;
     let err = match res {
         Ok(_) => panic!("expected start_extra_transports to fail"),
         Err(e) => e,
@@ -1749,6 +1773,375 @@ async fn start_extra_transports_refuses_kind_cluster() {
         msg.contains("transport"),
         "cluster meta-kind refusal surfaces: {msg}"
     );
+}
+
+/// An `http`-wire transport stand-in: keeps the server it is started
+/// with and reports a public URL.
+struct IngressStub {
+    manifest: mcpg_plugin_protocol::PluginManifest,
+    server: std::sync::Mutex<
+        Option<std::sync::Arc<dyn mcpg_plugin_protocol::transport::HttpIngressServer>>,
+    >,
+}
+
+const INGRESS_STUB_ID: &str = "dev.test.transport.ingress";
+
+impl IngressStub {
+    fn new() -> std::sync::Arc<Self> {
+        let memory = crate::builtins::transport_memory::MemoryTransport::new();
+        let mut manifest =
+            mcpg_plugin_protocol::transport::Transport::manifest(memory.as_ref()).clone();
+        manifest.id = INGRESS_STUB_ID.into();
+        std::sync::Arc::new(Self {
+            manifest,
+            server: std::sync::Mutex::new(None),
+        })
+    }
+}
+
+struct StubHandle;
+
+#[mcpg_plugin_protocol::async_trait]
+impl mcpg_plugin_protocol::transport::TransportHandle for StubHandle {
+    async fn listen_address(&self) -> Option<String> {
+        Some("https://stub.example.test".into())
+    }
+    async fn close(&self) {}
+}
+
+#[mcpg_plugin_protocol::async_trait]
+impl mcpg_plugin_protocol::transport::Transport for IngressStub {
+    fn manifest(&self) -> &mcpg_plugin_protocol::PluginManifest {
+        &self.manifest
+    }
+    fn name(&self) -> &str {
+        "ingress-stub-v1"
+    }
+    async fn start(
+        &self,
+        _listener_config: &serde_json::Value,
+        _dispatcher: std::sync::Arc<dyn mcpg_plugin_protocol::transport::MessageDispatcher>,
+    ) -> Result<
+        Box<dyn mcpg_plugin_protocol::transport::TransportHandle>,
+        mcpg_plugin_protocol::transport::TransportError,
+    > {
+        panic!("an http-wire transport is never started on the messages wire");
+    }
+    fn wire(&self) -> mcpg_plugin_protocol::transport::TransportWire {
+        mcpg_plugin_protocol::transport::TransportWire::Http
+    }
+    async fn start_http(
+        &self,
+        _listener_config: &serde_json::Value,
+        server: std::sync::Arc<dyn mcpg_plugin_protocol::transport::HttpIngressServer>,
+    ) -> Result<
+        Box<dyn mcpg_plugin_protocol::transport::TransportHandle>,
+        mcpg_plugin_protocol::transport::TransportError,
+    > {
+        *self.server.lock().unwrap() = Some(server);
+        Ok(Box::new(StubHandle))
+    }
+}
+
+fn registry_with_both_transports(
+    stub: std::sync::Arc<IngressStub>,
+) -> mcpg_plugin_host::PluginRegistry {
+    let mut reg = registry_with_memory_transport();
+    reg.register_transport(stub, mcpg_plugin_protocol::PluginTier::Native)
+        .expect("ingress stub registers");
+    reg
+}
+
+fn ingress_stub_entry() -> crate::config::PluginEntryConfig {
+    crate::config::PluginEntryConfig {
+        id: INGRESS_STUB_ID.to_owned(),
+        ..memory_transport_entry()
+    }
+}
+
+fn http_context(
+    router: axum::Router,
+    legacy_wire: bool,
+) -> (
+    ExtraTransportContext,
+    std::sync::Arc<arc_swap::ArcSwapOption<String>>,
+) {
+    let public_url = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+    let context = ExtraTransportContext {
+        http_server: Some(crate::transports::ingress::GatewayHttpIngress::new(router)),
+        public_url: Some(std::sync::Arc::clone(&public_url)),
+        legacy_wire,
+    };
+    (context, public_url)
+}
+
+#[tokio::test]
+async fn an_http_wire_transport_starts_with_the_router_and_publishes_its_url() {
+    let stub = IngressStub::new();
+    let reg = registry_with_both_transports(std::sync::Arc::clone(&stub));
+    let router = axum::Router::new().route("/mcp", axum::routing::post(|| async { "from router" }));
+    let (context, public_url) = http_context(router, true);
+    let handles = start_extra_transports(
+        &[kind_ref(INGRESS_STUB_ID)],
+        &[ingress_stub_entry()],
+        "single_node",
+        empty_runtime_swap(),
+        &reg,
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(handles.len(), 1);
+    assert_eq!(
+        public_url.load().as_deref().map(String::as_str),
+        Some("https://stub.example.test")
+    );
+
+    let server = stub
+        .server
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("started with a server");
+    let head = mcpg_plugin_protocol::transport::HttpIngressRequestHead {
+        method: "POST".into(),
+        uri: "/mcp".into(),
+        ..Default::default()
+    };
+    let response = server.serve(head, bytes::Bytes::new()).await;
+    assert_eq!(response.head.status, 200);
+    let mut body = Vec::new();
+    let mut frames = response.body;
+    while let Some(frame) = futures::StreamExt::next(&mut frames).await {
+        body.extend_from_slice(&frame.unwrap());
+    }
+    assert_eq!(body, b"from router");
+}
+
+#[tokio::test]
+async fn a_public_url_already_known_is_kept() {
+    let stub = IngressStub::new();
+    let reg = registry_with_both_transports(stub);
+    let (context, public_url) = http_context(axum::Router::new(), true);
+    public_url.store(Some(std::sync::Arc::new(
+        "https://relay.example.test".into(),
+    )));
+    start_extra_transports(
+        &[kind_ref(INGRESS_STUB_ID)],
+        &[ingress_stub_entry()],
+        "single_node",
+        empty_runtime_swap(),
+        &reg,
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        public_url.load().as_deref().map(String::as_str),
+        Some("https://relay.example.test")
+    );
+}
+
+#[tokio::test]
+async fn legacy_wire_off_refuses_a_messages_transport_and_keeps_an_http_one() {
+    let stub = IngressStub::new();
+    let reg = registry_with_both_transports(stub);
+    let (context, _) = http_context(axum::Router::new(), false);
+    let refused = start_extra_transports(
+        &[kind_ref("dev.mcpg.builtin.transport.memory")],
+        &[memory_transport_entry()],
+        "single_node",
+        empty_runtime_swap(),
+        &reg,
+        &context,
+    )
+    .await;
+    let msg = format!("{:#}", refused.err().expect("messages wire refused"));
+    assert!(msg.contains("legacy_wire: false"), "{msg}");
+
+    let started = start_extra_transports(
+        &[kind_ref(INGRESS_STUB_ID)],
+        &[ingress_stub_entry()],
+        "single_node",
+        empty_runtime_swap(),
+        &reg,
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(started.len(), 1);
+}
+
+/// The test-only `dev.test.transport.probe` cdylib, staged by a sandboxed
+/// runner. `None` under `cargo test`.
+fn http_transport_probe_cdylib() -> Option<std::path::PathBuf> {
+    staged_test_file("MCPG_TEST_HTTP_TRANSPORT_CDYLIB")
+}
+
+/// A real `http`-wire cdylib, loaded through `plugins[]`, sends MCP traffic
+/// across the FFI into the gateway's own router: `initialize` answers with
+/// a session, `notifications/initialized` is accepted on it, the
+/// `tools/list` on that session streams back as SSE, and the health route
+/// answers too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_native_http_wire_transport_serves_mcp_through_the_gateway_router() {
+    let Some(so) = http_transport_probe_cdylib() else {
+        eprintln!("skipped: this runner stages no http transport probe cdylib");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("answers.json");
+    let config: AppConfig = serde_yaml::from_str(&format!(
+        "plugins:\n  - id: dev.test.transport.probe\n    class: transport\n    kind: native\n    \
+         source:\n      path: {}\n    signature:\n      policy: disabled\n\
+         gateway:\n  server:\n    trust_subject_header: true\n",
+        so.display()
+    ))
+    .expect("config parses");
+    let plugins = config.plugins.clone();
+    let state = crate::app::build_from_config(config, Vec::new())
+        .await
+        .expect("the gateway builds with the probe loaded");
+    fn mcp_headers(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+        let mut headers = vec![
+            ("host", "probe.example.test"),
+            ("content-type", "application/json"),
+            ("accept", "application/json, text/event-stream"),
+        ];
+        headers.extend_from_slice(extra);
+        headers
+    }
+    let probe_config = serde_json::json!({
+        "report": report.display().to_string(),
+        "requests": [
+            {
+                "method": "POST",
+                "uri": "/mcp",
+                "headers": mcp_headers(&[]),
+                "body": serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "probe", "version": "1.0.0"}
+                    }
+                }).to_string(),
+            },
+            {
+                "method": "POST",
+                "uri": "/mcp",
+                "headers": mcp_headers(&[("mcp-protocol-version", "2025-11-25")]),
+                "body": serde_json::json!({
+                    "jsonrpc": "2.0", "method": "notifications/initialized"
+                }).to_string(),
+                "session_from": 0,
+            },
+            {
+                "method": "POST",
+                "uri": "/mcp",
+                "headers": mcp_headers(&[
+                    ("mcp-protocol-version", "2025-11-25"),
+                    ("x-mcpg-subject-id", "test-user"),
+                ]),
+                "body": serde_json::json!({
+                    "jsonrpc": "2.0", "id": 2, "method": "tools/list"
+                }).to_string(),
+                "session_from": 0,
+            },
+            {"method": "GET", "uri": "/health"},
+        ],
+    });
+    let router = crate::transports::http::router(state.clone(), "/health", "/mcp");
+    let context = ExtraTransportContext {
+        http_server: Some(crate::transports::ingress::GatewayHttpIngress::new(router)),
+        public_url: None,
+        legacy_wire: true,
+    };
+    let registry = state.runtime.load().plugin_registry_arc();
+    let handles = start_extra_transports(
+        &[crate::config::wiring::KindRef {
+            kind: "dev.test.transport.probe".into(),
+            config: probe_config,
+        }],
+        &plugins,
+        "single_node",
+        state.runtime.clone(),
+        &registry,
+        &context,
+    )
+    .await
+    .expect("the probe starts on the http wire");
+    assert_eq!(
+        handles[0].listen_address().await.as_deref(),
+        Some("https://probe.example.test")
+    );
+
+    let mut answers = None;
+    for _ in 0..400 {
+        if let Ok(bytes) = std::fs::read(&report) {
+            answers = Some(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    drop(handles);
+    let answers = answers.expect("the probe wrote its answers");
+    let header = |answer: &serde_json::Value, name: &str| {
+        answer["headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pair| pair[0] == name)
+            .map(|pair| pair[1].as_str().unwrap().to_owned())
+    };
+
+    let initialize = &answers[0];
+    assert_eq!(initialize["status"], 200, "{initialize}");
+    assert!(
+        header(initialize, "mcp-session-id").is_some(),
+        "{initialize}"
+    );
+    assert!(
+        initialize["body"]
+            .as_str()
+            .unwrap()
+            .contains("\"serverInfo\""),
+        "{initialize}"
+    );
+
+    assert_eq!(answers[1]["status"], 202, "{}", answers[1]);
+
+    let tools = &answers[2];
+    assert_eq!(tools["status"], 200, "{tools}");
+    assert_eq!(
+        header(tools, "content-type").as_deref(),
+        Some("text/event-stream")
+    );
+    let events = tools["body"].as_str().unwrap();
+    assert!(
+        events.contains("event: message") && events.contains(r#""id":2,"result":{"tools":"#),
+        "{tools}"
+    );
+    assert!(tools["error"].is_null(), "{tools}");
+
+    assert_eq!(answers[3]["status"], 200, "{}", answers[3]);
+}
+
+#[tokio::test]
+async fn an_http_wire_transport_without_a_router_is_refused() {
+    let stub = IngressStub::new();
+    let reg = registry_with_both_transports(stub);
+    let refused = start_extra_transports(
+        &[kind_ref(INGRESS_STUB_ID)],
+        &[ingress_stub_entry()],
+        "single_node",
+        empty_runtime_swap(),
+        &reg,
+        &ExtraTransportContext::default(),
+    )
+    .await;
+    let msg = format!("{:#}", refused.err().expect("refused"));
+    assert!(msg.contains("no gateway router"), "{msg}");
 }
 
 // -- build_binding_cache_overrides ---------------------------------
