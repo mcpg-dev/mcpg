@@ -62,6 +62,7 @@ jobs:
       - name: Build + publish
         env:
           PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
           RELEASE_REF: ${{ github.event.workflow_run.head_branch }}
         run: |

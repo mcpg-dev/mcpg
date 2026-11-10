@@ -58,6 +58,7 @@ jobs:
       - name: Assemble + publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
           RELEASE_REF: ${{ github.event.workflow_run.head_branch }}
         run: |

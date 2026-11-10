@@ -57,7 +57,11 @@ declare -A NPM_LIBC=(
 latest_release() { # <repo> → version (no leading v)
   # Not releases/latest: that endpoint hides prereleases, and the whole
   # pre-GA lineage is prerelease-flagged. Newest release, whatever its flag.
-  curl -fsSL "https://api.github.com/repos/${ORG}/$1/releases?per_page=1" \
+  # Authenticated when the job has a token: a hosted runner shares its IP,
+  # and the anonymous API limit then refuses the lookups with 403.
+  local auth=()
+  [ -n "${GH_TOKEN:-}" ] && auth=(-H "Authorization: Bearer ${GH_TOKEN}")
+  curl -fsSL "${auth[@]}" "https://api.github.com/repos/${ORG}/$1/releases?per_page=1" \
     | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["tag_name"].lstrip("v"))'
 }
 
