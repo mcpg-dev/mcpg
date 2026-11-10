@@ -19,9 +19,19 @@ use super::{AppConfig, TrustLevelConfig};
 /// only ever see anonymous callers.
 pub fn reachable_trust_ceiling(config: &AppConfig) -> TrustLevelConfig {
     let access = &config.governance.access;
+    // A transport plugin in `gateway.server.transports` may be an `http`-wire
+    // one that attests verified callers (a tailnet peer); whether it does is
+    // known only once it is loaded, and the request path still refuses what
+    // it does not attest.
+    let attesting_transport = !config.gateway.server.transports.is_empty()
+        && config
+            .plugins
+            .iter()
+            .any(|entry| entry.class == "transport");
     let verifiable = access.jwks.is_some()
         || access.oidc_oauth.is_some()
         || access.authorization_server.is_some()
+        || attesting_transport
         || config
             .plugins
             .iter()
@@ -54,13 +64,15 @@ pub fn unreachable_trust_bindings(config: &AppConfig) -> Vec<&str> {
 pub fn trust_ceiling_remedy(ceiling: TrustLevelConfig) -> &'static str {
     if ceiling == TrustLevelConfig::Unauthenticated {
         "configure an identity source (governance.access.oidc_oauth / .jwks / \
-         .authorization_server, or an identity_provider plugin), set \
+         .authorization_server, an identity_provider plugin, or a transport plugin that \
+         attests callers such as dev.mcpg.transport.tailscale), set \
          gateway.server.trust_subject_header to accept header-asserted identity, or lower the \
          binding's governance.minimum_trust (or default_minimum_trust, for a binding that \
          names no floor)"
     } else {
         "configure an identity source (governance.access.oidc_oauth / .jwks / \
-         .authorization_server, or an identity_provider plugin), or lower the binding's \
+         .authorization_server, an identity_provider plugin, or a transport plugin that \
+         attests callers such as dev.mcpg.transport.tailscale), or lower the binding's \
          governance.minimum_trust (or default_minimum_trust, for a binding that names no floor)"
     }
 }

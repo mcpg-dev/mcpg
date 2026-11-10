@@ -243,9 +243,12 @@ pub async fn run(state: AppState) -> Result<()> {
     let extra_context = if server.transports.is_empty() {
         ExtraTransportContext::default()
     } else {
-        let router = http::router(state.clone(), &server.health_path, &server.mcp_path);
         ExtraTransportContext {
-            http_server: Some(crate::transports::ingress::GatewayHttpIngress::new(router)),
+            http_router: Some(http::router(
+                state.clone(),
+                &server.health_path,
+                &server.mcp_path,
+            )),
             public_url: state
                 .runtime
                 .load()
@@ -641,8 +644,10 @@ pub async fn run(state: AppState) -> Result<()> {
 /// What `http`-wire transports need from the gateway, and the wire rule
 /// for `messages`-wire ones.
 pub(crate) struct ExtraTransportContext {
-    /// Serves `http`-wire requests; `None` refuses every `http`-wire entry.
-    pub http_server: Option<std::sync::Arc<dyn mcpg_plugin_protocol::transport::HttpIngressServer>>,
+    /// The router that answers `http`-wire requests; `None` refuses every
+    /// `http`-wire entry. Each entry gets its own server, which records the
+    /// peers that entry attests under its plugin id.
+    pub http_router: Option<axum::Router>,
     /// Receives the first `http`-wire transport's public URL (the base for
     /// webhook callbacks) while no other public address is known.
     pub public_url: Option<std::sync::Arc<arc_swap::ArcSwapOption<String>>>,
@@ -654,7 +659,7 @@ pub(crate) struct ExtraTransportContext {
 impl Default for ExtraTransportContext {
     fn default() -> Self {
         Self {
-            http_server: None,
+            http_router: None,
             public_url: None,
             legacy_wire: true,
         }
@@ -753,15 +758,17 @@ pub(crate) async fn start_extra_transports(
                     .await
             }
             TransportWire::Http => {
-                let Some(server) = &context.http_server else {
+                let Some(router) = &context.http_router else {
                     anyhow::bail!(
                         "gateway.server.transports[]: plugin `{plugin_id}` hands the \
                          gateway HTTP requests, but no gateway router is available"
                     );
                 };
-                transport
-                    .start_http(&kref.config, std::sync::Arc::clone(server))
-                    .await
+                let server = crate::transports::ingress::GatewayHttpIngress::new(
+                    router.clone(),
+                    plugin_id.clone(),
+                );
+                transport.start_http(&kref.config, server).await
             }
         };
         let handle = started.map_err(|e| {

@@ -32,14 +32,14 @@ struct ConfirmBody {
 pub(crate) async fn pap_operation_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-    tls_info: TlsInfoExt,
+    connection: ConnectionExt,
     axum::extract::Path(operation_id): axum::extract::Path<String>,
 ) -> Response {
     let path = format!("{OPERATIONS_PATH}/{operation_id}");
     let (runtime, _ctx, caller) = match operations_caller(
         &state,
         &headers,
-        tls_info,
+        connection,
         &axum::http::Method::GET,
         &path,
     )
@@ -61,17 +61,23 @@ pub(crate) async fn pap_operation_handler(
 pub(crate) async fn pap_operation_confirm_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-    tls_info: TlsInfoExt,
+    connection: ConnectionExt,
     axum::extract::Path(operation_id): axum::extract::Path<String>,
     body: Bytes,
 ) -> Response {
     let path = format!("{OPERATIONS_PATH}/{operation_id}/confirm");
-    let (runtime, ctx, caller) =
-        match operations_caller(&state, &headers, tls_info, &axum::http::Method::POST, &path).await
-        {
-            Ok(caller) => caller,
-            Err(response) => return response,
-        };
+    let (runtime, ctx, caller) = match operations_caller(
+        &state,
+        &headers,
+        connection,
+        &axum::http::Method::POST,
+        &path,
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
     let Some(operations) = runtime.pap_operations() else {
         return error_response(StatusCode::NOT_FOUND, "operation_not_found", None);
     };
@@ -131,16 +137,22 @@ pub(crate) async fn pap_operation_confirm_handler(
 pub(crate) async fn pap_operation_cancel_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-    tls_info: TlsInfoExt,
+    connection: ConnectionExt,
     axum::extract::Path(operation_id): axum::extract::Path<String>,
 ) -> Response {
     let path = format!("{OPERATIONS_PATH}/{operation_id}/cancel");
-    let (runtime, ctx, caller) =
-        match operations_caller(&state, &headers, tls_info, &axum::http::Method::POST, &path).await
-        {
-            Ok(caller) => caller,
-            Err(response) => return response,
-        };
+    let (runtime, ctx, caller) = match operations_caller(
+        &state,
+        &headers,
+        connection,
+        &axum::http::Method::POST,
+        &path,
+    )
+    .await
+    {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
     let Some(operations) = runtime.pap_operations() else {
         return error_response(StatusCode::NOT_FOUND, "operation_not_found", None);
     };
@@ -163,7 +175,7 @@ pub(crate) async fn pap_operation_cancel_handler(
 async fn operations_caller(
     state: &AppState,
     headers: &HeaderMap,
-    tls_info: TlsInfoExt,
+    connection: ConnectionExt,
     method: &axum::http::Method,
     path: &str,
 ) -> Result<
@@ -186,7 +198,7 @@ async fn operations_caller(
     let ctx = build_full_request_context(
         headers,
         &runtime,
-        tls_info.into_inner(),
+        connection.into_inner(),
         config.gateway.server.trust_subject_header,
         method,
         Some(path),

@@ -27,14 +27,14 @@ pub(crate) async fn health_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
-    tls_info: TlsInfoExt,
+    connection: ConnectionExt,
 ) -> Response {
     let runtime = state.runtime.load();
     let config = state.config.load();
     let request_context = match build_full_request_context(
         &headers,
         &runtime,
-        tls_info.into_inner(),
+        connection.into_inner(),
         config.gateway.server.trust_subject_header,
         &axum::http::Method::GET,
         Some(config.gateway.server.health_path.as_str()),
@@ -111,14 +111,14 @@ pub(crate) async fn metrics_handler(
 pub(crate) async fn readiness_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-    tls_info: TlsInfoExt,
+    connection: ConnectionExt,
 ) -> Response {
     let runtime = state.runtime.load();
     let config = state.config.load();
     let ctx = match build_full_request_context(
         &headers,
         &runtime,
-        tls_info.into_inner(),
+        connection.into_inner(),
         config.gateway.server.trust_subject_header,
         &axum::http::Method::GET,
         Some(READINESS_PATH),
@@ -139,14 +139,14 @@ pub(crate) async fn readiness_handler(
 pub(crate) async fn runtime_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-    tls_info: TlsInfoExt,
+    connection: ConnectionExt,
 ) -> Response {
     let runtime = state.runtime.load();
     let config = state.config.load();
     let ctx = match build_full_request_context(
         &headers,
         &runtime,
-        tls_info.into_inner(),
+        connection.into_inner(),
         config.gateway.server.trust_subject_header,
         &axum::http::Method::GET,
         Some(RUNTIME_PATH),

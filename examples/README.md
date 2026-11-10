@@ -60,6 +60,7 @@ cargo run -p mcpg -- --config examples/01-namecom-dns/config.yaml
 | 30 | [`30-warehouse-backends-surfaces`](30-warehouse-backends-surfaces/) | In-memory DuckDB | Warehouse backend as tool / resource / pipeline / child-tool | M |
 | 31 | [`31-twilio-sms-voice`](31-twilio-sms-voice/) | Twilio API | SMS + Voice tools, inbound webhooks → TwiML, native `resources/updated` push | L |
 | 32 | [`32-ngrok-public-endpoint`](32-ngrok-public-endpoint/) | ngrok, Open-Meteo | A public HTTPS URL with no inbound port, filtered at ngrok's edge | S |
+| 33 | [`33-tailscale-tailnet`](33-tailscale-tailnet/) | Tailscale, Open-Meteo | The gateway as a tailnet node; callers verified by tailnet identity, roles from the tailnet policy | S |
 
 ## What every sample includes
 

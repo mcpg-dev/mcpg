@@ -109,8 +109,9 @@ pub struct AccessConfig {
     /// routes (`/plugins/{id}/{entity}` and override paths) stay open to
     /// anonymous callers, each gated as it is without this key. Needs at
     /// least one verifier: `jwks`,
-    /// `oidc_oauth`, `authorization_server` or an `identity_provider`
-    /// plugin.
+    /// `oidc_oauth`, `authorization_server`, an `identity_provider`
+    /// plugin, or a transport plugin in `gateway.server.transports` that
+    /// attests callers (such as `dev.mcpg.transport.tailscale`).
     #[serde(default)]
     pub require_authentication: bool,
 }

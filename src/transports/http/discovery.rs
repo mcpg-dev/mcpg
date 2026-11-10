@@ -78,15 +78,13 @@ pub(crate) async fn aauth_authorize_handler(
         Ok(b) => b,
         Err(_) => return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response(),
     };
-    let tls_info = parts
-        .extensions
-        .get::<crate::transports::tls::TlsInfoArc>()
-        .cloned();
+    let connection =
+        crate::transports::attested::ConnectionFacts::from_extensions(&parts.extensions);
     let trust_subject_header = state.config.load().gateway.server.trust_subject_header;
     let ctx = match crate::transports::http_request_context(
         &parts.headers,
         &runtime,
-        tls_info,
+        connection,
         trust_subject_header,
         &parts.method,
         parts.uri.path_and_query().map(|pq| pq.as_str()),

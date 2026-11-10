@@ -38,21 +38,28 @@ use crate::{
     },
 };
 
-/// Per-handler convenience extractor: optional `Extension<TlsInfoArc>`
-/// stamped by [`crate::transports::tls::McpgTlsAcceptor`]. Plain HTTP
-/// requests (no TLS) and TLS requests where the acceptor decided
-/// there was nothing worth stamping (no SNI, no client cert) leave
-/// the extension absent — the wrapper resolves to `None` in both
-/// cases.
-type TlsInfoExt = Option<axum::extract::Extension<crate::transports::tls::TlsInfoArc>>;
+/// Per-handler extractor of what the connection vouches for: the
+/// `TlsInfoArc` [`crate::transports::tls::McpgTlsAcceptor`] stamps (absent on
+/// plain HTTP, and on TLS with no SNI and no client cert) and the peer an
+/// `http`-wire transport attests (absent on every other path).
+pub(crate) struct ConnectionExt(crate::transports::attested::ConnectionFacts);
 
-trait TlsInfoExtUnwrap {
-    fn into_inner(self) -> Option<crate::transports::tls::TlsInfoArc>;
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ConnectionExt {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            crate::transports::attested::ConnectionFacts::from_extensions(&parts.extensions),
+        ))
+    }
 }
 
-impl TlsInfoExtUnwrap for TlsInfoExt {
-    fn into_inner(self) -> Option<crate::transports::tls::TlsInfoArc> {
-        self.map(|axum::extract::Extension(arc)| arc)
+impl ConnectionExt {
+    fn into_inner(self) -> crate::transports::attested::ConnectionFacts {
+        self.0
     }
 }
 
@@ -788,11 +795,11 @@ fn mcp_post_preflight(
 async fn mcp_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-    tls_info: TlsInfoExt,
+    connection: ConnectionExt,
     // `ConnectInfo` rides the request extensions on BOTH serve paths (axum's
     // `into_make_service_with_connect_info` on plain HTTP; `McpgTlsAcceptor`'s
-    // inject shim on TLS), so extract it as an optional Extension — the same
-    // shape as `TlsInfoExt`. (`Option<ConnectInfo<…>>` itself doesn't satisfy
+    // inject shim on TLS), so extract it as an optional Extension.
+    // (`Option<ConnectInfo<…>>` itself doesn't satisfy
     // axum 0.8's `OptionalFromRequestParts`.) Absent in `oneshot` tests.
     peer: Option<axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     method: axum::http::Method,
@@ -805,7 +812,7 @@ async fn mcp_handler(
     let mut request_context = match build_full_request_context(
         &headers,
         &runtime,
-        tls_info.into_inner(),
+        connection.into_inner(),
         config.gateway.server.trust_subject_header,
         &method,
         Some(
@@ -1856,7 +1863,7 @@ async fn modern_subscriptions_listen_handler(
 async fn mcp_get_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-    tls_info: TlsInfoExt,
+    connection: ConnectionExt,
     peer: Option<axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     method: axum::http::Method,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
@@ -1888,7 +1895,7 @@ async fn mcp_get_handler(
     let request_context = match build_full_request_context(
         &headers,
         &runtime,
-        tls_info.into_inner(),
+        connection.into_inner(),
         config.gateway.server.trust_subject_header,
         &method,
         Some(
@@ -2145,7 +2152,7 @@ async fn mcp_get_handler(
 async fn mcp_delete_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-    tls_info: TlsInfoExt,
+    connection: ConnectionExt,
     peer: Option<axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     method: axum::http::Method,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
@@ -2177,7 +2184,7 @@ async fn mcp_delete_handler(
     let request_context = match build_full_request_context(
         &headers,
         &runtime,
-        tls_info.into_inner(),
+        connection.into_inner(),
         config.gateway.server.trust_subject_header,
         &method,
         Some(

@@ -968,6 +968,82 @@ async fn anonymous_caller_sees_no_prompts_or_resources() {
     }
 }
 
+/// A caller an `http`-wire transport attests (a tailnet peer) is that
+/// verified principal with no token of its own: it opens a session and sees
+/// the catalog an anonymous caller does not.
+#[tokio::test]
+async fn a_transport_attested_peer_is_a_verified_caller_without_a_token() {
+    use crate::transports::attested::{AttestedPeer, AttestedPeerArc};
+    let attested: AttestedPeerArc = std::sync::Arc::new(AttestedPeer {
+        transport: "dev.mcpg.transport.tailscale".into(),
+        peer: mcpg_plugin_protocol::transport::TransportPeer {
+            provider: "tailscale".into(),
+            trust_level: "verified".into(),
+            subject_id: "alice@example.com".into(),
+            issuer: Some("tailscale:example.com".into()),
+            ..Default::default()
+        },
+    });
+    let app = router(build_test_state(), "/health", "/mcp");
+    let send = |body: serde_json::Value, session: Option<&str>| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, MCP_ACCEPT_HEADER);
+        if let Some(session) = session {
+            builder = builder
+                .header(
+                    PROTOCOL_VERSION_HEADER,
+                    crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                )
+                .header(SESSION_ID_HEADER, session);
+        }
+        let mut request = builder.body(Body::from(body.to_string())).expect("request");
+        request
+            .extensions_mut()
+            .insert(std::sync::Arc::clone(&attested));
+        app.clone().oneshot(request)
+    };
+    let initialize = send(
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "tailnet-client", "version": "1.0.0"}
+            }
+        }),
+        None,
+    )
+    .await
+    .expect("initialize");
+    assert_eq!(initialize.status(), StatusCode::OK);
+    let session = initialize.headers()[SESSION_ID_HEADER]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let initialized = send(
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        Some(&session),
+    )
+    .await
+    .expect("initialized");
+    assert_eq!(initialized.status(), StatusCode::ACCEPTED);
+    let listed = send(
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "prompts/list"}),
+        Some(&session),
+    )
+    .await
+    .expect("prompts/list");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body = response_text(listed).await;
+    assert!(
+        body.contains("mcpg_operational_overview"),
+        "the attested caller sees the catalog: {body}"
+    );
+}
+
 #[tokio::test]
 async fn mcp_prompts_get_returns_prompt_messages() {
     let (app, session_id) = initialize_session(router(build_test_state(), "/health", "/mcp")).await;
@@ -8658,7 +8734,7 @@ async fn gateway_minted_credential_skips_the_identity_plugin_chain() {
             build_full_request_context(
                 &headers,
                 runtime,
-                None,
+                Default::default(),
                 false,
                 &axum::http::Method::POST,
                 Some("/mcp"),
@@ -9363,7 +9439,7 @@ async fn a_dpop_caller_carries_its_key_thumbprint() {
     let ctx = build_full_request_context(
         &headers,
         &runtime,
-        None,
+        Default::default(),
         false,
         &axum::http::Method::POST,
         Some("/mcp?trace=1"),
@@ -9385,7 +9461,7 @@ async fn a_dpop_caller_carries_its_key_thumbprint() {
     let refused = build_full_request_context(
         &headers,
         &runtime,
-        None,
+        Default::default(),
         false,
         &axum::http::Method::POST,
         None,

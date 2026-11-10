@@ -15,11 +15,14 @@ use crate::runtime::authorization_server::{EmaBearerOutcome, ExternalDpop, Exter
 
 /// Build a request context with full identity resolution: transport-level + plugin chain.
 ///
-/// `tls_info` should be the per-connection TLS metadata stamped onto
-/// the request by the [`crate::transports::tls`] acceptor; pass
-/// `None` for plain HTTP requests. The metadata threads through to
-/// `RequestMetadata.tls` so identity plugins like `dev.mcpg.identity.workload`'s
-/// X.509-SVID source can consume the peer cert chain.
+/// `connection` is what the request's connection vouches for. Its TLS
+/// metadata (stamped by the [`crate::transports::tls`] acceptor; absent on
+/// plain HTTP) threads through to `RequestMetadata.tls` so identity plugins
+/// like `dev.mcpg.identity.workload`'s X.509-SVID source can consume the
+/// peer cert chain. Its attested peer (from an `http`-wire transport such
+/// as a tailnet) names a caller whose request carries no verified
+/// credential of its own; identity plugins run after it and may still
+/// replace it.
 ///
 /// A credential the gateway minted itself is never handed to the identity
 /// plugins: a plugin verifying the same bearer against its own issuer would
@@ -31,7 +34,7 @@ use crate::runtime::authorization_server::{EmaBearerOutcome, ExternalDpop, Exter
 pub(crate) async fn build_full_request_context(
     headers: &HeaderMap,
     runtime: &crate::runtime::GatewayRuntime,
-    tls_info: Option<crate::transports::tls::TlsInfoArc>,
+    connection: crate::transports::attested::ConnectionFacts,
     trust_subject_header: bool,
     method: &axum::http::Method,
     path: Option<&str>,
@@ -55,11 +58,18 @@ pub(crate) async fn build_full_request_context(
     let ctx = match origin {
         CredentialOrigin::GatewayMinted => ctx,
         CredentialOrigin::External => {
+            let mut ctx = ctx;
+            if let Some(attested) = connection.peer.as_deref()
+                && let Some(identity) =
+                    crate::transports::attested::identity_from_peer(&ctx.identity, attested)
+            {
+                ctx.identity = identity;
+            }
             enrich_identity_via_plugins(
                 ctx,
                 headers,
                 runtime.plugin_registry(),
-                tls_info,
+                connection.tls,
                 method,
                 path,
             )

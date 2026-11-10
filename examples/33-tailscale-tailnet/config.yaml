@@ -1,0 +1,74 @@
+# =============================================================================
+# A gateway on your tailnet — callers authenticated by Tailscale, no tokens.
+# =============================================================================
+# The dev.mcpg.transport.tailscale plugin joins the gateway to the tailnet as
+# its own node (embedded; no tailscaled, no inbound port) and asks the node
+# who owns each peer. A tailnet member is a verified caller with no token;
+# the roles of the example.com/cap/mcpg app capability your tailnet policy
+# grants become the caller's.
+#
+#   export TS_AUTHKEY=<auth key from the Tailscale admin console>
+#   mcpg --config examples/33-tailscale-tailnet/config.yaml
+#
+# The log line `tailscale node up node=mcp.<tailnet>.ts.net` names the URL;
+# give tailnet clients https://mcp.<tailnet>.ts.net/mcp. HTTPS needs MagicDNS
+# and HTTPS certificates turned on for the tailnet.
+
+gateway:
+  server:
+    # The local listener stays on loopback: the tailnet is the only way in
+    # from other machines.
+    bind_address: "127.0.0.1:8787"
+    mcp_path: "/mcp"
+    health_path: "/health"
+    max_request_body_mb: 4
+    transports:
+      - kind: dev.mcpg.transport.tailscale
+        config:
+          hostname: mcp
+          state_dir: ./tailscale-state
+          auth_key: ${env.TS_AUTHKEY}
+          identity:
+            capability: example.com/cap/mcpg
+            # Devices the policy grants no example.com/cap/mcpg get HTTP 403.
+            require_capability: true
+
+plugins:
+  - id: dev.mcpg.transport.tailscale
+    kind: native
+    class: transport
+    source: { oci: "oci://ghcr.io/mcpg-dev/plugins/transport-tailscale:protocol-1" }
+    # The grant is fail-closed: every capability the descriptor requires must
+    # be listed here or the plugin is refused at load.
+    granted_capabilities: [network_outbound, transport_listen]
+
+governance:
+  access:
+    # Only verified callers: tailnet members (and bearer tokens, when a
+    # verifier is configured).
+    require_authentication: true
+
+mcp:
+  capabilities:
+    tools:
+      - name: weather.current
+        title: "Current weather"
+        description: "Current temperature and wind at a latitude and longitude (Open-Meteo, no key)."
+        annotations: { read_only: true, idempotent: true, open_world: true }
+        input_schema:
+          type: object
+          required: [latitude, longitude]
+          properties:
+            latitude: { type: number, minimum: -90, maximum: 90 }
+            longitude: { type: number, minimum: -180, maximum: 180 }
+          additionalProperties: false
+        governance:
+          minimum_trust: verified
+        backend:
+          kind: http
+          url: "https://api.open-meteo.com/v1/forecast?latitude=${arguments.latitude}&longitude=${arguments.longitude}&current=temperature_2m,wind_speed_10m"
+          method: get
+          timeout_ms: 10000
+          expected_status_codes: [200]
+          require_json_response: true
+          max_response_bytes: 65536

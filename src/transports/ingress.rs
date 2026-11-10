@@ -20,6 +20,7 @@ use mcpg_plugin_protocol::transport::{
 };
 use tower::ServiceExt as _;
 
+use crate::transports::attested::{AttestedPeer, AttestedPeerArc};
 use crate::transports::tls::TlsInfoArc;
 
 /// The largest request body an `http`-wire transport may hand over. MCP
@@ -31,15 +32,20 @@ pub const MAX_INGRESS_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// limit.
 const UNKNOWN_CLIENT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
-/// Serves `http`-wire transport requests through the gateway router.
+/// Serves one `http`-wire transport's requests through the gateway router.
 pub struct GatewayHttpIngress {
     router: Router,
+    /// The transport's plugin id; a peer it attests is recorded under it.
+    transport: String,
 }
 
 impl GatewayHttpIngress {
     #[must_use]
-    pub fn new(router: Router) -> Arc<Self> {
-        Arc::new(Self { router })
+    pub fn new(router: Router, transport: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            router,
+            transport: transport.into(),
+        })
     }
 }
 
@@ -49,7 +55,7 @@ impl HttpIngressServer for GatewayHttpIngress {
         if body.len() > MAX_INGRESS_BODY_BYTES {
             return plain(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
         }
-        let request = match build_request(head, body) {
+        let request = match build_request(head, body, &self.transport) {
             Ok(request) => request,
             Err(reason) => return plain(StatusCode::BAD_REQUEST, &reason),
         };
@@ -83,7 +89,11 @@ impl HttpIngressServer for GatewayHttpIngress {
     }
 }
 
-fn build_request(head: HttpIngressRequestHead, body: Bytes) -> Result<Request<Body>, String> {
+fn build_request(
+    head: HttpIngressRequestHead,
+    body: Bytes,
+    transport: &str,
+) -> Result<Request<Body>, String> {
     let method = Method::from_bytes(head.method.as_bytes())
         .map_err(|_| format!("invalid method {:?}", head.method))?;
     if !head.uri.starts_with('/') {
@@ -106,6 +116,14 @@ fn build_request(head: HttpIngressRequestHead, body: Bytes) -> Result<Request<Bo
     request.extensions_mut().insert(ConnectInfo(client));
     if let Some(tls) = head.tls {
         request.extensions_mut().insert::<TlsInfoArc>(Arc::new(tls));
+    }
+    if let Some(peer) = head.peer {
+        request
+            .extensions_mut()
+            .insert::<AttestedPeerArc>(Arc::new(AttestedPeer {
+                transport: transport.to_owned(),
+                peer,
+            }));
     }
     Ok(request)
 }
@@ -154,6 +172,15 @@ mod tests {
                 ),
             )
             .route(
+                "/peer",
+                get(
+                    |peer: Option<axum::Extension<AttestedPeerArc>>| async move {
+                        peer.map(|p| format!("{} {}", p.0.transport, p.0.peer.subject_id))
+                            .unwrap_or_default()
+                    },
+                ),
+            )
+            .route(
                 "/sse",
                 get(|| async {
                     let events = futures::stream::iter(["a", "b"])
@@ -181,7 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_reaches_the_router_with_the_client_address_host_and_tls() {
-        let server = GatewayHttpIngress::new(router());
+        let server = GatewayHttpIngress::new(router(), "dev.test.transport");
         let head = HttpIngressRequestHead {
             method: "POST".into(),
             uri: "/echo".into(),
@@ -191,6 +218,7 @@ mod tests {
                 sni: Some("x.ngrok.app".into()),
                 ..Default::default()
             }),
+            peer: None,
         };
         let (head, body) = collect(server.serve(head, Bytes::from_static(b"ping")).await).await;
         assert_eq!(head.status, 200);
@@ -202,7 +230,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_client_without_an_address_gets_the_shared_unknown_address() {
-        let server = GatewayHttpIngress::new(router());
+        let server = GatewayHttpIngress::new(router(), "dev.test.transport");
         let head = HttpIngressRequestHead {
             method: "POST".into(),
             uri: "/echo".into(),
@@ -213,8 +241,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_attested_peer_reaches_the_router_under_the_transport_that_serves_it() {
+        let server = GatewayHttpIngress::new(router(), "dev.mcpg.transport.tailscale");
+        let head = HttpIngressRequestHead {
+            method: "GET".into(),
+            uri: "/peer".into(),
+            peer: Some(mcpg_plugin_protocol::transport::TransportPeer {
+                provider: "tailscale".into(),
+                trust_level: "verified".into(),
+                subject_id: "alice@example.com".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (_, body) = collect(server.serve(head, Bytes::new()).await).await;
+        assert_eq!(body, b"dev.mcpg.transport.tailscale alice@example.com");
+        let plain = HttpIngressRequestHead {
+            method: "GET".into(),
+            uri: "/peer".into(),
+            ..Default::default()
+        };
+        let (_, body) = collect(server.serve(plain, Bytes::new()).await).await;
+        assert!(body.is_empty(), "no peer, no extension");
+    }
+
+    #[tokio::test]
     async fn an_sse_answer_streams_its_events() {
-        let server = GatewayHttpIngress::new(router());
+        let server = GatewayHttpIngress::new(router(), "dev.test.transport");
         let head = HttpIngressRequestHead {
             method: "GET".into(),
             uri: "/sse".into(),
@@ -227,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_requests_and_oversized_bodies_are_refused_before_the_router() {
-        let server = GatewayHttpIngress::new(router());
+        let server = GatewayHttpIngress::new(router(), "dev.test.transport");
         for head in [
             HttpIngressRequestHead {
                 method: "PO ST".into(),

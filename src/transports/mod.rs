@@ -5,6 +5,7 @@
 //! Also defines the shared `TraceContext` for W3C trace propagation.
 
 pub mod anon_limit;
+pub mod attested;
 pub mod http;
 pub mod http_route;
 pub mod ingress;
@@ -18,15 +19,15 @@ pub mod wire_policy;
 /// Lives here so the http_route dispatcher doesn't have to re-implement
 /// the identity resolution pipeline.
 ///
-/// `tls_info` carries the per-connection TLS metadata that the
-/// [`tls::McpgTlsAcceptor`] stamped onto the request — passing
-/// `None` is correct for plain-HTTP requests or when the route
-/// dispatcher couldn't recover an extension (defensive on
-/// transport flips).
+/// `connection` carries what the connection vouches for: the TLS
+/// metadata [`tls::McpgTlsAcceptor`] stamped onto the request and a
+/// transport-attested peer — the default is correct for plain-HTTP
+/// requests or when the route dispatcher couldn't recover an extension
+/// (defensive on transport flips).
 pub(crate) async fn http_request_context(
     headers: &axum::http::HeaderMap,
     runtime: &crate::runtime::GatewayRuntime,
-    tls_info: Option<tls::TlsInfoArc>,
+    connection: attested::ConnectionFacts,
     trust_subject_header: bool,
     method: &axum::http::Method,
     path: Option<&str>,
@@ -35,7 +36,7 @@ pub(crate) async fn http_request_context(
     http::build_full_request_context(
         headers,
         runtime,
-        tls_info,
+        connection,
         trust_subject_header,
         method,
         path,

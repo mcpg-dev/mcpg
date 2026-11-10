@@ -2762,6 +2762,18 @@ fn require_authentication_needs_a_verifier() {
     ])
     .expect("the embedded authorization server verifies callers");
     assert!(config.governance.access.require_authentication);
+
+    let tailnet = "plugins:\n  - id: dev.mcpg.transport.tailscale\n    class: transport\n    \
+                   source:\n      path: /plugins/libmcpg_plugin_transport_tailscale.so\n\
+                   gateway:\n  server:\n    transports:\n      - kind: dev.mcpg.transport.tailscale\n";
+    AppConfig::load_from_yaml_strs(&[tailnet, strict])
+        .expect("a transport that attests callers can verify them");
+    let loaded_only = "plugins:\n  - id: dev.mcpg.transport.tailscale\n    class: transport\n    \
+                       source:\n      path: /plugins/libmcpg_plugin_transport_tailscale.so\n";
+    assert!(
+        AppConfig::load_from_yaml_strs(&[loaded_only, strict]).is_err(),
+        "a transport plugin that is loaded but not started verifies nobody"
+    );
 }
 
 #[test]

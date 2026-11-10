@@ -1868,7 +1868,7 @@ fn http_context(
 ) {
     let public_url = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
     let context = ExtraTransportContext {
-        http_server: Some(crate::transports::ingress::GatewayHttpIngress::new(router)),
+        http_router: Some(router),
         public_url: Some(std::sync::Arc::clone(&public_url)),
         legacy_wire,
     };
@@ -2053,7 +2053,7 @@ async fn a_native_http_wire_transport_serves_mcp_through_the_gateway_router() {
     });
     let router = crate::transports::http::router(state.clone(), "/health", "/mcp");
     let context = ExtraTransportContext {
-        http_server: Some(crate::transports::ingress::GatewayHttpIngress::new(router)),
+        http_router: Some(router),
         public_url: None,
         legacy_wire: true,
     };
@@ -2125,6 +2125,127 @@ async fn a_native_http_wire_transport_serves_mcp_through_the_gateway_router() {
     assert!(tools["error"].is_null(), "{tools}");
 
     assert_eq!(answers[3]["status"], 200, "{}", answers[3]);
+}
+
+/// Boot a gateway whose config is `extra_yaml` plus the probe as a plugin
+/// and as a `gateway.server.transports` entry, run `requests` through the
+/// probe, and return its answers.
+async fn run_probe(
+    so: &std::path::Path,
+    extra_yaml: &str,
+    requests: serde_json::Value,
+) -> Vec<serde_json::Value> {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("answers.json");
+    let base = format!(
+        "plugins:\n  - id: dev.test.transport.probe\n    class: transport\n    kind: native\n    \
+         source:\n      path: {}\n    signature:\n      policy: disabled\n\
+         gateway:\n  server:\n    transports:\n      - kind: dev.test.transport.probe\n",
+        so.display()
+    );
+    let config =
+        AppConfig::load_from_yaml_strs(&[base.as_str(), extra_yaml]).expect("config loads");
+    let plugins = config.plugins.clone();
+    let state = crate::app::build_from_config(config, Vec::new())
+        .await
+        .expect("the gateway builds with the probe loaded");
+    let context = ExtraTransportContext {
+        http_router: Some(crate::transports::http::router(
+            state.clone(),
+            "/health",
+            "/mcp",
+        )),
+        public_url: None,
+        legacy_wire: true,
+    };
+    let registry = state.runtime.load().plugin_registry_arc();
+    let handles = start_extra_transports(
+        &[crate::config::wiring::KindRef {
+            kind: "dev.test.transport.probe".into(),
+            config: serde_json::json!({
+                "report": report.display().to_string(),
+                "requests": requests,
+            }),
+        }],
+        &plugins,
+        "single_node",
+        state.runtime.clone(),
+        &registry,
+        &context,
+    )
+    .await
+    .expect("the probe starts on the http wire");
+    for _ in 0..400 {
+        if let Ok(bytes) = std::fs::read(&report) {
+            drop(handles);
+            return serde_json::from_slice(&bytes).unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the probe wrote no answers");
+}
+
+/// A gateway that admits only verified callers, with no token verifier at
+/// all: the transport's attested peer (as a tailnet member) opens a session
+/// and lists the catalog across the FFI, and an anonymous caller on the same
+/// transport gets the 401 challenge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transport_attested_peer_passes_require_authentication_and_an_anonymous_caller_does_not()
+{
+    let Some(so) = http_transport_probe_cdylib() else {
+        eprintln!("skipped: this runner stages no http transport probe cdylib");
+        return;
+    };
+    let peer = serde_json::json!({
+        "provider": "tailscale",
+        "trust_level": "verified",
+        "subject_id": "alice@example.com",
+        "issuer": "tailscale:example.com"
+    });
+    let headers = serde_json::json!([
+        ["host", "probe.example.test"],
+        ["content-type", "application/json"],
+        ["accept", "application/json, text/event-stream"],
+        ["mcp-protocol-version", "2025-11-25"]
+    ]);
+    let initialize = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "tailnet-client", "version": "1.0.0"}
+        }
+    })
+    .to_string();
+    let answers = run_probe(
+        &so,
+        "governance:\n  access:\n    require_authentication: true\n",
+        serde_json::json!([
+            {"method": "POST", "uri": "/mcp", "headers": headers, "body": initialize},
+            {"method": "POST", "uri": "/mcp", "headers": headers, "body": initialize, "peer": peer},
+            {
+                "method": "POST", "uri": "/mcp", "headers": headers, "session_from": 1, "peer": peer,
+                "body": serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string()
+            },
+            {
+                "method": "POST", "uri": "/mcp", "headers": headers, "session_from": 1, "peer": peer,
+                "body": serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).to_string()
+            },
+        ]),
+    )
+    .await;
+    assert_eq!(answers[0]["status"], 401, "anonymous: {}", answers[0]);
+    assert_eq!(answers[1]["status"], 200, "attested: {}", answers[1]);
+    assert_eq!(answers[2]["status"], 202, "{}", answers[2]);
+    assert_eq!(answers[3]["status"], 200, "{}", answers[3]);
+    assert!(
+        answers[3]["body"]
+            .as_str()
+            .unwrap()
+            .contains(r#""id":2,"result":{"tools":"#),
+        "{}",
+        answers[3]
+    );
 }
 
 #[tokio::test]

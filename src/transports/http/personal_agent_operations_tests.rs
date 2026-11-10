@@ -524,7 +524,7 @@ async fn an_operations_tool_is_listed_without_its_output_schema() {
             build_full_request_context(
                 &headers,
                 &runtime,
-                None,
+                Default::default(),
                 false,
                 &axum::http::Method::POST,
                 Some("/mcp"),

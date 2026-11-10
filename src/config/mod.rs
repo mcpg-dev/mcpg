@@ -875,8 +875,9 @@ impl AppConfig {
             return Err(anyhow::anyhow!(
                 "governance.access.require_authentication refuses every caller below verified, \
                  but nothing here can verify one: configure governance.access.jwks, \
-                 governance.access.oidc_oauth, governance.access.authorization_server or an \
-                 identity_provider plugin"
+                 governance.access.oidc_oauth, governance.access.authorization_server, an \
+                 identity_provider plugin, or a transport plugin that attests callers (such \
+                 as dev.mcpg.transport.tailscale) in gateway.server.transports"
             ));
         }
         self.validate_binding_quota_refs()?;
