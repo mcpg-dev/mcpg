@@ -220,7 +220,11 @@ pub(crate) async fn open_post_continuation_sse(
 /// they open — two streams watching one resource must not be able to
 /// unsubscribe each other.
 pub(crate) struct ResourceSubscriptionGuard {
-    leases: Vec<crate::runtime::subscriptions::SubscriptionLease>,
+    leases:
+        std::sync::Arc<parking_lot::Mutex<Vec<crate::runtime::subscriptions::SubscriptionLease>>>,
+    /// What the realtime admission holds for this stream: released when the
+    /// stream ends, renewed by `renewal` until then.
+    admitted: Option<ListenAdmission>,
     /// The `mcpg.resource.unsubscribe` records the close of the stream
     /// writes, one for each lease, through the runtime current then (the
     /// swappable handle, so a stream keeps no reloaded-away registry).
@@ -230,8 +234,97 @@ pub(crate) struct ResourceSubscriptionGuard {
     )>,
 }
 
+/// The admission leases of one `subscriptions/listen` stream.
+struct ListenAdmission {
+    runtime: std::sync::Weak<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>>,
+    identity: crate::runtime::RequestIdentity,
+    client: Option<mcpg_plugin_protocol::ClientInfo>,
+    /// The leases still held; a refused renewal takes its lease out.
+    held: std::sync::Arc<parking_lot::Mutex<Vec<crate::runtime::admission::AdmissionLease>>>,
+    renewal: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ListenAdmission {
+    fn drop(&mut self) {
+        self.renewal.abort();
+        let held = std::mem::take(&mut *self.held.lock());
+        let (Some(runtime), Ok(handle)) = (
+            self.runtime.upgrade(),
+            tokio::runtime::Handle::try_current(),
+        ) else {
+            return;
+        };
+        let (identity, client) = (self.identity.clone(), self.client.clone());
+        handle.spawn(async move {
+            let runtime = runtime.load_full();
+            for lease in &held {
+                runtime
+                    .realtime_release(&identity, client.as_ref(), lease)
+                    .await;
+            }
+        });
+    }
+}
+
+/// Renew every lease in `held` at the admission's pace. A refused renewal
+/// ends that target's subscription: its lease leaves `held` and its
+/// subscription lease leaves `leases`.
+async fn renew_listen_admission(
+    runtime: std::sync::Weak<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>>,
+    identity: crate::runtime::RequestIdentity,
+    client: Option<mcpg_plugin_protocol::ClientInfo>,
+    held: std::sync::Arc<parking_lot::Mutex<Vec<crate::runtime::admission::AdmissionLease>>>,
+    leases: std::sync::Arc<
+        parking_lot::Mutex<Vec<crate::runtime::subscriptions::SubscriptionLease>>,
+    >,
+    mut renew_after: std::time::Duration,
+) {
+    use crate::runtime::admission::{AdmissionOp, AdmissionTarget};
+    loop {
+        tokio::time::sleep(renew_after).await;
+        let Some(runtime) = runtime.upgrade() else {
+            return;
+        };
+        let runtime = runtime.load_full();
+        let current = held.lock().clone();
+        if current.is_empty() {
+            return;
+        }
+        for lease in current {
+            match runtime
+                .realtime_admit(AdmissionOp::Renew, &identity, client.as_ref(), &lease)
+                .await
+            {
+                Ok(Some(grant)) => renew_after = renew_after.min(grant.renew_after),
+                Ok(None) => return,
+                Err(denial) => {
+                    let AdmissionTarget::Resource { uri } = &lease.target else {
+                        continue;
+                    };
+                    tracing::info!(
+                        uri = %uri,
+                        code = denial.code,
+                        "the realtime admission refused a renewal; the listen target ends"
+                    );
+                    held.lock().retain(|kept| kept.id != lease.id);
+                    let ended: Vec<_> = {
+                        let mut leases = leases.lock();
+                        let (ended, kept) = std::mem::take(&mut *leases)
+                            .into_iter()
+                            .partition(|held| held.uri() == uri);
+                        *leases = kept;
+                        ended
+                    };
+                    drop(ended);
+                }
+            }
+        }
+    }
+}
+
 impl Drop for ResourceSubscriptionGuard {
     fn drop(&mut self) {
+        self.admitted.take();
         let Some((runtime, mut events)) = self.on_close.take() else {
             return;
         };
@@ -266,6 +359,7 @@ impl ResourceSubscriptionGuard {
     /// told about are the ones this guard holds a lease on.
     pub(crate) fn established(&self) -> Vec<String> {
         self.leases
+            .lock()
             .iter()
             .map(|lease| lease.uri().to_owned())
             .collect()
@@ -284,8 +378,13 @@ pub(crate) async fn register_modern_resource_subscriptions(
     session_id: &str,
     request_context: &crate::runtime::RequestContext,
     uris: &[String],
-) -> ResourceSubscriptionGuard {
+) -> Result<ResourceSubscriptionGuard, crate::runtime::admission::AdmissionDenial> {
+    use crate::runtime::admission::AdmissionOp;
     use crate::runtime::stores::subscription_store::SubscriberIdentity;
+
+    let client = request_context.client();
+    let mut admitted = Vec::new();
+    let mut renew_after: Option<std::time::Duration> = None;
 
     let identity = Some(SubscriberIdentity::from_request_context(
         session_id,
@@ -327,6 +426,35 @@ pub(crate) async fn register_modern_resource_subscriptions(
                 "subscriptions/listen: skipping resources/updated target the caller may not read"
             );
             continue;
+        }
+        // The realtime admission decides whether the caller may hold this
+        // target. Its refusal fails the listen with the admission's own
+        // error, which names what the caller can do about it; the targets
+        // admitted so far are let go.
+        let admission_lease = crate::runtime::admission::listen_resource_lease(uri);
+        match runtime
+            .realtime_admit(
+                AdmissionOp::Admit,
+                &request_context.identity,
+                client.as_ref(),
+                &admission_lease,
+            )
+            .await
+        {
+            Ok(Some(grant)) => {
+                renew_after =
+                    Some(renew_after.map_or(grant.renew_after, |r| r.min(grant.renew_after)));
+                admitted.push(admission_lease);
+            }
+            Ok(None) => {}
+            Err(denial) => {
+                for lease in &admitted {
+                    runtime
+                        .realtime_release(&request_context.identity, client.as_ref(), lease)
+                        .await;
+                }
+                return Err(denial);
+            }
         }
         if let Some(lease) = subscriptions
             .acquire(session_id, uri, identity.clone())
@@ -377,10 +505,30 @@ pub(crate) async fn register_modern_resource_subscriptions(
     metrics::counter!("mcpg_subscriptions_listen_resources_registered_total")
         .increment(leases.len() as u64);
 
-    ResourceSubscriptionGuard {
+    let leases = std::sync::Arc::new(parking_lot::Mutex::new(leases));
+    let admitted = renew_after.map(|renew_after| {
+        let held = std::sync::Arc::new(parking_lot::Mutex::new(admitted));
+        let weak = std::sync::Arc::downgrade(runtime_handle);
+        ListenAdmission {
+            runtime: weak.clone(),
+            identity: request_context.identity.clone(),
+            client: client.clone(),
+            held: std::sync::Arc::clone(&held),
+            renewal: tokio::spawn(renew_listen_admission(
+                weak,
+                request_context.identity.clone(),
+                client,
+                held,
+                std::sync::Arc::clone(&leases),
+                renew_after,
+            )),
+        }
+    });
+    Ok(ResourceSubscriptionGuard {
         leases,
+        admitted,
         on_close: Some((std::sync::Arc::downgrade(runtime_handle), close_events)),
-    }
+    })
 }
 
 /// default reconnect hint in milliseconds. Emitted on every

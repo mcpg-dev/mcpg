@@ -45,6 +45,7 @@ pub mod personal_agent;
 pub mod plugins;
 pub mod policy;
 pub mod quotas;
+pub mod realtime;
 pub mod registry;
 pub mod resolver;
 pub mod schema;

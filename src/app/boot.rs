@@ -514,6 +514,7 @@ async fn build_with(
         &config.mcp.skills,
         skills_dir,
     )?);
+    runtime.set_realtime_admission(config.mcp.realtime.admission.as_ref());
     runtime.set_tunnel_federation(config.gateway.server.tunnel_federation.as_ref());
     runtime.set_list_page_size(config.mcp.list_page_size());
     runtime.set_license_state((&license).into());

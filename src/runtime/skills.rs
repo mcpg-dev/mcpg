@@ -90,7 +90,11 @@ pub struct SkillCatalog {
 
 impl SkillCatalog {
     /// Read every source of `config`. `None` when no source is configured.
-    /// A relative source path resolves against `config_dir`.
+    /// A relative source path resolves against `config_dir`, the folder of
+    /// the configuration file; a configuration with no file (inline, fetched
+    /// from a URL, pushed by a control plane) has none, and a relative path
+    /// is then refused: the working directory depends on how the gateway
+    /// was started.
     pub fn load(config: &SkillsConfig, config_dir: Option<&Path>) -> Result<Option<Self>> {
         if !config.is_enabled() {
             return Ok(None);
@@ -102,10 +106,19 @@ impl SkillCatalog {
         };
         let mut directory_uris: BTreeSet<String> = BTreeSet::new();
         for (index, source) in config.sources.iter().enumerate() {
-            let path = resolve(&source.path, config_dir);
+            let path = resolve(&source.path, config_dir)
+                .with_context(|| format!("mcp.skills.sources[{index}]"))?;
+            let before = catalog.skills.len();
             catalog
                 .add_source(&path, source.prefix.as_deref(), &mut directory_uris)
                 .with_context(|| format!("mcp.skills.sources[{index}] ({})", path.display()))?;
+            tracing::info!(
+                source = index,
+                configured = %source.path,
+                folder = %path.display(),
+                skills = catalog.skills.len() - before,
+                "skills source loaded"
+            );
         }
         catalog.skills.sort_by(|a, b| a.entry.uri.cmp(&b.entry.uri));
         catalog.build_directories(&directory_uris);
@@ -327,12 +340,21 @@ impl SkillCatalog {
     }
 }
 
-fn resolve(path: &str, config_dir: Option<&Path>) -> PathBuf {
-    let path = PathBuf::from(path);
-    match config_dir {
-        Some(dir) if path.is_relative() => dir.join(path),
-        _ => path,
-    }
+/// The absolute folder of a source `path`.
+fn resolve(path: &str, config_dir: Option<&Path>) -> Result<PathBuf> {
+    let configured = PathBuf::from(path);
+    let joined = match config_dir {
+        _ if configured.is_absolute() => configured,
+        Some(dir) => dir.join(configured),
+        None => bail!(
+            "the path `{path}` is relative, and this configuration comes from no file, so \
+             there is no configuration folder to resolve it against; give an absolute path"
+        ),
+    };
+    // A configuration file named by a relative path has a relative folder;
+    // the logged and reported folder is the absolute one.
+    std::path::absolute(&joined)
+        .with_context(|| format!("cannot make `{}` absolute", joined.display()))
 }
 
 /// Every regular file under `dir`, as its path segments below the source
@@ -684,6 +706,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(catalog.skill("skill://screen/SKILL.md").is_some());
+    }
+
+    #[test]
+    fn a_relative_source_without_a_config_folder_is_refused_and_an_absolute_one_loads() {
+        let relative = SkillsConfig {
+            sources: vec![SkillSourceConfig {
+                path: "skills".to_owned(),
+                prefix: None,
+            }],
+            ..SkillsConfig::default()
+        };
+        let err = format!("{:#}", SkillCatalog::load(&relative, None).unwrap_err());
+        assert!(
+            err.contains("mcp.skills.sources[0]")
+                && err.contains("`skills` is relative")
+                && err.contains("absolute path"),
+            "{err}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "screen/SKILL.md", &skill_md("screen", "d"));
+        let catalog = SkillCatalog::load(&config(vec![(dir.path(), None)]), None)
+            .unwrap()
+            .unwrap();
+        assert!(catalog.skill("skill://screen/SKILL.md").is_some());
+    }
+
+    #[test]
+    fn a_source_folder_is_absolute_also_under_a_relative_config_folder() {
+        assert!(
+            resolve("skills", Some(Path::new("")))
+                .unwrap()
+                .is_absolute()
+        );
+        assert!(
+            resolve("skills", Some(Path::new("conf")))
+                .unwrap()
+                .ends_with("conf/skills")
+        );
+        assert_eq!(
+            resolve("/srv/skills", None).unwrap(),
+            Path::new("/srv/skills")
+        );
     }
 
     #[test]

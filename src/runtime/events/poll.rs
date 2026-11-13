@@ -662,19 +662,39 @@ impl EventsCore {
             arguments: &params.arguments,
         };
         let lease = stores.leases.get(&id).await.map_err(store_fault)?;
-        match &lease {
-            None => {
-                let cap = poll.max_leases_per_principal;
-                let held = stores
-                    .leases
-                    .count_of(&principal_key, cap as usize)
-                    .await
-                    .map_err(store_fault)?;
-                if held as u64 >= cap {
-                    return Err(EventsError::resource_exhausted("poll_leases", Some(cap)));
-                }
-                self.check_plan_readers(&ty, &holder).await?;
+        if lease.is_none() {
+            let cap = poll.max_leases_per_principal;
+            let held = stores
+                .leases
+                .count_of(&principal_key, cap as usize)
+                .await
+                .map_err(store_fault)?;
+            if held as u64 >= cap {
+                return Err(EventsError::resource_exhausted("poll_leases", Some(cap)));
             }
+            self.check_plan_readers(&ty, &holder).await?;
+        }
+        // The first poll of a lease asks the realtime admission; each later
+        // one renews it once the grant's interval has passed, so a caller
+        // that stops polling stops renewing.
+        runtime
+            .realtime_admit_paced(
+                lease.is_some(),
+                &ctx.identity,
+                ctx.client().as_ref(),
+                &crate::runtime::admission::AdmissionLease {
+                    id: id.to_string(),
+                    delivery: "poll",
+                    target: crate::runtime::admission::AdmissionTarget::Event {
+                        name: ty.name.clone(),
+                        arguments: arguments.clone(),
+                    },
+                },
+            )
+            .await
+            .map_err(crate::runtime::admission::AdmissionDenial::into_events_error)?;
+        match &lease {
+            None => {}
             Some(lease) if !lease.has_more => {
                 let next_read = lease.last_read_ms.saturating_add(poll.min_next_poll_ms);
                 if now < next_read {

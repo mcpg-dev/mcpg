@@ -1774,16 +1774,28 @@ async fn modern_subscriptions_listen_handler(
     if let Some(ref sid) = session_id
         && !watched_resources.is_empty()
     {
-        resource_subscriptions = Some(
-            register_modern_resource_subscriptions(
-                &runtime,
-                &state.runtime,
-                sid,
-                &request_context,
-                &watched_resources,
-            )
-            .await,
-        );
+        match register_modern_resource_subscriptions(
+            &runtime,
+            &state.runtime,
+            sid,
+            &request_context,
+            &watched_resources,
+        )
+        .await
+        {
+            Ok(guard) => resource_subscriptions = Some(guard),
+            Err(denial) => {
+                return map_protocol_error_response(
+                    ProtocolError::application(
+                        Some(request_id_value),
+                        denial.code,
+                        denial.message,
+                        denial.data,
+                    ),
+                    &request_context.request_id,
+                );
+            }
+        }
     }
 
     // The first frame is `notifications/subscriptions/acknowledged` with

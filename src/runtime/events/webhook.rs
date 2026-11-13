@@ -144,6 +144,22 @@ fn depth(value: &Value) -> usize {
     }
 }
 
+/// What the realtime admission holds for the webhook subscription `id`.
+fn webhook_admission_lease(
+    id: &impl std::fmt::Display,
+    name: &str,
+    arguments: &Value,
+) -> crate::runtime::admission::AdmissionLease {
+    crate::runtime::admission::AdmissionLease {
+        id: id.to_string(),
+        delivery: "webhook",
+        target: crate::runtime::admission::AdmissionTarget::Event {
+            name: name.to_owned(),
+            arguments: arguments.clone(),
+        },
+    }
+}
+
 /// The `-32012` (or `-32013`) a denial of the policy gate becomes on an
 /// `events/*` method. The reason is a fixed category, never the rule.
 pub(crate) fn gate_error(response: crate::protocol::ProtocolHttpResponse) -> EventsError {
@@ -336,6 +352,17 @@ impl EventsCore {
                 return Err(EventsError::internal(STORE_FAULT));
             }
         };
+        // A new subscription asks the realtime admission; a refresh renews
+        // it once the grant's interval has passed.
+        runtime
+            .realtime_admit_paced(
+                matches!(existing, Existing::Live(_)),
+                &ctx.identity,
+                ctx.client().as_ref(),
+                &webhook_admission_lease(&id, &ty.name, &arguments),
+            )
+            .await
+            .map_err(crate::runtime::admission::AdmissionDenial::into_events_error)?;
         // A concurrent subscribe on the same key can create the record
         // between the read and the create; the second pass refreshes it.
         for _ in 0..2 {
@@ -767,6 +794,18 @@ impl EventsCore {
                     expires_at_ms: record.expires_at_ms,
                 });
                 self.audit_unsubscribe(ctx, &record).await;
+                runtime
+                    .load_full()
+                    .realtime_release(
+                        &ctx.identity,
+                        ctx.client().as_ref(),
+                        &webhook_admission_lease(
+                            &id,
+                            &params.name,
+                            &Value::Object(params.arguments.clone()),
+                        ),
+                    )
+                    .await;
                 metrics::counter!("mcpg_events_unsubscribe_total", "outcome" => "deleted")
                     .increment(1);
                 Ok(UnsubscribeEventsResult::default())

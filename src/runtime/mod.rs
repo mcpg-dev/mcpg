@@ -33,6 +33,7 @@ pub mod quota_gate;
 pub mod reapers;
 pub(crate) use reapers::reaper_leadership;
 pub use reapers::{pipeline_reaper, task_reaper};
+pub mod admission;
 pub mod redact;
 pub mod safe_dns;
 mod seen_request_ids;
@@ -391,6 +392,11 @@ pub struct RequestContext {
     /// performs: it runs outside any MCP session and proposes nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pap_operation: Option<String>,
+    /// This is the gateway's own call of the realtime admission tool: it
+    /// runs outside any MCP session, and only such a call may reach that
+    /// tool.
+    #[serde(skip)]
+    pub(crate) realtime_admission: bool,
     /// The caller's address: the first `X-Forwarded-For` hop when
     /// `server.trust_proxy_ip` is set, else the transport peer. `None` for
     /// a transport without a peer address.
@@ -438,6 +444,7 @@ impl RequestContext {
             connect_link: Arc::default(),
             personal_agent: None,
             pap_operation: None,
+            realtime_admission: false,
             client_ip: None,
             client: None,
             cached_session: Arc::new(OnceLock::new()),
@@ -861,6 +868,9 @@ pub struct GatewayRuntime {
     /// when no source is configured: the extension is then not declared
     /// and its methods are unknown.
     skills: Option<Arc<skills::SkillCatalog>>,
+    /// `mcp.realtime.admission`: the tool asked before, during and after a
+    /// caller holds realtime delivery. `None` admits every caller.
+    realtime_admission: Option<Arc<admission::RealtimeAdmission>>,
     /// `mcp.configurations.events` of the config this runtime was built
     /// from. Read per request by `server/discover` and the `events/*`
     /// arms, so a reload that turns events on or off takes effect at

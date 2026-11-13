@@ -8,15 +8,31 @@ impl GatewayRuntime {
         params: ToolCallParams,
         request_context: &RequestContext,
     ) -> ProtocolHttpResponse {
+        // The realtime admission tool answers only the gateway's own calls;
+        // to a caller it is an unknown tool.
+        if self.is_admission_tool(&params.name) && !request_context.realtime_admission {
+            return protocol_http_error(
+                200,
+                Some(request_id),
+                -32602,
+                format!("unknown tool: {}", params.name),
+                self.debug_error_data(
+                    request_context,
+                    "Use tools/list to discover available tool names.",
+                ),
+            );
+        }
         // A confirmed Personal Agent Protocol operation runs outside any MCP
         // session: the Session that confirms it may never have opened one.
-        let session = if request_context.pap_operation.is_some() {
-            Ok(None)
-        } else {
-            request_context
-                .load_session_cached(&*self.session_store, true)
-                .map(Some)
-        };
+        // So does the gateway's own admission call.
+        let session =
+            if request_context.pap_operation.is_some() || request_context.realtime_admission {
+                Ok(None)
+            } else {
+                request_context
+                    .load_session_cached(&*self.session_store, true)
+                    .map(Some)
+            };
         match session {
             Ok(_) => match self.capability_registry.tool_route(&params.name) {
                 Some(route) => {

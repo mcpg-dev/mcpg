@@ -43,6 +43,7 @@ use crate::protocol::v_2026_07_28::extensions::events::errors::{
 use crate::protocol::v_2026_07_28::extensions::events::wire::{
     DeliveryMode, StreamEventsParams, StreamFrame, stream_events_result,
 };
+use crate::runtime::admission::{AdmissionDenial, AdmissionLease, AdmissionOp, AdmissionTarget};
 use crate::runtime::policy::PolicyRoute;
 use crate::runtime::{GatewayRequestId, RequestContext, RequestIdentity, TransportKind};
 
@@ -126,6 +127,8 @@ enum Close {
     Server,
     /// The subscription ended for this reason.
     Terminated(TerminationReason),
+    /// The realtime admission refused the renewal with this error.
+    Refused(EventsError),
 }
 
 /// One open stream.
@@ -137,6 +140,10 @@ struct Stream {
     identity: RequestIdentity,
     /// The MCP client that opened the stream, for its close record.
     client: Option<Value>,
+    /// What the realtime admission holds for this stream, and when it is
+    /// renewed next; `None` without an admission.
+    admission: Option<(AdmissionLease, tokio::time::Instant)>,
+    client_info: Option<mcpg_plugin_protocol::ClientInfo>,
     /// The stream's row in `GET /admin/v1/subscriptions`.
     presence: PresenceRow,
     credential: CredentialSnapshot,
@@ -239,6 +246,30 @@ impl EventsCore {
         let heartbeat = Duration::from_millis(push.heartbeat_interval_ms);
         let stream_id = uuid::Uuid::now_v7().to_string();
         let opened_ms = now_ms();
+        let client_info = ctx.client();
+        let admission_lease = AdmissionLease {
+            id: stream_id.clone(),
+            delivery: "stream",
+            target: AdmissionTarget::Event {
+                name: ty.name.clone(),
+                arguments: arguments.clone(),
+            },
+        };
+        let admission = runtime
+            .realtime_admit(
+                AdmissionOp::Admit,
+                &ctx.identity,
+                client_info.as_ref(),
+                &admission_lease,
+            )
+            .await
+            .map_err(AdmissionDenial::into_events_error)?
+            .map(|grant| {
+                (
+                    admission_lease,
+                    tokio::time::Instant::now() + grant.renew_after,
+                )
+            });
         let presence = PresenceRow {
             principal: crate::runtime::util::plugin_identity_from_request(ctx),
             client: ctx
@@ -254,7 +285,7 @@ impl EventsCore {
             since_ms: opened_ms,
             refreshed_ms: opened_ms,
         };
-        stores
+        if let Err(error) = stores
             .leases
             .put_stream(
                 &principal_key,
@@ -264,7 +295,14 @@ impl EventsCore {
                 heartbeat * 2,
             )
             .await
-            .map_err(store_fault)?;
+        {
+            if let Some((lease, _)) = &admission {
+                runtime
+                    .realtime_release(&ctx.identity, client_info.as_ref(), lease)
+                    .await;
+            }
+            return Err(store_fault(error));
+        }
         self.note_lease_demand(
             &stores,
             &ty,
@@ -285,6 +323,8 @@ impl EventsCore {
             client: ctx
                 .client()
                 .map(|c| serde_json::json!({ "name": c.name, "version": c.version })),
+            admission,
+            client_info,
             presence,
             credential: credential_snapshot(ctx),
             principal_key,
@@ -340,13 +380,29 @@ impl Stream {
         {
             tracing::debug!(error = %error, "stream lease release failed; it expires on its own");
         }
-        let reason = match close {
+        let reason = match &close {
             Close::Client => "client",
             Close::Server => "server",
             Close::Terminated(reason) => reason.label(),
+            Close::Refused(_) => "admission",
         };
+        // A refused renewal already ended the hold on the admission's side.
+        if !matches!(close, Close::Refused(_))
+            && let Some((lease, _)) = &self.admission
+            && let Some(runtime) = self.core.upgrade().and_then(|core| core.runtime())
+        {
+            runtime
+                .load_full()
+                .realtime_release(&self.identity, self.client_info.as_ref(), lease)
+                .await;
+        }
         match close {
             Close::Client => {}
+            Close::Refused(error) => {
+                let frame = StreamFrame::Terminated(error.numbered(self.numbering).to_error_body());
+                let _ = self.tx.send(frame.to_notification(&self.request_id)).await;
+                let _ = self.tx.send(stream_events_result(&self.request_id)).await;
+            }
             Close::Server => {
                 let _ = self.tx.send(stream_events_result(&self.request_id)).await;
             }
@@ -522,6 +578,25 @@ impl Stream {
             return Some(Close::Terminated(TerminationReason::Forbidden(
                 ForbiddenReason::Revoked,
             )));
+        }
+        if let Some((lease, due)) = &mut self.admission
+            && tokio::time::Instant::now() >= *due
+        {
+            match runtime
+                .realtime_admit(
+                    AdmissionOp::Renew,
+                    &self.identity,
+                    self.client_info.as_ref(),
+                    lease,
+                )
+                .await
+            {
+                Ok(Some(grant)) => *due = tokio::time::Instant::now() + grant.renew_after,
+                // The admission went away with a reload: nothing holds the
+                // stream any more.
+                Ok(None) => self.admission = None,
+                Err(denial) => return Some(Close::Refused(denial.into_events_error())),
+            }
         }
         if tokio::time::Instant::now() >= *recheck_at {
             *recheck_at = tokio::time::Instant::now() + self.reauthorize;

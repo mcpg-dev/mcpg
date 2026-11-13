@@ -350,6 +350,15 @@ Where the AAuth resource signing key comes from — exactly one source.
 | `disclosure` | [`DisclosureLevel`](#disclosurelevel) | `"summary"` |  |
 | `enabled` | boolean | `false` |  |
 
+### `AdmissionOnError`
+
+The decision when the admission tool gives none.
+
+**Allowed values:**
+
+- `deny`
+- `allow`
+
 ### `AgentExtensionsConfig`
 
 Where a Personal Agent's extensions are read.
@@ -1934,6 +1943,7 @@ Two children that mirror MCP's own vocabulary: - `capabilities:` — what the se
 | `federations` | array&lt;[`FederationConfig`](#federationconfig)&gt; | `[]` | Upstream MCP servers federated through this gateway. Each entry is a *capability source* (1:N): MCPG connects to the upstream, imports its capabilities, and re-serves them under a prefix. Default empty — existing configs are unaffected. |
 | `instructions` | string (optional) |  | The `instructions` a client receives in `server/discover` and in the `initialize` result, typically shown to the model: what this server is for and how to use its tools. At most 64 KiB. Unset keeps MCPG's own text. |
 | `list_page_size` | integer (optional) |  | How many entries one page of `tools/list`, `prompts/list`, `resources/list` and `resources/templates/list` holds, on every wire; a client follows `nextCursor` for the rest. 1 to 1 000; unset is 100. A client that reads only the first page sees only this many. |
+| `realtime` | [`RealtimeConfig`](#realtimeconfig) |  | Realtime delivery (MCP Events streams, polls and webhook subscriptions; resource subscriptions): an admission tool the gateway asks before, during and after a caller holds it. Unset admits every caller the policy allows. |
 | `registries` | array&lt;[`McpRegistryConfig`](#mcpregistryconfig)&gt; | `[]` | MCP registries whose listed servers MCPG auto-federates: a background syncer crawls each registry's `/v0.1` API and materializes one federation per usable server, kept in sync as the registry changes. Default empty. |
 | `registry` | [`ServedRegistryConfig`](#servedregistryconfig) | (see type) | The registry MCPG *serves* (contrast `registries`, the registries MCPG *consumes*): a v0.1 MCP-Registry view of this gateway — one entry describing the governed catalog — so registry-driven clients (e.g. Copilot's allowed-registry policy) can discover MCPG as their approved server. Off by default. |
 | `server_info` | [`McpServerInfoConfig`](#mcpserverinfoconfig) | `{}` | How the server presents itself to clients: `serverInfo` in `server/discover` and in the `initialize` result. Every field is optional; an unset field keeps MCPG's own value. `version` is always the gateway's. |
@@ -2378,6 +2388,32 @@ One named rate-limit policy.
 | --- | --- | --- | --- |
 | `calls_per_minute` | integer |  | Calls allowed per minute. Bucket refills at this rate. |
 
+### `RealtimeAdmissionConfig`
+
+`mcp.realtime.admission`.
+
+The gateway calls `tool` as the caller, through the whole tool-call path (policy, gates, the backend), with these arguments:
+
+- `op`: `admit` (a caller opens realtime delivery), `renew` (it still holds it) or `release` (it let go; best effort). - `lease_id`: one id per held delivery, the same in all three calls and on every replica. - `kind`: `events` or `resource`. - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or `subscribe` for a resource. - `event`: `{name, arguments}` for events; `resource`: `{uri}` for a resource. - `client`: `{name, version}` of the MCP client, when it named itself.
+
+The tool answers with an object that has a boolean `allow`. With `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten the renew interval. With `allow: false`, `error: {code, message, data}` reaches the caller: a numeric `code` is the JSON-RPC error code and `data` (or `details`) its data; any other `code` gives `-32013` with the whole `error` object as data.
+
+The tool is internal: `tools/list` does not show it and a caller's own `tools/call` of it is refused.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `on_error` | [`AdmissionOnError`](#admissiononerror) | `"deny"` | What a call that fails or answers no decision means: `deny` (default) refuses the caller, `allow` admits it. |
+| `renew_interval_ms` | integer | `60000` | How often a held stream or subscription is renewed. A poll lease and a webhook subscription are renewed when the caller polls or refreshes, at most this often. Set the lease lifetime on the tool's side to at least twice this. |
+| `tool` | string |  | The tool binding to call. |
+
+### `RealtimeConfig`
+
+`mcp.realtime`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `admission` | [`RealtimeAdmissionConfig`](#realtimeadmissionconfig) (optional) |  | Ask a tool of this gateway before a caller gets realtime delivery, while it holds it, and when it lets go. |
+
 ### `RedirectUriPolicy`
 
 How the `https://` redirect URIs of a Client ID Metadata Document are admitted.
@@ -2769,7 +2805,7 @@ One folder of skills under `mcp.skills.sources`.
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `path` | string |  | The folder. A relative path resolves against the folder of the last config file, or the working directory when the config came from no file. Files and folders whose names start with `.` are not served. Symbolic links are followed (a Kubernetes ConfigMap mount is made of them); a broken link or a link loop is refused. |
+| `path` | string |  | The folder. A relative path resolves against the folder of the last config file. A config that comes from no file (inline, from a URL, pushed by a control plane) must give an absolute path; a relative one is refused at boot. The gateway logs the absolute folder of each source. Files and folders whose names start with `.` are not served. Symbolic links are followed (a Kubernetes ConfigMap mount is made of them); a broken link or a link loop is refused. |
 | `prefix` | string (optional) |  | A path the skills of this source are served under, such as `acme/billing`: its folder `refunds/` is then `skill://acme/billing/refunds/SKILL.md`. Segments are separated by `/` and use letters, digits, `-`, `.`, `_` and `~`. Unset serves the skills at the root of the `skill://` namespace. |
 
 ### `SkillsConfig`

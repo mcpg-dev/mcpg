@@ -1,6 +1,6 @@
 [package]
 name = "mcpg"
-version = "0.6.1"
+version = "0.7.0"
 license = "Apache-2.0"
 edition = "2024"
 description = "MCPG gateway — the governed MCP endpoint. Binary: `mcpg`."
@@ -58,8 +58,8 @@ mcpg-backend-llm-shared = { git = "https://github.com/mcpg-dev/mcpg-backend-llm-
 # gateway links it directly for the SSRF resolution guard (`safe_dns`).
 mcpg-plugin-backend-net-core = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-net-core", tag = "v0.1.0-rc.9", version = "=0.1.0-rc.9" }
 mcpg-aauth-core = { git = "https://github.com/mcpg-dev/mcpg-aauth-core", tag = "v0.1.0-rc.6", version = "=0.1.0-rc.6" }
-mcpg-mcp-client = { git = "https://github.com/mcpg-dev/mcpg-mcp-client", tag = "v0.1.0-rc.11", version = "=0.1.0-rc.11" }
-mcpg-mcp-wire = { git = "https://github.com/mcpg-dev/mcpg-mcp-wire", tag = "v0.1.0-rc.8", version = "=0.1.0-rc.8" }
+mcpg-mcp-client = { git = "https://github.com/mcpg-dev/mcpg-mcp-client", tag = "v0.1.0-rc.13", version = "=0.1.0-rc.13" }
+mcpg-mcp-wire = { git = "https://github.com/mcpg-dev/mcpg-mcp-wire", tag = "v0.1.0-rc.10", version = "=0.1.0-rc.10" }
 mcpg-sensitive = { git = "https://github.com/mcpg-dev/mcpg-sensitive", tag = "v0.1.0-rc.6", version = "=0.1.0-rc.6" }
 # MCP Events: Standard Webhooks signing and verification (inbound event
 # routes, webhook deliveries) and the strict outbound client for

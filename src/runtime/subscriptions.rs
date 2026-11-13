@@ -329,6 +329,13 @@ impl SubscriptionService {
         Ok(true)
     }
 
+    /// Whether this replica holds a subscription of `session_id` on `uri`.
+    pub fn is_held(&self, session_id: &str, uri: &str) -> bool {
+        self.lock_holders()
+            .get(&(session_id.to_owned(), uri.to_owned()))
+            .is_some_and(|holders| holders.count > 0)
+    }
+
     /// Legacy `resources/unsubscribe`: drop the session's holder on this URI
     /// regardless of count. Returns whether there was one.
     pub async fn unsubscribe_once(self: &Arc<Self>, session_id: &str, uri: &str) -> bool {

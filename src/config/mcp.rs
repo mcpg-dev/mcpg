@@ -115,6 +115,16 @@ pub struct McpConfig {
         skip_serializing_if = "crate::config::skills::SkillsConfig::is_default"
     )]
     pub skills: crate::config::skills::SkillsConfig,
+
+    /// Realtime delivery (MCP Events streams, polls and webhook
+    /// subscriptions; resource subscriptions): an admission tool the
+    /// gateway asks before, during and after a caller holds it. Unset
+    /// admits every caller the policy allows.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::config::realtime::RealtimeConfig::is_default"
+    )]
+    pub realtime: crate::config::realtime::RealtimeConfig,
 }
 
 /// Longest `mcp.instructions` the gateway accepts, in bytes.
@@ -218,6 +228,20 @@ impl McpConfig {
         self.validate_registries()?;
         self.validate_identity()?;
         self.skills.validate()?;
+        self.realtime.validate()?;
+        if let Some(admission) = &self.realtime.admission
+            && !self
+                .capabilities
+                .tools
+                .iter()
+                .any(|tool| tool.name == admission.tool)
+        {
+            anyhow::bail!(
+                "mcp.realtime.admission.tool names `{}`, which is not a tool under \
+                 mcp.capabilities.tools",
+                admission.tool
+            );
+        }
         if let Some(size) = self.list_page_size
             && !(1..=MAX_LIST_PAGE_SIZE).contains(&size)
         {

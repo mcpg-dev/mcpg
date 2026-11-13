@@ -284,6 +284,14 @@
       },
       "type": "object"
     },
+    "AdmissionOnError": {
+      "description": "The decision when the admission tool gives none.",
+      "enum": [
+        "deny",
+        "allow"
+      ],
+      "type": "string"
+    },
     "AgentExtensionsConfig": {
       "additionalProperties": false,
       "description": "Where a Personal Agent's extensions are read.",
@@ -5826,6 +5834,14 @@
             "null"
           ]
         },
+        "realtime": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RealtimeConfig"
+            }
+          ],
+          "description": "Realtime delivery (MCP Events streams, polls and webhook subscriptions; resource subscriptions): an admission tool the gateway asks before, during and after a caller holds it. Unset admits every caller the policy allows."
+        },
         "registries": {
           "default": [],
           "description": "MCP registries whose listed servers MCPG auto-federates: a background syncer crawls each registry's `/v0.1` API and materializes one federation per usable server, kept in sync as the registry changes. Default empty.",
@@ -7584,6 +7600,54 @@
       ],
       "type": "object"
     },
+    "RealtimeAdmissionConfig": {
+      "additionalProperties": false,
+      "description": "`mcp.realtime.admission`.\n\nThe gateway calls `tool` as the caller, through the whole tool-call path (policy, gates, the backend), with these arguments:\n\n- `op`: `admit` (a caller opens realtime delivery), `renew` (it still holds it) or `release` (it let go; best effort). - `lease_id`: one id per held delivery, the same in all three calls and on every replica. - `kind`: `events` or `resource`. - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or `subscribe` for a resource. - `event`: `{name, arguments}` for events; `resource`: `{uri}` for a resource. - `client`: `{name, version}` of the MCP client, when it named itself.\n\nThe tool answers with an object that has a boolean `allow`. With `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten the renew interval. With `allow: false`, `error: {code, message, data}` reaches the caller: a numeric `code` is the JSON-RPC error code and `data` (or `details`) its data; any other `code` gives `-32013` with the whole `error` object as data.\n\nThe tool is internal: `tools/list` does not show it and a caller's own `tools/call` of it is refused.",
+      "properties": {
+        "on_error": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AdmissionOnError"
+            }
+          ],
+          "default": "deny",
+          "description": "What a call that fails or answers no decision means: `deny` (default) refuses the caller, `allow` admits it."
+        },
+        "renew_interval_ms": {
+          "default": 60000,
+          "description": "How often a held stream or subscription is renewed. A poll lease and a webhook subscription are renewed when the caller polls or refreshes, at most this often. Set the lease lifetime on the tool's side to at least twice this.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tool": {
+          "description": "The tool binding to call.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool"
+      ],
+      "type": "object"
+    },
+    "RealtimeConfig": {
+      "additionalProperties": false,
+      "description": "`mcp.realtime`.",
+      "properties": {
+        "admission": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RealtimeAdmissionConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Ask a tool of this gateway before a caller gets realtime delivery, while it holds it, and when it lets go."
+        }
+      },
+      "type": "object"
+    },
     "RedirectUriPolicy": {
       "description": "How the `https://` redirect URIs of a Client ID Metadata Document are admitted.",
       "oneOf": [
@@ -8776,7 +8840,7 @@
       "description": "One folder of skills under `mcp.skills.sources`.",
       "properties": {
         "path": {
-          "description": "The folder. A relative path resolves against the folder of the last config file, or the working directory when the config came from no file. Files and folders whose names start with `.` are not served. Symbolic links are followed (a Kubernetes ConfigMap mount is made of them); a broken link or a link loop is refused.",
+          "description": "The folder. A relative path resolves against the folder of the last config file. A config that comes from no file (inline, from a URL, pushed by a control plane) must give an absolute path; a relative one is refused at boot. The gateway logs the absolute folder of each source. Files and folders whose names start with `.` are not served. Symbolic links are followed (a Kubernetes ConfigMap mount is made of them); a broken link or a link loop is refused.",
           "type": "string"
         },
         "prefix": {

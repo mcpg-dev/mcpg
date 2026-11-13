@@ -23,6 +23,7 @@ impl GatewayRuntime {
             .capability_registry
             .tools_with_source()
             .into_iter()
+            .filter(|(tool, _)| !self.is_admission_tool(&tool.name))
             .filter(|(tool, federation)| {
                 self.surface_is_visible(
                     request_context,

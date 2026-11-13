@@ -10,13 +10,17 @@ pub async fn reload_config(state: &AppState) -> Result<()> {
     // their boot snapshot — so a signal/admin reload picks up edited files
     // without silently dropping a URL/base64 layer.
     let new_config = AppConfig::load_sources(&state.config_sources)?;
-    // Anchor relative `schemas[].file` refs against the LAST file layer's
-    // directory (inline layers have no directory to anchor against).
-    let config_dir = state.config_sources.iter().rev().find_map(|s| match s {
+    reload_with_config(state, new_config, config_dir_of(state)).await
+}
+
+/// The folder relative paths of the boot configuration resolve against
+/// (`schemas[].file`, `mcp.skills.sources[].path`): the LAST file layer's
+/// directory. Inline layers have no directory to anchor against.
+fn config_dir_of(state: &AppState) -> Option<std::path::PathBuf> {
+    state.config_sources.iter().rev().find_map(|s| match s {
         crate::config::ConfigSource::File(p) => p.parent().map(std::path::Path::to_path_buf),
         crate::config::ConfigSource::Inline { .. } => None,
-    });
-    reload_with_config(state, new_config, config_dir).await
+    })
 }
 
 /// Hot-reload from an in-memory config (control-plane push), where the on-disk
@@ -34,7 +38,9 @@ pub async fn reload_config_from_yaml(state: &AppState, yaml: &str) -> Result<()>
 /// it; nothing swaps outside that pipeline.
 pub(crate) async fn reapply_config(state: &AppState) -> Result<()> {
     let base = state.base_config.load_full();
-    reload_with_config(state, (*base).clone(), None).await
+    // The base config is the boot configuration (or a pushed one, which
+    // cannot carry relative paths), so its paths anchor where boot's did.
+    reload_with_config(state, (*base).clone(), config_dir_of(state)).await
 }
 
 /// Shared core of the two reload entry points: take a freshly-loaded config,
@@ -406,6 +412,7 @@ pub(crate) async fn reload_with_config(
         &new_config.mcp.skills,
         config_dir.as_deref(),
     )?);
+    new_runtime.set_realtime_admission(new_config.mcp.realtime.admission.as_ref());
     new_runtime.set_tunnel_federation(new_config.gateway.server.tunnel_federation.as_ref());
     new_runtime.set_list_page_size(new_config.mcp.list_page_size());
     new_runtime.set_license_state((&license).into());

@@ -14591,3 +14591,254 @@ mod personal_agent_operations;
 
 #[path = "http/skills_tests.rs"]
 mod skills;
+
+// -- Realtime admission --
+
+const ADMISSION_TOOL: &str = "realtime.admit";
+const ADMISSION_URI: &str = "mcpg://runtime/overview";
+
+fn admission_mock(name: &str, backend: Value) -> BackendConfig {
+    serde_json::from_value(serde_json::json!({
+        "name": name,
+        "description": "a mock",
+        "backend": backend,
+    }))
+    .expect("a mock binding")
+}
+
+/// A gateway whose realtime admission asks a mock tool that answers
+/// `backend`.
+fn build_admission_state(
+    backend: Value,
+    on_error: crate::config::realtime::AdmissionOnError,
+) -> AppState {
+    let state = build_test_state_with_all_runtime_controls_mut(
+        true,
+        RuntimeDebugConfig {
+            enabled: true,
+            ..RuntimeDebugConfig::default()
+        },
+        vec![
+            admission_mock(ADMISSION_TOOL, backend),
+            admission_mock(
+                "orders.list",
+                serde_json::json!({ "kind": "mock", "response": { "ok": true } }),
+            ),
+        ],
+        ToolAccessPolicyConfig::default(),
+        |runtime| {
+            runtime.set_realtime_admission(Some(
+                &crate::config::realtime::RealtimeAdmissionConfig {
+                    tool: ADMISSION_TOOL.to_owned(),
+                    renew_interval_ms: 60_000,
+                    on_error,
+                },
+            ));
+        },
+    );
+    install_protocol_registry_for_tests(&state);
+    assert!(
+        state
+            .runtime
+            .load()
+            .resolve_resource_route(ADMISSION_URI)
+            .is_some(),
+        "fixture must serve {ADMISSION_URI}"
+    );
+    state
+}
+
+fn admission_answers(decision: Value) -> Value {
+    serde_json::json!({ "kind": "mock", "response": decision })
+}
+
+fn admission_subscribers(state: &AppState) -> usize {
+    state
+        .runtime
+        .load()
+        .subscription_store()
+        .subscribers_for(ADMISSION_URI)
+        .len()
+}
+
+async fn admission_subscribe(state: &AppState) -> Value {
+    let (app, session_id) = initialize_session(router(state.clone(), "/health", "/mcp")).await;
+    let (_, response) = mcp_request(
+        app,
+        &session_id,
+        77,
+        "resources/subscribe",
+        Some(serde_json::json!({ "uri": ADMISSION_URI })),
+    )
+    .await;
+    extract_jsonrpc_response(response, 77).await
+}
+
+async fn admission_listen(state: &AppState) -> axum::response::Response {
+    router(state.clone(), "/health", "/mcp")
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, MCP_ACCEPT_HEADER)
+                .header("mcp-protocol-version", "2026-07-28")
+                .header("mcp-method", "subscriptions/listen")
+                .header(SUBJECT_ID_HEADER, "test-user")
+                .body(Body::from(
+                    serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": 78,
+                        "method": "subscriptions/listen",
+                        "params": {
+                            "subscriptions": [
+                                { "type": "resources/updated", "uri": ADMISSION_URI }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn the_admission_tool_is_not_listed_and_a_caller_cannot_call_it() {
+    let state = build_admission_state(
+        admission_answers(serde_json::json!({ "allow": true })),
+        crate::config::realtime::AdmissionOnError::Deny,
+    );
+    let (app, session_id) = initialize_session(router(state, "/health", "/mcp")).await;
+
+    let (app, response) = mcp_request(app, &session_id, 2, "tools/list", None).await;
+    let listed = extract_jsonrpc_response(response, 2).await;
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert!(names.contains(&"orders.list"), "{names:?}");
+    assert!(!names.contains(&ADMISSION_TOOL), "{names:?}");
+
+    let (_, response) = mcp_request(
+        app,
+        &session_id,
+        3,
+        "tools/call",
+        Some(serde_json::json!({ "name": ADMISSION_TOOL, "arguments": { "op": "admit" } })),
+    )
+    .await;
+    let called = extract_jsonrpc_response(response, 3).await;
+    assert_eq!(called["error"]["code"], -32602, "{called}");
+    assert!(called.get("result").is_none(), "{called}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_admission_admits_a_caller_to_a_resource() {
+    let state = build_admission_state(
+        admission_answers(serde_json::json!({ "allow": true, "renewAfterSeconds": 30 })),
+        crate::config::realtime::AdmissionOnError::Deny,
+    );
+    let answer = admission_subscribe(&state).await;
+    assert!(answer.get("error").is_none(), "{answer}");
+    assert_eq!(admission_subscribers(&state), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_subscribe_carries_the_error_of_the_admission_tool() {
+    let state = build_admission_state(
+        admission_answers(serde_json::json!({
+            "allow": false,
+            "error": {
+                "code": "realtime_limit",
+                "message": "the free plan has one realtime consumer",
+                "details": { "limit": 1, "held": 1 },
+            },
+        })),
+        crate::config::realtime::AdmissionOnError::Deny,
+    );
+    let answer = admission_subscribe(&state).await;
+    assert_eq!(answer["error"]["code"], -32013, "{answer}");
+    assert_eq!(
+        answer["error"]["message"],
+        "the free plan has one realtime consumer"
+    );
+    assert_eq!(answer["error"]["data"]["code"], "realtime_limit");
+    assert_eq!(answer["error"]["data"]["details"]["limit"], 1);
+    assert_eq!(admission_subscribers(&state), 0, "nothing is subscribed");
+
+    let state = build_admission_state(
+        admission_answers(serde_json::json!({
+            "allow": false,
+            "error": { "code": -32050, "message": "plan limit", "data": { "plan": "free" } },
+        })),
+        crate::config::realtime::AdmissionOnError::Deny,
+    );
+    let answer = admission_subscribe(&state).await;
+    assert_eq!(answer["error"]["code"], -32050, "{answer}");
+    assert_eq!(answer["error"]["message"], "plan limit");
+    assert_eq!(
+        answer["error"]["data"],
+        serde_json::json!({ "plan": "free" })
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_admission_call_follows_on_error() {
+    let failing = serde_json::json!({ "kind": "mock", "error": true, "error_message": "db down" });
+
+    let state = build_admission_state(
+        failing.clone(),
+        crate::config::realtime::AdmissionOnError::Deny,
+    );
+    let answer = admission_subscribe(&state).await;
+    assert_eq!(answer["error"]["code"], -32603, "{answer}");
+    assert!(
+        !answer.to_string().contains("db down"),
+        "the tool's failure stays inside: {answer}"
+    );
+    assert_eq!(admission_subscribers(&state), 0);
+
+    let state = build_admission_state(failing, crate::config::realtime::AdmissionOnError::Allow);
+    let answer = admission_subscribe(&state).await;
+    assert!(answer.get("error").is_none(), "{answer}");
+    assert_eq!(admission_subscribers(&state), 1);
+
+    // An answer without a decision is a failed call too.
+    let state = build_admission_state(
+        admission_answers(serde_json::json!({ "rows": [] })),
+        crate::config::realtime::AdmissionOnError::Deny,
+    );
+    let answer = admission_subscribe(&state).await;
+    assert_eq!(answer["error"]["code"], -32603, "{answer}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listen_stream_asks_the_admission_for_each_resource() {
+    let state = build_admission_state(
+        admission_answers(serde_json::json!({ "allow": true })),
+        crate::config::realtime::AdmissionOnError::Deny,
+    );
+    let response = admission_listen(&state).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(admission_subscribers(&state), 1);
+    drop(response);
+
+    let state = build_admission_state(
+        admission_answers(serde_json::json!({
+            "allow": false,
+            "error": { "code": "realtime_limit", "message": "one consumer only" },
+        })),
+        crate::config::realtime::AdmissionOnError::Deny,
+    );
+    let response = admission_listen(&state).await;
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], -32013, "{body}");
+    assert_eq!(body["error"]["message"], "one consumer only");
+    assert_eq!(body["id"], 78);
+    assert_eq!(admission_subscribers(&state), 0, "nothing is subscribed");
+}

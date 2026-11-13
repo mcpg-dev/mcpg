@@ -25,6 +25,8 @@
 //!   purge.
 
 pub mod admin;
+#[cfg(test)]
+mod admission_tests;
 pub(crate) mod audit;
 pub mod builtin;
 pub mod catalog;

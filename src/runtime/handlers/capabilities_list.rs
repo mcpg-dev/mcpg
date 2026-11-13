@@ -538,16 +538,64 @@ impl GatewayRuntime {
                         {
                             return gate_response;
                         }
+                        // The realtime admission decides whether this caller
+                        // may hold the subscription; its refusal is the
+                        // caller's error as the admission wrote it.
+                        let admission_lease = crate::runtime::admission::session_resource_lease(
+                            session_id,
+                            &params.uri,
+                        );
+                        let admission_client = request_context.client();
+                        let admission_grant = match self
+                            .realtime_admit(
+                                crate::runtime::admission::AdmissionOp::Admit,
+                                &request_context.identity,
+                                admission_client.as_ref(),
+                                &admission_lease,
+                            )
+                            .await
+                        {
+                            Ok(grant) => grant,
+                            Err(denial) => {
+                                return protocol_http_error(
+                                    200,
+                                    Some(request_id),
+                                    denial.code,
+                                    denial.message,
+                                    denial.data,
+                                );
+                            }
+                        };
                         // Subscriber identity, for subject-scoped notification
                         // filtering.
                         let subscriber_identity =
                             Some(crate::runtime::subscription_store::SubscriberIdentity::
                                 from_request_context(session_id, request_context));
-                        match self
+                        let subscribed = self
                             .subscriptions()
                             .subscribe_once(session_id, &params.uri, subscriber_identity)
-                            .await
-                        {
+                            .await;
+                        match (&subscribed, admission_grant) {
+                            // A repeat subscribe keeps the renewal it has.
+                            (Ok(true), Some(grant)) => self.keep_session_subscription_admitted(
+                                session_id,
+                                &params.uri,
+                                &request_context.identity,
+                                admission_client.clone(),
+                                admission_lease.clone(),
+                                grant,
+                            ),
+                            (Err(_), Some(_)) => {
+                                self.realtime_release(
+                                    &request_context.identity,
+                                    admission_client.as_ref(),
+                                    &admission_lease,
+                                )
+                                .await;
+                            }
+                            _ => {}
+                        }
+                        match subscribed {
                             Ok(_established) => {
                                 // Audit: resources/subscribe success.
                                 let audit_ctx = mcpg_plugin_protocol::PluginContext {
@@ -631,6 +679,15 @@ impl GatewayRuntime {
                         );
                         let _ = self.plugin_registry.emit_audit_event(&event).await;
                         if was_subscribed {
+                            self.realtime_release(
+                                &request_context.identity,
+                                request_context.client().as_ref(),
+                                &crate::runtime::admission::session_resource_lease(
+                                    session_id,
+                                    &params.uri,
+                                ),
+                            )
+                            .await;
                             let watch = self.watch_engine.clone();
                             let uri = params.uri.clone();
                             tokio::spawn(async move {

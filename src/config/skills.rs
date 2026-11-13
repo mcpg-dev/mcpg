@@ -63,8 +63,10 @@ fn is_default_governance(governance: &mcpg_expr::governance::BackendGovernanceCo
 #[serde(deny_unknown_fields)]
 pub struct SkillSourceConfig {
     /// The folder. A relative path resolves against the folder of the last
-    /// config file, or the working directory when the config came from no
-    /// file. Files and folders whose names start with `.` are not served.
+    /// config file. A config that comes from no file (inline, from a URL,
+    /// pushed by a control plane) must give an absolute path; a relative
+    /// one is refused at boot. The gateway logs the absolute folder of each
+    /// source. Files and folders whose names start with `.` are not served.
     /// Symbolic links are followed (a Kubernetes ConfigMap mount is made of
     /// them); a broken link or a link loop is refused.
     pub path: String,
