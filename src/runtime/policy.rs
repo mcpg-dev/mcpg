@@ -1030,9 +1030,7 @@ impl CelToolAccessPolicy {
         //   `"read" in identity.scopes`
         //   `identity.attributes["department"] == "eng"`
         let identity_map = build_policy_identity_map(policy_context);
-        context
-            .add_variable("identity", identity_map)
-            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        context.add_variable_from_value("identity", identity_map);
 
         let value = self
             .program
