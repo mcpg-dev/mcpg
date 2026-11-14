@@ -1,6 +1,6 @@
 [package]
 name = "mcpg"
-version = "0.7.1"
+version = "0.7.2"
 license = "Apache-2.0"
 edition = "2024"
 description = "MCPG gateway — the governed MCP endpoint. Binary: `mcpg`."
@@ -198,7 +198,7 @@ libc = "0.2"
 # runtime's #[cfg(test)] fallback constructs them statically here. Dev-only
 # ⇒ the release `mcpg` binary links none of them (nor their client stacks,
 # e.g. sqlx). The exception is the mock fixture, a real dependency above.
-mcpg-plugin-backend-sql = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sql", tag = "v0.2.2", version = "=0.2.2" }
+mcpg-plugin-backend-sql = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-sql", tag = "v0.2.3", version = "=0.2.3" }
 mcpg-plugin-backend-http = { git = "https://github.com/mcpg-dev/mcpg-plugin-backend-http", tag = "v0.1.3", version = "=0.1.3" }
 # The version req keeps this dev-dep in the published manifest as a git+tag
 # reference: the in-src runtime tests compile against the mock backend, so a
