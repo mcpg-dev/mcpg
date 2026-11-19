@@ -639,16 +639,14 @@ impl CapabilityRegistry {
         let Some(validator) = self.schema_validators.get(tool_name) else {
             return Ok(());
         };
-        let args = arguments
-            .as_ref()
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        let result = validator.validate(&args);
+        let empty = Value::Object(serde_json::Map::new());
+        let args = arguments.as_ref().unwrap_or(&empty);
+        let result = validator.validate(args);
         if result.is_ok() {
             return Ok(());
         }
         let errors: Vec<String> = validator
-            .iter_errors(&args)
+            .iter_errors(args)
             .map(|e| {
                 if e.instance_path.as_str().is_empty() {
                     e.to_string()
@@ -1088,7 +1086,7 @@ impl CapabilityRegistry {
                             .filter(|v| !already_used.contains(v))
                             .cloned()
                             .collect();
-                        // MCP 2025-11-25 caps completion values
+                        // MCP caps completion values
                         // at 100. Clamp and set `hasMore` / `total`
                         // accordingly so clients that paginate manually
                         // can tell they should refine the prefix.
@@ -1203,7 +1201,7 @@ impl RegisteredResource {
     }
 }
 
-/// MCP 2025-11-25 `completion/complete` caps the returned `values`
+/// MCP `completion/complete` caps the returned `values`
 /// array at 100. This helper truncates and sets `hasMore` / `total`
 /// so clients can tell when they should refine their prefix.
 pub(crate) fn clamp_completion_values(

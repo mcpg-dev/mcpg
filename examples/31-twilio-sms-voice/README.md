@@ -42,8 +42,9 @@ Provide the two `cred://` values through your gateway credential source; the
   - Status callback → `…/hooks/status`
 - **Native push** — the `watch:` on `twilio.inbox` uses
   `strategy: { type: plugin, kind: twilio_inbound, kinds: [sms] }`; a client that
-  `resources/subscribe`s to `twilio://messages` gets `resources/updated` when an
-  inbound SMS lands, then `resources/read`s the fresh data.
+  opens a `subscriptions/listen` stream naming `twilio://messages` gets
+  `notifications/resources/updated` when an inbound SMS lands, then
+  `resources/read`s the fresh data.
 
 ## Run
 

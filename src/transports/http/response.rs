@@ -1,13 +1,21 @@
 //! Response mapping for the HTTP transport.
 //!
-//! Projects the runtime's version-neutral outcomes — `GatewayResponse`,
+//! Projects the runtime's outcomes — `GatewayResponse`,
 //! `ProtocolHttpResponse`, `ProtocolError`, `TransportRejection` — onto HTTP
 //! status codes, bodies and headers, and stamps the headers every surface
-//! shares (`x-mcpg-request-id`, `Mcp-Session-Id`, the RFC 9728
+//! shares (`Mcp-Protocol-Version`, `x-mcpg-request-id`, the RFC 9728
 //! `WWW-Authenticate` challenge).
 
 use super::*;
 use crate::runtime::authorization_server::dpop::{DPOP_JKT_ATTRIBUTE, DPOP_SCHEME, DpopChallenge};
+
+const PROTOCOL_VERSION_HEADER_NAME: HeaderName = HeaderName::from_static(PROTOCOL_VERSION_HEADER);
+const SUPPORTED_PROTOCOL_VERSION_VALUE: HeaderValue =
+    HeaderValue::from_static(crate::protocol::SUPPORTED_PROTOCOL_VERSION);
+const REQUEST_ID_HEADER_NAME: HeaderName = HeaderName::from_static(REQUEST_ID_RESPONSE_HEADER);
+const INSUFFICIENT_SCOPE_HEADER_NAME: HeaderName =
+    HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER);
+const SIGN_IN_REQUIRED_HEADER_NAME: HeaderName = HeaderName::from_static(SIGN_IN_REQUIRED_HEADER);
 
 pub(crate) fn map_gateway_response(response: GatewayResponse) -> Response {
     let request_id = response.request_id.clone();
@@ -19,9 +27,6 @@ pub(crate) fn map_gateway_response(response: GatewayResponse) -> Response {
         GatewayResponsePayload::Runtime(snapshot) => {
             Json(serde_json::to_value(snapshot).expect("runtime snapshot serialized"))
                 .into_response()
-        }
-        GatewayResponsePayload::Protocol(protocol_response) => {
-            map_protocol_http_response(protocol_response)
         }
     };
 
@@ -108,17 +113,7 @@ pub(crate) fn map_protocol_http_response(response: ProtocolHttpResponse) -> Resp
         axum::http::StatusCode::from_u16(response.http_status)
             .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-    http_response.headers_mut().insert(
-        HeaderName::from_static(PROTOCOL_VERSION_HEADER),
-        HeaderValue::from_static(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-    );
-    if let Some(session_id) = response.session_id_header
-        && let Ok(value) = HeaderValue::from_str(&session_id)
-    {
-        http_response
-            .headers_mut()
-            .insert(HeaderName::from_static(SESSION_ID_HEADER), value);
-    }
+    // `Mcp-Protocol-Version` is stamped by the MCP endpoint's router layer.
     if let Some(completed_at) = idempotent_replayed {
         http_response
             .headers_mut()
@@ -141,55 +136,22 @@ pub(crate) fn map_protocol_http_response(response: ProtocolHttpResponse) -> Resp
     {
         http_response
             .headers_mut()
-            .insert(HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER), value);
+            .insert(INSUFFICIENT_SCOPE_HEADER_NAME, value);
     }
     if sign_in_required {
-        http_response.headers_mut().insert(
-            HeaderName::from_static(SIGN_IN_REQUIRED_HEADER),
-            HeaderValue::from_static("1"),
-        );
+        http_response
+            .headers_mut()
+            .insert(SIGN_IN_REQUIRED_HEADER_NAME, HeaderValue::from_static("1"));
     }
     http_response
 }
 
-/// SEP-2567/2575: a 2026-07-28 server exposes only the POST endpoint.
-/// Return an HTTP 405 response when the request negotiates the modern
-/// wire, or always when the legacy wire is off; `None` lets the legacy
-/// GET/DELETE handler proceed.
-pub(crate) fn reject_method_on_modern_wire(
-    runtime: &crate::runtime::GatewayRuntime,
-    headers: &HeaderMap,
-    request_id: &GatewayRequestId,
-    legacy_wire: bool,
-) -> Option<Response> {
-    if !legacy_wire || WireVersion::from_headers(runtime, headers).is_modern() {
-        Some(with_request_id_header(
-            (
-                axum::http::StatusCode::METHOD_NOT_ALLOWED,
-                [("allow", "POST")],
-            )
-                .into_response(),
-            request_id,
-        ))
-    } else {
-        None
-    }
-}
-
-/// Inject `Mcp-Session-Id` header into any response when the request carried a session.
-/// Per MCP spec, the session ID header MUST be present in ALL HTTP responses after
-/// session creation — not just the initialize response.
-pub(crate) fn with_session_id_header(mut response: Response, session_id: Option<&str>) -> Response {
-    if let Some(session_id) = session_id {
-        // Only add if not already present (initialize sets it from runtime).
-        if !response.headers().contains_key(SESSION_ID_HEADER)
-            && let Ok(value) = HeaderValue::from_str(session_id)
-        {
-            response
-                .headers_mut()
-                .insert(HeaderName::from_static(SESSION_ID_HEADER), value);
-        }
-    }
+/// Stamp `Mcp-Protocol-Version` with the one revision the gateway serves.
+pub(crate) fn with_protocol_version_header(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        PROTOCOL_VERSION_HEADER_NAME,
+        SUPPORTED_PROTOCOL_VERSION_VALUE,
+    );
     response
 }
 
@@ -416,19 +378,19 @@ pub(crate) fn with_www_authenticate_challenge(
     // step-up can name the scopes the caller lacks.
     let scope_hint = response
         .headers()
-        .get(HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER))
+        .get(INSUFFICIENT_SCOPE_HEADER_NAME)
         .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
         .filter(|s| !s.is_empty());
     let mut response = with_aauth_challenge(response, aauth, scope_hint.as_deref());
     // Lift the scope hint regardless of status so it is always stripped.
     let insufficient_scope = response
         .headers_mut()
-        .remove(HeaderName::from_static(INSUFFICIENT_SCOPE_HEADER))
+        .remove(INSUFFICIENT_SCOPE_HEADER_NAME)
         .and_then(|v| v.to_str().ok().map(|s| s.to_owned()))
         .filter(|s| !s.is_empty());
     let sign_in_required = response
         .headers_mut()
-        .remove(HeaderName::from_static(SIGN_IN_REQUIRED_HEADER))
+        .remove(SIGN_IN_REQUIRED_HEADER_NAME)
         .is_some();
 
     if !auth_enabled {
@@ -533,6 +495,15 @@ pub(crate) fn with_www_authenticate_challenge(
                 .append(axum::http::header::WWW_AUTHENTICATE, value);
         }
     }
+    response
+}
+
+/// What [`with_www_authenticate_challenge`] does to a response whose status
+/// is neither 401 nor 403: strip the internal headers.
+pub(crate) fn without_internal_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.remove(INSUFFICIENT_SCOPE_HEADER_NAME);
+    headers.remove(SIGN_IN_REQUIRED_HEADER_NAME);
     response
 }
 
@@ -683,74 +654,58 @@ pub(crate) fn map_protocol_error_response(
     error: ProtocolError,
     request_id: &GatewayRequestId,
 ) -> Response {
-    let mut response = Json(error.into_jsonrpc_error()).into_response();
-    response.headers_mut().insert(
-        HeaderName::from_static(PROTOCOL_VERSION_HEADER),
-        HeaderValue::from_static(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-    );
-    with_request_id_header(response, request_id)
+    let response = Json(error.into_jsonrpc_error()).into_response();
+    with_request_id_header(with_protocol_version_header(response), request_id)
 }
 
-/// Status-aware variant of [`map_protocol_error_response`] for
-/// callers that need to surface a JSON-RPC error envelope at a
-/// specific HTTP status (e.g., SEP-2575 modern stateless wants
-/// `-32601` carried on HTTP 404, not 200).
+/// Status-aware variant of [`map_protocol_error_response`] for callers that
+/// carry a JSON-RPC error at a specific HTTP status (a `-32601` is a `404`).
 pub(crate) fn map_protocol_error_with_status(
     error: ProtocolError,
     status: axum::http::StatusCode,
     request_id: &GatewayRequestId,
 ) -> Response {
-    let mut response = (status, Json(error.into_jsonrpc_error())).into_response();
-    response.headers_mut().insert(
-        HeaderName::from_static(PROTOCOL_VERSION_HEADER),
-        HeaderValue::from_static(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-    );
-    with_request_id_header(response, request_id)
+    let response = (status, Json(error.into_jsonrpc_error())).into_response();
+    with_request_id_header(with_protocol_version_header(response), request_id)
 }
 
-/// Render a transport-level rejection (e.g., SEP-2243
-/// `Mcp-Method` header mismatch) as an HTTP response. Used by the
-/// modern dispatch path when the handler's
-/// `validate_transport_headers` rejects a request *before* parsing.
+/// Render a rejection made before dispatch (the protocol version, a routing
+/// header, the request `_meta`, session capacity) as an HTTP response.
 pub(crate) fn map_transport_rejection(
     rejection: crate::protocol::shared::messages::TransportRejection,
     request_id: &GatewayRequestId,
 ) -> Response {
     use axum::http::StatusCode;
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": rejection.jsonrpc_id,
-        "error": {
-            "code": rejection.error_code,
-            "message": rejection.message,
-            "data": rejection.data,
-        }
-    });
+    let body = crate::transports::dispatch::transport_rejection_body(&rejection);
     let status = StatusCode::from_u16(rejection.status).unwrap_or(StatusCode::BAD_REQUEST);
-    let mut response = (status, Json(body)).into_response();
-    response.headers_mut().insert(
-        HeaderName::from_static(PROTOCOL_VERSION_HEADER),
-        HeaderValue::from_static(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-    );
-    with_request_id_header(response, request_id)
+    let response = (status, Json(body)).into_response();
+    with_request_id_header(with_protocol_version_header(response), request_id)
 }
 
-pub(crate) fn map_sse_events(events: Vec<SseEventRecord>) -> Response {
-    let stream = iter(events.into_iter().map(sse_event_from_record));
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+/// Frame a `tools/call` response as a per-request SSE stream: each
+/// notification the request emitted, in order, then the JSON-RPC response;
+/// the stream then closes. No frame carries an SSE event id: the stream is
+/// not resumable.
+pub(crate) fn map_response_stream(frames: Vec<String>) -> Response {
+    let stream = iter(
+        frames
+            .into_iter()
+            .map(|data| Ok::<_, Infallible>(Event::default().event("message").data(data))),
+    );
+    with_protocol_version_header(
+        Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response(),
+    )
 }
 
 pub(crate) fn with_request_id_header(
     mut response: Response,
     request_id: &GatewayRequestId,
 ) -> Response {
-    let header_name = HeaderName::from_static(REQUEST_ID_RESPONSE_HEADER);
     match HeaderValue::from_str(request_id.as_str()) {
         Ok(value) => {
-            response.headers_mut().insert(header_name, value);
+            response.headers_mut().insert(REQUEST_ID_HEADER_NAME, value);
         }
         Err(error) => {
             warn!(

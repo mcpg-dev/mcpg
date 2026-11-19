@@ -1,6 +1,6 @@
 //! SEP-2640 Skills over HTTP: the capability, `skills/list`, `skills/get`,
-//! `resources/directory/read`, `resources/read` and `resources/list`, on
-//! both wires and under the access policy.
+//! `resources/directory/read`, `resources/read` and `resources/list`, also
+//! under the access policy.
 
 use super::*;
 use crate::config::skills::{SkillSourceConfig, SkillsConfig};
@@ -58,62 +58,33 @@ fn sha(bytes: &[u8]) -> String {
     crate::protocol::shared::skills::format_digest(&Sha256::digest(bytes))
 }
 
-async fn call(app: &Router, session_id: &str, id: u64, method: &str, params: Value) -> Value {
-    let (_, response) = mcp_request(app.clone(), session_id, id, method, Some(params)).await;
-    extract_jsonrpc_response(response, id).await
+async fn call(app: &Router, id: u64, method: &str, params: Value) -> Value {
+    call_with_status(app, id, method, params).await.1
+}
+
+/// One request as the header-asserted `conformance-user`, with the HTTP
+/// status of its answer.
+async fn call_with_status(
+    app: &Router,
+    id: u64,
+    method: &str,
+    params: Value,
+) -> (StatusCode, Value) {
+    let (_, response) = mcp_request(app.clone(), id, method, Some(params)).await;
+    let status = response.status();
+    (status, extract_jsonrpc_response(response, id).await)
 }
 
 #[tokio::test]
-async fn initialize_declares_the_extension_with_directory_read() {
+async fn skills_list_returns_complete_manifests_whose_digests_match_the_reads() {
     let dir = skills_folder();
     let app = router(
         skills_state(dir.path(), ToolAccessPolicyConfig::default(), 100),
         "/health",
         "/mcp",
     );
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/mcp")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, MCP_ACCEPT_HEADER)
-                .body(Body::from(
-                    serde_json::json!({
-                        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                        "params": {
-                            "protocolVersion": "2025-11-25",
-                            "capabilities": {},
-                            "clientInfo": { "name": "t", "version": "1" }
-                        }
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = extract_jsonrpc_response(response, 1).await;
-    let capabilities = &body["result"]["capabilities"];
-    assert_eq!(
-        capabilities["extensions"]["io.modelcontextprotocol/skills"],
-        serde_json::json!({ "directoryRead": true }),
-        "{body}"
-    );
-    assert!(capabilities["resources"].is_object(), "{body}");
-}
 
-#[tokio::test]
-async fn skills_list_returns_complete_manifests_whose_digests_match_the_reads() {
-    let dir = skills_folder();
-    let (app, session) = initialize_session(router(
-        skills_state(dir.path(), ToolAccessPolicyConfig::default(), 100),
-        "/health",
-        "/mcp",
-    ))
-    .await;
-
-    let listed = call(&app, &session, 2, "skills/list", serde_json::json!({})).await;
+    let listed = call(&app, 2, "skills/list", serde_json::json!({})).await;
     let skills = listed["result"]["skills"].as_array().expect("skills");
     let uris: Vec<&str> = skills.iter().map(|s| s["uri"].as_str().unwrap()).collect();
     assert_eq!(
@@ -123,10 +94,7 @@ async fn skills_list_returns_complete_manifests_whose_digests_match_the_reads() 
             "skill://macos/mouse/SKILL.md"
         ]
     );
-    assert!(
-        listed["result"].get("resultType").is_none(),
-        "legacy wire: {listed}"
-    );
+    assert_eq!(listed["result"]["resultType"], "complete", "{listed}");
     let computer_use = &skills[0];
     assert_eq!(
         computer_use["frontmatter"],
@@ -153,7 +121,6 @@ async fn skills_list_returns_complete_manifests_whose_digests_match_the_reads() 
     {
         let read = call(
             &app,
-            &session,
             10 + id as u64,
             "resources/read",
             serde_json::json!({ "uri": file["uri"] }),
@@ -171,15 +138,13 @@ async fn skills_list_returns_complete_manifests_whose_digests_match_the_reads() 
 #[tokio::test]
 async fn skills_get_answers_for_a_served_skill_and_refuses_any_other_uri() {
     let dir = skills_folder();
-    let (app, session) = initialize_session(router(
+    let app = router(
         skills_state(dir.path(), ToolAccessPolicyConfig::default(), 100),
         "/health",
         "/mcp",
-    ))
-    .await;
+    );
     let got = call(
         &app,
-        &session,
         2,
         "skills/get",
         serde_json::json!({ "uri": "skill://macos/mouse/SKILL.md" }),
@@ -198,29 +163,21 @@ async fn skills_get_answers_for_a_served_skill_and_refuses_any_other_uri() {
         (4, "skill://macos/computer-use/references/tool-map.md"),
         (5, "skill://macos/computer-use"),
     ] {
-        let refused = call(
-            &app,
-            &session,
-            id,
-            "skills/get",
-            serde_json::json!({ "uri": uri }),
-        )
-        .await;
+        let refused = call(&app, id, "skills/get", serde_json::json!({ "uri": uri })).await;
         assert_eq!(refused["error"]["code"], -32602, "{uri}: {refused}");
     }
-    let no_params = call(&app, &session, 6, "skills/get", serde_json::json!({})).await;
+    let no_params = call(&app, 6, "skills/get", serde_json::json!({})).await;
     assert_eq!(no_params["error"]["code"], -32602, "{no_params}");
 }
 
 #[tokio::test]
 async fn directory_read_lists_the_direct_children_of_every_level() {
     let dir = skills_folder();
-    let (app, session) = initialize_session(router(
+    let app = router(
         skills_state(dir.path(), ToolAccessPolicyConfig::default(), 100),
         "/health",
         "/mcp",
-    ))
-    .await;
+    );
     let children = |body: &Value| -> Vec<(String, String)> {
         body["result"]["resources"]
             .as_array()
@@ -236,7 +193,6 @@ async fn directory_read_lists_the_direct_children_of_every_level() {
     };
     let root = call(
         &app,
-        &session,
         2,
         "resources/directory/read",
         serde_json::json!({ "uri": "skill://macos" }),
@@ -257,7 +213,6 @@ async fn directory_read_lists_the_direct_children_of_every_level() {
     );
     let skill = call(
         &app,
-        &session,
         3,
         "resources/directory/read",
         serde_json::json!({ "uri": "skill://macos/computer-use" }),
@@ -287,7 +242,6 @@ async fn directory_read_lists_the_direct_children_of_every_level() {
     ] {
         let refused = call(
             &app,
-            &session,
             id,
             "resources/directory/read",
             serde_json::json!({ "uri": uri }),
@@ -300,13 +254,12 @@ async fn directory_read_lists_the_direct_children_of_every_level() {
 #[tokio::test]
 async fn resources_list_names_each_skill_md() {
     let dir = skills_folder();
-    let (app, session) = initialize_session(router(
+    let app = router(
         skills_state(dir.path(), ToolAccessPolicyConfig::default(), 100),
         "/health",
         "/mcp",
-    ))
-    .await;
-    let listed = call(&app, &session, 2, "resources/list", serde_json::json!({})).await;
+    );
+    let listed = call(&app, 2, "resources/list", serde_json::json!({})).await;
     let entry = listed["result"]["resources"]
         .as_array()
         .unwrap()
@@ -323,13 +276,12 @@ async fn resources_list_names_each_skill_md() {
 #[tokio::test]
 async fn skills_list_pages_with_a_cursor_and_refuses_a_forged_one() {
     let dir = skills_folder();
-    let (app, session) = initialize_session(router(
+    let app = router(
         skills_state(dir.path(), ToolAccessPolicyConfig::default(), 1),
         "/health",
         "/mcp",
-    ))
-    .await;
-    let first = call(&app, &session, 2, "skills/list", serde_json::json!({})).await;
+    );
+    let first = call(&app, 2, "skills/list", serde_json::json!({})).await;
     assert_eq!(first["result"]["skills"].as_array().unwrap().len(), 1);
     let cursor = first["result"]["nextCursor"]
         .as_str()
@@ -337,7 +289,6 @@ async fn skills_list_pages_with_a_cursor_and_refuses_a_forged_one() {
         .to_owned();
     let second = call(
         &app,
-        &session,
         3,
         "skills/list",
         serde_json::json!({ "cursor": cursor }),
@@ -350,7 +301,6 @@ async fn skills_list_pages_with_a_cursor_and_refuses_a_forged_one() {
     assert!(second["result"].get("nextCursor").is_none(), "{second}");
     let forged = call(
         &app,
-        &session,
         4,
         "skills/list",
         serde_json::json!({ "cursor": "forged" }),
@@ -372,13 +322,8 @@ async fn the_skills_floor_hides_and_refuses_everything_a_caller_may_not_read() {
         }],
         ..ToolAccessPolicyConfig::default()
     };
-    let (app, session) = initialize_session(router(
-        skills_state(dir.path(), policy, 100),
-        "/health",
-        "/mcp",
-    ))
-    .await;
-    let listed = call(&app, &session, 2, "skills/list", serde_json::json!({})).await;
+    let app = router(skills_state(dir.path(), policy, 100), "/health", "/mcp");
+    let listed = call(&app, 2, "skills/list", serde_json::json!({})).await;
     assert_eq!(
         listed["result"]["skills"],
         serde_json::json!([]),
@@ -386,7 +331,6 @@ async fn the_skills_floor_hides_and_refuses_everything_a_caller_may_not_read() {
     );
     let got = call(
         &app,
-        &session,
         3,
         "skills/get",
         serde_json::json!({ "uri": "skill://macos/mouse/SKILL.md" }),
@@ -395,7 +339,6 @@ async fn the_skills_floor_hides_and_refuses_everything_a_caller_may_not_read() {
     assert_eq!(got["error"]["code"], -32602, "{got}");
     let directory = call(
         &app,
-        &session,
         4,
         "resources/directory/read",
         serde_json::json!({ "uri": "skill://macos" }),
@@ -404,7 +347,6 @@ async fn the_skills_floor_hides_and_refuses_everything_a_caller_may_not_read() {
     assert_eq!(directory["error"]["code"], -32602, "{directory}");
     let read = call(
         &app,
-        &session,
         5,
         "resources/read",
         serde_json::json!({ "uri": "skill://macos/mouse/SKILL.md" }),
@@ -414,7 +356,7 @@ async fn the_skills_floor_hides_and_refuses_everything_a_caller_may_not_read() {
         read["error"].is_object(),
         "a header-asserted caller reads nothing: {read}"
     );
-    let resources = call(&app, &session, 6, "resources/list", serde_json::json!({})).await;
+    let resources = call(&app, 6, "resources/list", serde_json::json!({})).await;
     assert!(
         !resources.to_string().contains("skill://"),
         "resources/list hides the skills too: {resources}"
@@ -434,31 +376,12 @@ async fn the_skills_floor_can_open_skills_to_an_anonymous_caller() {
         }],
         ..ToolAccessPolicyConfig::default()
     };
-    let (app, session) = initialize_session(router(
-        skills_state(dir.path(), policy, 100),
-        "/health",
-        "/mcp",
-    ))
-    .await;
+    let app = router(skills_state(dir.path(), policy, 100), "/health", "/mcp");
+    // Deliberately no SUBJECT_ID_HEADER.
     let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/mcp")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, MCP_ACCEPT_HEADER)
-                .header(
-                    PROTOCOL_VERSION_HEADER,
-                    crate::protocol::SUPPORTED_PROTOCOL_VERSION,
-                )
-                .header(SESSION_ID_HEADER, &session)
-                // deliberately no SUBJECT_ID_HEADER
-                .body(Body::from(
-                    serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "skills/list" })
-                        .to_string(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(mcp_post(
+            serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "skills/list" }),
+        ))
         .await
         .unwrap();
     let listed = extract_jsonrpc_response(response, 2).await;
@@ -471,7 +394,7 @@ async fn the_skills_floor_can_open_skills_to_an_anonymous_caller() {
 
 #[tokio::test]
 async fn without_a_source_the_methods_are_unknown() {
-    let (app, session) = initialize_session(router(build_test_state(), "/health", "/mcp")).await;
+    let app = router(build_test_state(), "/health", "/mcp");
     for (id, method, params) in [
         (2, "skills/list", serde_json::json!({})),
         (
@@ -486,7 +409,7 @@ async fn without_a_source_the_methods_are_unknown() {
             serde_json::json!({ "uri": "skill://a" }),
         ),
     ] {
-        let answer = call(&app, &session, id, method, params).await;
+        let answer = call(&app, id, method, params).await;
         assert_eq!(answer["error"]["code"], -32601, "{method}: {answer}");
     }
 }
@@ -510,67 +433,26 @@ async fn directory_read_is_unknown_when_it_is_turned_off() {
         ToolAccessPolicyConfig::default(),
         move |runtime| runtime.set_skills(Some(catalog)),
     );
-    let (app, session) = initialize_session(router(state, "/health", "/mcp")).await;
+    let app = router(state, "/health", "/mcp");
     let answer = call(
         &app,
-        &session,
         2,
         "resources/directory/read",
         serde_json::json!({ "uri": "skill://mouse" }),
     )
     .await;
     assert_eq!(answer["error"]["code"], -32601, "{answer}");
-    let listed = call(&app, &session, 3, "skills/list", serde_json::json!({})).await;
+    let listed = call(&app, 3, "skills/list", serde_json::json!({})).await;
     assert_eq!(listed["result"]["skills"].as_array().map(Vec::len), Some(2));
 }
 
-/// One 2026-07-28 request, as a header-asserted caller.
-async fn modern(app: &Router, id: u64, method: &str, params: Value) -> (StatusCode, Value) {
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/mcp")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, MCP_ACCEPT_HEADER)
-                .header("mcp-protocol-version", "2026-07-28")
-                .header("mcp-method", method)
-                .header(header::HeaderName::from_static(SUBJECT_ID_HEADER), "conformance-user")
-                .body(Body::from(
-                    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
-                        .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    (status, extract_jsonrpc_response(response, id).await)
-}
-
 #[tokio::test]
-async fn the_modern_wire_declares_the_extension_and_stamps_its_results() {
+async fn discover_declares_the_extension_and_results_are_stamped() {
     let dir = skills_folder();
     let state = skills_state(dir.path(), ToolAccessPolicyConfig::default(), 100);
-    install_protocol_registry_for_tests(&state);
     let app = router(state, "/health", "/mcp");
 
-    let (_, discovered) = modern(
-        &app,
-        1,
-        "server/discover",
-        serde_json::json!({
-            "protocolVersion": "2026-07-28",
-            "clientInfo": { "name": "t", "version": "1" },
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                "io.modelcontextprotocol/clientInfo": { "name": "t", "version": "1" },
-                "io.modelcontextprotocol/clientCapabilities": {}
-            }
-        }),
-    )
-    .await;
+    let (_, discovered) = call_with_status(&app, 1, "server/discover", serde_json::json!({})).await;
     let capabilities = &discovered["result"]["capabilities"];
     assert_eq!(
         capabilities["extensions"]["io.modelcontextprotocol/skills"],
@@ -579,14 +461,14 @@ async fn the_modern_wire_declares_the_extension_and_stamps_its_results() {
     );
     assert!(capabilities["resources"].is_object(), "{discovered}");
 
-    let (status, listed) = modern(&app, 2, "skills/list", serde_json::json!({})).await;
+    let (status, listed) = call_with_status(&app, 2, "skills/list", serde_json::json!({})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listed["result"]["resultType"], "complete", "{listed}");
     assert_eq!(listed["result"]["cacheScope"], "private");
     assert!(listed["result"]["ttlMs"].is_u64());
     assert_eq!(listed["result"]["skills"].as_array().map(Vec::len), Some(2));
 
-    let (_, got) = modern(
+    let (_, got) = call_with_status(
         &app,
         3,
         "skills/get",
@@ -599,7 +481,7 @@ async fn the_modern_wire_declares_the_extension_and_stamps_its_results() {
         "skill://macos/mouse/SKILL.md"
     );
 
-    let (_, directory) = modern(
+    let (_, directory) = call_with_status(
         &app,
         4,
         "resources/directory/read",
@@ -614,11 +496,9 @@ async fn the_modern_wire_declares_the_extension_and_stamps_its_results() {
 }
 
 #[tokio::test]
-async fn the_modern_wire_answers_404_while_no_skills_are_served() {
-    let state = build_test_state();
-    install_protocol_registry_for_tests(&state);
-    let app = router(state, "/health", "/mcp");
-    let (status, answer) = modern(&app, 2, "skills/list", serde_json::json!({})).await;
+async fn skills_methods_answer_404_while_no_skills_are_served() {
+    let app = router(build_test_state(), "/health", "/mcp");
+    let (status, answer) = call_with_status(&app, 2, "skills/list", serde_json::json!({})).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
     assert_eq!(answer["error"]["code"], -32601);
 }

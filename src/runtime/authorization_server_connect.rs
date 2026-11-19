@@ -8,16 +8,14 @@
 //! ID token names, so a user stores one only for themselves.
 //!
 //! A federated call whose caller has no stored sign-in may answer with a
-//! URL-mode elicitation (MCP Elicitation, `2025-11-25` and `2026-07-28`):
-//! the link `/oauth/connect?e=<id>`, offered to that caller only. The id is
-//! random and names nobody (Safe URL Handling); the link record binds it to
-//! the caller's principal, MCP client and session. The callback stores
-//! nothing unless the user who signed in is that principal, and completes
-//! a link once (Elicitation, Phishing). The `2025-11-25` session that
-//! offered a link is told when it completes
-//! (`notifications/elicitation/complete`). On `2026-07-28` the retry
-//! carries a sealed `requestState` that names the link, bound to the caller
-//! and the tool, and waits a short while for the link to complete.
+//! URL-mode elicitation (MCP Elicitation): the link
+//! `/oauth/connect?e=<id>`, offered to that caller only. The id is random
+//! and names nobody (Safe URL Handling); the link record binds it to the
+//! caller's principal, MCP client and session. The callback stores nothing
+//! unless the user who signed in is that principal, and completes a link
+//! once (Elicitation, Phishing). The retry carries a sealed `requestState`
+//! that names the link, bound to the caller and the tool, and waits a short
+//! while for the link to complete.
 //!
 //! Nothing here logs a link id.
 
@@ -38,8 +36,8 @@ use super::{AuthorizationServer, now_unix};
 
 /// Query parameter of `/oauth/connect` that names a link.
 pub const LINK_PARAMETER: &str = "e";
-/// Prefix of a `2026-07-28` `requestState` that names a link, beside the
-/// pipeline codec's `c.` and `h.`.
+/// Prefix of a `requestState` that names a link, beside the pipeline
+/// codec's `c.` and `h.`.
 pub const LINK_REQUEST_STATE_PREFIX: &str = "l.";
 /// The key of the URL elicitation in `InputRequiredResult.inputRequests`.
 pub const LINK_INPUT_KEY: &str = "connect_sign_in";
@@ -85,36 +83,10 @@ impl std::fmt::Debug for ConnectPage {
     }
 }
 
-/// A completed link the MCP session that offered it is told of, by the id
-/// its elicitation carried.
-#[derive(Clone, PartialEq, Eq)]
-pub struct CompletedLink {
-    pub session_id: String,
-    pub elicitation_id: String,
-}
-
-impl CompletedLink {
-    /// `notifications/elicitation/complete` (MCP `2025-11-25`).
-    pub fn notification(&self) -> serde_json::Value {
-        serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/elicitation/complete",
-            "params": { "elicitationId": self.elicitation_id },
-        })
-    }
-}
-
-impl std::fmt::Debug for CompletedLink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CompletedLink").finish_non_exhaustive()
-    }
-}
-
 /// A link offered to a caller.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ConnectLink {
-    /// The link id, which the `2025-11-25` elicitation carries as its
-    /// `elicitationId`.
+    /// The link id, which the link's `requestState` seals.
     pub id: String,
     /// `/oauth/connect?e=<id>` under the issuer.
     pub url: String,
@@ -144,8 +116,6 @@ pub struct LinkOffer<'a> {
     pub client_id: Option<&'a str>,
     /// The MCP session the link is offered on.
     pub session_id: Option<&'a str>,
-    /// Whether that session is told when the link completes.
-    pub notify: bool,
     /// A link offered to the caller for the same request, offered again
     /// while it is pending.
     pub resume: Option<&'a str>,
@@ -208,7 +178,7 @@ impl std::fmt::Debug for LinkStateCheck {
     }
 }
 
-/// The `requestState` of a `2026-07-28` result that offers a link.
+/// The `requestState` of a result that offers a link.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LinkRequestState {
     link: String,
@@ -223,17 +193,6 @@ impl StateRecord for LinkRequestState {}
 pub(super) struct PendingLink {
     pub(super) id: String,
     pub(super) record: LinkRecord,
-}
-
-impl PendingLink {
-    /// The session to tell of the completion, when the link asked for it.
-    pub(super) fn completion(self) -> Option<CompletedLink> {
-        let session_id = self.record.session_id.filter(|_| self.record.notify)?;
-        Some(CompletedLink {
-            session_id,
-            elicitation_id: self.id,
-        })
-    }
 }
 
 impl std::fmt::Debug for PendingLink {
@@ -318,12 +277,7 @@ impl AuthorizationServer {
         let idp_name = login.display_name();
         let now = now_unix();
         let unavailable = |error: StateError| LinkError::Unavailable(error.to_string());
-        let notify = offer.notify && offer.session_id.is_some();
-        let by_session = keys::pending_link(
-            offer.principal,
-            offer.session_id.unwrap_or_default(),
-            notify,
-        );
+        let by_session = keys::pending_link(offer.principal, offer.session_id.unwrap_or_default());
         let last_offered = match offer.resume.filter(|id| is_random_token(id)) {
             Some(resume) => Some(resume.to_owned()),
             None => state
@@ -362,7 +316,6 @@ impl AuthorizationServer {
             principal: offer.principal.to_owned(),
             client_id: offer.client_id.map(str::to_owned),
             session_id: offer.session_id.map(str::to_owned),
-            notify,
             exp: now.saturating_add(ttl),
         };
         let lifetime = Duration::from_secs(ttl);
@@ -420,7 +373,7 @@ impl AuthorizationServer {
         Ok(Some(record))
     }
 
-    /// The `requestState` of a `2026-07-28` result that offers the link
+    /// The `requestState` of a result that offers the link
     /// `link_id`, which expires at `expires_at`, to `principal` for the
     /// tool `tool`: sealed under the state keys, and valid while the link
     /// is.

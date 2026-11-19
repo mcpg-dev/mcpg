@@ -1,5 +1,5 @@
 //! What the connection a request arrived on vouches for: the TLS session
-//! the gateway terminated, and a caller identity an `http`-wire transport
+//! the gateway terminated, and a caller identity a transport plugin
 //! established (for a tailnet: the owner of the peer node).
 
 use std::sync::Arc;
@@ -17,7 +17,7 @@ pub struct AttestedPeer {
     pub peer: TransportPeer,
 }
 
-/// The request extension an `http`-wire transport's request carries.
+/// The request extension a transport plugin's request carries.
 pub type AttestedPeerArc = Arc<AttestedPeer>;
 
 /// The connection facts identity resolution reads.

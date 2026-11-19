@@ -24,7 +24,7 @@ pub(crate) fn validate_origin(
     request_id: &GatewayRequestId,
 ) -> Option<Response> {
     let origin = headers
-        .get(ORIGIN_HEADER)
+        .get(axum::http::header::ORIGIN)
         .and_then(|value| value.to_str().ok())?;
     // case-insensitive origin comparison. RFC 6454 §6.1 says
     // the scheme + host + port triple is case-insensitive for ASCII;
@@ -88,225 +88,33 @@ fn is_loopback_origin(origin_lower: &str) -> bool {
     false
 }
 
+/// Gate a POST's `Accept`. `Err` is the `400` for a header that does not
+/// admit `application/json`; `Ok` says whether it also admits
+/// `text/event-stream`, i.e. whether this client consented to an SSE upgrade.
 pub(crate) fn validate_post_accept(
     headers: &HeaderMap,
     request_id: &GatewayRequestId,
-) -> Option<Response> {
-    let Some(value) = headers.get(axum::http::header::ACCEPT) else {
-        return Some(with_request_id_header(
-            axum::http::StatusCode::BAD_REQUEST.into_response(),
-            request_id,
-        ));
-    };
-    let Ok(accepts) = value.to_str() else {
-        return Some(with_request_id_header(
-            axum::http::StatusCode::BAD_REQUEST.into_response(),
-            request_id,
-        ));
-    };
-    // media-range-aware match (see validate_get_accept).
-    //
-    // The spec'd "Streamable HTTP" Accept advertisement is
-    // `application/json, text/event-stream` — clients that may need to
-    // receive an SSE upgrade for long-lived responses include both.
-    // Clients that won't ever need SSE (modern stateless wire's
-    // inline-only MRTR shape, or any client that only ever calls
-    // non-streaming methods) legitimately advertise just
-    // `application/json`. Requiring both forced spec-compliant
-    // modern clients (including the upstream conformance suite) to
-    // hit 400 here even though their request never needed SSE.
+) -> Result<bool, Response> {
+    // The Streamable HTTP Accept advertisement is
+    // `application/json, text/event-stream`: a client that may receive an
+    // SSE response lists both. A client that never needs SSE (MRTR answers
+    // inline, and most methods never stream) legitimately lists only
+    // `application/json`.
     //
     // Policy: accept `application/json` as the minimum. If the client
-    // also lists SSE, MCPG may upgrade; if not, the response stays
-    // inline JSON.
-    if accept_list_includes(accepts, JSON_ACCEPT) {
-        return None;
-    }
-
-    Some(with_request_id_header(
-        axum::http::StatusCode::BAD_REQUEST.into_response(),
-        request_id,
-    ))
-}
-
-/// Whether a POST's `Accept` admits `text/event-stream`, i.e. whether this
-/// client consented to an SSE upgrade.
-///
-/// Runs after [`validate_post_accept`] has already established that
-/// `application/json` is present, so a `false` here means "JSON only" rather
-/// than "unusable header".
-pub(crate) fn post_accepts_sse(headers: &HeaderMap) -> bool {
-    headers
+    // also lists SSE, MCPG may answer with a stream; if not, the response
+    // stays inline JSON.
+    match headers
         .get(axum::http::header::ACCEPT)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|accepts| accept_list_includes(accepts, SSE_ACCEPT))
-}
-
-/// Enforce `Mcp-Protocol-Version` header rules for the primary POST endpoint.
-///
-/// Per the MCP Streamable HTTP spec (2025-11-25): when the client sends
-/// `Mcp-Protocol-Version`, it MUST be a supported revision; otherwise the server
-/// MUST reply with HTTP `400 Bad Request`.
-///
-/// absent headers on post-initialize requests are interpreted as the
-/// `2025-03-26` legacy revision — the SHOULD from the spec — and are
-/// observable via `mcpg_protocol_version_absent_total`. We accept the
-/// current revision plus the declared legacy revisions here; the runtime
-/// still reconciles the effective version with the session state.
-///
-/// With `legacy_wire` off, a `2025-xx` header is refused like an unknown one.
-pub(crate) fn enforce_http_protocol_version_header(
-    headers: &HeaderMap,
-    body_id: Option<&Value>,
-    legacy_wire: bool,
-) -> Result<(), Response> {
-    let Some(raw) = headers.get(PROTOCOL_VERSION_HEADER) else {
-        metrics::counter!(
-            "mcpg_protocol_version_absent_total",
-            "assumed" => crate::protocol::LEGACY_DEFAULT_PROTOCOL_VERSION,
-        )
-        .increment(1);
-        return Ok(());
-    };
-    let header = raw
-        .to_str()
-        .map_err(|_| invalid_request_protocol_version(body_id.cloned()))?;
-    let session_wire = header == crate::protocol::SUPPORTED_PROTOCOL_VERSION
-        || crate::protocol::LEGACY_PROTOCOL_VERSIONS.contains(&header);
-    if session_wire && !legacy_wire {
-        return Err(unsupported_protocol_version_response(
-            header,
-            body_id.cloned(),
-            false,
-        ));
-    }
-    if header == crate::protocol::SUPPORTED_PROTOCOL_VERSION {
-        return Ok(());
-    }
-    if crate::protocol::LEGACY_PROTOCOL_VERSIONS.contains(&header) {
-        metrics::counter!(
-            "mcpg_protocol_version_legacy_total",
-            "version" => header.to_owned(),
-        )
-        .increment(1);
-        return Ok(());
-    }
-    // Accept modern wire strings through the shared version vocabulary
-    // (`ProtocolVersion::parse`), which also takes the pre-final
-    // `DRAFT-2026-v1` alias — the registry-driven dispatch path below
-    // resolves either spelling to the modern handler.
-    if crate::protocol::version::ProtocolVersion::parse(header)
-        == Some(crate::protocol::version::ProtocolVersion::V_2026_07_28)
+        .map(admitted_media)
     {
-        metrics::counter!(
-            "mcpg_protocol_version_modern_total",
-            "version" => header.to_owned(),
-        )
-        .increment(1);
-        return Ok(());
+        Some(AdmittedMedia { json: true, sse }) => Ok(sse),
+        _ => Err(with_request_id_header(
+            axum::http::StatusCode::BAD_REQUEST.into_response(),
+            request_id,
+        )),
     }
-    Err(unsupported_protocol_version_response(
-        header,
-        body_id.cloned(),
-        legacy_wire,
-    ))
-}
-
-/// The refusal of a POST that negotiated a `2025-xx` revision while
-/// `legacy_wire` is off. `requested` names the revision the client asked
-/// for: the header, else `initialize`'s `params.protocolVersion`, else the
-/// revision a request with neither is taken to speak.
-pub(crate) fn legacy_wire_refused(headers: &HeaderMap, body: &Value) -> Response {
-    let requested = headers
-        .get(PROTOCOL_VERSION_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            body.pointer("/params/protocolVersion")
-                .and_then(Value::as_str)
-        })
-        .unwrap_or(crate::protocol::LEGACY_DEFAULT_PROTOCOL_VERSION);
-    unsupported_protocol_version_response(requested, body.get("id").cloned(), false)
-}
-
-/// The refusal of a POST that carries `Mcp-Session-Id` while `legacy_wire`
-/// is off: `2026-07-28` has no sessions.
-pub(crate) fn session_header_refused(body_id: Option<Value>) -> Response {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": body_id.unwrap_or(Value::Null),
-        "error": {
-            "code": -32600,
-            "message": "Mcp-Session-Id is not accepted: this gateway serves only \
-                        2026-07-28, which has no sessions",
-        }
-    });
-    protocol_version_error_response(body, false)
-}
-
-/// JSON-RPC error for a present-but-unservable `Mcp-Protocol-Version`.
-/// Uses the MCP-reserved `UnsupportedProtocolVersion` code (`-32022`,
-/// adopted in `2026-07-28`), matching the code the registry's
-/// `into_rejection` emits, not the generic `-32600` (`InvalidRequest`)
-/// which is reserved for a malformed header. The `error.data` here adds a
-/// `kind` discriminator (the registry's variant omits it); both carry
-/// `requested` + `supported`.
-fn unsupported_protocol_version_response(
-    requested: &str,
-    body_id: Option<Value>,
-    legacy_wire: bool,
-) -> Response {
-    // Advertise every revision MCPG can actually serve, not just
-    // the default, so a client receiving the error can pick a working
-    // revision without trial-and-error.
-    let supported = crate::protocol::served_protocol_versions(legacy_wire);
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": body_id.unwrap_or(Value::Null),
-        "error": {
-            "code": crate::protocol::shared::error::UNSUPPORTED_PROTOCOL_VERSION_CODE,
-            "message": "Unsupported protocol version",
-            "data": {
-                "kind": "unsupported_protocol_version",
-                "requested": requested,
-                "supported": supported,
-            }
-        }
-    });
-    protocol_version_error_response(body, legacy_wire)
-}
-
-/// JSON-RPC error for a malformed (non-UTF-8) `Mcp-Protocol-Version`
-/// header. Uses `-32600` (`InvalidRequest`) — the header is unparseable,
-/// not merely an unsupported revision.
-fn invalid_request_protocol_version(body_id: Option<Value>) -> Response {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": body_id.unwrap_or(Value::Null),
-        "error": {
-            "code": -32600,
-            "message": "Mcp-Protocol-Version header is not valid UTF-8",
-        }
-    });
-    protocol_version_error_response(body, true)
-}
-
-/// Shared 400 + JSON body + `Mcp-Protocol-Version` response header used by
-/// the protocol-version rejection paths. The id is carried in the body
-/// (SEP-2575 mandates error responses correlate against the request id).
-/// The header names `2026-07-28` when the legacy wire is off.
-fn protocol_version_error_response(body: Value, legacy_wire: bool) -> Response {
-    use axum::http::StatusCode;
-    let mut resp = (StatusCode::BAD_REQUEST, Json(body)).into_response();
-    let version = if legacy_wire {
-        crate::protocol::SUPPORTED_PROTOCOL_VERSION
-    } else {
-        crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION
-    };
-    resp.headers_mut().insert(
-        HeaderName::from_static(PROTOCOL_VERSION_HEADER),
-        HeaderValue::from_static(version),
-    );
-    resp
 }
 
 pub(crate) fn validate_post_content_type(
@@ -339,39 +147,24 @@ pub(crate) fn validate_post_content_type(
     ))
 }
 
-pub(crate) fn validate_get_accept(
-    headers: &HeaderMap,
-    request_id: &GatewayRequestId,
-) -> Option<Response> {
-    let Some(value) = headers.get(axum::http::header::ACCEPT) else {
-        return Some(with_request_id_header(
-            axum::http::StatusCode::BAD_REQUEST.into_response(),
-            request_id,
-        ));
-    };
-    let Ok(accepts) = value.to_str() else {
-        return Some(with_request_id_header(
-            axum::http::StatusCode::BAD_REQUEST.into_response(),
-            request_id,
-        ));
-    };
-    // parse Accept as comma-separated media ranges instead of a
-    // substring match. `text/event-streamXYZ` and `;q=0` must both be
-    // rejected per RFC 9110 §12.5.1.
-    if accept_list_includes(accepts, SSE_ACCEPT) {
-        return None;
-    }
-
-    Some(with_request_id_header(
-        axum::http::StatusCode::BAD_REQUEST.into_response(),
-        request_id,
-    ))
+/// Which of `application/json` and `text/event-stream` an `Accept` value
+/// admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdmittedMedia {
+    json: bool,
+    sse: bool,
 }
 
-/// Returns true when `header_value` parses as a comma-separated media
-/// range list that contains `media` with a non-zero quality. Quality
-/// values, trailing params, and surrounding whitespace are tolerated.
-pub(crate) fn accept_list_includes(header_value: &str, media: &str) -> bool {
+/// Read `header_value` as a comma-separated media range list: a media type is
+/// admitted when an entry names it, or is `*/*`, with a non-zero quality.
+/// Quality values, trailing params, and surrounding whitespace are tolerated;
+/// a prefix collision (`text/event-streamXYZ`) and `;q=0` are refused (RFC
+/// 9110 §12.5.1).
+fn admitted_media(header_value: &str) -> AdmittedMedia {
+    let mut admitted = AdmittedMedia {
+        json: false,
+        sse: false,
+    };
     for entry in header_value.split(',') {
         let entry = entry.trim();
         if entry.is_empty() {
@@ -380,7 +173,10 @@ pub(crate) fn accept_list_includes(header_value: &str, media: &str) -> bool {
         let mut parts = entry.split(';');
         let Some(range) = parts.next() else { continue };
         let range = range.trim();
-        if !range.eq_ignore_ascii_case(media) && range != "*/*" {
+        let any = range == "*/*";
+        let json = any || range.eq_ignore_ascii_case(JSON_ACCEPT);
+        let sse = any || range.eq_ignore_ascii_case(SSE_ACCEPT);
+        if !json && !sse {
             continue;
         }
         // If an explicit q=0 is present, treat as rejection.
@@ -395,47 +191,86 @@ pub(crate) fn accept_list_includes(header_value: &str, media: &str) -> bool {
             }
         }
         if accepted {
-            return true;
+            admitted.json |= json;
+            admitted.sse |= sse;
+            if admitted.json && admitted.sse {
+                break;
+            }
         }
     }
-    false
+    admitted
 }
 
 #[cfg(test)]
 mod accept_tests {
     use super::super::SSE_ACCEPT;
-    use super::accept_list_includes;
+    use super::{AdmittedMedia, admitted_media};
+
+    fn admits_sse(header_value: &str) -> bool {
+        admitted_media(header_value).sse
+    }
 
     #[test]
     fn exact_match_accepted() {
-        assert!(accept_list_includes(SSE_ACCEPT, SSE_ACCEPT));
+        assert!(admits_sse(SSE_ACCEPT));
     }
 
     #[test]
     fn wildcard_range_accepted() {
-        assert!(accept_list_includes("*/*", SSE_ACCEPT));
+        assert!(admits_sse("*/*"));
     }
 
     #[test]
     fn prefix_collision_rejected() {
-        assert!(!accept_list_includes("text/event-streamXYZ", SSE_ACCEPT));
+        assert!(!admits_sse("text/event-streamXYZ"));
     }
 
     #[test]
     fn multiple_ranges_tolerated() {
-        assert!(accept_list_includes(
-            "application/json, text/event-stream;q=0.9",
-            SSE_ACCEPT,
-        ));
+        assert!(admits_sse("application/json, text/event-stream;q=0.9"));
     }
 
     #[test]
     fn q_zero_rejected() {
-        assert!(!accept_list_includes("text/event-stream;q=0", SSE_ACCEPT));
+        assert!(!admits_sse("text/event-stream;q=0"));
     }
 
     #[test]
     fn missing_media_rejected() {
-        assert!(!accept_list_includes("application/json", SSE_ACCEPT));
+        assert!(!admits_sse("application/json"));
+    }
+
+    /// Each media type is decided on its own: a refused entry for one never
+    /// hides a later entry that admits it, and `*/*` admits both.
+    #[test]
+    fn json_and_sse_are_decided_in_one_pass() {
+        let both = AdmittedMedia {
+            json: true,
+            sse: true,
+        };
+        assert_eq!(admitted_media("application/json, text/event-stream"), both);
+        assert_eq!(admitted_media("*/*"), both);
+        assert_eq!(admitted_media("text/event-stream;q=0, */*"), both);
+        assert_eq!(
+            admitted_media("APPLICATION/JSON"),
+            AdmittedMedia {
+                json: true,
+                sse: false,
+            }
+        );
+        assert_eq!(
+            admitted_media("application/json;q=0, text/event-stream"),
+            AdmittedMedia {
+                json: false,
+                sse: true,
+            }
+        );
+        assert_eq!(
+            admitted_media("application/json-patch+json, text/html"),
+            AdmittedMedia {
+                json: false,
+                sse: false,
+            }
+        );
     }
 }

@@ -176,6 +176,14 @@ pub const CORE_PSEUDO_ID: &str = "core";
 /// Caller-supplied `target` is typically `metadata.module_path()`
 /// for metrics or `event.metadata().target()` for tracing events.
 pub fn source_from_target(target: &str, target_to_plugin_id: &HashMap<String, String>) -> String {
+    source_ref_from_target(target, target_to_plugin_id).to_owned()
+}
+
+/// [`source_from_target`], borrowing the id from the map.
+pub fn source_ref_from_target<'m>(
+    target: &str,
+    target_to_plugin_id: &'m HashMap<String, String>,
+) -> &'m str {
     // The first `::` segment is the crate-root module name;
     // metrics-rs and tracing both default `target` to
     // `module_path!()` at the call site, which always begins with
@@ -183,8 +191,7 @@ pub fn source_from_target(target: &str, target_to_plugin_id: &HashMap<String, St
     let head = target.split("::").next().unwrap_or(target);
     target_to_plugin_id
         .get(head)
-        .cloned()
-        .unwrap_or_else(|| CORE_PSEUDO_ID.to_owned())
+        .map_or(CORE_PSEUDO_ID, String::as_str)
 }
 
 /// Should an event from `source_plugin_id` at `event_level` be

@@ -13,8 +13,7 @@
 //! referrer) `Sec-Fetch-Site` is `same-origin` (else 403). The
 //! authorization endpoint and the callback answer `GET` only: a `HEAD`
 //! would claim the client's one-time PKCE challenge, or spend the one-time
-//! sign-in. A completed link tells the MCP session that offered it
-//! (`notifications/elicitation/complete`) once the answer is sent.
+//! sign-in.
 //!
 //! Every response is `no-store`, sends no referrer and is not sniffed, and
 //! every redirect is a `303` (RFC 9700 §4.12). A page is HTML without
@@ -272,8 +271,7 @@ fn admit<'a>(
 
 /// `response` as HTTP: its page or redirect, its cookies and its audit
 /// record. The revocation of a replaced IdP sign-in runs after the answer,
-/// on the server current then, and so does the notification of a
-/// completed link.
+/// on the server current then.
 async fn respond(
     runtime: &Arc<crate::runtime::GatewayRuntime>,
     mut response: BrowserResponse,
@@ -292,14 +290,6 @@ async fn respond(
             if let Some(server) = runtime.ema_authorization_server() {
                 server.revoke_superseded(superseded).await;
             }
-        });
-    }
-    if let Some(completed) = response.link_completed.take() {
-        let runtime = Arc::clone(runtime);
-        tokio::spawn(async move {
-            runtime
-                .notify_session(&completed.session_id, completed.notification())
-                .await;
         });
     }
     let mut http = match response.outcome {

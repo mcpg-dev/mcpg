@@ -667,8 +667,8 @@ impl BackendHost for GatewayBackendHost {
             return Err(BackendHostError::NotImplemented);
         };
         // The URI carries the storage prefix; the registry resolves
-        // it to the right backend. Bare-id legacy form falls back to
-        // the operator's default provider.
+        // it to the right backend. A bare id falls back to the
+        // operator's default provider.
         let (storage_id, id) = registry.parse_resource_uri(uri);
         let Some(store) = registry.by_id(&storage_id) else {
             return Ok(None);

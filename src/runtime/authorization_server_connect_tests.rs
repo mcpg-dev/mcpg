@@ -1,24 +1,23 @@
 //! Links that store a caller's IdP sign-in, and the connect page: a link
 //! is offered to one principal and names nobody; the page binds its form
 //! to the browser; the callback stores the sign-in only for the user the
-//! link was offered to, once, and tells the session that offered it.
+//! link was offered to, once.
 
 use super::*;
 use crate::runtime::authorization_server::connect::{
-    CompletedLink, ConnectLink, ConnectPage, LINK_REQUEST_STATE_PREFIX, LINK_RESUME_WAIT,
-    LinkError, LinkOffer, LinkStateCheck, LinkStatus, MAX_NEW_LINKS_PER_PRINCIPAL,
+    ConnectLink, ConnectPage, LINK_REQUEST_STATE_PREFIX, LINK_RESUME_WAIT, LinkError, LinkOffer,
+    LinkStateCheck, LinkStatus, MAX_NEW_LINKS_PER_PRINCIPAL,
 };
 use crate::runtime::authorization_server::interactive::ConsentRequest;
 use crate::runtime::authorization_server::state::LinkRecord;
 
-const SESSION: &str = "sess-legacy-1";
+const SESSION: &str = "sess-1";
 
 fn offer<'a>(principal: &'a str, resume: Option<&'a str>) -> LinkOffer<'a> {
     LinkOffer {
         principal,
         client_id: Some("web-app"),
         session_id: Some(SESSION),
-        notify: true,
         resume,
     }
 }
@@ -125,7 +124,6 @@ async fn a_link_is_offered_to_one_principal_and_names_nobody() {
             principal: principal.clone(),
             client_id: Some("web-app".to_owned()),
             session_id: Some(SESSION.to_owned()),
-            notify: true,
             exp: link.expires_at,
         }
     );
@@ -199,9 +197,8 @@ async fn a_pending_link_is_offered_again_to_its_principal_only() {
     );
 }
 
-/// A caller retrying on the `2025-11-25` wire names no link, so each of
-/// their calls on one session is offered the link that session is
-/// pending, and the store holds one link per principal and session. A
+/// A call whose retry names no link is offered the link its session has
+/// pending, so the store holds one link per principal and session. A
 /// principal is offered at most [`MAX_NEW_LINKS_PER_PRINCIPAL`] new links
 /// per link lifetime; a pending one is still offered again.
 #[tokio::test]
@@ -228,17 +225,6 @@ async fn a_session_is_offered_its_pending_link_and_new_links_are_capped() {
         .await
         .expect("offered");
     assert_ne!(other_session.id, first.id);
-    let silent = server
-        .offer_link(LinkOffer {
-            notify: false,
-            ..offer(&principal, None)
-        })
-        .await
-        .expect("offered");
-    assert_ne!(
-        silent.id, first.id,
-        "a link the session is told of is not reused where it is not"
-    );
     let theirs = offered(&server, &another_principal(&idp)).await;
     assert_ne!(theirs.id, first.id);
 
@@ -253,7 +239,7 @@ async fn a_session_is_offered_its_pending_link_and_new_links_are_capped() {
     let window = now_unix() / server.interactive_settings().transaction_ttl_secs;
     let rate = keys::link_rate(&principal, window);
     let taken = state_of(&server).incr(&rate, 0, None).await.expect("store");
-    assert_eq!(taken, 4, "only new links count");
+    assert_eq!(taken, 3, "only new links count");
     state_of(&server)
         .incr(&rate, MAX_NEW_LINKS_PER_PRINCIPAL - taken, None)
         .await
@@ -664,7 +650,7 @@ async fn cancelling_the_connect_page_stores_nothing() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_link_completed_by_its_user_stores_the_sign_in_and_tells_the_session() {
+async fn a_link_completed_by_its_user_stores_the_sign_in() {
     let captured = CapturedMetrics::default();
     let _recording = metrics::set_default_local_recorder(&captured);
     let idp = Idp::start().await;
@@ -682,26 +668,6 @@ async fn a_link_completed_by_its_user_stores_the_sign_in_and_tells_the_session()
         ref other => panic!("expected the connected page, got {other:?}"),
     }
     assert!(clears_binding(&response, &started));
-    let completed = response
-        .link_completed
-        .clone()
-        .expect("the session is told");
-    assert_eq!(
-        completed,
-        CompletedLink {
-            session_id: SESSION.to_owned(),
-            elicitation_id: link.id.clone(),
-        }
-    );
-    assert_eq!(
-        completed.notification(),
-        json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/elicitation/complete",
-            "params": { "elicitationId": link.id },
-        })
-    );
-    assert!(!format!("{completed:?}").contains(&link.id));
     let audit = login_audit(&response);
     assert_eq!(audit.purpose, TransactionPurpose::Link);
     let stored = state_of(&server)
@@ -730,27 +696,6 @@ async fn a_link_completed_by_its_user_stores_the_sign_in_and_tells_the_session()
 }
 
 #[tokio::test]
-async fn a_link_without_a_session_to_tell_completes_silently() {
-    let idp = Idp::start().await;
-    let server = server(&idp);
-    let principal = principal_of_user(&idp);
-    let link = server
-        .offer_link(LinkOffer {
-            principal: &principal,
-            client_id: None,
-            session_id: Some(SESSION),
-            notify: false,
-            resume: None,
-        })
-        .await
-        .expect("offered");
-    let started = start_link(&server, &link.id).await;
-    let response = complete(&server, &idp, &started, Some("idp-refresh-1")).await;
-    assert!(matches!(response.outcome, BrowserOutcome::Done(_)));
-    assert_eq!(response.link_completed, None);
-}
-
-#[tokio::test]
 async fn a_link_completed_by_another_user_stores_nothing_and_is_audited() {
     let captured = CapturedMetrics::default();
     let _recording = metrics::set_default_local_recorder(&captured);
@@ -765,7 +710,6 @@ async fn a_link_completed_by_another_user_stores_nothing_and_is_audited() {
     assert_eq!(refused, &ErrorPage::another_user("Acme SSO"));
     assert_eq!(refused.status, 403);
     assert!(clears_binding(&response, &started));
-    assert_eq!(response.link_completed, None);
     assert!(response.superseded.is_none());
     let Some(BrowserAudit::ConnectRefused(ref audit)) = response.audit else {
         panic!("expected mcpg.as.connect_refused, got {:?}", response.audit);
@@ -849,7 +793,6 @@ async fn a_standalone_connect_stores_the_sign_in_of_whoever_signs_in() {
     let started = started(&decide(&server, &page, "approve").await, "");
     let response = complete(&server, &idp, &started, Some("idp-refresh-1")).await;
     assert!(matches!(response.outcome, BrowserOutcome::Done(_)));
-    assert_eq!(response.link_completed, None);
     let stored = state_of(&server)
         .get(&keys::idp_session(&principal_of_user(&idp)))
         .await

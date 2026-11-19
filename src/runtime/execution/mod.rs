@@ -105,33 +105,19 @@ pub(crate) struct BackendInvocationRequest {
     pub arguments: Option<Value>,
     /// Expression context for resolving dynamic config fields at call time.
     pub expr_ctx: super::expr::ExprContext,
-    /// Progress token from the client's `_meta.progressToken`, if provided.
-    /// On the modern (`2026-07-28`) wire this is read from the namespaced
-    /// `_meta.io.modelcontextprotocol/progressToken` key; on `2025-11-25`
-    /// from the bare `_meta.progressToken`.
+    /// Progress token from the request's
+    /// `_meta.io.modelcontextprotocol/progressToken` (else the bare
+    /// `_meta.progressToken`), if provided.
     pub progress_token: Option<Value>,
     /// SEP-2575 per-request log-level floor for `notifications/message`
-    /// emitted by this request's pipeline (`log` steps).
-    ///
-    /// Modern (`2026-07-28`) wire only — parsed from
+    /// emitted by this request's pipeline (`log` steps), parsed from
     /// `_meta.io.modelcontextprotocol/logLevel`. Semantics:
     /// - `Some(level)` → emit only messages at or above `level`;
-    /// - `None` on the modern wire → emit **nothing** (the spec MUST:
-    ///   "If absent, the server MUST NOT send any `notifications/message`
-    ///   notifications for this request.").
-    ///
-    /// On the legacy `2025-11-25` wire this field is always `None` and is
-    /// **not** consulted — that wire keeps its session-`logging/setLevel`
-    /// model and emits log notifications unconditionally (byte-identical
-    /// behaviour preserved).
+    /// - `None` → emit **nothing** (the spec MUST: "If absent, the server
+    ///   MUST NOT send any `notifications/message` notifications for this
+    ///   request.").
     pub request_log_level: Option<crate::protocol::v_2026_07_28::wire::meta::LogLevel>,
-    /// Legacy (`2025-11-25`) session-wide `logging/setLevel` floor.
-    /// Populated from the loaded session snapshot on the legacy wire so
-    /// pipeline `log` steps honor the session minimum (LOG-2). `None`
-    /// on the modern wire (which uses the per-request `request_log_level`
-    /// gate instead) and in tests that don't load a session.
-    pub legacy_session_log_level: Option<crate::protocol::LoggingLevel>,
-    /// Snapshot of the client's negotiated capabilities. The executor uses
+    /// Snapshot of the client's declared capabilities. The executor uses
     /// this to reject pipeline steps that would require a server-to-client
     /// request the client never declared support for (T2-02).
     pub client_capabilities: crate::protocol::ClientCapabilities,
@@ -381,29 +367,64 @@ pub(crate) struct ExecutionDispatcher {
     /// Pipeline store handle for buffering `log` / `progress`
     /// notifications emitted by non-suspending pipeline steps. The
     /// pipeline executor publishes each notification to the delivery
-    /// bus (live subscribers) AND stores it here, so a GET-SSE channel
-    /// that subscribes AFTER the publish drains them on open via
+    /// bus (live subscribers) AND stores it here, so the response of
+    /// the request that emitted it drains them via
     /// `take_pending_deliveries`. `None` in tests that build the
     /// dispatcher standalone.
     pipeline_store: Option<Arc<dyn super::pipeline_store::PipelineStore>>,
-    /// last emitted `progress` value per session_id, then per
-    /// progress_token_string. MCP 2025-11-25 §Progress requires progress to
-    /// be strictly non-decreasing — any emission that would go backwards is
-    /// dropped with an observability counter.
+    /// The last `progress` value emitted per session, then per progress
+    /// token. MCP §Progress requires progress to be strictly
+    /// non-decreasing, so an emission that would go back is dropped with an
+    /// observability counter.
     ///
-    /// pruned when the session ends (see
-    /// `clear_progress_state_for_session`) so a long-running gateway does
-    /// not retain a row per (session, token) for the lifetime of the
-    /// process. Keyed by session first: every replica prunes for every
-    /// session that ends in the fleet.
-    /// Perf: DashMap avoids global Mutex contention on progress emission.
-    progress_state: dashmap::DashMap<String, std::collections::HashMap<String, f64>>,
+    /// A session keeps at most [`MAX_PROGRESS_TOKENS_PER_SESSION`] tokens,
+    /// each as a keyed hash of the client's token, so neither a long-lived
+    /// session nor a long token grows it. The entry goes when the session
+    /// ends (`clear_progress_state_for_session`), and at the end of the
+    /// request for a session that keeps no row.
+    progress_state: dashmap::DashMap<String, ProgressMarks>,
+    /// Keys the token hashes of `progress_state`.
+    progress_hasher: std::hash::RandomState,
+}
+
+/// Most progress tokens one session's monotonicity state keeps; a new token
+/// replaces the one used longest ago.
+const MAX_PROGRESS_TOKENS_PER_SESSION: usize = 64;
+
+/// The last progress value of each of a session's recent progress tokens,
+/// least recently used first.
+#[derive(Debug, Default)]
+pub(crate) struct ProgressMarks(std::collections::VecDeque<(u64, f64)>);
+
+impl ProgressMarks {
+    /// Record `completed` for `token`. `Err` carries the earlier value when
+    /// `completed` would go back.
+    fn advance(&mut self, token: u64, completed: f64) -> Result<(), f64> {
+        if let Some(at) = self.0.iter().position(|(held, _)| *held == token) {
+            let (_, previous) = self.0[at];
+            if completed < previous {
+                return Err(previous);
+            }
+            self.0.remove(at);
+        } else if self.0.len() >= MAX_PROGRESS_TOKENS_PER_SESSION {
+            self.0.pop_front();
+        }
+        self.0.push_back((token, completed));
+        Ok(())
+    }
 }
 
 impl ExecutionDispatcher {
-    /// Drop the progress monotonicity state of a session that ended.
+    /// Drop the progress monotonicity state of a session that ended, or of
+    /// a session no later request can name.
     pub(crate) fn clear_progress_state_for_session(&self, session_id: &str) {
         self.progress_state.remove(session_id);
+    }
+
+    /// Sessions that hold progress monotonicity state.
+    #[cfg(test)]
+    pub(crate) fn progress_sessions_tracked(&self) -> usize {
+        self.progress_state.len()
     }
 }
 
@@ -515,6 +536,7 @@ impl ExecutionDispatcher {
             federation_engine: arc_swap::ArcSwapOption::empty(),
             pipeline_store: None,
             progress_state: dashmap::DashMap::new(),
+            progress_hasher: std::hash::RandomState::new(),
         }
     }
 
@@ -530,6 +552,7 @@ impl ExecutionDispatcher {
             federation_engine: arc_swap::ArcSwapOption::empty(),
             pipeline_store: None,
             progress_state: dashmap::DashMap::new(),
+            progress_hasher: std::hash::RandomState::new(),
         }
     }
 
@@ -539,8 +562,8 @@ impl ExecutionDispatcher {
     }
 
     /// Set the pipeline store handle. Used by `log` / `progress`
-    /// pipeline steps to buffer notifications so a late-subscribing
-    /// GET-SSE channel can drain them on open.
+    /// pipeline steps to buffer notifications for the response of the
+    /// request that emitted them.
     pub(crate) fn set_pipeline_store(
         &mut self,
         store: Arc<dyn super::pipeline_store::PipelineStore>,
@@ -695,31 +718,30 @@ impl ExecutionDispatcher {
             return;
         };
 
-        // enforce strictly-non-decreasing progress per
-        // (session_id, progress_token). MCP 2025-11-25 §Progress
-        // requires monotonic emission; any caller that would go
-        // backwards is dropped with an observability counter.
-        let token_str = match progress_token {
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            _ => String::new(),
+        // MCP §Progress: progress per (session, progress token) never goes
+        // back; an emission that would is dropped with a counter.
+        use std::hash::BuildHasher as _;
+        let token_key = match progress_token {
+            Value::String(s) if !s.is_empty() => Some(self.progress_hasher.hash_one(s.as_str())),
+            Value::Number(n) => Some(self.progress_hasher.hash_one(n.to_string().as_str())),
+            _ => None,
         };
-        if !token_str.is_empty() {
-            let mut tokens = self.progress_state.entry(session_id.clone()).or_default();
-            let prev = tokens.get(&token_str).copied().unwrap_or(f64::NEG_INFINITY);
-            if completed < prev {
-                drop(tokens);
+        if let Some(token_key) = token_key {
+            let advanced = self
+                .progress_state
+                .entry(session_id.clone())
+                .or_default()
+                .advance(token_key, completed);
+            if let Err(previous) = advanced {
                 metrics::counter!("mcpg_progress_non_monotonic_dropped_total").increment(1);
                 tracing::warn!(
                     session_id = %session_id,
-                    progress_token = %token_str,
-                    previous = prev,
+                    previous,
                     attempted = completed,
                     "dropping non-monotonic progress emission (spec MUST)"
                 );
                 return;
             }
-            tokens.insert(token_str, completed);
         }
 
         let notification = crate::protocol::ProgressNotification {
@@ -742,7 +764,6 @@ impl ExecutionDispatcher {
         let message = super::pipeline_store::DeliveryMessage {
             kind: super::pipeline_store::DeliveryKind::ProgressNotification,
             jsonrpc_message,
-            delivery_id: String::new(),
         };
         // Use the tokio runtime handle to publish synchronously
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -954,15 +975,9 @@ impl ExecutionDispatcher {
             progress_token: None,
             // Resume path: like `progress_token`, the per-request log
             // floor was a property of the original (now-returned)
-            // request. A modern resume that re-runs `log` steps thus
-            // suppresses them (None ⇒ modern suppress-all), which is the
-            // spec-safe default; legacy ignores this field regardless.
+            // request. A resume that re-runs `log` steps thus suppresses
+            // them (None ⇒ suppress-all), which is the spec-safe default.
             request_log_level: None,
-            // Resume path: the session store isn't reachable from the
-            // executor, so the legacy floor is not re-applied on resume.
-            // `None` preserves the prior unfiltered behaviour for the
-            // rare resume-of-`log`-step case.
-            legacy_session_log_level: None,
             client_capabilities: state.client_capabilities.clone(),
             // Resume path: the token was dropped when the original
             // request returned; cancellation during resume is picked up
@@ -1076,37 +1091,11 @@ impl ExecutionDispatcher {
         request: &BackendInvocationRequest,
         runtime_snapshot: Option<RuntimeSnapshot>,
     ) -> ToolCallResult {
-        // A pipeline binding runs a sequence of independently-committing
-        // steps; re-running the whole pipeline here would replay earlier steps
-        // that already committed (possibly non-idempotent) side effects. A
-        // binding that routes to a pipeline therefore never retries as a unit
-        // — a step failure surfaces to the caller instead of silently redoing
-        // committed work.
-        let retry_config = if matches!(route, BackendInvocationRoute::Pipeline { .. }) {
-            None
-        } else {
-            self.retry_configs.get(&request.tool_name)
-        };
-        let max_attempts = retry_config.map_or(1, |rc| 1 + rc.max_attempts);
-
-        let backend_kind = backend_kind(&request.tool_name);
-        let span = tracing::info_span!(
-            "binding_call",
-            binding.name = %request.tool_name,
-            binding.type_ = %backend_kind,
-        );
+        let span = binding_call_span(request);
         let _guard = span.enter();
-
-        // Single-step progress: emit 0/1 "started" if client provided a progressToken
-        // and this is not a pipeline (pipelines emit their own granular progress).
-        let emit_single_step_progress = request.progress_token.is_some()
-            && !matches!(route, BackendInvocationRoute::Pipeline { .. });
-        if emit_single_step_progress && let Some(ref token) = request.progress_token {
-            self.emit_pipeline_progress(&request.context, token, 0.0, 1.0);
-        }
-
+        let attempts = self.begin_attempts(&route, request);
         let mut last_result = None;
-        for attempt in 0..max_attempts {
+        for attempt in 0..attempts.max_attempts {
             let execution_context = ToolExecutionContext {
                 runtime_snapshot: runtime_snapshot.clone(),
             };
@@ -1277,69 +1266,182 @@ impl ExecutionDispatcher {
                         .execute(adapter, request, &execution_context)
                 }
             };
-
-            // If no retry config, return immediately
-            let rc = match retry_config {
-                Some(rc) if result.is_error => rc,
-                _ => {
-                    if emit_single_step_progress && let Some(ref token) = request.progress_token {
-                        self.emit_pipeline_progress(&request.context, token, 1.0, 1.0);
-                    }
-                    return result;
+            match self.settle_attempt(&attempts, request, attempt, result) {
+                AttemptOutcome::Done(result) => return result,
+                AttemptOutcome::Retry { backoff, result } => {
+                    std::thread::sleep(backoff);
+                    last_result = Some(result);
                 }
-            };
-
-            // Check if the error is retryable based on config
-            let retryable = self.is_retryable_error(&result, rc);
-            if !retryable || attempt + 1 >= max_attempts {
-                if attempt > 0 {
-                    tracing::warn!(
-                        tool_name = %request.tool_name,
-                        attempt = attempt + 1,
-                        max_attempts = max_attempts,
-                        "retry exhausted, returning last error"
-                    );
-                    metrics::counter!(
-                        "mcpg_binding_retries_exhausted_total",
-                        "backend_name" => request.tool_name.clone(),
-                    )
-                    .increment(1);
-                }
-                if emit_single_step_progress && let Some(ref token) = request.progress_token {
-                    self.emit_pipeline_progress(&request.context, token, 1.0, 1.0);
-                }
-                return result;
             }
+        }
+        self.end_attempts(&attempts, request, last_result)
+    }
 
-            // Calculate backoff
-            let backoff_ms = rc.initial_backoff_ms * 2u64.saturating_pow(attempt);
-            tracing::info!(
-                tool_name = %request.tool_name,
-                attempt = attempt + 1,
-                max_attempts = max_attempts,
-                backoff_ms = backoff_ms,
-                "binding call failed, retrying"
-            );
-            metrics::counter!(
-                "mcpg_binding_retries_total",
-                "backend_name" => request.tool_name.clone(),
-            )
-            .increment(1);
+    /// Buffered dispatch for an async caller. A plugin-backed route awaits
+    /// its plugin on the calling task, so a ferried plugin call parks the
+    /// task and not the worker thread; every other route runs
+    /// [`Self::dispatch_tool_call`].
+    pub(crate) async fn dispatch_tool_call_async(
+        &self,
+        route: BackendInvocationRoute,
+        request: &BackendInvocationRequest,
+        runtime_snapshot: Option<RuntimeSnapshot>,
+    ) -> ToolCallResult {
+        match PluginRoute::of(&route, &self.network_profiles) {
+            Some(plugin_route) => {
+                self.dispatch_plugin_route(&route, plugin_route, request)
+                    .await
+            }
+            None => self.dispatch_tool_call(route, request, runtime_snapshot),
+        }
+    }
 
-            std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
-            last_result = Some(result);
+    /// [`Self::dispatch_tool_call`] for a plugin-backed route, with the same
+    /// spans, retries and progress. The plugin's data timeout bounds each
+    /// attempt, so the attempts hold the HTTP request deadline, and a request
+    /// dropped once they began still finishes, as with the blocking dispatch.
+    #[tracing::instrument(name = "dispatch_tool_call", skip(self, plugin_route, request), fields(tool_name = %request.tool_name))]
+    async fn dispatch_plugin_route(
+        &self,
+        route: &BackendInvocationRoute,
+        plugin_route: PluginRoute<'_>,
+        request: &BackendInvocationRequest,
+    ) -> ToolCallResult {
+        use tracing::Instrument as _;
+        let span = binding_call_span(request);
+        let _backend_call = crate::transports::request_deadline::begin_backend_call();
+        async {
+            let attempts = self.begin_attempts(route, request);
+            let mut last_result = None;
+            for attempt in 0..attempts.max_attempts {
+                let result = plugin_route
+                    .call(request, self.plugin_registry.as_ref())
+                    .await;
+                match self.settle_attempt(&attempts, request, attempt, result) {
+                    AttemptOutcome::Done(result) => return result,
+                    AttemptOutcome::Retry { backoff, result } => {
+                        tokio::time::sleep(backoff).await;
+                        last_result = Some(result);
+                    }
+                }
+            }
+            self.end_attempts(&attempts, request, last_result)
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Plans the attempts of one dispatch and emits the 0/1 progress of a
+    /// single-step call.
+    fn begin_attempts(
+        &self,
+        route: &BackendInvocationRoute,
+        request: &BackendInvocationRequest,
+    ) -> DispatchAttempts<'_> {
+        // A pipeline binding runs a sequence of independently-committing
+        // steps; re-running the whole pipeline here would replay earlier steps
+        // that already committed (possibly non-idempotent) side effects. A
+        // binding that routes to a pipeline therefore never retries as a unit
+        // — a step failure surfaces to the caller instead of silently redoing
+        // committed work. A pipeline also emits its own per-step progress.
+        let pipeline = matches!(route, BackendInvocationRoute::Pipeline { .. });
+        let retry = if pipeline {
+            None
+        } else {
+            self.retry_configs.get(&request.tool_name)
+        };
+        let attempts = DispatchAttempts {
+            retry,
+            max_attempts: retry.map_or(1, |rc| 1 + rc.max_attempts),
+            single_step_progress: request.progress_token.is_some() && !pipeline,
+        };
+        self.emit_single_step_progress(&attempts, request, 0.0);
+        attempts
+    }
+
+    /// Settles one attempt: its result ends the dispatch, or a retryable
+    /// error asks for another attempt after a backoff.
+    fn settle_attempt(
+        &self,
+        attempts: &DispatchAttempts<'_>,
+        request: &BackendInvocationRequest,
+        attempt: u32,
+        result: ToolCallResult,
+    ) -> AttemptOutcome {
+        let rc = match attempts.retry {
+            Some(rc) if result.is_error => rc,
+            _ => {
+                self.emit_single_step_progress(attempts, request, 1.0);
+                return AttemptOutcome::Done(result);
+            }
+        };
+
+        let retryable = self.is_retryable_error(&result, rc);
+        if !retryable || attempt + 1 >= attempts.max_attempts {
+            if attempt > 0 {
+                tracing::warn!(
+                    tool_name = %request.tool_name,
+                    attempt = attempt + 1,
+                    max_attempts = attempts.max_attempts,
+                    "retry exhausted, returning last error"
+                );
+                metrics::counter!(
+                    "mcpg_binding_retries_exhausted_total",
+                    "backend_name" => request.tool_name.clone(),
+                )
+                .increment(1);
+            }
+            self.emit_single_step_progress(attempts, request, 1.0);
+            return AttemptOutcome::Done(result);
         }
 
+        let backoff_ms = rc.initial_backoff_ms * 2u64.saturating_pow(attempt);
+        tracing::info!(
+            tool_name = %request.tool_name,
+            attempt = attempt + 1,
+            max_attempts = attempts.max_attempts,
+            backoff_ms = backoff_ms,
+            "binding call failed, retrying"
+        );
+        metrics::counter!(
+            "mcpg_binding_retries_total",
+            "backend_name" => request.tool_name.clone(),
+        )
+        .increment(1);
+        AttemptOutcome::Retry {
+            backoff: Duration::from_millis(backoff_ms),
+            result,
+        }
+    }
+
+    /// The result of a dispatch whose every attempt asked for a retry.
+    fn end_attempts(
+        &self,
+        attempts: &DispatchAttempts<'_>,
+        request: &BackendInvocationRequest,
+        last_result: Option<ToolCallResult>,
+    ) -> ToolCallResult {
         let final_result = last_result.unwrap_or_else(|| ToolCallResult {
             content: vec![ToolContent::text("unexpected retry loop exit".to_owned())],
             structured_content: None,
             is_error: true,
             meta: None,
         });
-        if emit_single_step_progress && let Some(ref token) = request.progress_token {
-            self.emit_pipeline_progress(&request.context, token, 1.0, 1.0);
-        }
+        self.emit_single_step_progress(attempts, request, 1.0);
         final_result
+    }
+
+    fn emit_single_step_progress(
+        &self,
+        attempts: &DispatchAttempts<'_>,
+        request: &BackendInvocationRequest,
+        completed: f64,
+    ) {
+        if attempts.single_step_progress
+            && let Some(ref token) = request.progress_token
+        {
+            self.emit_pipeline_progress(&request.context, token, completed, 1.0);
+        }
     }
 
     /// Check if a tool call error matches the retry configuration.
@@ -1348,37 +1450,44 @@ impl ExecutionDispatcher {
     }
 }
 
+/// The span a binding dispatch runs in.
+fn binding_call_span(request: &BackendInvocationRequest) -> tracing::Span {
+    let backend_kind = backend_kind(&request.tool_name);
+    tracing::info_span!(
+        "binding_call",
+        binding.name = %request.tool_name,
+        binding.type_ = %backend_kind,
+    )
+}
+
+/// The retry budget and the progress bracket of one buffered dispatch.
+struct DispatchAttempts<'a> {
+    retry: Option<&'a crate::config::RetryConfig>,
+    max_attempts: u32,
+    single_step_progress: bool,
+}
+
+/// What a dispatch does after one attempt.
+enum AttemptOutcome {
+    Done(ToolCallResult),
+    Retry {
+        backoff: Duration,
+        result: ToolCallResult,
+    },
+}
+
 // --- Pipeline step helpers ---
 
-#[tracing::instrument(skip(request, plugin_registry), fields(profile = %profile))]
 fn execute_nats_request(
     profile: &str,
     request: &BackendInvocationRequest,
     plugin_registry: Option<&std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
 ) -> ToolCallResult {
-    if let Some(cancelled) = early_cancel_check(request, profile, "nats") {
-        return cancelled;
-    }
-
-    match plugin_registry.and_then(|r| r.backend("nats")) {
-        Some(plugin) => {
-            execute_binding_plugin("nats", profile, request, plugin.as_ref(), plugin_registry)
-        }
-        None => ToolCallResult {
-            content: vec![ToolContent::text(format!(
-                "NATS execution for '{}' failed: NATS binding plugin not registered",
-                request.tool_name
-            ))],
-            structured_content: None,
-            is_error: true,
-            meta: None,
-        },
-    }
+    PluginRoute::Nats { profile }.call_blocking(request, plugin_registry)
 }
 
-/// Dispatch a binding call through a `BackendPlugin` registered in the
-/// plugin registry. Shared between the NATS and Kafka routes — any future
-/// transport plugin (MQTT, RabbitMQ, …) will flow through this path as well.
+/// Dispatch a binding call to `plugin` from a synchronous caller, with the
+/// headers and reply projection of a binding ([`PluginReply::Binding`]).
 fn execute_binding_plugin(
     kind: &str,
     profile: &str,
@@ -1386,136 +1495,432 @@ fn execute_binding_plugin(
     plugin: &dyn mcpg_plugin_protocol::BackendPlugin,
     plugin_registry: Option<&std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
 ) -> ToolCallResult {
-    let args = request.arguments.clone().unwrap_or(serde_json::json!({}));
-    let payload = match serde_json::to_vec(&args) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return ToolCallResult {
-                content: vec![ToolContent::text(format!(
-                    "failed to serialize {kind} request payload: {e}"
-                ))],
+    PluginCall {
+        kind,
+        profile,
+        request,
+        plugin,
+        plugin_registry,
+        reply: PluginReply::Binding,
+    }
+    .run_blocking()
+}
+
+/// A route the gateway serves by calling a backend plugin. The blocking and
+/// the awaiting dispatch resolve, trace and call it the same way.
+#[derive(Clone, Copy)]
+enum PluginRoute<'a> {
+    Nats {
+        profile: &'a str,
+    },
+    Kafka {
+        profile: &'a str,
+    },
+    Sql {
+        profile: &'a str,
+    },
+    Llm {
+        kind: crate::backends::LlmKind,
+        profile: &'a str,
+    },
+    Http {
+        profile: &'a str,
+        network_profiles: &'a std::collections::BTreeMap<String, NetworkToolRuntimeConfig>,
+    },
+    /// A backend dispatched by its `kind` string.
+    Envelope {
+        kind: &'a str,
+        profile: &'a str,
+    },
+}
+
+impl<'a> PluginRoute<'a> {
+    /// The plugin call of `route`; `None` for a route the gateway serves
+    /// itself (internal and debug tools, federated tools, pipelines).
+    fn of(
+        route: &'a BackendInvocationRoute,
+        network_profiles: &'a std::collections::BTreeMap<String, NetworkToolRuntimeConfig>,
+    ) -> Option<Self> {
+        use BackendInvocationRoute as Route;
+        Some(match route {
+            Route::NatsRequest { profile } => Self::Nats { profile },
+            Route::KafkaRequest { profile } => Self::Kafka { profile },
+            Route::SqlRequest { profile } => Self::Sql { profile },
+            Route::LlmRequest { profile, kind } => Self::Llm {
+                kind: *kind,
+                profile,
+            },
+            Route::NetworkJsonCall { profile } | Route::NetworkQueryCall { profile } => {
+                Self::Http {
+                    profile,
+                    network_profiles,
+                }
+            }
+            Route::GraphqlCall { profile } => Self::Envelope {
+                kind: "graphql",
+                profile,
+            },
+            Route::OpenapiCall { profile } => Self::Envelope {
+                kind: "openapi",
+                profile,
+            },
+            // `require_json_stdout` comes from the command plugin's
+            // registered profile.
+            Route::CommandJsonCall { profile, .. } => Self::Envelope {
+                kind: "command",
+                profile,
+            },
+            Route::MockResponse { profile } => Self::Envelope {
+                kind: "mock",
+                profile,
+            },
+            Route::EnvelopePlugin { kind, profile } => Self::Envelope { kind, profile },
+            _ => return None,
+        })
+    }
+
+    fn profile(self) -> &'a str {
+        match self {
+            Self::Nats { profile }
+            | Self::Kafka { profile }
+            | Self::Sql { profile }
+            | Self::Llm { profile, .. }
+            | Self::Http { profile, .. }
+            | Self::Envelope { profile, .. } => profile,
+        }
+    }
+
+    fn span(self) -> tracing::Span {
+        match self {
+            Self::Nats { profile } => {
+                tracing::info_span!("execute_nats_request", profile = %profile)
+            }
+            Self::Kafka { profile } => {
+                tracing::info_span!("execute_kafka_request", profile = %profile)
+            }
+            Self::Sql { profile } => tracing::info_span!("execute_sql_request", profile = %profile),
+            Self::Llm { kind, profile } => {
+                tracing::info_span!("execute_llm_request", profile = %profile, kind = ?kind)
+            }
+            Self::Http { .. } | Self::Envelope { .. } => tracing::Span::none(),
+        }
+    }
+
+    /// The plugin the route calls, the kind it is registered under and the
+    /// shape of its reply; or the result that ends the call before the
+    /// plugin runs (a cancelled request, a missing profile or plugin).
+    fn resolve(
+        self,
+        request: &BackendInvocationRequest,
+        plugin_registry: Option<&std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
+    ) -> Result<
+        (
+            Arc<dyn mcpg_plugin_protocol::BackendPlugin>,
+            &'a str,
+            PluginReply,
+        ),
+        ToolCallResult,
+    > {
+        let (kind, cancel_label, reply) = match self {
+            Self::Nats { .. } => ("nats", "nats", PluginReply::Binding),
+            Self::Kafka { .. } => ("kafka", "kafka", PluginReply::Binding),
+            Self::Sql { .. } => ("sql", "sql", PluginReply::Binding),
+            Self::Llm { kind, .. } => (kind.plugin_kind(), "llm", PluginReply::Binding),
+            Self::Http { .. } => ("http", "http", PluginReply::Http),
+            Self::Envelope { kind, .. } => (kind, kind, PluginReply::Envelope),
+        };
+        let profile = self.profile();
+        if let Some(cancelled) = early_cancel_check(request, profile, cancel_label) {
+            return Err(cancelled);
+        }
+        if let Self::Http {
+            network_profiles, ..
+        } = self
+            && !network_profiles.contains_key(profile)
+        {
+            return Err(missing_profile_result(request, profile, "network"));
+        }
+        let Some(plugin) = plugin_registry.and_then(|r| r.backend(kind)) else {
+            let tool = &request.tool_name;
+            let message = match self {
+                Self::Nats { .. } => format!(
+                    "NATS execution for '{tool}' failed: NATS binding plugin not registered"
+                ),
+                Self::Kafka { .. } => format!(
+                    "Kafka execution for '{tool}' failed: Kafka binding plugin not registered"
+                ),
+                Self::Sql { .. } => {
+                    format!("SQL execution for '{tool}' failed: SQL binding plugin not registered")
+                }
+                Self::Llm { .. } => format!(
+                    "LLM execution for '{tool}' failed: {kind} binding plugin not registered"
+                ),
+                Self::Http { .. } => format!(
+                    "HTTP execution for '{tool}' failed: HTTP backend plugin not registered"
+                ),
+                Self::Envelope { .. } => format!(
+                    "{kind} execution for '{tool}' failed: {kind} backend plugin not registered"
+                ),
+            };
+            return Err(ToolCallResult {
+                content: vec![ToolContent::text(message)],
                 structured_content: None,
                 is_error: true,
                 meta: None,
-            };
-        }
-    };
-    let payload_bytes = payload.len() as u64;
-
-    let mut headers = Vec::new();
-    if let Some(tc) = request.context.trace_context.as_ref() {
-        headers.push(("traceparent".to_owned(), tc.child_traceparent()));
-        if let Some(ts) = tc.tracestate.as_deref() {
-            headers.push(("tracestate".to_owned(), ts.to_owned()));
-        }
-    }
-    headers.push(accept_usage_header());
-
-    let binding_request = mcpg_plugin_protocol::BackendRequest {
-        payload,
-        headers,
-        request_id: request.context.request_id.to_string(),
-        session_id: request.context.session_id.clone(),
-        identity: Some(crate::runtime::plugin_identity_from_request(
-            &request.context,
-        )),
-        // Leaf backends propagate the operator-supplied key to their
-        // upstreams (HTTP / SQL / NATS / Kafka).
-        idempotency: request
-            .idempotency_hint
-            .as_ref()
-            .map(|h| h.to_plugin_hint()),
-        client: request.context.client(),
-    };
-
-    let profile_owned = profile.to_owned();
-    let started = std::time::Instant::now();
-    let result = run_async_in_sync_context(plugin, &profile_owned, binding_request);
-    let duration_ms = started.elapsed().as_millis() as u64;
-
-    // Every backend dispatch lands on the audit lane (today metered
-    // only). Hash-free; payload + response sizes give auditors enough
-    // signal to spot anomalies without storing the bytes themselves.
-    if let Some(registry) = plugin_registry {
-        let actor = crate::runtime::plugin_identity_from_request(&request.context);
-        let request_id = request.context.request_id.as_str().to_owned();
-        let session_id = request.context.session_id.clone();
-        let kind_owned = kind.to_owned();
-        let profile_owned_for_audit = profile.to_owned();
-        let registry_arc = registry.clone();
-        let (success, response_bytes, error_message) = match &result {
-            Ok(reply) => (true, reply.payload.len() as u64, None),
-            Err(e) => (false, 0u64, Some(e.to_string())),
+            });
         };
-        // Collect plugin-supplied audit fields (e.g. SQL's `db.driver` +
-        // `db.query_ref`) before crossing the spawn boundary; the plugin
-        // reference doesn't outlive this scope.
-        let extra_details = plugin.audit_metadata(profile);
-        tokio::spawn(async move {
-            let event = mcpg_plugin_host::audit_events::backend_executed_event(
-                actor,
-                &request_id,
-                session_id.as_deref(),
-                &kind_owned,
-                &profile_owned_for_audit,
-                success,
-                duration_ms,
-                payload_bytes,
-                response_bytes,
-                error_message.as_deref(),
-                extra_details,
-            );
-            let _ = registry_arc.emit_audit_event(&event).await;
-        });
+        Ok((plugin, kind, reply))
     }
 
-    match result {
-        Ok(reply) => {
-            let (payload, usage) = split_reported_usage(&reply.payload);
-            let reply_text = String::from_utf8_lossy(&payload);
-            let structured: Option<serde_json::Value> = serde_json::from_slice(&payload).ok();
-            // Verbatim-result convention: a plugin may wrap a full
-            // CallToolResult under `__mcpg_verbatim_result` to control
-            // `is_error` + a literal multi-block `content` array.
-            if let Some(verbatim) = structured.as_ref().and_then(|v| v.get(VERBATIM_RESULT_KEY))
-                && let Ok(mut projected) =
-                    serde_json::from_value::<ToolCallResult>(verbatim.clone())
-            {
-                projected.meta = Some(with_reported_usage(
-                    binding_audit_meta(kind, profile, projected.is_error),
-                    usage,
-                ));
-                return projected;
+    /// Calls the plugin from a synchronous caller.
+    fn call_blocking(
+        self,
+        request: &BackendInvocationRequest,
+        plugin_registry: Option<&std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
+    ) -> ToolCallResult {
+        let span = self.span();
+        let _entered = span.enter();
+        match self.resolve(request, plugin_registry) {
+            Ok((plugin, kind, reply)) => PluginCall {
+                kind,
+                profile: self.profile(),
+                request,
+                plugin: plugin.as_ref(),
+                plugin_registry,
+                reply,
             }
-            // A non-null `downstreamError` slot is the plugin's tool-level
-            // error signal. Honour it the same way `execute_envelope_plugin`
-            // does so a backend's error contract is identical whether it is
-            // invoked as a top-level binding or as a pipeline step.
-            let envelope_is_error = structured
-                .as_ref()
-                .and_then(|v| v.get("downstreamError"))
-                .map(|d| !d.is_null())
-                .unwrap_or(false);
-            let mut content_text = reply_text.to_string();
-            if reply.truncated {
-                content_text.push_str("\n[response truncated]");
+            .run_blocking(),
+            Err(done) => done,
+        }
+    }
+
+    /// Calls the plugin and awaits it on the calling task.
+    async fn call(
+        self,
+        request: &BackendInvocationRequest,
+        plugin_registry: Option<&std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
+    ) -> ToolCallResult {
+        use tracing::Instrument as _;
+        let span = self.span();
+        let (plugin, kind, reply) = match span.in_scope(|| self.resolve(request, plugin_registry)) {
+            Ok(resolved) => resolved,
+            Err(done) => return done,
+        };
+        let call = PluginCall {
+            kind,
+            profile: self.profile(),
+            request,
+            plugin: plugin.as_ref(),
+            plugin_registry,
+            reply,
+        };
+        call.run().instrument(span).await
+    }
+}
+
+/// The headers a plugin call carries besides the trace context, and how its
+/// reply becomes the tool result.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PluginReply {
+    /// nats / kafka / sql / llm: the usage header; the reply may report
+    /// usage or carry a verbatim result.
+    Binding,
+    /// A backend dispatched by kind: `mcpg-tool-name` and the usage header;
+    /// the reply reads as a binding's.
+    Envelope,
+    /// http: `mcpg-tool-name`; the reply is the http envelope as sent.
+    Http,
+}
+
+/// One call to a backend plugin. The blocking and the awaiting dispatch
+/// build the plugin request, record the audit event and read the reply
+/// through it, and differ only in how they wait for the plugin.
+struct PluginCall<'a> {
+    kind: &'a str,
+    profile: &'a str,
+    request: &'a BackendInvocationRequest,
+    plugin: &'a dyn mcpg_plugin_protocol::BackendPlugin,
+    plugin_registry: Option<&'a std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
+    reply: PluginReply,
+}
+
+impl PluginCall<'_> {
+    fn run_blocking(&self) -> ToolCallResult {
+        let (backend_request, payload_bytes) = match self.backend_request() {
+            Ok(built) => built,
+            Err(failed) => return failed,
+        };
+        let started = Instant::now();
+        let result = run_async_in_sync_context(self.plugin, self.profile, backend_request);
+        self.finish(result, started.elapsed(), payload_bytes)
+    }
+
+    async fn run(&self) -> ToolCallResult {
+        let (backend_request, payload_bytes) = match self.backend_request() {
+            Ok(built) => built,
+            Err(failed) => return failed,
+        };
+        let started = Instant::now();
+        let result = self.plugin.execute(self.profile, backend_request).await;
+        self.finish(result, started.elapsed(), payload_bytes)
+    }
+
+    /// The plugin request and the size of its payload.
+    fn backend_request(
+        &self,
+    ) -> Result<(mcpg_plugin_protocol::BackendRequest, u64), ToolCallResult> {
+        let (kind, request) = (self.kind, self.request);
+        let empty = serde_json::Value::Object(serde_json::Map::new());
+        let payload = match serde_json::to_vec(request.arguments.as_ref().unwrap_or(&empty)) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Err(ToolCallResult {
+                    content: vec![ToolContent::text(format!(
+                        "failed to serialize {kind} request payload: {e}"
+                    ))],
+                    structured_content: None,
+                    is_error: true,
+                    meta: None,
+                });
             }
-            ToolCallResult {
-                content: vec![ToolContent::text(content_text)],
-                structured_content: structured,
-                is_error: envelope_is_error,
-                meta: Some(with_reported_usage(
-                    binding_audit_meta(kind, profile, envelope_is_error),
-                    usage,
-                )),
+        };
+        let payload_bytes = payload.len() as u64;
+
+        let mut headers = Vec::new();
+        if let Some(tc) = request.context.trace_context.as_ref() {
+            headers.push(("traceparent".to_owned(), tc.child_traceparent()));
+            if let Some(ts) = tc.tracestate.as_deref() {
+                headers.push(("tracestate".to_owned(), ts.to_owned()));
             }
         }
-        Err(e) => ToolCallResult {
-            content: vec![ToolContent::text(format!("{kind} request failed: {e}"))],
-            structured_content: None,
-            is_error: true,
-            meta: Some(binding_audit_meta(kind, profile, true)),
-        },
+        if self.reply != PluginReply::Binding {
+            headers.push(("mcpg-tool-name".to_owned(), request.tool_name.clone()));
+        }
+        if self.reply != PluginReply::Http {
+            headers.push(accept_usage_header());
+        }
+
+        let backend_request = mcpg_plugin_protocol::BackendRequest {
+            payload,
+            headers,
+            request_id: request.context.request_id.to_string(),
+            session_id: request.context.session_id.clone(),
+            identity: Some(crate::runtime::plugin_identity_from_request(
+                &request.context,
+            )),
+            // Leaf backends propagate the operator-supplied key to their
+            // upstreams (the http backend as the `Idempotency-Key` header).
+            idempotency: request
+                .idempotency_hint
+                .as_ref()
+                .map(|h| h.to_plugin_hint()),
+            client: request.context.client(),
+        };
+        Ok((backend_request, payload_bytes))
+    }
+
+    /// Records the call on the audit lane and projects the plugin's reply
+    /// onto the tool result.
+    fn finish(
+        &self,
+        result: Result<mcpg_plugin_protocol::BackendResponse, mcpg_plugin_protocol::BackendError>,
+        elapsed: Duration,
+        payload_bytes: u64,
+    ) -> ToolCallResult {
+        let (kind, profile, request) = (self.kind, self.profile, self.request);
+        let duration_ms = elapsed.as_millis() as u64;
+
+        // Every backend dispatch lands on the audit lane. Hash-free; payload
+        // + response sizes give auditors enough signal to spot anomalies
+        // without storing the bytes themselves.
+        if let Some(registry) = self.plugin_registry {
+            let actor = crate::runtime::plugin_identity_from_request(&request.context);
+            let request_id = request.context.request_id.as_str().to_owned();
+            let session_id = request.context.session_id.clone();
+            let kind_owned = kind.to_owned();
+            let profile_owned_for_audit = profile.to_owned();
+            let registry_arc = registry.clone();
+            let (success, response_bytes, error_message) = match &result {
+                Ok(reply) => (true, reply.payload.len() as u64, None),
+                Err(e) => (false, 0u64, Some(e.to_string())),
+            };
+            // Plugin-supplied audit fields (e.g. SQL's `db.driver` +
+            // `db.query_ref`) are read before the spawn boundary; the plugin
+            // reference doesn't outlive this scope.
+            let extra_details = self.plugin.audit_metadata(profile);
+            tokio::spawn(async move {
+                let event = mcpg_plugin_host::audit_events::backend_executed_event(
+                    actor,
+                    &request_id,
+                    session_id.as_deref(),
+                    &kind_owned,
+                    &profile_owned_for_audit,
+                    success,
+                    duration_ms,
+                    payload_bytes,
+                    response_bytes,
+                    error_message.as_deref(),
+                    extra_details,
+                );
+                let _ = registry_arc.emit_audit_event(&event).await;
+            });
+        }
+
+        let reply = match result {
+            Ok(reply) => reply,
+            Err(e) => {
+                return ToolCallResult {
+                    content: vec![ToolContent::text(format!("{kind} request failed: {e}"))],
+                    structured_content: None,
+                    is_error: true,
+                    meta: Some(binding_audit_meta(kind, profile, true)),
+                };
+            }
+        };
+        let http = self.reply == PluginReply::Http;
+        let (payload, usage) = if http {
+            (std::borrow::Cow::Borrowed(reply.payload.as_slice()), None)
+        } else {
+            split_reported_usage(&reply.payload)
+        };
+        let reply_text = String::from_utf8_lossy(&payload);
+        let structured: Option<serde_json::Value> = serde_json::from_slice(&payload).ok();
+        // Verbatim-result convention: a plugin (mock) that needs to control
+        // `is_error` + a literal multi-block `content` array (which the
+        // standard projection can't express) wraps a full CallToolResult
+        // under `__mcpg_verbatim_result`. It is projected directly; the
+        // audit meta still reflects the kind/profile.
+        if !http
+            && let Some(verbatim) = structured.as_ref().and_then(|v| v.get(VERBATIM_RESULT_KEY))
+            && let Ok(mut projected) = serde_json::from_value::<ToolCallResult>(verbatim.clone())
+        {
+            projected.meta = Some(with_reported_usage(
+                binding_audit_meta(kind, profile, projected.is_error),
+                usage,
+            ));
+            return projected;
+        }
+        // A non-null `downstreamError` slot is the plugin's tool-level error
+        // signal, so the retry layer and the operator-visible `is_error` read
+        // it the same way for a top-level binding and a pipeline step.
+        let envelope_is_error = structured
+            .as_ref()
+            .and_then(|v| v.get("downstreamError"))
+            .map(|d| !d.is_null())
+            .unwrap_or(false);
+        let mut content_text = reply_text.to_string();
+        if reply.truncated {
+            content_text.push_str("\n[response truncated]");
+        }
+        ToolCallResult {
+            content: vec![ToolContent::text(content_text)],
+            structured_content: structured,
+            is_error: envelope_is_error,
+            meta: Some(with_reported_usage(
+                binding_audit_meta(kind, profile, envelope_is_error),
+                usage,
+            )),
+        }
     }
 }
 
@@ -1544,8 +1949,8 @@ async fn execute_binding_plugin_streaming(
     progress_token: &serde_json::Value,
     plugin_registry: Option<&std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
 ) -> ToolCallResult {
-    let args = request.arguments.clone().unwrap_or(serde_json::json!({}));
-    let payload = match serde_json::to_vec(&args) {
+    let empty = serde_json::Value::Object(serde_json::Map::new());
+    let payload = match serde_json::to_vec(request.arguments.as_ref().unwrap_or(&empty)) {
         Ok(bytes) => bytes,
         Err(e) => {
             return ToolCallResult {
@@ -1750,7 +2155,6 @@ fn emit_chunk_notification(
     let delivery = crate::runtime::pipeline_store::DeliveryMessage {
         kind: crate::runtime::pipeline_store::DeliveryKind::ProgressNotification,
         jsonrpc_message: notification,
-        delivery_id: String::new(),
     };
     let bus = Arc::clone(delivery_bus);
     let session = session_id.to_owned();
@@ -1864,30 +2268,12 @@ pub(crate) fn take_reported_usage(
     serde_json::from_value(usage).ok()
 }
 
-#[tracing::instrument(skip(request, plugin_registry), fields(profile = %profile))]
 fn execute_kafka_request(
     profile: &str,
     request: &BackendInvocationRequest,
     plugin_registry: Option<&std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
 ) -> ToolCallResult {
-    if let Some(cancelled) = early_cancel_check(request, profile, "kafka") {
-        return cancelled;
-    }
-
-    match plugin_registry.and_then(|r| r.backend("kafka")) {
-        Some(plugin) => {
-            execute_binding_plugin("kafka", profile, request, plugin.as_ref(), plugin_registry)
-        }
-        None => ToolCallResult {
-            content: vec![ToolContent::text(format!(
-                "Kafka execution for '{}' failed: Kafka binding plugin not registered",
-                request.tool_name
-            ))],
-            structured_content: None,
-            is_error: true,
-            meta: None,
-        },
-    }
+    PluginRoute::Kafka { profile }.call_blocking(request, plugin_registry)
 }
 
 /// Dispatch a binding invocation through the plugin registry, bridging
@@ -2007,57 +2393,26 @@ mod federated_value_tests {
 #[cfg(test)]
 mod log_filter_tests {
     use super::*;
-    use crate::protocol::LoggingLevel;
+    use crate::protocol::v_2026_07_28::wire::meta::LogLevel;
 
     #[test]
-    fn legacy_no_floor_emits_everything() {
-        // Byte-identical 2025-11-25 default: no session floor ⇒ emit.
-        assert!(!log_step_suppressed("debug", false, None, None));
-        assert!(!log_step_suppressed("info", false, None, None));
+    fn no_request_floor_suppresses_all() {
+        assert!(log_step_suppressed("error", None));
+        assert!(log_step_suppressed("emergency", None));
     }
 
     #[test]
-    fn legacy_session_floor_suppresses_below_minimum() {
-        // Session set to Warning: debug/info suppressed, warning/error emit.
-        assert!(log_step_suppressed(
-            "debug",
-            false,
-            None,
-            Some(LoggingLevel::Warning)
-        ));
-        assert!(log_step_suppressed(
-            "info",
-            false,
-            None,
-            Some(LoggingLevel::Warning)
-        ));
-        assert!(!log_step_suppressed(
-            "warning",
-            false,
-            None,
-            Some(LoggingLevel::Warning)
-        ));
-        assert!(!log_step_suppressed(
-            "error",
-            false,
-            None,
-            Some(LoggingLevel::Warning)
-        ));
+    fn a_request_floor_suppresses_below_its_minimum() {
+        // Floor Warning: debug/info suppressed, warning/error emit.
+        assert!(log_step_suppressed("debug", Some(LogLevel::Warning)));
+        assert!(log_step_suppressed("info", Some(LogLevel::Warning)));
+        assert!(!log_step_suppressed("warning", Some(LogLevel::Warning)));
+        assert!(!log_step_suppressed("error", Some(LogLevel::Warning)));
     }
 
     #[test]
-    fn legacy_unrecognised_level_emits() {
-        assert!(!log_step_suppressed(
-            "bogus",
-            false,
-            None,
-            Some(LoggingLevel::Error)
-        ));
-    }
-
-    #[test]
-    fn modern_no_request_floor_suppresses_all() {
-        assert!(log_step_suppressed("error", true, None, None));
+    fn an_unrecognised_level_emits_under_a_floor() {
+        assert!(!log_step_suppressed("bogus", Some(LogLevel::Error)));
     }
 }
 
@@ -2067,151 +2422,7 @@ fn execute_envelope_plugin(
     request: &BackendInvocationRequest,
     plugin_registry: Option<&std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
 ) -> ToolCallResult {
-    if let Some(cancelled) = early_cancel_check(request, profile, kind) {
-        return cancelled;
-    }
-
-    let plugin = match plugin_registry.and_then(|r| r.backend(kind)) {
-        Some(p) => p,
-        None => {
-            return ToolCallResult {
-                content: vec![ToolContent::text(format!(
-                    "{kind} execution for '{}' failed: {kind} backend plugin not registered",
-                    request.tool_name
-                ))],
-                structured_content: None,
-                is_error: true,
-                meta: None,
-            };
-        }
-    };
-
-    let args = request.arguments.clone().unwrap_or(serde_json::json!({}));
-    let payload = match serde_json::to_vec(&args) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return ToolCallResult {
-                content: vec![ToolContent::text(format!(
-                    "failed to serialize {kind} request payload: {e}"
-                ))],
-                structured_content: None,
-                is_error: true,
-                meta: None,
-            };
-        }
-    };
-    let payload_bytes = payload.len() as u64;
-
-    let mut headers = Vec::new();
-    if let Some(tc) = request.context.trace_context.as_ref() {
-        headers.push(("traceparent".to_owned(), tc.child_traceparent()));
-        if let Some(ts) = tc.tracestate.as_deref() {
-            headers.push(("tracestate".to_owned(), ts.to_owned()));
-        }
-    }
-    headers.push(("mcpg-tool-name".to_owned(), request.tool_name.clone()));
-    headers.push(accept_usage_header());
-
-    let binding_request = mcpg_plugin_protocol::BackendRequest {
-        payload,
-        headers,
-        request_id: request.context.request_id.to_string(),
-        session_id: request.context.session_id.clone(),
-        identity: Some(crate::runtime::plugin_identity_from_request(
-            &request.context,
-        )),
-        idempotency: request
-            .idempotency_hint
-            .as_ref()
-            .map(|h| h.to_plugin_hint()),
-        client: request.context.client(),
-    };
-
-    let profile_owned = profile.to_owned();
-    let started = std::time::Instant::now();
-    let result = run_async_in_sync_context(plugin.as_ref(), &profile_owned, binding_request);
-    let duration_ms = started.elapsed().as_millis() as u64;
-
-    if let Some(registry) = plugin_registry {
-        let actor = crate::runtime::plugin_identity_from_request(&request.context);
-        let request_id = request.context.request_id.as_str().to_owned();
-        let session_id = request.context.session_id.clone();
-        let kind_owned = kind.to_owned();
-        let profile_owned_for_audit = profile.to_owned();
-        let registry_arc = registry.clone();
-        let (success, response_bytes, error_message) = match &result {
-            Ok(reply) => (true, reply.payload.len() as u64, None),
-            Err(e) => (false, 0u64, Some(e.to_string())),
-        };
-        let extra_details = plugin.audit_metadata(profile);
-        tokio::spawn(async move {
-            let event = mcpg_plugin_host::audit_events::backend_executed_event(
-                actor,
-                &request_id,
-                session_id.as_deref(),
-                &kind_owned,
-                &profile_owned_for_audit,
-                success,
-                duration_ms,
-                payload_bytes,
-                response_bytes,
-                error_message.as_deref(),
-                extra_details,
-            );
-            let _ = registry_arc.emit_audit_event(&event).await;
-        });
-    }
-
-    match result {
-        Ok(reply) => {
-            let (payload, usage) = split_reported_usage(&reply.payload);
-            let reply_text = String::from_utf8_lossy(&payload);
-            let structured: Option<serde_json::Value> = serde_json::from_slice(&payload).ok();
-            // Verbatim-result convention: a plugin (mock) that needs to
-            // control `is_error` + a literal multi-block `content` array
-            // (which the standard projection can't express) wraps a full
-            // CallToolResult under `__mcpg_verbatim_result`. Project it
-            // directly; the audit meta still reflects the kind/profile.
-            if let Some(verbatim) = structured.as_ref().and_then(|v| v.get(VERBATIM_RESULT_KEY))
-                && let Ok(mut projected) =
-                    serde_json::from_value::<ToolCallResult>(verbatim.clone())
-            {
-                projected.meta = Some(with_reported_usage(
-                    binding_audit_meta(kind, profile, projected.is_error),
-                    usage,
-                ));
-                return projected;
-            }
-            // A non-null `downstreamError` slot is the plugin's
-            // tool-level error signal — mirror the http path so the
-            // retry layer + operator-visible `is_error` match the
-            // legacy inline contract.
-            let envelope_is_error = structured
-                .as_ref()
-                .and_then(|v| v.get("downstreamError"))
-                .map(|d| !d.is_null())
-                .unwrap_or(false);
-            let mut content_text = reply_text.to_string();
-            if reply.truncated {
-                content_text.push_str("\n[response truncated]");
-            }
-            ToolCallResult {
-                content: vec![ToolContent::text(content_text)],
-                structured_content: structured,
-                is_error: envelope_is_error,
-                meta: Some(with_reported_usage(
-                    binding_audit_meta(kind, profile, envelope_is_error),
-                    usage,
-                )),
-            }
-        }
-        Err(e) => ToolCallResult {
-            content: vec![ToolContent::text(format!("{kind} request failed: {e}"))],
-            structured_content: None,
-            is_error: true,
-            meta: Some(binding_audit_meta(kind, profile, true)),
-        },
-    }
+    PluginRoute::Envelope { kind, profile }.call_blocking(request, plugin_registry)
 }
 
 /// Envelope sentinel a plugin sets to have the gateway project a literal
@@ -2235,68 +2446,27 @@ pub(crate) enum HttpDispatchMode {
     QueryString,
 }
 
-/// Mirrors [`execute_nats_request`] / [`execute_kafka_request`] — the
-/// shared [`execute_binding_plugin`] carries the actual call.
-#[tracing::instrument(skip(request, plugin_registry), fields(profile = %profile))]
+/// Mirrors [`execute_nats_request`] / [`execute_kafka_request`] for the SQL
+/// binding plugin.
 fn execute_sql_request(
     profile: &str,
     request: &BackendInvocationRequest,
     plugin_registry: Option<&std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
 ) -> ToolCallResult {
-    if let Some(cancelled) = early_cancel_check(request, profile, "sql") {
-        return cancelled;
-    }
-
-    match plugin_registry.and_then(|r| r.backend("sql")) {
-        Some(plugin) => {
-            execute_binding_plugin("sql", profile, request, plugin.as_ref(), plugin_registry)
-        }
-        None => ToolCallResult {
-            content: vec![ToolContent::text(format!(
-                "SQL execution for '{}' failed: SQL binding plugin not registered",
-                request.tool_name
-            ))],
-            structured_content: None,
-            is_error: true,
-            meta: None,
-        },
-    }
+    PluginRoute::Sql { profile }.call_blocking(request, plugin_registry)
 }
 
 /// Mirror of [`execute_sql_request`] for the per-provider LLM binding
 /// plugins. `kind` selects the registered plugin
 /// (`openai.chat` / `azure_openai.chat` / `anthropic.chat` /
 /// `gemini.chat` / `compat.chat`).
-#[tracing::instrument(skip(request, plugin_registry), fields(profile = %profile, kind = ?kind))]
 fn execute_llm_request(
     kind: crate::backends::LlmKind,
     profile: &str,
     request: &BackendInvocationRequest,
     plugin_registry: Option<&std::sync::Arc<mcpg_plugin_host::PluginRegistry>>,
 ) -> ToolCallResult {
-    if let Some(cancelled) = early_cancel_check(request, profile, "llm") {
-        return cancelled;
-    }
-
-    let plugin_kind = kind.plugin_kind();
-    match plugin_registry.and_then(|r| r.backend(plugin_kind)) {
-        Some(plugin) => execute_binding_plugin(
-            plugin_kind,
-            profile,
-            request,
-            plugin.as_ref(),
-            plugin_registry,
-        ),
-        None => ToolCallResult {
-            content: vec![ToolContent::text(format!(
-                "LLM execution for '{}' failed: {} binding plugin not registered",
-                request.tool_name, plugin_kind
-            ))],
-            structured_content: None,
-            is_error: true,
-            meta: None,
-        },
-    }
+    PluginRoute::Llm { kind, profile }.call_blocking(request, plugin_registry)
 }
 
 /// Streaming counterpart of [`execute_llm_request`]. Used when the

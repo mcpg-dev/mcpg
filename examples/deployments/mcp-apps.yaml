@@ -181,14 +181,15 @@ mcp:
     # ── MCP Apps (io.modelcontextprotocol/ui) ──
     apps:
       # Master switch. Lights up the DOWNSTREAM capability advertisement
-      # (server/discover + legacy initialize) AND the egress CSP /
+      # (server/discover) AND the egress CSP /
       # permission policy below. Default false. NOTE: even when false,
       # `_meta.ui` still passes through unchanged on descriptors — only
       # the advertisement + policy are gated.
       enabled: true
 
-      # Advertise the Apps capability on MCPG's OUTGOING (client->upstream)
-      # initialize so federated servers emit their UI tools. A
+      # Advertise the Apps capability in the client capabilities of MCPG's
+      # OUTGOING (client->upstream) requests so federated servers emit their
+      # UI tools. A
       # spec-compliant upstream withholds UI tools unless the client
       # claims this capability. Defaults to `enabled`; set explicitly to
       # pull UI tools from upstreams while NOT advertising to your own

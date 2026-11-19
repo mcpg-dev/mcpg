@@ -101,10 +101,7 @@ pub use diagnostics::{
 };
 pub use events::{EventsAdvertiseLocation, EventsConfig};
 pub use feature_flags::FeatureFlagsConfig;
-pub use federation::{
-    AuthMode, FederationConfig, SubjectToken, SynthesizeMode, UpstreamProtocolVersion,
-    UpstreamTransport,
-};
+pub use federation::{AuthMode, FederationConfig, SubjectToken, SynthesizeMode, UpstreamTransport};
 pub use gateway::{ConfigWatchConfig, GatewayConfig};
 pub use governance::GovernanceConfig;
 pub use guardrails::{GuardrailHookConfig, GuardrailOnError, GuardrailsConfig};
@@ -116,10 +113,7 @@ pub use interactive_login::{
     RedirectUriPolicy, StateKeyConfig, TrustedIdpLoginConfig, interactive_login_summary,
 };
 pub use license::LicenseConfig;
-pub use mcp::{
-    McpCapabilitiesConfig, McpConfig, McpConfigurationsConfig, McpElicitationConfig,
-    McpRootsConfig, McpSamplingConfig, McpServerInfoConfig,
-};
+pub use mcp::{McpCapabilitiesConfig, McpConfig, McpConfigurationsConfig, McpServerInfoConfig};
 pub use observability::{LogsConfig, MetricsConfig, ObservabilityConfig, SinkConfig, TracesConfig};
 pub use plugins::{
     HealthProbeConfig, PluginEntryConfig, PluginHttpRouteConfig, PluginObservabilityToggle,
@@ -198,8 +192,8 @@ fn env_key_root(key: &str) -> String {
 pub struct AppConfig {
     /// `mcp:` namespace — the MCP protocol surface.
     /// Two children: `capabilities:` (tools / prompts / resources /
-    /// resource_templates / tasks / elicitation / sampling / roots —
-    /// what the server advertises in `initialize`) and
+    /// resource_templates / tasks — what the server advertises in
+    /// `server/discover`) and
     /// `configurations:` (sessions / pipelines / subscriptions /
     /// delivery / cancellation — runtime-emergent state).
     /// Capability persistence (`store:` / `bus:`) defaults to
@@ -759,11 +753,6 @@ impl AppConfig {
         }
         require_positive(
             "gateway.server",
-            "replay_window_limit",
-            server.replay_window_limit as u64,
-        )?;
-        require_positive(
-            "gateway.server",
             "session_idle_timeout_ms",
             server.session_idle_timeout_ms,
         )?;
@@ -1067,7 +1056,7 @@ impl AppConfig {
             if binding.name.trim().is_empty() {
                 return Err(anyhow::anyhow!("{}.name must not be empty", path));
             }
-            // MCP 2025-11-25 tool-name guidance: 1..=128 chars of
+            // MCP tool-name guidance: 1..=128 chars of
             // [A-Za-z0-9_.-]. Enforced strictly — permitting other chars
             // breaks downstream integrations silently.
             if binding.name.len() > 128 {

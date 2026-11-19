@@ -1,8 +1,8 @@
 # MCPG — Model Context Protocol Gateway
 
-MCPG is a protocol-authority gateway for the [Model Context Protocol](https://spec.modelcontextprotocol.io/). It sits between MCP clients and downstream backend systems, owning protocol handling, session lifecycle, identity, authorization, execution dispatch, and observability.
+MCPG is a protocol-authority gateway for the [Model Context Protocol](https://spec.modelcontextprotocol.io/). It sits between MCP clients and downstream backend systems, owning protocol handling, identity, authorization, execution dispatch, and observability.
 
-**Production-grade Rust · extensive unit + integration + MCP-conformance coverage · implements MCP `2026-07-28` and `2025-11-25` (both CI-conformance-gated; legacy `2025-06-18` / `2025-03-26` accepted on request)**
+**Production-grade Rust · extensive unit + integration + MCP-conformance coverage · implements MCP `2026-07-28` (CI-conformance-gated)**
 
 > **Build an MCP server with MCPG:** see
 > [`docs/agent-authoring-guide.md`](docs/agent-authoring-guide.md)
@@ -23,12 +23,12 @@ MCPG is a protocol-authority gateway for the [Model Context Protocol](https://sp
 
 ## What MCPG Does
 
-- Speaks **MCP over Streamable HTTP with SSE streaming** — the finalized **`2026-07-28`** revision (stateless, header-routed) and the session-based **`2025-11-25`** default; the server always emits `2026-07-28` as its wire string and accepts the legacy `2025-06-18` / `2025-03-26` revisions when a client requests them
+- Speaks **MCP `2026-07-28` over Streamable HTTP with SSE streaming** — `server/discover`, per-request `_meta` context, `Mcp-Method` / `Mcp-Name` routing headers, `subscriptions/listen`, and Multi Round-Trip Requests; a request that names another revision is refused with `-32022`
 - Routes tool calls, prompt gets, and resource reads to **operator-defined backends**
 - Enforces **pre-dispatch authorization** with trust levels and CEL expressions
 - Resolves identity via **JWKS, OIDC/OAuth (multi-provider)**, or header assertion
 - Orchestrates **multi-step pipelines** with client interaction (elicitation, sampling)
-- Supports **MCP Tasks** — task-augmented tool calls with background execution, polling, cancellation, and result retrieval
+- Supports the **MCP Tasks extension** — server-directed tasks on `tools/call` with background execution, `tasks/get` polling, `tasks/update` input, and cancellation
 - Distributes state across **NATS, Redis, or in-process** backends per capability (activated via per-capability `<capability>.store` / `<bus>.bus` overrides)
 - Manages **outbound credentials** (OAuth 2.0 client_credentials, Vault dynamic DB, static) via the `credential_issuer` plugin family — backends reference issued values through `cred://<plugin_id>/<target>` URIs, with cached, auto-refreshed tokens
 - Surfaces **MCP App URLs** (`_meta.mcpAppUrl`) on resource descriptors with CEL interpolation
@@ -164,8 +164,8 @@ MCP Client
 HTTP Transport ──→ Identity Resolution ──→ Gateway Runtime ──→ Plugin Chain ──→ Backend Execution
     │                (OIDC/JWKS/Plugin)           │           (gate/transform)   (backend plugins)
     │                                            │
-    ├── SSE Streaming                    Session Management
-    │   (replay window)                  (4 store backends)
+    ├── SSE Streaming                    Per-caller session rows
+    │   (per-request, listen)            (4 store backends)
     │
     └── Prometheus + OpenTelemetry
 ```

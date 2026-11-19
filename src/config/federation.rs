@@ -83,15 +83,9 @@ impl FederationConfig {
         self.upstream.validate(&path)?;
         self.import.validate(&path)?;
         if self.import.events {
-            let legacy = matches!(self.upstream.transport, UpstreamTransport::Stdio)
-                || self
-                    .upstream
-                    .protocol_version
-                    .pinned()
-                    .is_some_and(|_| !self.upstream.protocol_version.is_modern());
-            if legacy {
+            if matches!(self.upstream.transport, UpstreamTransport::Stdio) {
                 bail!(
-                    "{path}.import.events: MCP Events needs an upstream on the 2026-07-28 wire over streamable_http (protocol_version: 2026-07-28 or auto)"
+                    "{path}.import.events: MCP Events needs a streamable_http upstream; the stdio transport carries no events"
                 );
             }
             if let Some(prefix) = &self.naming.event_prefix
@@ -162,6 +156,12 @@ impl FederationConfig {
 }
 
 /// Upstream connection details.
+///
+/// MCPG connects to the upstream as an MCP 2026-07-28 client: it sends
+/// `server/discover` at connect and refuses an upstream whose
+/// `supportedVersions` leave out `2026-07-28`. Every request carries the
+/// per-request `_meta` identity; over `streamable_http` it also carries
+/// the `Mcp-Method` / `Mcp-Name` / `Mcp-Param-{Name}` routing headers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
@@ -172,17 +172,6 @@ pub struct UpstreamConfig {
     /// Wire transport.
     #[serde(default)]
     pub transport: UpstreamTransport,
-    /// MCP wire revision MCPG speaks to this upstream as a client.
-    ///
-    /// Default `v2025_11_25` (the session-bound wire) keeps the
-    /// federation client byte-identical to legacy traffic. Set
-    /// `v2026_07_28` to speak the stateless modern client wire: no
-    /// `initialize` handshake, no `Mcp-Session-Id`, per-request `_meta`
-    /// identity, and the SEP-2243 `Mcp-Method` / `Mcp-Name` /
-    /// `Mcp-Param-{Name}` routing headers. Only the `streamable_http`
-    /// transport honors `v2026_07_28`.
-    #[serde(default)]
-    pub protocol_version: UpstreamProtocolVersion,
     /// Command to spawn for the `stdio` transport (ignored otherwise).
     #[serde(default)]
     pub command: Option<String>,
@@ -244,11 +233,6 @@ impl UpstreamConfig {
                 }
             }
             UpstreamTransport::Stdio => {
-                if self.protocol_version.is_modern() {
-                    bail!(
-                        "{path}.upstream.protocol_version: `2026-07-28` is only supported on the streamable_http transport"
-                    );
-                }
                 if self.command.as_deref().unwrap_or("").trim().is_empty() {
                     bail!("{path}.upstream.command must be set for the stdio transport");
                 }
@@ -275,64 +259,6 @@ impl UpstreamConfig {
             }
         }
         Ok(())
-    }
-}
-
-/// MCP wire revision the federation client speaks to an upstream.
-#[derive(
-    Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
-)]
-pub enum UpstreamProtocolVersion {
-    /// Detect the upstream's wire at connect time (the default): attempt
-    /// the modern `server/discover`, and fall back to the legacy
-    /// `initialize` handshake when the peer rejects it (the SEP-2575
-    /// backward-compatibility probe). The detected wire is cached per
-    /// federation for the engine's lifetime. Pin one of the dated
-    /// revisions to skip probing. The `stdio` transport never probes
-    /// (it is legacy-only).
-    #[default]
-    #[serde(rename = "auto")]
-    Auto,
-    /// Session-bound `2025-11-25` wire (`initialize` handshake,
-    /// `Mcp-Session-Id`, no SEP-2243 headers) — byte-identical to the
-    /// legacy federation client.
-    #[serde(rename = "2025-11-25")]
-    V2025_11_25,
-    /// Stateless `2026-07-28` wire (no handshake / session, per-request
-    /// `_meta` identity, SEP-2243 routing headers).
-    #[serde(rename = "2026-07-28")]
-    V2026_07_28,
-}
-
-impl UpstreamProtocolVersion {
-    /// Whether this pins the modern stateless wire (`auto` is not
-    /// modern until a probe proves the upstream is).
-    #[must_use]
-    pub fn is_modern(self) -> bool {
-        self.pinned().is_some_and(|version| {
-            version == crate::protocol::version::ProtocolVersion::V_2026_07_28
-        })
-    }
-
-    /// Whether the wire is probed at connect time.
-    #[must_use]
-    pub fn is_auto(self) -> bool {
-        self.pinned().is_none()
-    }
-
-    /// The revision this pins, or `None` for `auto`.
-    ///
-    /// The single mapping from the config vocabulary to
-    /// [`crate::protocol::version::ProtocolVersion`]. Callers that need to know
-    /// "which wire" go through this rather than re-matching the config enum,
-    /// so a new revision is added to the protocol type and mapped once.
-    #[must_use]
-    pub fn pinned(self) -> Option<crate::protocol::version::ProtocolVersion> {
-        match self {
-            Self::Auto => None,
-            Self::V2025_11_25 => Some(crate::protocol::version::ProtocolVersion::V_2025_11_25),
-            Self::V2026_07_28 => Some(crate::protocol::version::ProtocolVersion::V_2026_07_28),
-        }
     }
 }
 
@@ -560,8 +486,8 @@ pub struct ImportConfig {
     /// from the gateway's own log, in every delivery mode the gateway
     /// enables, and is fed by one upstream subscription per distinct set
     /// of arguments in demand, held with this federation's catalogue
-    /// credential. Needs an upstream on the `2026-07-28` wire over
-    /// `streamable_http` that advertises events; any other imports none.
+    /// credential. Needs a `streamable_http` upstream that advertises
+    /// events; any other imports none.
     #[serde(default)]
     pub events: bool,
 }
@@ -779,21 +705,16 @@ impl Default for SynthesizeConfig {
     }
 }
 
-/// Gate on synthesized change notifications.
+/// Gate on synthesized change notifications. The gateway's listener on
+/// an upstream subscribes to list changes only, so `resources/updated`
+/// for subscribed federated resources comes from polling.
 #[derive(
     Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SynthesizeMode {
-    /// Synthesize only when the upstream demonstrably cannot push
-    /// resource updates: the modern (`2026-07-28`) wire and the `stdio`
-    /// transport. A legacy streamable-http upstream keeps its GET-SSE
-    /// push path and is not polled.
+    /// Poll subscribed resources (the default).
     #[default]
-    Auto,
-    /// Always poll, even for upstreams with a push channel (covers
-    /// legacy servers that only emit `resources/updated` for
-    /// subscriptions the gateway does not place upstream).
     Poll,
     /// Never synthesize.
     Off,
@@ -942,42 +863,11 @@ naming:
     }
 
     #[test]
-    fn protocol_version_defaults_to_auto_and_parses_pins() {
-        // Default probes the upstream's wire at connect (SEP-2575
-        // backward-compat sequence); a probe is not a modern pin.
-        let c = cfg(minimal());
-        assert!(c.upstream.protocol_version.is_auto());
-        assert!(!c.upstream.protocol_version.is_modern());
-
-        // Both dated pins parse and skip probing.
-        let legacy = cfg(r#"
-name: notion
-upstream:
-  url: "https://notion-mcp.example.com/mcp"
-  protocol_version: "2025-11-25"
-"#);
-        legacy.validate().expect("legacy pin valid");
-        assert!(!legacy.upstream.protocol_version.is_auto());
-        assert!(!legacy.upstream.protocol_version.is_modern());
-
-        let modern = cfg(r#"
-name: notion
-upstream:
-  url: "https://notion-mcp.example.com/mcp"
-  protocol_version: "2026-07-28"
-naming:
-  tool_prefix: "notion."
-"#);
-        modern.validate().expect("modern streamable_http valid");
-        assert!(modern.upstream.protocol_version.is_modern());
-    }
-
-    #[test]
     fn synthesize_defaults_and_parses_modes() {
         let c = cfg(minimal());
         assert!(matches!(
             c.synthesize.resources_updated,
-            SynthesizeMode::Auto
+            SynthesizeMode::Poll
         ));
         assert_eq!(c.synthesize.poll_interval_ms, 30_000);
 
@@ -986,13 +876,13 @@ name: notion
 upstream:
   url: "https://notion-mcp.example.com/mcp"
 synthesize:
-  resources_updated: poll
+  resources_updated: off
   poll_interval_ms: 5000
 "#);
         polled.validate().expect("synthesize block valid");
         assert!(matches!(
             polled.synthesize.resources_updated,
-            SynthesizeMode::Poll
+            SynthesizeMode::Off
         ));
         assert_eq!(polled.synthesize.poll_interval_ms, 5000);
 
@@ -1008,24 +898,6 @@ synthesize:
                 .unwrap_err()
                 .to_string()
                 .contains("synthesize.poll_interval_ms")
-        );
-    }
-
-    #[test]
-    fn modern_protocol_version_rejected_on_stdio() {
-        let c = cfg(r#"
-name: local
-upstream:
-  transport: stdio
-  command: "/bin/echo"
-  protocol_version: "2026-07-28"
-  upstream_safety: { allow_stdio: true }
-"#);
-        assert!(
-            c.validate()
-                .unwrap_err()
-                .to_string()
-                .contains("only supported on the streamable_http transport")
         );
     }
 
@@ -1443,7 +1315,7 @@ upstream:
     }
 
     #[test]
-    fn importing_events_needs_the_modern_wire_over_http() {
+    fn importing_events_needs_a_streamable_http_upstream() {
         let with = |upstream: &str, naming: &str| {
             cfg(&format!(
                 "name: gh\nupstream: {upstream}\nimport: {{ events: true }}\nnaming: {naming}"
@@ -1451,19 +1323,8 @@ upstream:
             .validate()
         };
         let http = r#"{ url: "https://gh.example/mcp" }"#;
-        with(http, "{}").expect("auto may find the modern wire");
-        with(
-            r#"{ url: "https://gh.example/mcp", protocol_version: "2026-07-28" }"#,
-            r#"{ event_prefix: "gh." }"#,
-        )
-        .expect("a pinned modern wire");
-        let legacy = with(
-            r#"{ url: "https://gh.example/mcp", protocol_version: "2025-11-25" }"#,
-            "{}",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(legacy.contains("import.events"), "{legacy}");
+        with(http, "{}").expect("a streamable_http upstream");
+        with(http, r#"{ event_prefix: "gh." }"#).expect("a valid event prefix");
         let stdio = with(
             r#"{ transport: stdio, command: gh-mcp, upstream_safety: { allow_stdio: true } }"#,
             "{}",

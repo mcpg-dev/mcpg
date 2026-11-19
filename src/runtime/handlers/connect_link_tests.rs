@@ -1,5 +1,4 @@
-//! The URL elicitation a tool call answers with, in the shape of each
-//! protocol version (MCP Elicitation).
+//! The URL elicitation a tool call answers with (MCP Elicitation).
 
 use serde_json::json;
 
@@ -24,40 +23,10 @@ fn body(response: &ProtocolHttpResponse) -> Value {
     .expect("response serializes")
 }
 
-/// `2025-11-25`: the error `-32042` whose `data.elicitations` holds one
-/// URL-mode elicitation with its id, url and message, and whose own
-/// message carries that text and link for a client that shows only it.
+/// An `InputRequiredResult` whose one input request is a URL-mode
+/// `elicitation/create` without an id, and the `requestState` to echo.
 #[test]
-fn the_2025_wire_answers_url_elicitation_required() {
-    let response = url_elicitation_required(json!("call-1"), &elicitation());
-    assert_eq!(response.http_status, 200);
-    assert_eq!(
-        body(&response),
-        json!({
-            "jsonrpc": "2.0",
-            "id": "call-1",
-            "error": {
-                "code": -32042,
-                "message": "`crm` needs your Acme SSO sign-in Link: \
-                            https://gw.example/oauth/connect?e=link-id-0123456789",
-                "data": {
-                    "elicitations": [{
-                        "mode": "url",
-                        "elicitationId": "link-id-0123456789",
-                        "url": "https://gw.example/oauth/connect?e=link-id-0123456789",
-                        "message": "`crm` needs your Acme SSO sign-in",
-                    }],
-                },
-            },
-        })
-    );
-}
-
-/// `2026-07-28`: an `InputRequiredResult` whose one input request is a
-/// URL-mode `elicitation/create` without an id (the version removed
-/// `elicitationId`), and the `requestState` to echo.
-#[test]
-fn the_2026_wire_answers_an_input_required_result() {
+fn the_answer_is_an_input_required_result() {
     let response = input_required(json!(7), &elicitation(), "l.sealed".to_owned());
     assert_eq!(response.http_status, 200);
     let body = body(&response);
@@ -81,33 +50,11 @@ fn the_2026_wire_answers_an_input_required_result() {
     );
 }
 
-/// Only a `2025-11-25` request on a session with a delivery stream is told
-/// when its link completes.
+/// The URL-mode elicitation carries no `elicitationId`: the retry names the
+/// link by its sealed `requestState`.
 #[test]
-fn only_a_legacy_session_is_told_of_completion() {
-    let context = |session: Option<&str>| {
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            session.map(str::to_owned),
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        )
-    };
-    let legacy = context(Some("sess-1"))
-        .with_negotiated_version(crate::protocol::version::ProtocolVersion::V_2025_11_25);
-    assert_eq!(
-        connect_link_notify_session(&legacy).as_deref(),
-        Some("sess-1")
-    );
-    assert_eq!(connect_link_notify_session(&context(None)), None);
-    let modern = context(Some("sess-2"))
-        .with_negotiated_version(crate::protocol::version::ProtocolVersion::V_2026_07_28);
-    assert_eq!(connect_link_notify_session(&modern), None);
-    let mut ephemeral = context(Some("sess-3"));
-    ephemeral.session_ephemeral = true;
-    assert_eq!(connect_link_notify_session(&ephemeral), None);
+fn the_answer_does_not_carry_an_elicitation_id() {
+    let response = input_required(json!(7), &elicitation(), "l.sealed".to_owned());
+    let body = body(&response).to_string();
+    assert!(!body.contains("elicitationId"), "{body}");
 }

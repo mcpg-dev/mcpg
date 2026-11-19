@@ -1,68 +1,40 @@
-use std::collections::{HashMap, VecDeque};
+//! The gateway's internal session rows. A row ties together what outlives
+//! one request of a caller: its tasks, a suspended MRTR pipeline, its
+//! `subscriptions/listen` streams and its delivery bus key. Rows are minted
+//! by the runtime (`GatewayRuntime::ensure_session`), never named by a
+//! client, and end when an operator terminates them or no replica uses them
+//! for the idle timeout.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-
-use crate::protocol::{
-    ClientCapabilities, ImplementationInfo, InitializeParams, JSONRPC_VERSION, LoggingLevel,
-    LoggingMessageNotification, LoggingMessageParams, ProtocolResponse,
-};
-use crate::runtime::ResumeCursor;
-
-/// Session lifecycle state machine: sessions start in `AwaitingInitialized` after
-/// the `initialize` request, transition to `Operational` after `notifications/initialized`,
-/// and are destroyed on DELETE or idle timeout. All capability operations require `Operational`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SessionPhase {
-    AwaitingInitialized,
-    Operational,
-}
 
 /// Point-in-time snapshot of a session's state, used for read-only queries
 /// without holding a lock on the session store.
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     pub session_id: String,
-    pub protocol_version: String,
-    pub client_info: ImplementationInfo,
-    pub client_capabilities: ClientCapabilities,
-    pub phase: SessionPhase,
-    pub log_level: LoggingLevel,
     pub created_at: DateTime<Utc>,
     /// Trust-qualified principal key of the session creator (`None` =
-    /// anonymous). Surfaced so the HTTP layer can enforce session-owner
-    /// binding.
+    /// anonymous). The owner checks on listen streams, tasks and resumes
+    /// compare the caller against it.
     pub owner_principal: Option<String>,
 }
 
-/// A single SSE event stored in the replay window. When a client reconnects with
-/// `Last-Event-Id`, the store replays all events with IDs after the cursor so
-/// the client never misses a message.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SseEventRecord {
-    pub event_id: String,
-    pub data: String,
-    pub retry_ms: Option<u64>,
-}
-
-/// Tuning knobs for the session store: replay window depth, idle timeout,
-/// and capacity limits. The multi-backend architecture (in-memory, file, NATS KV,
-/// Redis) shares this config; each backend maps limits to its storage model.
+/// Tuning knobs for the session store: idle timeout and capacity limits.
+/// Every backend (in-memory, file, NATS KV, Redis) shares this config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionStoreConfig {
-    pub replay_window_limit: usize,
     pub session_idle_timeout_ms: u64,
     /// Maximum number of concurrent sessions. 0 = unlimited.
     pub max_sessions: usize,
-    /// Per-tenant session quota. 0 = unlimited. The stricter of this
-    /// and `max_sessions` wins.
+    /// Sessions one principal may hold at once. 0 = unlimited. The stricter
+    /// of this and `max_sessions` wins.
     pub max_sessions_per_tenant: usize,
 }
 
 impl Default for SessionStoreConfig {
     fn default() -> Self {
         Self {
-            replay_window_limit: 16,
             session_idle_timeout_ms: 900_000,
             max_sessions: 10_000,
             max_sessions_per_tenant: 0,
@@ -70,29 +42,11 @@ impl Default for SessionStoreConfig {
     }
 }
 
-/// Errors from session lookup operations, mapped to JSON-RPC error responses.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SessionAccessError {
-    MissingSessionId,
-    UnknownSession,
-    NotInitialized,
-}
-
-/// Errors from SSE stream operations, mapped to HTTP status codes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StreamAccessError {
-    MissingSessionId,
-    UnknownSession,
-    NotInitialized,
-    InvalidCursor,
-    ExpiredCursor,
-}
-
 /// Why a session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionEndReason {
-    /// A client or an operator ended the session.
+    /// An operator ended the session.
     Terminated,
     /// No replica used the session for the idle timeout.
     IdleExpired,
@@ -178,54 +132,29 @@ impl Drop for LifetimeRegistration {
 }
 
 pub trait SessionStore: Send + Sync {
-    /// Persist a new session.
-    ///
-    /// `negotiated_protocol_version` is the version the runtime selected after
-    /// inspecting the client's `InitializeParams.protocol_version`. The store
-    /// must record this negotiated value, not the raw client-requested string,
-    /// so later request handling operates on what was actually agreed.
-    fn create_session(
-        &self,
-        negotiated_protocol_version: &str,
-        params: &InitializeParams,
-    ) -> SessionSnapshot;
+    /// Persist a new session under a fresh random id. A store at
+    /// `max_sessions` answers with an empty-id snapshot and keeps nothing.
+    fn create_session(&self) -> SessionSnapshot;
     /// Create a session under a caller-supplied id, returning the existing
     /// snapshot unchanged if one already lives at `session_id` (idempotent).
     ///
-    /// Used by modern (DRAFT-2026-v1) stateless mode: every replica
-    /// derives the same deterministic id for a principal, so the session
-    /// row — persisted to cluster KV — is shared. The default impl ignores
-    /// the id and mints a random one (in-process stores have no cross-
-    /// replica notion); cluster-KV-backed stores override.
-    fn create_session_with_id(
-        &self,
-        session_id: &str,
-        negotiated_protocol_version: &str,
-        params: &InitializeParams,
-    ) -> SessionSnapshot {
+    /// Every replica derives the same id for a principal, so the row —
+    /// persisted to cluster KV — is shared. The default impl ignores the id
+    /// and mints a random one (in-process stores have no cross-replica
+    /// notion); cluster-KV-backed stores override.
+    fn create_session_with_id(&self, session_id: &str) -> SessionSnapshot {
         let _ = session_id;
-        self.create_session(negotiated_protocol_version, params)
+        self.create_session()
     }
-    /// Record the principal that owns `session_id`. Used by the HTTP
-    /// layer to bind session-scoped operations to their creator when
-    /// `sessions.bind_session_owner` is enabled. Default no-op for
-    /// in-process / test stores that don't surface owner binding.
+    /// Record the trust-qualified principal key that owns `session_id`.
+    /// Default no-op for in-process / test stores that don't surface owner
+    /// binding.
     fn bind_session_owner(&self, session_id: &str, owner_principal: Option<&str>) {
         let _ = (session_id, owner_principal);
     }
-    fn session_protocol_version(&self, session_id: &str) -> Option<String>;
-    fn load_session(
-        &self,
-        session_id: Option<&str>,
-        require_operational: bool,
-    ) -> Result<SessionSnapshot, SessionAccessError>;
-    fn transition_session_to_operational(&self, session_id: &str)
-    -> Result<(), SessionAccessError>;
-    fn set_session_log_level(
-        &self,
-        session_id: Option<&str>,
-        level: LoggingLevel,
-    ) -> Result<(), SessionAccessError>;
+    /// The live session under `session_id`, which the read keeps alive;
+    /// `None` when none lives under it.
+    fn load_session(&self, session_id: &str) -> Option<SessionSnapshot>;
     /// End `session_id`; `None` when no session lives under it.
     fn terminate_session(&self, session_id: &str) -> Option<EndedSession>;
     /// Register a sink told of every session that ends without a
@@ -256,7 +185,7 @@ pub trait SessionStore: Send + Sync {
     /// Side-effect-free check: is a session with this id currently held in the
     /// store's live (in-memory) set? Unlike `load_session` this must NOT
     /// re-hydrate from the backing KV, so the idle-eviction cascade can tell a
-    /// truly-gone session from one a client re-created under the same id.
+    /// truly-gone session from one the runtime minted again under the same id.
     /// Default `false` (no live set) — cascade proceeds.
     fn contains_active_session(&self, session_id: &str) -> bool {
         let _ = session_id;
@@ -277,69 +206,6 @@ pub trait SessionStore: Send + Sync {
         let _ = (session_id, cap);
         None
     }
-    fn open_sse_stream(
-        &self,
-        session_id: Option<&str>,
-        resume_cursor: Option<&ResumeCursor>,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError>;
-    fn stream_protocol_response(
-        &self,
-        session_id: &str,
-        protocol_response: &ProtocolResponse,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        self.stream_protocol_response_with_pending(session_id, protocol_response, &[])
-    }
-    /// Like [`Self::stream_protocol_response`] but interleaves
-    /// `pending_notifications` (each a serialised JSON-RPC notification
-    /// envelope) between the priming/logging events and the terminal
-    /// response. Used by the legacy POST→SSE path to inject `log` /
-    /// `progress` notifications produced inside the same pipeline
-    /// invocation onto the response stream BEFORE the result so the
-    /// client SDK matches them to the in-flight request.
-    fn stream_protocol_response_with_pending(
-        &self,
-        session_id: &str,
-        protocol_response: &ProtocolResponse,
-        pending_notifications: &[String],
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError>;
-    fn stream_raw_message(
-        &self,
-        session_id: &str,
-        message_json: &str,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError>;
-
-    /// Like [`Self::stream_raw_message`] but tags the emitted SSE event id
-    /// with the originating coordinator-KV `delivery_id` (as an opaque
-    /// `@{delivery_id}` suffix). A later reconnect that echoes this id as
-    /// `Last-Event-Id` lets the gateway delete the exact backlog row the
-    /// client already received, so a live-delivered server-push is not
-    /// replayed from the backlog. Defaults to the untagged
-    /// path so non-delivery / test impls need no change.
-    fn stream_delivery_message(
-        &self,
-        session_id: &str,
-        message_json: &str,
-        _delivery_id: &str,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        self.stream_raw_message(session_id, message_json)
-    }
-
-    /// Stream a delivery, choosing the tagged or untagged path by whether it
-    /// carries a backlog id. Sole owner of that choice, so the runtime and the
-    /// transport's SSE forwarder cannot disagree about when a replay tag is
-    /// emitted.
-    fn stream_message(
-        &self,
-        session_id: &str,
-        message_json: &str,
-        delivery_id: &str,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        if delivery_id.is_empty() {
-            self.stream_raw_message(session_id, message_json)
-        } else {
-            self.stream_delivery_message(session_id, message_json, delivery_id)
-        }
-    }
 
     /// List active sessions. Returns summary snapshots.
     fn list_sessions(&self) -> Vec<SessionSnapshot> {
@@ -352,25 +218,13 @@ pub trait SessionStore: Send + Sync {
     }
 }
 
+/// A session row: who owns it and when it was last used. It holds no
+/// stream or replay state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredSession {
     session_id: String,
-    protocol_version: String,
-    client_info: ImplementationInfo,
-    client_capabilities: ClientCapabilities,
-    phase: SessionPhase,
-    log_level: LoggingLevel,
-    next_stream_ordinal: u64,
-    streams: HashMap<String, StoredStream>,
-    /// The stream that receives server-initiated messages. Updated on
-    /// every `open_sse_stream`; ensures deterministic delivery routing.
-    #[serde(default)]
-    active_stream_id: Option<String>,
     /// Trust-qualified principal key of the session creator (trust tier +
     /// provider + issuer + subject; `None` for an anonymous creator).
-    /// Used by the HTTP layer to bind session-scoped operations
-    /// (GET/DELETE/subscribe/continuation) to their owner when
-    /// `sessions.bind_session_owner` is enabled.
     #[serde(default)]
     owner_principal: Option<String>,
     /// The session counts toward its owner's `max_sessions_per_tenant`
@@ -394,14 +248,22 @@ fn tenant_of(session: &StoredSession) -> &str {
 }
 
 impl StoredSession {
+    fn new(session_id: String) -> Self {
+        let now = Utc::now();
+        Self {
+            session_id,
+            owner_principal: None,
+            tenant_slot: false,
+            last_seen_at: now,
+            created_at: now,
+            written_at_ms: 0,
+            verified_at_ms: now.timestamp_millis(),
+        }
+    }
+
     fn snapshot(&self) -> SessionSnapshot {
         SessionSnapshot {
             session_id: self.session_id.clone(),
-            protocol_version: self.protocol_version.clone(),
-            client_info: self.client_info.clone(),
-            client_capabilities: self.client_capabilities.clone(),
-            phase: self.phase,
-            log_level: self.log_level,
             created_at: self.created_at,
             owner_principal: self.owner_principal.clone(),
         }
@@ -410,97 +272,6 @@ impl StoredSession {
     fn touch(&mut self) {
         self.last_seen_at = Utc::now();
     }
-
-    /// Drop the replay of the oldest streams while more than
-    /// [`RETAINED_STREAMS`] are kept or their events hold more than
-    /// [`RETAINED_REPLAY_BYTES`]; the active stream stays.
-    fn retire_old_streams(&mut self) {
-        let mut ids: Vec<(u64, String)> = self
-            .streams
-            .keys()
-            .map(|id| (stream_ordinal(id).unwrap_or(0), id.clone()))
-            .collect();
-        ids.sort_unstable();
-        let mut kept = ids.len();
-        let mut bytes: usize = self.streams.values().map(StoredStream::replay_bytes).sum();
-        for (_, id) in ids {
-            if kept <= RETAINED_STREAMS && bytes <= RETAINED_REPLAY_BYTES {
-                break;
-            }
-            if self.active_stream_id.as_deref() == Some(id.as_str()) {
-                continue;
-            }
-            if let Some(stream) = self.streams.remove(&id) {
-                kept -= 1;
-                bytes -= stream.replay_bytes();
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct StoredStream {
-    replay_window: VecDeque<SseEventRecord>,
-    next_event_ordinal: u64,
-    /// Token bucket for `notifications/message` rate limiting. Not
-    /// persisted; `None` until the first log attempt fills it lazily.
-    #[serde(skip)]
-    log_bucket: Option<LogTokenBucket>,
-}
-
-impl StoredStream {
-    /// The bytes of event data the replay holds.
-    fn replay_bytes(&self) -> usize {
-        self.replay_window
-            .iter()
-            .map(|event| event.event_id.len() + event.data.len())
-            .sum()
-    }
-}
-
-/// Per-stream token bucket for logging-notification rate limiting.
-#[derive(Debug, Clone)]
-struct LogTokenBucket {
-    tokens: f64,
-    last_refill: std::time::Instant,
-}
-
-/// Default cadence: 50 log messages per second per stream, burst 100.
-/// High enough that ordinary logging is unaffected; low enough that a
-/// run-away error loop cannot saturate the delivery bus.
-const LOG_RATE_PER_SEC: f64 = 50.0;
-const LOG_RATE_BURST: f64 = 100.0;
-
-impl LogTokenBucket {
-    fn take(&mut self) -> bool {
-        let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * LOG_RATE_PER_SEC).min(LOG_RATE_BURST);
-        self.last_refill = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-const SSE_RETRY_MS: u64 = 1500;
-
-/// The streams a session keeps the replay of: its most recent ones. A client
-/// resumes a stream it was cut from, not one it finished long ago; every
-/// request opens a stream, so without a bound the row grows at each one.
-const RETAINED_STREAMS: usize = 16;
-
-/// The most event data a session's replay keeps, in bytes: the oldest
-/// streams go first. A response stream holds its whole result, and a row
-/// must stay well under a coordinator's message limit (NATS: 1 MiB).
-const RETAINED_REPLAY_BYTES: usize = 256 * 1024;
-
-/// The ordinal of a `stream-{ordinal}` id.
-fn stream_ordinal(stream_id: &str) -> Option<u64> {
-    stream_id.strip_prefix("stream-")?.parse().ok()
 }
 
 /// How often a read refreshes the row of a session in use: a quarter of
@@ -533,178 +304,29 @@ enum SharedRow {
     Unknown,
 }
 
-/// Check if the session limit is reached. Returns `Some(rejection_snapshot)` if the
-/// limit is exceeded, `None` if the session can be created.
-fn check_session_limit(
+/// The snapshot a store answers a refused create with: an empty id.
+fn refused_snapshot() -> SessionSnapshot {
+    SessionSnapshot {
+        session_id: String::new(),
+        created_at: Utc::now(),
+        owner_principal: None,
+    }
+}
+
+/// Whether the session limit is reached.
+fn session_limit_reached(
     sessions: &dashmap::DashMap<String, StoredSession>,
     config: &SessionStoreConfig,
-    protocol_version: &str,
-) -> Option<SessionSnapshot> {
+) -> bool {
     if config.max_sessions > 0 && sessions.len() >= config.max_sessions {
         tracing::warn!(
             current = sessions.len(),
             max = config.max_sessions,
             "session limit reached, rejecting new session"
         );
-        return Some(SessionSnapshot {
-            session_id: String::new(),
-            protocol_version: protocol_version.to_owned(),
-            client_info: crate::protocol::ImplementationInfo {
-                name: String::new(),
-                title: None,
-                version: String::new(),
-                description: None,
-                website_url: None,
-                icons: None,
-            },
-            client_capabilities: Default::default(),
-            phase: SessionPhase::AwaitingInitialized,
-            log_level: LoggingLevel::Info,
-            created_at: chrono::Utc::now(),
-            owner_principal: None,
-        });
+        return true;
     }
-    None
-}
-
-fn append_event(
-    stream: &mut StoredStream,
-    stream_id: &str,
-    data: String,
-    retry_ms: Option<u64>,
-    replay_window_limit: usize,
-) -> SseEventRecord {
-    append_event_with_delivery(stream, stream_id, data, retry_ms, replay_window_limit, None)
-}
-
-/// Separator between the canonical `{stream_id}:{ordinal}` event id and the
-/// optional coordinator-KV delivery id it carried. The delivery id
-/// (`{seq}-{uuid}`) never contains this byte, and the stream-id/ordinal
-/// never do either, so the split is unambiguous. The suffix is opaque to
-/// clients (which echo the whole `Last-Event-Id` back); the gateway parses
-/// it on reconnect to prune the acknowledged backlog row so an
-/// already-delivered server-push is not replayed.
-const DELIVERY_ID_SEP: char = '@';
-
-/// Like [`append_event`] but, when `delivery_id` is `Some`, appends an
-/// opaque `@{delivery_id}` suffix to the event id. The suffix lets a later
-/// reconnect carrying this id as `Last-Event-Id` identify (and delete) the
-/// exact coordinator-KV backlog row the client already received, so a
-/// live-delivered terminal result is not replayed from the backlog.
-fn append_event_with_delivery(
-    stream: &mut StoredStream,
-    stream_id: &str,
-    data: String,
-    retry_ms: Option<u64>,
-    replay_window_limit: usize,
-    delivery_id: Option<&str>,
-) -> SseEventRecord {
-    let ordinal = stream.next_event_ordinal;
-    let event_id = match delivery_id {
-        Some(did) => format!("{stream_id}:{ordinal}{DELIVERY_ID_SEP}{did}"),
-        None => format!("{stream_id}:{ordinal}"),
-    };
-    stream.next_event_ordinal += 1;
-    let record = SseEventRecord {
-        event_id,
-        data,
-        retry_ms,
-    };
-    stream.replay_window.push_back(record.clone());
-    while stream.replay_window.len() > replay_window_limit {
-        stream.replay_window.pop_front();
-    }
-    record
-}
-
-/// Strip the optional `@{delivery_id}` suffix from an event id, returning
-/// the canonical `{stream_id}:{ordinal}` core. Event ids never carry the
-/// separator unless a server-push delivery added one, so this is a no-op
-/// for ordinary stream events.
-fn event_id_core(event_id: &str) -> &str {
-    match event_id.split_once(DELIVERY_ID_SEP) {
-        Some((core, _delivery_id)) => core,
-        None => event_id,
-    }
-}
-
-/// Extract the coordinator-KV delivery id a client acknowledged by echoing
-/// it inside `Last-Event-Id`. `None` when the cursor is an ordinary stream
-/// event (no server-push delivery suffix).
-pub(crate) fn delivery_id_from_event_id(event_id: &str) -> Option<&str> {
-    event_id
-        .split_once(DELIVERY_ID_SEP)
-        .map(|(_core, delivery_id)| delivery_id)
-        .filter(|d| !d.is_empty())
-}
-
-fn logging_notification_event(
-    stream: &mut StoredStream,
-    stream_id: &str,
-    session_log_level: LoggingLevel,
-    event_level: LoggingLevel,
-    logger: &str,
-    data: serde_json::Value,
-    replay_window_limit: usize,
-) -> Option<SseEventRecord> {
-    if event_level < session_log_level {
-        return None;
-    }
-
-    // Rate-limit log notifications so a runaway loop cannot amplify
-    // into SSE backpressure. Critical+ bypasses the limiter.
-    let bypass = matches!(
-        event_level,
-        LoggingLevel::Critical | LoggingLevel::Alert | LoggingLevel::Emergency
-    );
-    if !bypass {
-        let bucket = stream.log_bucket.get_or_insert(LogTokenBucket {
-            tokens: LOG_RATE_BURST,
-            last_refill: std::time::Instant::now(),
-        });
-        if !bucket.take() {
-            metrics::counter!(
-                "mcpg_logging_notification_rate_limited_total",
-                "logger" => logger.to_owned(),
-            )
-            .increment(1);
-            return None;
-        }
-    }
-
-    // Security: scrub credential-shaped values before replay buffer.
-    let data = crate::runtime::redact::redact_credentials(&data);
-
-    let notification = LoggingMessageNotification {
-        jsonrpc: JSONRPC_VERSION,
-        method: "notifications/message",
-        params: LoggingMessageParams {
-            level: event_level,
-            logger: Some(logger.to_owned()),
-            data,
-        },
-    };
-
-    Some(append_event(
-        stream,
-        stream_id,
-        serde_json::to_string(&notification).expect("logging notification serialized"),
-        None,
-        replay_window_limit,
-    ))
-}
-
-fn parse_event_id(event_id: &str) -> Option<(&str, u64)> {
-    // Strip any opaque `@{delivery_id}` suffix first so the canonical
-    // `{stream_id}:{ordinal}` core parses identically whether or not the
-    // client echoed a delivery-tagged cursor back.
-    let (stream_id, ordinal) = event_id_core(event_id).rsplit_once(':')?;
-    let ordinal = ordinal.parse().ok()?;
-    Some((stream_id, ordinal))
-}
-
-fn event_ordinal(event_id: &str) -> Option<u64> {
-    parse_event_id(event_id).map(|(_, ordinal)| ordinal)
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -712,10 +334,6 @@ fn event_ordinal(event_id: &str) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 /// Session store backed by any [`mcpg_cluster_api::KeyValueStore`] impl.
-///
-/// Replaces the per-backend `RedisSessionStore` / `NatsKvSessionStore`
-/// impls that lived in `mcpg-plugin-backend-{redis,nats}` before the
-/// substrate was unified behind the cluster API.
 ///
 /// In-memory `HashMap` is the hot working set; every mutation also
 /// serialises the [`StoredSession`] to KV, and a read refreshes the row at
@@ -738,18 +356,15 @@ fn event_ordinal(event_id: &str) -> Option<u64> {
 /// stops serving the session within that interval, and a row a replica
 /// writes after the end cannot bring the session back.
 ///
-/// Sticky sessions (per-replica session affinity) are an external
-/// invariant — without them, two replicas writing the same session
-/// concurrently race on KV and the last-writer wins. A future
-/// `LeaseState`-backed cluster-strict claim could remove that
-/// requirement if stickiness can't be enforced.
+/// `mcpg_active_sessions` moves here: up when a create inserts a new copy,
+/// down when this replica records an end. Summed over the fleet it is the
+/// number of live rows.
 pub struct KvBackedSessionStore {
     config: SessionStoreConfig,
     state: std::sync::Arc<dyn mcpg_cluster_api::KeyValueStore>,
-    /// Sharded so requests on different sessions don't serialise on one lock
-    /// (each session's stream ordinals / replay window still serialise via the
-    /// per-key shard guard). Expiry is lazy per-entry on access + a throttled
-    /// full sweep (`maybe_sweep`), NOT an O(N) scan on every request.
+    /// Sharded so requests on different sessions don't serialise on one lock.
+    /// Expiry is lazy per-entry on access + a throttled full sweep
+    /// (`maybe_sweep`), NOT an O(N) scan on every request.
     sessions: dashmap::DashMap<String, StoredSession>,
     /// The long-lived streams of each session on this replica, ended with it.
     lifetimes: Lifetimes,
@@ -777,11 +392,8 @@ impl std::fmt::Debug for KvBackedSessionStore {
 }
 
 impl KvBackedSessionStore {
-    /// Sync constructor over an empty in-process `MemoryKv`. Skips
-    /// the async hydrate step `new` runs against persistent backings
-    /// — there's nothing to hydrate from a freshly-allocated map.
-    /// Useful for tests + the `cluster.kind: single_node` boot path
-    /// where async hydration would be a wasted round-trip.
+    /// Sync constructor over an empty in-process `MemoryKv`. Useful for
+    /// tests + the `cluster.kind: single_node` boot path.
     pub fn new_in_memory(config: SessionStoreConfig) -> Self {
         Self {
             config,
@@ -795,9 +407,8 @@ impl KvBackedSessionStore {
         }
     }
 
-    /// Mark the KV as shared with other replicas. A local copy still awaiting
-    /// `notifications/initialized` then checks the shared row's phase on each
-    /// access, since another replica may have taken the notification.
+    /// Mark the KV as shared with other replicas: an idle copy defers to the
+    /// shared row, and the end of a session is recorded for the fleet.
     #[must_use]
     pub fn shared_across_replicas(mut self, shared: bool) -> Self {
         self.shared = shared;
@@ -873,6 +484,13 @@ impl KvBackedSessionStore {
         SharedRow::Live(row)
     }
 
+    /// Insert `session`, a copy this replica just created, into the working
+    /// set and count it as active.
+    fn insert_created(&self, session: StoredSession) {
+        self.sessions.insert(session.session_id.clone(), session);
+        metrics::gauge!("mcpg_active_sessions").increment(1.0);
+    }
+
     /// End `session`, whose copy this replica no longer holds: record the
     /// end for every replica that shares the store, delete the session's
     /// rows unless `keep_rows` (a later session under its id has taken
@@ -893,6 +511,9 @@ impl KvBackedSessionStore {
             Self::block(async { self.state.put_if_absent(&key, marker, Some(ttl)).await })
                 .unwrap_or(true)
         };
+        if recorded {
+            metrics::gauge!("mcpg_active_sessions").decrement(1.0);
+        }
         if !keep_rows {
             self.remove_session(session);
         }
@@ -915,10 +536,9 @@ impl KvBackedSessionStore {
 
     /// Lazy per-entry expiry: atomically evict `session_id` iff it is still
     /// idle-expired (the `remove_if` predicate re-checks under the shard lock,
-    /// so a concurrent `touch()` can't be clobbered). O(1); replaces the old
-    /// per-request O(N) whole-map scan. A copy that is idle here while
-    /// another replica keeps the session in use takes the shared row
-    /// instead; one the store cannot tell about stays.
+    /// so a concurrent `touch()` can't be clobbered). O(1). A copy that is
+    /// idle here while another replica keeps the session in use takes the
+    /// shared row instead; one the store cannot tell about stays.
     fn evict_if_expired(&self, session_id: &str) {
         let Some(created_at) = self
             .sessions
@@ -1236,11 +856,9 @@ impl KvBackedSessionStore {
     /// Persist a freshly-created session row with create-once semantics:
     /// an atomic `put_if_absent` rather than a last-writer-wins `put`. The
     /// session id is a fresh random UUID, so the key is effectively always
-    /// absent and this wins; the create-once guard simply means two replicas
-    /// that ever derive the same id (or a re-create after a read-back) cannot
-    /// clobber a live row. Mirrors the modern deterministic-id create path,
-    /// which already converges idempotently. Returns whether the row was
-    /// written by this call.
+    /// absent and this wins; the create-once guard means two replicas that
+    /// ever derive the same id cannot clobber a live row. Returns whether
+    /// the row was written by this call.
     fn persist_session_create_once(&self, session: &StoredSession) -> bool {
         let key = Self::session_key(&session.session_id);
         let bytes = match serde_json::to_vec(session) {
@@ -1269,17 +887,13 @@ impl KvBackedSessionStore {
     /// shared KV and insert it, so a session created on another replica
     /// (or before a restart) resolves here instead of 404'ing.
     ///
-    /// No KV round-trip when the session is already local and operational
-    /// (the sticky-session / same-replica happy path); in a shared store, a
-    /// local copy still awaiting `notifications/initialized` checks the
-    /// shared row's phase ([`Self::adopt_shared_phase`]). The `sessions`
-    /// lock is held only for the membership check and the final insert,
-    /// never across the (blocking) KV read. Mirrors `new()`'s boot-hydrate
-    /// idle-timeout check so a read-back behaves identically to a restart
-    /// hydrate.
+    /// No KV round-trip when the session is already local (the
+    /// same-replica happy path) beyond the throttled end check of
+    /// [`Self::verify_copy`]. The `sessions` lock is held only for the
+    /// membership check and the final insert, never across the (blocking)
+    /// KV read.
     fn ensure_hydrated(&self, session_id: &str) {
         if self.sessions.contains_key(session_id) {
-            self.adopt_shared_phase(session_id);
             self.verify_copy(session_id);
             return;
         }
@@ -1314,128 +928,29 @@ impl KvBackedSessionStore {
             .entry(session.session_id.clone())
             .or_insert(session);
     }
-
-    /// A session's phase only moves forward, and the replica that takes
-    /// `notifications/initialized` need not be the one that created the
-    /// session: a local copy still awaiting it adopts the shared row's
-    /// `Operational`. One KV read per call, and only while the local copy
-    /// awaits `notifications/initialized`.
-    fn adopt_shared_phase(&self, session_id: &str) {
-        if !self.shared {
-            return;
-        }
-        let awaiting = self
-            .sessions
-            .get(session_id)
-            .is_some_and(|s| s.phase == SessionPhase::AwaitingInitialized);
-        if !awaiting {
-            return;
-        }
-        let key = Self::session_key(session_id);
-        let Ok(Some(value)) = Self::block(async { self.state.get(&key).await }) else {
-            return;
-        };
-        let Ok(shared) = serde_json::from_slice::<StoredSession>(&value.bytes) else {
-            return;
-        };
-        if shared.phase == SessionPhase::Operational
-            && let Some(mut local) = self.sessions.get_mut(session_id)
-        {
-            local.phase = SessionPhase::Operational;
-        }
-    }
-
-    /// Shared body for `stream_raw_message` / `stream_delivery_message`:
-    /// append `message_json` as a new event on the session's active stream,
-    /// optionally tagging the event id with `delivery_id`.
-    fn stream_message_inner(
-        &self,
-        session_id: &str,
-        message_json: &str,
-        delivery_id: Option<&str>,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        self.ensure_hydrated(session_id);
-        self.evict_if_expired(session_id);
-        let mut session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(StreamAccessError::UnknownSession)?;
-        if session.phase != SessionPhase::Operational {
-            return Err(StreamAccessError::NotInitialized);
-        }
-        session.touch();
-        let stream_id = session
-            .active_stream_id
-            .clone()
-            .ok_or(StreamAccessError::NotInitialized)?;
-        let stream = session
-            .streams
-            .get_mut(&stream_id)
-            .ok_or(StreamAccessError::UnknownSession)?;
-        let event = append_event_with_delivery(
-            stream,
-            &stream_id,
-            message_json.to_owned(),
-            None,
-            self.config.replay_window_limit,
-            delivery_id,
-        );
-        let stored = session.clone();
-        drop(session);
-        self.persist_session(&stored);
-        Ok(vec![event])
-    }
 }
 
 impl SessionStore for KvBackedSessionStore {
-    fn create_session(
-        &self,
-        negotiated_protocol_version: &str,
-        params: &InitializeParams,
-    ) -> SessionSnapshot {
-        let now = Utc::now();
-        let mut session = StoredSession {
-            session_id: uuid::Uuid::new_v4().to_string(),
-            protocol_version: negotiated_protocol_version.to_owned(),
-            client_info: params.client_info.clone(),
-            client_capabilities: params.capabilities.clone(),
-            phase: SessionPhase::AwaitingInitialized,
-            log_level: LoggingLevel::Info,
-            next_stream_ordinal: 0,
-            streams: HashMap::new(),
-            active_stream_id: None,
-            owner_principal: None,
-            tenant_slot: false,
-            last_seen_at: now,
-            created_at: now,
-            written_at_ms: 0,
-            verified_at_ms: now.timestamp_millis(),
-        };
+    fn create_session(&self) -> SessionSnapshot {
+        let mut session = StoredSession::new(uuid::Uuid::new_v4().to_string());
         let snapshot = session.snapshot();
         self.maybe_sweep();
-        if let Some(rejection) =
-            check_session_limit(&self.sessions, &self.config, &session.protocol_version)
-        {
-            return rejection;
+        if session_limit_reached(&self.sessions, &self.config) {
+            return refused_snapshot();
         }
         // Create-once: a fresh random-UUID session must not clobber a live
-        // row of the same id (mirrors the modern deterministic-id path).
+        // row of the same id.
         if self.persist_session_create_once(&session) {
-            session.written_at_ms = now.timestamp_millis();
+            session.written_at_ms = session.created_at.timestamp_millis();
         }
-        self.sessions.insert(session.session_id.clone(), session);
+        self.insert_created(session);
         snapshot
     }
 
-    fn create_session_with_id(
-        &self,
-        session_id: &str,
-        negotiated_protocol_version: &str,
-        params: &InitializeParams,
-    ) -> SessionSnapshot {
+    fn create_session_with_id(&self, session_id: &str) -> SessionSnapshot {
         // Idempotent: if the row already exists (this replica, or another
         // via the KV read-back hydration), return it unchanged so
-        // concurrent cross-replica creates of the same deterministic id
+        // concurrent cross-replica creates of the same derived id
         // converge on one session rather than clobbering each other.
         self.ensure_hydrated(session_id);
         self.evict_if_expired(session_id);
@@ -1447,39 +962,23 @@ impl SessionStore for KvBackedSessionStore {
             self.persist_session(&stored);
             return snap;
         }
-        let now = Utc::now();
-        let session = StoredSession {
-            session_id: session_id.to_owned(),
-            protocol_version: negotiated_protocol_version.to_owned(),
-            client_info: params.client_info.clone(),
-            client_capabilities: params.capabilities.clone(),
-            phase: SessionPhase::AwaitingInitialized,
-            log_level: LoggingLevel::Info,
-            next_stream_ordinal: 0,
-            streams: HashMap::new(),
-            active_stream_id: None,
-            owner_principal: None,
-            tenant_slot: false,
-            last_seen_at: now,
-            created_at: now,
-            written_at_ms: 0,
-            verified_at_ms: now.timestamp_millis(),
-        };
         self.maybe_sweep();
-        if let Some(rejection) =
-            check_session_limit(&self.sessions, &self.config, &session.protocol_version)
-        {
-            return rejection;
+        if session_limit_reached(&self.sessions, &self.config) {
+            return refused_snapshot();
         }
         // The copy goes in before the row is written: a row whose copy is gone
         // belongs to an ended session. A concurrent create under the same id
         // that went in first wins.
         let (snapshot, stored) = {
-            let copy = self
-                .sessions
-                .entry(session.session_id.clone())
-                .or_insert(session);
-            (copy.snapshot(), copy.clone())
+            use dashmap::mapref::entry::Entry;
+            match self.sessions.entry(session_id.to_owned()) {
+                Entry::Occupied(copy) => (copy.get().snapshot(), copy.get().clone()),
+                Entry::Vacant(slot) => {
+                    let copy = slot.insert(StoredSession::new(session_id.to_owned()));
+                    metrics::gauge!("mcpg_active_sessions").increment(1.0);
+                    (copy.snapshot(), copy.clone())
+                }
+            }
         };
         self.persist_session(&stored);
         snapshot
@@ -1496,35 +995,12 @@ impl SessionStore for KvBackedSessionStore {
         self.persist_session(&stored);
     }
 
-    fn session_protocol_version(&self, session_id: &str) -> Option<String> {
-        self.ensure_hydrated(session_id);
-        self.evict_if_expired(session_id);
-        let mut session = self.sessions.get_mut(session_id)?;
-        session.touch();
-        let version = session.protocol_version.clone();
-        let snapshot = session.clone();
-        drop(session);
-        self.persist_session(&snapshot);
-        Some(version)
-    }
-
-    fn load_session(
-        &self,
-        session_id: Option<&str>,
-        require_operational: bool,
-    ) -> Result<SessionSnapshot, SessionAccessError> {
-        let session_id = session_id.ok_or(SessionAccessError::MissingSessionId)?;
+    fn load_session(&self, session_id: &str) -> Option<SessionSnapshot> {
         self.ensure_hydrated(session_id);
         self.evict_if_expired(session_id);
         self.maybe_sweep();
-        let mut session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(SessionAccessError::UnknownSession)?;
+        let mut session = self.sessions.get_mut(session_id)?;
         session.touch();
-        if require_operational && session.phase != SessionPhase::Operational {
-            return Err(SessionAccessError::NotInitialized);
-        }
         // A read bumps `last_seen_at` in memory, and writes the row at most
         // once per refresh interval: a blocking KV write on EVERY request
         // would thrash the tokio worker pool under load, and the shared
@@ -1539,56 +1015,13 @@ impl SessionStore for KvBackedSessionStore {
             drop(session);
             self.persist_session(&stored);
         }
-        Ok(snapshot)
-    }
-
-    fn transition_session_to_operational(
-        &self,
-        session_id: &str,
-    ) -> Result<(), SessionAccessError> {
-        self.ensure_hydrated(session_id);
-        self.evict_if_expired(session_id);
-        self.maybe_sweep();
-        let mut session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(SessionAccessError::UnknownSession)?;
-        session.phase = SessionPhase::Operational;
-        session.touch();
-        let stored = session.clone();
-        drop(session);
-        self.persist_session(&stored);
-        Ok(())
-    }
-
-    fn set_session_log_level(
-        &self,
-        session_id: Option<&str>,
-        level: LoggingLevel,
-    ) -> Result<(), SessionAccessError> {
-        let session_id = session_id.ok_or(SessionAccessError::MissingSessionId)?;
-        self.ensure_hydrated(session_id);
-        self.evict_if_expired(session_id);
-        self.maybe_sweep();
-        let mut session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(SessionAccessError::UnknownSession)?;
-        if session.phase != SessionPhase::Operational {
-            return Err(SessionAccessError::NotInitialized);
-        }
-        session.log_level = level;
-        session.touch();
-        let stored = session.clone();
-        drop(session);
-        self.persist_session(&stored);
-        Ok(())
+        Some(snapshot)
     }
 
     fn terminate_session(&self, session_id: &str) -> Option<EndedSession> {
-        // Hydrate first so a DELETE/terminate that lands on a replica
-        // which never saw the session still removes the shared KV copy —
-        // otherwise the session would resurrect via read-back elsewhere.
+        // Hydrate first so a terminate that lands on a replica which never
+        // saw the session still removes the shared KV copy — otherwise the
+        // session would resurrect via read-back elsewhere.
         self.ensure_hydrated(session_id);
         let (_, session) = self.sessions.remove(session_id)?;
         let reason = SessionEndReason::Terminated;
@@ -1732,232 +1165,6 @@ impl SessionStore for KvBackedSessionStore {
             .map(|end| end.is_none())
     }
 
-    fn open_sse_stream(
-        &self,
-        session_id: Option<&str>,
-        resume_cursor: Option<&ResumeCursor>,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        let session_id = session_id.ok_or(StreamAccessError::MissingSessionId)?;
-        self.ensure_hydrated(session_id);
-        self.evict_if_expired(session_id);
-        let mut session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(StreamAccessError::UnknownSession)?;
-        if session.phase != SessionPhase::Operational {
-            return Err(StreamAccessError::NotInitialized);
-        }
-        session.touch();
-
-        if let Some(resume_cursor) = resume_cursor {
-            let (stream_id, last_ordinal) = parse_event_id(&resume_cursor.last_event_id)
-                .ok_or(StreamAccessError::InvalidCursor)?;
-            let Some(stream) = session.streams.get(stream_id) else {
-                // A stream the session opened and has since retired.
-                let retired = stream_ordinal(stream_id)
-                    .is_some_and(|ordinal| ordinal < session.next_stream_ordinal);
-                return Err(if retired {
-                    StreamAccessError::ExpiredCursor
-                } else {
-                    StreamAccessError::InvalidCursor
-                });
-            };
-            // Compare on the canonical `{stream_id}:{ordinal}` core so a
-            // delivery-tagged cursor still matches its stored record
-            // regardless of the opaque delivery-id suffix.
-            let cursor_core = event_id_core(&resume_cursor.last_event_id);
-            let cursor_still_retained = stream
-                .replay_window
-                .iter()
-                .any(|event| event_id_core(&event.event_id) == cursor_core);
-            if !cursor_still_retained {
-                return Err(StreamAccessError::ExpiredCursor);
-            }
-            let events = stream
-                .replay_window
-                .iter()
-                .filter(|event| {
-                    event_ordinal(&event.event_id).is_some_and(|ordinal| ordinal > last_ordinal)
-                })
-                .cloned()
-                .collect();
-            let stored = session.clone();
-            drop(session);
-            self.persist_session(&stored);
-            return Ok(events);
-        }
-
-        if let Some(ref prev) = session.active_stream_id {
-            tracing::info!(
-                session_id = %session.session_id,
-                previous_stream = %prev,
-                "active SSE stream superseded by a new GET"
-            );
-            metrics::counter!("mcpg_sse_active_stream_superseded_total").increment(1);
-        }
-        let stream_id = format!("stream-{}", session.next_stream_ordinal);
-        session.next_stream_ordinal += 1;
-        session.active_stream_id = Some(stream_id.clone());
-        let session_id_owned = session.session_id.clone();
-        let log_level = session.log_level;
-        let stream = session
-            .streams
-            .entry(stream_id.clone())
-            .or_insert_with(StoredStream::default);
-        let prime_event = append_event(
-            stream,
-            &stream_id,
-            String::new(),
-            Some(SSE_RETRY_MS),
-            self.config.replay_window_limit,
-        );
-        let logging_event = logging_notification_event(
-            stream,
-            &stream_id,
-            log_level,
-            LoggingLevel::Info,
-            "mcpg.transport",
-            serde_json::json!({
-                "message": "SSE stream opened",
-                "sessionId": session_id_owned,
-            }),
-            self.config.replay_window_limit,
-        );
-        let events = match logging_event {
-            Some(logging_event) => vec![prime_event, logging_event],
-            None => vec![prime_event],
-        };
-        session.retire_old_streams();
-        let stored = session.clone();
-        drop(session);
-        self.persist_session(&stored);
-        Ok(events)
-    }
-
-    fn stream_protocol_response_with_pending(
-        &self,
-        session_id: &str,
-        protocol_response: &ProtocolResponse,
-        pending_notifications: &[String],
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        self.ensure_hydrated(session_id);
-        self.evict_if_expired(session_id);
-        let mut session = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(StreamAccessError::UnknownSession)?;
-        if session.phase != SessionPhase::Operational {
-            return Err(StreamAccessError::NotInitialized);
-        }
-        session.touch();
-
-        if let Some(ref prev) = session.active_stream_id {
-            tracing::info!(
-                session_id = %session.session_id,
-                previous_stream = %prev,
-                "active SSE stream superseded by a new GET"
-            );
-            metrics::counter!("mcpg_sse_active_stream_superseded_total").increment(1);
-        }
-        let stream_id = format!("stream-{}", session.next_stream_ordinal);
-        session.next_stream_ordinal += 1;
-        session.active_stream_id = Some(stream_id.clone());
-        let session_id_owned = session.session_id.clone();
-        let log_level = session.log_level;
-        let stream = session
-            .streams
-            .entry(stream_id.clone())
-            .or_insert_with(StoredStream::default);
-        let prime_event = append_event(
-            stream,
-            &stream_id,
-            String::new(),
-            Some(SSE_RETRY_MS),
-            self.config.replay_window_limit,
-        );
-        let logging_event = logging_notification_event(
-            stream,
-            &stream_id,
-            log_level,
-            LoggingLevel::Info,
-            "mcpg.transport",
-            serde_json::json!({
-                "message": "Streaming protocol response",
-                "sessionId": session_id_owned,
-            }),
-            self.config.replay_window_limit,
-        );
-        // Pending notifications collected by the pipeline executor during
-        // this same request (e.g. `log` / `progress` steps). Injected
-        // BEFORE the terminal response so the client matches them to the
-        // in-flight tools/call.
-        let mut pending_events = Vec::with_capacity(pending_notifications.len());
-        for notification_payload in pending_notifications {
-            let event = append_event(
-                stream,
-                &stream_id,
-                notification_payload.clone(),
-                None,
-                self.config.replay_window_limit,
-            );
-            pending_events.push(event);
-        }
-        // Serialise the inner JSON-RPC envelope (NOT the
-        // `ProtocolResponse` Rust enum). The enum has external tagging
-        // by default, which would emit `{"JsonRpcSuccess":{…}}` on
-        // the SSE wire — clients then can't match the response's
-        // `id` to their request and time out. The standard MCP
-        // contract is the bare `{"jsonrpc":"2.0","id":…,"result":…}`
-        // envelope; the variant tag is a Rust-internal detail.
-        // `NotificationAccepted` should never reach this path (the
-        // caller only streams successful protocol responses); we
-        // still handle it defensively as an empty event.
-        let response_payload = match protocol_response {
-            ProtocolResponse::JsonRpcSuccess(success) => {
-                serde_json::to_string(success).expect("protocol response serialized")
-            }
-            ProtocolResponse::JsonRpcError(error) => {
-                serde_json::to_string(error).expect("protocol response serialized")
-            }
-            ProtocolResponse::NotificationAccepted => String::new(),
-        };
-        let response_event = append_event(
-            stream,
-            &stream_id,
-            response_payload,
-            None,
-            self.config.replay_window_limit,
-        );
-        let mut events = vec![prime_event];
-        if let Some(logging_event) = logging_event {
-            events.push(logging_event);
-        }
-        events.extend(pending_events);
-        events.push(response_event);
-        session.retire_old_streams();
-        let stored = session.clone();
-        drop(session);
-        self.persist_session(&stored);
-        Ok(events)
-    }
-
-    fn stream_raw_message(
-        &self,
-        session_id: &str,
-        message_json: &str,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        self.stream_message_inner(session_id, message_json, None)
-    }
-
-    fn stream_delivery_message(
-        &self,
-        session_id: &str,
-        message_json: &str,
-        delivery_id: &str,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        self.stream_message_inner(session_id, message_json, Some(delivery_id))
-    }
-
     fn list_sessions(&self) -> Vec<SessionSnapshot> {
         self.sessions.iter().map(|e| e.value().snapshot()).collect()
     }
@@ -1967,48 +1174,97 @@ impl SessionStore for KvBackedSessionStore {
     }
 }
 
+/// A recorder that keeps the net movement of `mcpg_active_sessions` on the
+/// thread it is installed on, for tests that check the gauge balances.
+#[cfg(test)]
+pub(crate) mod active_sessions_probe {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    #[derive(Default)]
+    struct Net(AtomicI64);
+
+    impl metrics::GaugeFn for Net {
+        fn increment(&self, value: f64) {
+            self.0.fetch_add(value as i64, Ordering::SeqCst);
+        }
+        fn decrement(&self, value: f64) {
+            self.0.fetch_sub(value as i64, Ordering::SeqCst);
+        }
+        fn set(&self, value: f64) {
+            self.0.store(value as i64, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default, Clone)]
+    pub(crate) struct ActiveSessions(Arc<Net>);
+
+    impl ActiveSessions {
+        /// Run `f` with this recorder installed on the current thread.
+        pub(crate) fn watch<T>(&self, f: impl FnOnce() -> T) -> T {
+            metrics::with_local_recorder(self, f)
+        }
+
+        /// Increments minus decrements seen so far.
+        pub(crate) fn net(&self) -> i64 {
+            self.0.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl metrics::Recorder for ActiveSessions {
+        fn describe_counter(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _: metrics::KeyName,
+            _: Option<metrics::Unit>,
+            _: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_gauge(&self, key: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+            if key.name() == "mcpg_active_sessions" {
+                metrics::Gauge::from_arc(Arc::clone(&self.0))
+            } else {
+                metrics::Gauge::noop()
+            }
+        }
+        fn register_histogram(
+            &self,
+            _: &metrics::Key,
+            _: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ImplementationInfo, InitializeParams, SUPPORTED_PROTOCOL_VERSION};
-
-    fn test_init_params() -> InitializeParams {
-        InitializeParams {
-            protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-            capabilities: Default::default(),
-            client_info: ImplementationInfo {
-                name: "test-client".to_owned(),
-                title: None,
-                version: "0.1.0".to_owned(),
-                description: None,
-                website_url: None,
-                icons: None,
-            },
-        }
-    }
 
     fn temp_data_dir() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().to_path_buf();
         (dir, path)
-    }
-
-    #[test]
-    fn in_memory_store_persists_negotiated_version_not_requested() {
-        // Client may request a legacy version string. The runtime negotiates,
-        // then the store MUST persist the negotiated value so later requests
-        // operate on the agreed version.
-        let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
-        let mut params = test_init_params();
-        params.protocol_version = "1999-01-01".to_owned();
-
-        let snapshot = store.create_session(SUPPORTED_PROTOCOL_VERSION, &params);
-        assert_eq!(snapshot.protocol_version, SUPPORTED_PROTOCOL_VERSION);
-
-        let persisted = store
-            .session_protocol_version(&snapshot.session_id)
-            .expect("session exists");
-        assert_eq!(persisted, SUPPORTED_PROTOCOL_VERSION);
     }
 
     fn ms_timeout_store() -> KvBackedSessionStore {
@@ -2030,121 +1286,99 @@ mod tests {
     #[test]
     fn idle_session_pruned_with_realistic_ms_timeout() {
         let store = ms_timeout_store();
-        let id = store
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
+        let id = store.create_session().session_id;
         // Just past the 15-minute window: 900_001 ms >= the 900_000 ms idle
         // timeout, so the session must be pruned on the next access.
         backdate_session(&store, &id, chrono::Duration::milliseconds(900_001));
-        let err = store
-            .load_session(Some(&id), false)
-            .expect_err("expired session must be pruned");
-        assert!(matches!(err, SessionAccessError::UnknownSession));
+        assert!(
+            store.load_session(&id).is_none(),
+            "expired session must be pruned"
+        );
     }
 
     #[test]
     fn fresh_session_survives_realistic_ms_timeout() {
         let store = ms_timeout_store();
-        let id = store
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        assert!(store.load_session(Some(&id), false).is_ok());
+        let id = store.create_session().session_id;
+        assert!(store.load_session(&id).is_some());
     }
 
     #[test]
     fn session_just_under_ms_timeout_survives() {
         let store = ms_timeout_store();
-        let id = store
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
+        let id = store.create_session().session_id;
         backdate_session(&store, &id, chrono::Duration::milliseconds(899_000));
-        assert!(store.load_session(Some(&id), false).is_ok());
-    }
-
-    #[test]
-    fn event_id_helpers_parse_delivery_suffix() {
-        // A plain stream event id has no delivery suffix.
-        assert_eq!(event_id_core("stream-0:3"), "stream-0:3");
-        assert_eq!(delivery_id_from_event_id("stream-0:3"), None);
-        assert_eq!(parse_event_id("stream-0:3"), Some(("stream-0", 3)));
-
-        // A delivery-tagged id: the canonical core parses identically and the
-        // opaque delivery id is recoverable.
-        let tagged = "stream-0:3@00000000000000000007-abc";
-        assert_eq!(event_id_core(tagged), "stream-0:3");
-        assert_eq!(parse_event_id(tagged), Some(("stream-0", 3)));
-        assert_eq!(
-            delivery_id_from_event_id(tagged),
-            Some("00000000000000000007-abc")
-        );
-        // An empty suffix is treated as no ack.
-        assert_eq!(delivery_id_from_event_id("stream-0:3@"), None);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn delivery_tagged_event_resumes_via_suffixed_cursor() {
-        // A server-push streamed via `stream_delivery_message` carries an
-        // opaque `@{delivery_id}` suffix on its event id. The client echoes
-        // the whole id back as Last-Event-Id; resume must still locate the
-        // record and replay only events AFTER it (the suffix must not break
-        // same-replica reconnect).
-        let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
-        let session_id = store
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        store
-            .transition_session_to_operational(&session_id)
-            .expect("transition");
-        // Opening the stream allocates the active stream and a priming event.
-        store
-            .open_sse_stream(Some(&session_id), None)
-            .expect("open stream");
-
-        let delivery_id = "00000000000000000001-feedface";
-        let delivered = store
-            .stream_delivery_message(
-                &session_id,
-                r#"{"jsonrpc":"2.0","id":9,"result":{"ok":true}}"#,
-                delivery_id,
-            )
-            .expect("delivery streamed");
-        assert_eq!(delivered.len(), 1);
-        // The wire event id carries the opaque suffix.
-        assert!(delivered[0].event_id.ends_with(&format!("@{delivery_id}")));
-
-        // Resume echoing the suffixed id: the record is found (not Expired)
-        // and nothing after it exists, so the replay set is empty.
-        let resume = crate::runtime::ResumeCursor {
-            last_event_id: delivered[0].event_id.clone(),
-        };
-        let resumed = store
-            .open_sse_stream(Some(&session_id), Some(&resume))
-            .expect("resume must locate the delivery-tagged cursor");
-        assert!(resumed.is_empty());
+        assert!(store.load_session(&id).is_some());
     }
 
     #[test]
     fn bind_session_owner_round_trips_via_snapshot() {
         let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
-        let id = store
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
+        let id = store.create_session().session_id;
         // A freshly created session has no owner until bound.
-        assert!(
-            store
-                .load_session(Some(&id), false)
-                .unwrap()
-                .owner_principal
-                .is_none()
-        );
+        assert!(store.load_session(&id).unwrap().owner_principal.is_none());
         store.bind_session_owner(&id, Some("alice"));
         assert_eq!(
-            store
-                .load_session(Some(&id), false)
-                .unwrap()
-                .owner_principal
-                .as_deref(),
+            store.load_session(&id).unwrap().owner_principal.as_deref(),
             Some("alice")
+        );
+    }
+
+    /// A row carries the session's owner and times and nothing else: no
+    /// stream, replay or log-level state is ever written into it.
+    #[test]
+    fn a_row_holds_no_stream_or_replay_state() {
+        let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
+        let id = store.create_session().session_id;
+        store.bind_session_owner(&id, Some("alice"));
+        let entry =
+            futures::executor::block_on(store.state.get(&KvBackedSessionStore::session_key(&id)))
+                .unwrap()
+                .expect("row written");
+        let row: serde_json::Value = serde_json::from_slice(&entry.bytes).unwrap();
+        let mut keys: Vec<&str> = row
+            .as_object()
+            .expect("a row is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "created_at",
+                "last_seen_at",
+                "owner_principal",
+                "session_id"
+            ]
+        );
+    }
+
+    /// A row a replica of an earlier build wrote, with stream and handshake
+    /// fields beside the owner, still reads back.
+    #[test]
+    fn a_row_with_fields_this_build_does_not_keep_still_reads() {
+        let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
+        let now = Utc::now().to_rfc3339();
+        let row = serde_json::json!({
+            "session_id": "s-old",
+            "protocol_version": "x",
+            "phase": "Operational",
+            "streams": {},
+            "owner_principal": "verified::idp::iss::alice",
+            "last_seen_at": now,
+            "created_at": now,
+        });
+        futures::executor::block_on(store.state.put(
+            &KvBackedSessionStore::session_key("s-old"),
+            bytes::Bytes::from(serde_json::to_vec(&row).unwrap()),
+            None,
+        ))
+        .unwrap();
+        let snapshot = store.load_session("s-old").expect("reads back");
+        assert_eq!(
+            snapshot.owner_principal.as_deref(),
+            Some("verified::idp::iss::alice")
         );
     }
 
@@ -2172,11 +1406,8 @@ mod tests {
             )
             .await
             .expect("store created");
-            let snapshot = store.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
-            session_id = snapshot.session_id.clone();
-            store
-                .transition_session_to_operational(&session_id)
-                .expect("transition");
+            session_id = store.create_session().session_id;
+            store.bind_session_owner(&session_id, Some("alice"));
         }
 
         {
@@ -2186,12 +1417,9 @@ mod tests {
             )
             .await
             .expect("store created");
-            let snapshot = store
-                .load_session(Some(&session_id), true)
-                .expect("session recovered");
+            let snapshot = store.load_session(&session_id).expect("session recovered");
             assert_eq!(snapshot.session_id, session_id);
-            assert_eq!(snapshot.phase, SessionPhase::Operational);
-            assert_eq!(snapshot.protocol_version, SUPPORTED_PROTOCOL_VERSION);
+            assert_eq!(snapshot.owner_principal.as_deref(), Some("alice"));
         }
     }
 
@@ -2210,57 +1438,16 @@ mod tests {
             .await
             .expect("store B");
 
-        let snapshot = store_a.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
-        let session_id = snapshot.session_id.clone();
-        store_a
-            .transition_session_to_operational(&session_id)
-            .expect("transition on A");
+        let session_id = store_a.create_session().session_id;
+        store_a.bind_session_owner(&session_id, Some("alice"));
 
         // B never saw this session locally; the read path must hydrate it
-        // from the shared KV instead of returning UnknownSession.
+        // from the shared KV instead of finding nothing.
         let recovered = store_b
-            .load_session(Some(&session_id), true)
+            .load_session(&session_id)
             .expect("B resolves the session via KV read-back");
         assert_eq!(recovered.session_id, session_id);
-        assert_eq!(recovered.phase, SessionPhase::Operational);
-        assert_eq!(recovered.protocol_version, SUPPORTED_PROTOCOL_VERSION);
-        assert_eq!(
-            store_b.session_protocol_version(&session_id).as_deref(),
-            Some(SUPPORTED_PROTOCOL_VERSION),
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn initialized_on_one_replica_is_operational_on_the_one_that_created_it() {
-        // Round-robin without affinity: `initialize` lands on A,
-        // `notifications/initialized` on B, the next call on A again. A's own
-        // copy still awaits the notification; it must take the shared phase.
-        let shared_kv: std::sync::Arc<dyn mcpg_cluster_api::KeyValueStore> =
-            std::sync::Arc::new(crate::builtins::cluster_primitives::MemoryKv::new());
-        let store_a = KvBackedSessionStore::new(SessionStoreConfig::default(), shared_kv.clone())
-            .await
-            .expect("store A")
-            .shared_across_replicas(true);
-        let store_b = KvBackedSessionStore::new(SessionStoreConfig::default(), shared_kv.clone())
-            .await
-            .expect("store B")
-            .shared_across_replicas(true);
-
-        let snapshot = store_a.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
-        let session_id = snapshot.session_id.clone();
-        assert!(matches!(
-            store_a.load_session(Some(&session_id), true),
-            Err(SessionAccessError::NotInitialized)
-        ));
-
-        store_b
-            .transition_session_to_operational(&session_id)
-            .expect("notifications/initialized on B");
-
-        let on_a = store_a
-            .load_session(Some(&session_id), true)
-            .expect("A sees the session operational");
-        assert_eq!(on_a.phase, SessionPhase::Operational);
+        assert_eq!(recovered.owner_principal.as_deref(), Some("alice"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2277,8 +1464,7 @@ mod tests {
             .await
             .expect("store B");
 
-        let snapshot = store_a.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
-        let session_id = snapshot.session_id.clone();
+        let session_id = store_a.create_session().session_id;
 
         // B terminates a session it never saw locally → must clear KV.
         assert!(store_b.terminate_session(&session_id).is_some());
@@ -2288,10 +1474,7 @@ mod tests {
         let store_c = KvBackedSessionStore::new(SessionStoreConfig::default(), shared_kv.clone())
             .await
             .expect("store C");
-        assert!(matches!(
-            store_c.load_session(Some(&session_id), false),
-            Err(SessionAccessError::UnknownSession)
-        ));
+        assert!(store_c.load_session(&session_id).is_none());
     }
 
     fn short_idle_config() -> SessionStoreConfig {
@@ -2302,9 +1485,7 @@ mod tests {
     }
 
     fn owned_session(store: &KvBackedSessionStore, owner: Option<&str>) -> String {
-        let id = store
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
+        let id = store.create_session().session_id;
         store.bind_session_owner(&id, owner);
         id
     }
@@ -2381,7 +1562,7 @@ mod tests {
         let slot = format!("{}{id}", KvBackedSessionStore::tenant_slot_prefix("dave"));
         assert!(futures::executor::block_on(kv.delete(&slot)).unwrap());
 
-        a.transition_session_to_operational(&id).unwrap();
+        a.bind_session_owner(&id, Some("dave"));
         let entry = futures::executor::block_on(kv.get(&slot))
             .unwrap()
             .expect("written again");
@@ -2403,9 +1584,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn session_alive_answers_for_the_fleet() {
         let (_kv, a, b) = shared_pair(short_idle_config()).await;
-        let id = a
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
+        let id = a.create_session().session_id;
         assert_eq!(a.session_alive(&id), Some(true));
         assert_eq!(b.session_alive(&id), Some(true), "B reads A's row");
         assert_eq!(b.session_alive("never-created"), Some(false));
@@ -2425,9 +1604,7 @@ mod tests {
             session_idle_timeout_ms: 1,
             ..SessionStoreConfig::default()
         });
-        let id = idle
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
+        let id = idle.create_session().session_id;
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         assert_eq!(
             idle.session_alive(&id),
@@ -2437,9 +1614,7 @@ mod tests {
 
         let own =
             KvBackedSessionStore::new_in_memory(SessionStoreConfig::default()).fleet_visible(false);
-        let id = own
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
+        let id = own.create_session().session_id;
         assert_eq!(own.session_alive(&id), None);
     }
 
@@ -2480,23 +1655,19 @@ mod tests {
         let (_kv, a, b) = shared_pair(short_idle_config()).await;
         let (evicted_tx, mut evicted_rx) = tokio::sync::mpsc::unbounded_channel();
         b.set_end_notifier(evicted_tx);
-        let session_id = a
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        a.transition_session_to_operational(&session_id).unwrap();
-        b.load_session(Some(&session_id), true)
-            .expect("B adopts the session");
+        let session_id = a.create_session().session_id;
+        b.load_session(&session_id).expect("B adopts the session");
 
         // A serves the session for longer than the idle timeout; B's own
         // copy goes idle meanwhile.
         let until = std::time::Instant::now() + std::time::Duration::from_millis(2_600);
         while std::time::Instant::now() < until {
-            a.load_session(Some(&session_id), true).expect("live on A");
+            a.load_session(&session_id).expect("live on A");
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
         let on_b = b
-            .load_session(Some(&session_id), true)
+            .load_session(&session_id)
             .expect("B takes the shared row instead of expiring a session in use");
         assert_eq!(on_b.session_id, session_id);
         assert!(
@@ -2510,19 +1681,13 @@ mod tests {
         let (kv, a, b) = shared_pair(short_idle_config()).await;
         let (evicted_tx, mut evicted_rx) = tokio::sync::mpsc::unbounded_channel();
         b.set_end_notifier(evicted_tx);
-        let session_id = a
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        a.transition_session_to_operational(&session_id).unwrap();
-        b.load_session(Some(&session_id), true).unwrap();
+        let session_id = a.create_session().session_id;
+        b.load_session(&session_id).unwrap();
         // The idle timeout, and the refresh interval a replica in use may
         // hold its touch back for.
         tokio::time::sleep(std::time::Duration::from_millis(3_300)).await;
 
-        assert!(matches!(
-            b.load_session(Some(&session_id), true),
-            Err(SessionAccessError::UnknownSession)
-        ));
+        assert!(b.load_session(&session_id).is_none());
         let ended = evicted_rx.try_recv().expect("the end is told");
         assert_eq!(ended.session_id, session_id);
         assert_eq!(ended.reason, SessionEndReason::IdleExpired);
@@ -2539,15 +1704,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_row_within_a_refresh_interval_of_idle_is_still_in_use() {
         let (_kv, a, b) = shared_pair(short_idle_config()).await;
-        let session_id = a
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        a.transition_session_to_operational(&session_id).unwrap();
-        b.load_session(Some(&session_id), true).unwrap();
+        let session_id = a.create_session().session_id;
+        b.load_session(&session_id).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(2_300)).await;
 
         assert!(
-            b.load_session(Some(&session_id), true).is_ok(),
+            b.load_session(&session_id).is_some(),
             "idle for 2.3 s of a 2 s timeout, within the 1 s refresh interval"
         );
     }
@@ -2560,21 +1722,15 @@ mod tests {
         let (kv, a, b) = shared_pair(short_idle_config()).await;
         let (end_tx, mut end_rx) = tokio::sync::mpsc::unbounded_channel();
         b.set_end_notifier(end_tx);
-        let session_id = a
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        a.transition_session_to_operational(&session_id).unwrap();
-        b.load_session(Some(&session_id), true)
+        let session_id = a.create_session().session_id;
+        b.load_session(&session_id)
             .expect("B serves the session too");
         let ended = a.terminate_session(&session_id).expect("A ends it");
         assert!(ended.recorded, "A records the end");
 
         // The verify interval of a 2 s idle timeout is its 1 s refresh interval.
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-        assert!(matches!(
-            b.load_session(Some(&session_id), true),
-            Err(SessionAccessError::UnknownSession)
-        ));
+        assert!(b.load_session(&session_id).is_none());
         let told = end_rx.try_recv().expect("B tells its runtime");
         assert_eq!(told.session_id, session_id);
         assert_eq!(told.reason, SessionEndReason::Terminated);
@@ -2588,11 +1744,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_row_written_after_the_end_does_not_bring_the_session_back() {
         let (kv, a, b) = shared_pair(SessionStoreConfig::default()).await;
-        let session_id = a
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        a.transition_session_to_operational(&session_id).unwrap();
-        b.load_session(Some(&session_id), true).unwrap();
+        let session_id = a.create_session().session_id;
+        b.load_session(&session_id).unwrap();
         let in_flight = b.sessions.get(&session_id).unwrap().clone();
         assert!(a.terminate_session(&session_id).is_some());
 
@@ -2605,10 +1758,7 @@ mod tests {
             .await
             .expect("store C")
             .shared_across_replicas(true);
-        assert!(matches!(
-            c.load_session(Some(&session_id), false),
-            Err(SessionAccessError::UnknownSession)
-        ));
+        assert!(c.load_session(&session_id).is_none());
         assert_eq!(c.session_alive(&session_id), Some(false));
     }
 
@@ -2653,11 +1803,8 @@ mod tests {
         a.set_end_notifier(a_tx);
         let (b_tx, mut b_rx) = tokio::sync::mpsc::unbounded_channel();
         b.set_end_notifier(b_tx);
-        let session_id = a
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        a.transition_session_to_operational(&session_id).unwrap();
-        b.load_session(Some(&session_id), true).unwrap();
+        let session_id = a.create_session().session_id;
+        b.load_session(&session_id).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(3_300)).await;
 
         a.evict_if_expired(&session_id);
@@ -2675,15 +1822,12 @@ mod tests {
     async fn the_end_of_a_session_does_not_end_a_later_one_under_its_id() {
         let (_kv, a, b) = shared_pair(SessionStoreConfig::default()).await;
         let id = "mcpg-m-same";
-        let first = a.create_session_with_id(id, SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+        let first = a.create_session_with_id(id);
         assert!(a.terminate_session(id).is_some());
-        let second = a.create_session_with_id(id, SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+        let second = a.create_session_with_id(id);
         assert_ne!(first.created_at, second.created_at);
 
-        assert!(
-            b.load_session(Some(id), false).is_ok(),
-            "the later session reads back"
-        );
+        assert!(b.load_session(id).is_some(), "the later session reads back");
         assert!(
             b.drop_ended_session(id, first.created_at).is_none(),
             "the word of the earlier end leaves it"
@@ -2697,10 +1841,7 @@ mod tests {
     #[tokio::test]
     async fn the_streams_of_a_session_end_with_it() {
         let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
-        let id = store
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        store.transition_session_to_operational(&id).unwrap();
+        let id = store.create_session().session_id;
         drop(store.session_lifetime(&id).expect("a copy is held"));
         assert!(
             store.lifetimes.is_empty(),
@@ -2724,118 +1865,12 @@ mod tests {
         );
     }
 
-    fn operational_session(store: &KvBackedSessionStore) -> String {
-        let id = store
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        store.transition_session_to_operational(&id).unwrap();
-        id
-    }
-
-    fn resume(store: &KvBackedSessionStore, id: &str, event: &SseEventRecord) -> StreamAccessError {
-        store
-            .open_sse_stream(
-                Some(id),
-                Some(&ResumeCursor {
-                    last_event_id: event.event_id.clone(),
-                }),
-            )
-            .err()
-            .unwrap_or(StreamAccessError::UnknownSession)
-    }
-
-    /// Every request opens a stream; a session keeps the replay of its most
-    /// recent ones, so its row stays small however many requests it serves.
-    #[test]
-    fn a_session_keeps_the_replay_of_its_recent_streams_only() {
-        let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
-        let id = operational_session(&store);
-        let mut answers = Vec::new();
-        for _ in 0..200 {
-            answers.push(
-                store
-                    .stream_protocol_response(&id, &ProtocolResponse::NotificationAccepted)
-                    .unwrap(),
-            );
-        }
-        let kept = store.sessions.get(&id).unwrap().streams.len();
-        assert_eq!(kept, RETAINED_STREAMS, "streams kept after 200 requests");
-
-        let last = answers.last().unwrap().last().unwrap();
-        assert!(
-            store
-                .open_sse_stream(
-                    Some(&id),
-                    Some(&ResumeCursor {
-                        last_event_id: answers[199][0].event_id.clone(),
-                    }),
-                )
-                .unwrap()
-                .contains(last),
-            "the latest stream resumes"
-        );
-        assert_eq!(
-            resume(&store, &id, &answers[0][0]),
-            StreamAccessError::ExpiredCursor,
-            "a retired stream is an expired cursor, not an invalid one"
-        );
-        assert_eq!(
-            resume(
-                &store,
-                &id,
-                &SseEventRecord {
-                    event_id: "stream-9999:0".to_owned(),
-                    data: String::new(),
-                    retry_ms: None,
-                }
-            ),
-            StreamAccessError::InvalidCursor
-        );
-    }
-
-    /// A response stream holds its whole result: the replay drops the
-    /// oldest streams once their events pass the byte budget.
-    #[test]
-    fn large_results_keep_the_replay_under_its_byte_budget() {
-        let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
-        let id = operational_session(&store);
-        let result = serde_json::json!({ "text": "x".repeat(100 * 1024) });
-        for n in 0..10 {
-            let answer = ProtocolResponse::JsonRpcSuccess(crate::protocol::JsonRpcSuccess {
-                jsonrpc: JSONRPC_VERSION,
-                id: serde_json::json!(n),
-                result: result.clone(),
-            });
-            store.stream_protocol_response(&id, &answer).unwrap();
-        }
-        let session = store.sessions.get(&id).unwrap();
-        let bytes: usize = session
-            .streams
-            .values()
-            .map(StoredStream::replay_bytes)
-            .sum();
-        assert!(
-            bytes <= RETAINED_REPLAY_BYTES,
-            "{bytes} bytes of replay in {} streams",
-            session.streams.len()
-        );
-        assert!(
-            session
-                .streams
-                .contains_key(session.active_stream_id.as_deref().unwrap()),
-            "the active stream stays"
-        );
-    }
-
     /// The word of an end another replica recorded ends this replica's
     /// streams of the session, though the copy has left its working set.
     #[test]
     fn the_word_of_an_end_ends_the_streams_here() {
         let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
-        let id = store
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
-        store.transition_session_to_operational(&id).unwrap();
+        let id = store.create_session().session_id;
         let created_at = store.sessions.get(&id).unwrap().created_at;
         let ended = store.session_lifetime(&id).unwrap().ended();
         store.sessions.remove(&id);
@@ -2856,9 +1891,7 @@ mod tests {
         .await
         .unwrap()
         .shared_across_replicas(true);
-        let id = store
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
+        let id = store.create_session().session_id;
         backdate_session(&store, &id, chrono::Duration::hours(1));
         let idle = store.sessions.get(&id).unwrap().clone();
         assert!(store.persist_session(&idle), "the row is idle too");
@@ -2950,9 +1983,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_read_refreshes_the_shared_row_at_most_once_per_interval() {
         let (kv, a, _b) = shared_pair(short_idle_config()).await;
-        let session_id = a
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params())
-            .session_id;
+        let session_id = a.create_session().session_id;
         let (created, expires_at) = shared_row(&kv, &session_id).expect("row written");
         let ttl = expires_at
             .expect("the row has a TTL")
@@ -2963,7 +1994,7 @@ mod tests {
             "idle timeout plus two refresh intervals, got {ttl:?}"
         );
 
-        a.load_session(Some(&session_id), false).unwrap();
+        a.load_session(&session_id).unwrap();
         let (unchanged, _) = shared_row(&kv, &session_id).unwrap();
         assert_eq!(
             unchanged.last_seen_at, created.last_seen_at,
@@ -2971,7 +2002,7 @@ mod tests {
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-        a.load_session(Some(&session_id), false).unwrap();
+        a.load_session(&session_id).unwrap();
         let (refreshed, _) = shared_row(&kv, &session_id).unwrap();
         assert!(
             refreshed.last_seen_at > created.last_seen_at,
@@ -2989,7 +2020,7 @@ mod tests {
             )
             .await
             .expect("store created");
-            let snapshot = store.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+            let snapshot = store.create_session();
             assert!(store.terminate_session(&snapshot.session_id).is_some());
             snapshot.session_id
         };
@@ -2998,112 +2029,36 @@ mod tests {
             KvBackedSessionStore::new_with_file(SessionStoreConfig::default(), data_dir.clone())
                 .await
                 .expect("store created");
-        let result = store.load_session(Some(&session_id), false);
-        assert!(matches!(result, Err(SessionAccessError::UnknownSession)));
+        assert!(store.load_session(&session_id).is_none());
     }
 
+    /// `mcpg_active_sessions` goes up once per row a create inserts and down
+    /// once per end this replica records: an idempotent create, a read-back
+    /// and the end another replica records move it not at all.
     #[tokio::test(flavor = "multi_thread")]
-    async fn file_backed_store_recovers_stream_replay_state() {
-        let (_dir, data_dir) = temp_data_dir();
-        let session_id;
-        let original_events;
+    async fn the_active_sessions_gauge_balances() {
+        let (_kv, a, b) = shared_pair(short_idle_config()).await;
+        let probe = active_sessions_probe::ActiveSessions::default();
+        probe.watch(|| {
+            let first = a.create_session().session_id;
+            let derived = a.create_session_with_id("mcpg-m-gauge").session_id;
+            assert_eq!(a.create_session_with_id("mcpg-m-gauge").session_id, derived);
+            assert_eq!(probe.net(), 2, "two rows, one of them created twice");
 
-        {
-            let store = KvBackedSessionStore::new_with_file(
-                SessionStoreConfig::default(),
-                data_dir.clone(),
-            )
-            .await
-            .expect("store created");
-            let snapshot = store.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
-            session_id = snapshot.session_id.clone();
-            store
-                .transition_session_to_operational(&session_id)
-                .expect("transition");
-            original_events = store
-                .open_sse_stream(Some(&session_id), None)
-                .expect("open stream");
-            assert!(!original_events.is_empty());
-        }
+            b.load_session(&first).expect("B reads A's row back");
+            assert_eq!(probe.net(), 2, "a read-back creates nothing");
 
-        {
-            let store = KvBackedSessionStore::new_with_file(
-                SessionStoreConfig::default(),
-                data_dir.clone(),
-            )
-            .await
-            .expect("store created");
-            let snapshot = store
-                .load_session(Some(&session_id), true)
-                .expect("session recovered");
-            assert_eq!(snapshot.phase, SessionPhase::Operational);
-
-            let resume = crate::runtime::ResumeCursor {
-                last_event_id: original_events[0].event_id.clone(),
-            };
-            let resumed = store
-                .open_sse_stream(Some(&session_id), Some(&resume))
-                .expect("resume stream");
-            assert_eq!(resumed.len(), original_events.len() - 1);
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn file_backed_store_log_level_persists() {
-        let (_dir, data_dir) = temp_data_dir();
-        let session_id;
-
-        {
-            let store = KvBackedSessionStore::new_with_file(
-                SessionStoreConfig::default(),
-                data_dir.clone(),
-            )
-            .await
-            .expect("store created");
-            let snapshot = store.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
-            session_id = snapshot.session_id.clone();
-            store
-                .transition_session_to_operational(&session_id)
-                .expect("transition");
-            store
-                .set_session_log_level(Some(&session_id), LoggingLevel::Debug)
-                .expect("set log level");
-        }
-
-        {
-            let store = KvBackedSessionStore::new_with_file(
-                SessionStoreConfig::default(),
-                data_dir.clone(),
-            )
-            .await
-            .expect("store created");
-            let snapshot = store
-                .load_session(Some(&session_id), true)
-                .expect("session recovered");
-            assert_eq!(snapshot.log_level, LoggingLevel::Debug);
-        }
+            assert!(a.terminate_session(&first).unwrap().recorded);
+            assert!(!b.terminate_session(&first).is_some_and(|end| end.recorded));
+            assert!(a.terminate_session(&derived).unwrap().recorded);
+            assert_eq!(probe.net(), 0, "every row created is ended once");
+        });
     }
 }
 
 #[cfg(test)]
 mod session_limit_store_tests {
     use super::*;
-    use crate::protocol::{ImplementationInfo, InitializeParams, SUPPORTED_PROTOCOL_VERSION};
-
-    fn test_init_params() -> InitializeParams {
-        InitializeParams {
-            protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-            capabilities: Default::default(),
-            client_info: ImplementationInfo {
-                name: "test-client".to_owned(),
-                title: None,
-                version: "0.1.0".to_owned(),
-                description: None,
-                website_url: None,
-                icons: None,
-            },
-        }
-    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn file_backed_store_enforces_max_sessions() {
@@ -3119,16 +2074,16 @@ mod session_limit_store_tests {
         .await
         .expect("store created");
 
-        let snap1 = store.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+        let snap1 = store.create_session();
         assert!(!snap1.session_id.is_empty(), "first session should succeed");
 
-        let snap2 = store.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+        let snap2 = store.create_session();
         assert!(
             !snap2.session_id.is_empty(),
             "second session should succeed"
         );
 
-        let snap3 = store.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+        let snap3 = store.create_session();
         assert!(
             snap3.session_id.is_empty(),
             "third session should be rejected"
@@ -3142,31 +2097,36 @@ mod session_limit_store_tests {
             ..Default::default()
         });
 
-        let snap1 = store.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+        let snap1 = store.create_session();
         assert!(!snap1.session_id.is_empty(), "first session should succeed");
 
-        let snap2 = store.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+        let snap2 = store.create_session();
         assert!(
             snap2.session_id.is_empty(),
             "second session should be rejected"
+        );
+        assert!(
+            store
+                .create_session_with_id("mcpg-m-over")
+                .session_id
+                .is_empty(),
+            "a derived id is refused at the limit too"
         );
     }
 
     #[test]
     fn create_session_with_id_uses_the_supplied_id_and_is_idempotent() {
-        // Modern stateless mode derives a deterministic id per principal;
-        // the store must honour it and converge on one session for repeat
-        // calls (concurrent cross-replica creates of the same id).
+        // Every replica derives the same id for a principal; the store must
+        // honour it and converge on one session for repeat calls
+        // (concurrent cross-replica creates of the same id).
         let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig::default());
         let sid = "mcpg-m-deadbeef";
-        let snap1 =
-            store.create_session_with_id(sid, SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+        let snap1 = store.create_session_with_id(sid);
         assert_eq!(snap1.session_id, sid, "must use the caller-supplied id");
 
         // A second call with the same id returns the SAME session, not a new
-        // one — so two replicas racing the same deterministic id agree.
-        let snap2 =
-            store.create_session_with_id(sid, SUPPORTED_PROTOCOL_VERSION, &test_init_params());
+        // one — so two replicas racing the same derived id agree.
+        let snap2 = store.create_session_with_id(sid);
         assert_eq!(snap2.session_id, sid);
         assert_eq!(
             snap1.created_at, snap2.created_at,
@@ -3174,14 +2134,14 @@ mod session_limit_store_tests {
         );
 
         // And it is loadable by that id (the cross-replica read path).
-        assert!(store.load_session(Some(sid), false).is_ok());
+        assert!(store.load_session(sid).is_some());
     }
 
     #[test]
     fn idle_eviction_forwards_the_session_id_to_the_notifier() {
-        // A session the client never terminates is dropped by idle expiry; the
-        // runtime cleanup cascade needs that id, so the store must forward it
-        // on the eviction channel.
+        // A session nobody terminates is dropped by idle expiry; the runtime
+        // cleanup cascade needs that id, so the store must forward it on the
+        // eviction channel.
         let store = KvBackedSessionStore::new_in_memory(SessionStoreConfig {
             session_idle_timeout_ms: 1,
             ..SessionStoreConfig::default()
@@ -3189,8 +2149,7 @@ mod session_limit_store_tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EndedSession>();
         store.set_end_notifier(tx);
 
-        let snap = store.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
-        let sid = snap.session_id.clone();
+        let sid = store.create_session().session_id;
         assert!(store.contains_active_session(&sid));
 
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3207,61 +2166,33 @@ mod session_limit_store_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn legacy_create_session_is_create_once_against_shared_kv() {
-        // RF-4: the legacy create persists with `put_if_absent`, so a live row
-        // already in the shared KV under the same id is never clobbered by a
-        // re-create. Pre-seed the KV with a session whose phase has advanced,
-        // then drive a second replica's create at the SAME id — the seeded
-        // row must survive (last-writer-wins would have reset it).
+    async fn create_session_is_create_once_against_shared_kv() {
+        // The create persists with `put_if_absent`, so a live row already in
+        // the shared KV under the same id is never clobbered by a re-create.
         let shared_kv: std::sync::Arc<dyn mcpg_cluster_api::KeyValueStore> =
             std::sync::Arc::new(crate::builtins::cluster_primitives::MemoryKv::new());
         let store_a = KvBackedSessionStore::new(SessionStoreConfig::default(), shared_kv.clone())
             .await
             .expect("store A");
 
-        let snap = store_a.create_session(SUPPORTED_PROTOCOL_VERSION, &test_init_params());
-        let sid = snap.session_id.clone();
-        store_a
-            .transition_session_to_operational(&sid)
-            .expect("advance A's session phase");
+        let sid = store_a.create_session().session_id;
+        store_a.bind_session_owner(&sid, Some("alice"));
 
-        // A second replica that has the SAME id in its working set (e.g. it
-        // minted an identical id, the pathological create-once case) must not
-        // overwrite the live shared row with a fresh AwaitingInitialized one.
-        let live = store_a.load_session(Some(&sid), false).expect("A live");
-        assert_eq!(live.phase, SessionPhase::Operational);
-
+        // A second replica that minted the SAME id (the pathological
+        // create-once case) must not overwrite the live shared row with a
+        // fresh unowned one.
         let store_b = KvBackedSessionStore::new(SessionStoreConfig::default(), shared_kv.clone())
             .await
             .expect("store B");
-        // Force B to attempt a create-once write for the existing id by
-        // round-tripping through the create-once persister directly.
-        let now = Utc::now();
-        let clobber = StoredSession {
-            session_id: sid.clone(),
-            protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-            client_info: test_init_params().client_info,
-            client_capabilities: test_init_params().capabilities,
-            phase: SessionPhase::AwaitingInitialized,
-            log_level: LoggingLevel::Info,
-            next_stream_ordinal: 0,
-            streams: HashMap::new(),
-            active_stream_id: None,
-            owner_principal: None,
-            tenant_slot: false,
-            last_seen_at: now,
-            created_at: now,
-            written_at_ms: 0,
-            verified_at_ms: 0,
-        };
+        let clobber = StoredSession::new(sid.clone());
         let wrote = store_b.persist_session_create_once(&clobber);
         assert!(!wrote, "create-once must lose to the live shared row");
 
-        // The shared row still reflects A's advanced phase.
+        // The shared row still names A's owner.
         let store_c = KvBackedSessionStore::new(SessionStoreConfig::default(), shared_kv.clone())
             .await
             .expect("store C");
-        let recovered = store_c.load_session(Some(&sid), false).expect("C resolves");
-        assert_eq!(recovered.phase, SessionPhase::Operational);
+        let recovered = store_c.load_session(&sid).expect("C resolves");
+        assert_eq!(recovered.owner_principal.as_deref(), Some("alice"));
     }
 }

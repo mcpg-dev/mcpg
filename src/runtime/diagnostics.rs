@@ -106,9 +106,8 @@ impl GatewayRuntime {
             },
         ];
 
-        // NATS readiness: the binding plugin owns its own client; the host
-        // no longer observes NATS connection state directly. Plugins can
-        // expose health via their own manifest / shutdown hooks in future.
+        // The binding plugin owns its NATS client, so the host reports no
+        // NATS readiness here.
 
         // Overall status is computed from the base checks; the cluster
         // coordinator check only affects it under the `fail` gate.

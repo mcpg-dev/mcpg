@@ -210,7 +210,7 @@ Per-variable static completion lists feed MCP `completion/complete`
 on `ref/resource`: when an MCP client opens auto-complete on a
 resource-template variable, the gateway returns the configured values
 filtered by the caller's prefix (capped at 100 per response per MCP
-2025-11-25). Keys MUST match a `{variable}` declared in `uri_template`;
+2026-07-28). Keys MUST match a `{variable}` declared in `uri_template`;
 mismatched keys are dropped at startup with a warning.
 
 Match precedence mirrors prompt-argument completion: prefix matches
@@ -345,8 +345,9 @@ control steps (`elicitation`, `sampling`, `cel_gate`, `gather`, `log`, …). See
   Supports CEL interpolation for dynamic URLs.
 - **Timeouts**: set `timeout_ms` on every backend (default 30 s is
   too long for interactive use).
-- **Long-running tools**: set `task_support: required` so the
-  client gets a `Task` handle and polls `tasks/result`.
+- **Long-running tools**: set `task_support: required` so a client
+  that declares the `io.modelcontextprotocol/tasks` extension gets a
+  task (`resultType: "task"`) and polls `tasks/get`.
 
 ---
 

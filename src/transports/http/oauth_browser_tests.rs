@@ -104,7 +104,7 @@ fn app_state_with(
             .expect("authorization server builds"),
     );
     adjust(&config, &mut runtime);
-    AppState {
+    crate::app::AppStateInner {
         config: Arc::new(ArcSwap::from_pointee(config.clone())),
         base_config: Arc::new(ArcSwap::from_pointee(config)),
         registry_overlay: Arc::new(ArcSwap::from_pointee(
@@ -117,7 +117,7 @@ fn app_state_with(
             ),
         ),
         observability: Arc::new(crate::observability::ObservabilityHandle::default()),
-        config_sources: Vec::new(),
+        config_sources: Arc::from([]),
         sse_stream_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         config_overlay: Arc::new(ArcSwap::from_pointee(serde_json::Value::Object(
             serde_json::Map::new(),
@@ -128,6 +128,7 @@ fn app_state_with(
         #[cfg(feature = "governance-quotas")]
         quota_gate: Arc::new(arc_swap::ArcSwap::from_pointee(None)),
     }
+    .into()
 }
 
 fn gateway(authorization_server: Option<serde_json::Value>) -> Router {

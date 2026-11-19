@@ -205,7 +205,6 @@ fn load_uses_defaults_without_file() {
     assert_eq!(config.gateway.server.health_path, "/health");
     assert_eq!(config.gateway.server.mcp_path, "/mcp");
     assert!(config.gateway.server.allowed_origins.is_empty());
-    assert_eq!(config.gateway.server.replay_window_limit, 16);
     assert_eq!(config.gateway.server.session_idle_timeout_ms, 900_000);
     let command_profile = config
         .debug
@@ -330,7 +329,6 @@ fn load_merges_yaml_file() {
         mcp_path: /gateway/mcp
         allowed_origins:
             - http://localhost:3000
-        replay_window_limit: 32
         session_idle_timeout_ms: 1800
 feature_flags:
     debug_tools_enabled: true
@@ -409,7 +407,6 @@ governance:
         config.gateway.server.allowed_origins,
         vec!["http://localhost:3000"]
     );
-    assert_eq!(config.gateway.server.replay_window_limit, 32);
     assert_eq!(config.gateway.server.session_idle_timeout_ms, 1800);
     let command_profile = config
         .debug
@@ -494,7 +491,6 @@ fn validate_rejects_invalid_health_path() {
                 health_path: "health".to_owned(),
                 mcp_path: "/mcp".to_owned(),
                 allowed_origins: Vec::new(),
-                replay_window_limit: 16,
                 session_idle_timeout_ms: 900_000,
                 shutdown_timeout_ms: 30_000,
                 request_timeout_ms: 30_000,
@@ -508,13 +504,9 @@ fn validate_rejects_invalid_health_path() {
                 browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
-                relax_request_id_uniqueness: false,
-                unary_json_fast_path: false,
                 access_log: true,
-                enforce_modern_request_meta: false,
-                legacy_wire: true,
+                enforce_request_meta: false,
                 scrub_process_env_after_boot: false,
-                server_ping_interval_ms: None,
                 max_sessions_per_tenant: 0,
                 extra_resource_uri_schemes: Vec::new(),
                 max_request_body_mb: 4,
@@ -730,7 +722,6 @@ fn validate_rejects_invalid_mcp_path() {
                 health_path: "/health".to_owned(),
                 mcp_path: "mcp".to_owned(),
                 allowed_origins: Vec::new(),
-                replay_window_limit: 16,
                 session_idle_timeout_ms: 900_000,
                 shutdown_timeout_ms: 30_000,
                 request_timeout_ms: 30_000,
@@ -744,13 +735,9 @@ fn validate_rejects_invalid_mcp_path() {
                 browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
-                relax_request_id_uniqueness: false,
-                unary_json_fast_path: false,
                 access_log: true,
-                enforce_modern_request_meta: false,
-                legacy_wire: true,
+                enforce_request_meta: false,
                 scrub_process_env_after_boot: false,
-                server_ping_interval_ms: None,
                 max_sessions_per_tenant: 0,
                 extra_resource_uri_schemes: Vec::new(),
                 max_request_body_mb: 4,
@@ -787,7 +774,6 @@ fn validate_rejects_empty_allowed_origin() {
                 health_path: "/health".to_owned(),
                 mcp_path: "/mcp".to_owned(),
                 allowed_origins: vec![String::new()],
-                replay_window_limit: 16,
                 session_idle_timeout_ms: 900_000,
                 shutdown_timeout_ms: 30_000,
                 request_timeout_ms: 30_000,
@@ -801,70 +787,9 @@ fn validate_rejects_empty_allowed_origin() {
                 browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
-                relax_request_id_uniqueness: false,
-                unary_json_fast_path: false,
                 access_log: true,
-                enforce_modern_request_meta: false,
-                legacy_wire: true,
+                enforce_request_meta: false,
                 scrub_process_env_after_boot: false,
-                server_ping_interval_ms: None,
-                max_sessions_per_tenant: 0,
-                extra_resource_uri_schemes: Vec::new(),
-                max_request_body_mb: 4,
-                tls: None,
-                tunnel: None,
-                tunnel_federation: None,
-                transport: TransportMode::Http,
-                transports: Vec::new(),
-                allow_private_backends: false,
-                health_check: crate::config::HealthCheckConfig::default(),
-            },
-            ..Default::default()
-        },
-        observability: ObservabilityConfig {
-            logs: LogsConfig::default(),
-            ..ObservabilityConfig::default()
-        },
-        governance: GovernanceConfig {
-            policy: PolicyConfig::default(),
-            ..Default::default()
-        },
-        ..AppConfig::default()
-    };
-
-    assert!(config.validate().is_err());
-}
-
-#[test]
-fn validate_rejects_zero_replay_window_limit() {
-    let config = AppConfig {
-        gateway: GatewayConfig {
-            server: ServerConfig {
-                bind_address: "127.0.0.1:8787".to_owned(),
-                health_path: "/health".to_owned(),
-                mcp_path: "/mcp".to_owned(),
-                allowed_origins: Vec::new(),
-                replay_window_limit: 0,
-                session_idle_timeout_ms: 900_000,
-                shutdown_timeout_ms: 30_000,
-                request_timeout_ms: 30_000,
-                completion_rate_limit_per_sec: None,
-                anonymous_rate_limit_per_min: 0, // tests opt out of the anon limiter unless exercising it
-                anonymous_rate_limit_burst: 0,
-                trust_proxy_ip: false,
-                trust_subject_header: false,
-                cors: None,
-                canonical_url: None,
-                browser_redirect_url: None,
-                aauth_resource_metadata: None,
-                revalidate_mutated_tool_arguments: false,
-                relax_request_id_uniqueness: false,
-                unary_json_fast_path: false,
-                access_log: true,
-                enforce_modern_request_meta: false,
-                legacy_wire: true,
-                scrub_process_env_after_boot: false,
-                server_ping_interval_ms: None,
                 max_sessions_per_tenant: 0,
                 extra_resource_uri_schemes: Vec::new(),
                 max_request_body_mb: 4,
@@ -901,7 +826,6 @@ fn validate_rejects_zero_session_idle_timeout() {
                 health_path: "/health".to_owned(),
                 mcp_path: "/mcp".to_owned(),
                 allowed_origins: Vec::new(),
-                replay_window_limit: 16,
                 session_idle_timeout_ms: 0,
                 shutdown_timeout_ms: 30_000,
                 request_timeout_ms: 30_000,
@@ -915,13 +839,9 @@ fn validate_rejects_zero_session_idle_timeout() {
                 browser_redirect_url: None,
                 aauth_resource_metadata: None,
                 revalidate_mutated_tool_arguments: false,
-                relax_request_id_uniqueness: false,
-                unary_json_fast_path: false,
                 access_log: true,
-                enforce_modern_request_meta: false,
-                legacy_wire: true,
+                enforce_request_meta: false,
                 scrub_process_env_after_boot: false,
-                server_ping_interval_ms: None,
                 max_sessions_per_tenant: 0,
                 extra_resource_uri_schemes: Vec::new(),
                 max_request_body_mb: 4,
@@ -3008,7 +2928,8 @@ fn canonical_sha256_stable_across_calls() {
 fn canonical_sha256_changes_when_config_changes() {
     let baseline = AppConfig::default();
     let mut tweaked = AppConfig::default();
-    tweaked.gateway.server.replay_window_limit = baseline.gateway.server.replay_window_limit + 1;
+    tweaked.gateway.server.session_idle_timeout_ms =
+        baseline.gateway.server.session_idle_timeout_ms + 1;
     assert_ne!(baseline.canonical_sha256(), tweaked.canonical_sha256());
 }
 
@@ -3567,7 +3488,6 @@ fn pipeline_step_is_suspending_classification() {
         timeout_ms: 1000,
         mode: Default::default(),
         url: None,
-        elicitation_id: None,
         presentation_hint: None,
         meta: None,
         correlation_token: None,

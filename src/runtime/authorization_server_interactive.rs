@@ -635,8 +635,7 @@ pub enum BrowserOutcome {
 }
 
 /// A sign-in page's answer, the cookies it changes, what the audit log
-/// records of it, the IdP refresh token a newer sign-in replaced, and the
-/// MCP session a completed link tells.
+/// records of it, and the IdP refresh token a newer sign-in replaced.
 #[derive(Debug)]
 pub struct BrowserResponse {
     pub outcome: BrowserOutcome,
@@ -645,8 +644,6 @@ pub struct BrowserResponse {
     /// Revoke with [`AuthorizationServer::revoke_superseded`] once the
     /// answer is sent.
     pub superseded: Option<SupersededSignIn>,
-    /// Send `notifications/elicitation/complete` once the answer is sent.
-    pub link_completed: Option<super::connect::CompletedLink>,
 }
 
 impl BrowserResponse {
@@ -660,7 +657,6 @@ impl BrowserResponse {
             cookies: Vec::new(),
             audit: None,
             superseded: None,
-            link_completed: None,
         }
     }
 
@@ -2414,7 +2410,6 @@ impl AuthorizationServer {
             ),
         };
         response.superseded = superseded;
-        response.link_completed = link.and_then(super::connect::PendingLink::completion);
         (response, reason)
     }
 

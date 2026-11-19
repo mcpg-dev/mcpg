@@ -75,14 +75,7 @@ fn verified(subject: &str) -> RequestIdentity {
 }
 
 fn ctx(identity: RequestIdentity) -> RequestContext {
-    RequestContext::new(
-        GatewayRequestId::new(),
-        None,
-        None,
-        None,
-        identity,
-        TransportKind::Http,
-    )
+    RequestContext::new(GatewayRequestId::new(), None, identity, TransportKind::Http)
 }
 
 fn params(name: &str, cursor: Option<String>) -> PollEventsParams {

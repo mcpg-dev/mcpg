@@ -51,12 +51,11 @@ fn build_operations_state(tool: Value, operations: Value) -> (AppState, Arc<Auth
 }
 
 /// A Personal Agent's Session on the gateway: its DPoP key and Session
-/// Token, and its MCP session once connected.
+/// Token.
 struct Agent {
     app: Router,
     key: ClientDpopKey,
     token: String,
-    mcp_session: Option<String>,
     next_id: std::sync::atomic::AtomicU64,
 }
 
@@ -84,68 +83,40 @@ impl Agent {
             app: app.clone(),
             key,
             token,
-            mcp_session: None,
             next_id: std::sync::atomic::AtomicU64::new(10),
         }
     }
 
+    /// One MCP request with the Session Token and a fresh DPoP proof.
     async fn mcp(&self, body: Value) -> axum::response::Response {
-        let mut builder = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::ACCEPT, MCP_ACCEPT_HEADER)
-            .header(header::AUTHORIZATION, format!("DPoP {}", self.token))
-            .header("dpop", self.key.proof("POST", EMA_MCP_HTU, &self.token));
-        if let Some(session) = &self.mcp_session {
-            builder = builder
-                .header(
-                    PROTOCOL_VERSION_HEADER,
-                    crate::protocol::SUPPORTED_PROTOCOL_VERSION,
-                )
-                .header(SESSION_ID_HEADER, session);
-        }
+        let authorization = format!("DPoP {}", self.token);
+        let proof = self.key.proof("POST", EMA_MCP_HTU, &self.token);
         self.app
             .clone()
-            .oneshot(builder.body(Body::from(body.to_string())).expect("request"))
+            .oneshot(mcp_post_with(
+                &[("authorization", &authorization), ("dpop", &proof)],
+                body,
+            ))
             .await
             .expect("response")
     }
 
-    /// `initialize`, then `notifications/initialized`.
-    async fn connect(mut self) -> Self {
-        let initialized = self
+    /// `server/discover`, which the gateway serves only to an agent it
+    /// admits.
+    async fn connect(self) -> Self {
+        let discovered = self
             .mcp(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-11-25",
-                    "capabilities": {},
-                    "clientInfo": { "name": "personal-agent", "version": "1.0.0" },
-                },
+                "method": "server/discover",
             }))
             .await;
-        assert_eq!(initialized.status(), StatusCode::OK);
-        self.mcp_session = Some(
-            initialized
-                .headers()
-                .get(SESSION_ID_HEADER)
-                .expect("session header")
-                .to_str()
-                .expect("session id")
-                .to_owned(),
-        );
-        let ready = self
-            .mcp(serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }))
-            .await;
-        assert_eq!(ready.status(), StatusCode::ACCEPTED);
+        assert_eq!(discovered.status(), StatusCode::OK);
         self
     }
 
     /// The result of `tools/call` of the command tool with `arguments`.
     async fn call(&self, arguments: Value) -> Value {
-        // A session takes each request id once.
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -308,12 +279,7 @@ async fn an_agent_without_the_extension_is_performed_for_or_refused() {
         .mcp(serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-11-25",
-                "capabilities": {},
-                "clientInfo": { "name": "personal-agent", "version": "1.0.0" },
-            },
+            "method": "server/discover",
         }))
         .await;
     assert_eq!(refused.status(), StatusCode::FORBIDDEN);

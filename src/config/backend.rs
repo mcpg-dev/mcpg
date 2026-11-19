@@ -105,7 +105,7 @@ pub struct BackendConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quotas: Option<crate::config::quotas::BackendQuotasRef>,
 
-    // Tool hints (MCP 2025-11-25):
+    // Tool hints:
     #[serde(default)]
     pub annotations: Option<BackendAnnotationsConfig>,
     #[serde(default)]
@@ -145,7 +145,7 @@ pub struct BackendConfig {
     #[serde(default)]
     pub watch: Option<ResourceWatchConfig>,
 
-    /// MCP 2025-11-25 descriptor extensions — icons and free-form `_meta`.
+    /// MCP descriptor extensions — icons and free-form `_meta`.
     /// Populated directly on the tool/prompt/resource/template
     /// descriptor that this binding produces.
     #[serde(default)]
@@ -606,12 +606,13 @@ pub enum PipelineStepConfig {
     /// Distinct from listing the individual suspending steps in
     /// sequence (which suspends/resumes one at a time).
     Gather(PipelineGatherStepConfig),
-    /// Emit a `notifications/message` on the session's SSE
-    /// channel. Non-suspending — pipeline continues immediately.
+    /// Emit a `notifications/message` to the caller through the
+    /// session's delivery bus, when the request's `_meta` log level
+    /// admits it. Non-suspending — pipeline continues immediately.
     Log(PipelineLogStepConfig),
-    /// Emit a `notifications/progress` on the session's SSE
-    /// channel. Non-suspending. Skipped (silently) when the
-    /// inbound request didn't include a `progressToken`.
+    /// Emit a `notifications/progress` to the caller through the
+    /// session's delivery bus. Non-suspending. Skipped (silently)
+    /// when the inbound request didn't include a progress token.
     Progress(PipelineProgressStepConfig),
     /// Nested SQL container with transactional semantics.
     /// Each inner step runs against a pinned connection; any error
@@ -982,9 +983,9 @@ pub struct PipelineCelGateStepConfig {
     pub error_message: Option<String>,
 }
 
-/// Elicitation mode per MCP 2025-11-25. `form` collects a schema-driven
-/// response; `url` redirects the client to a URL and correlates the
-/// completion via `notifications/elicitation/complete`.
+/// Elicitation mode. `form` collects a schema-driven response; `url`
+/// sends the user to a URL, and the client reports the outcome when it
+/// retries the request with its `inputResponses`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PipelineElicitationMode {
@@ -1004,11 +1005,6 @@ pub struct PipelineElicitationStepConfig {
     /// URL mode: URL the client should navigate the user to.
     #[serde(default)]
     pub url: Option<String>,
-    /// URL mode: server-owned identifier the client echoes back on
-    /// `notifications/elicitation/complete`. When omitted the runtime
-    /// generates a UUID per invocation.
-    #[serde(default)]
-    pub elicitation_id: Option<String>,
     /// Presentation hint: `"inline"`, `"popup"`, or `"newWindow"`.
     #[serde(default)]
     pub presentation_hint: Option<String>,
@@ -1018,8 +1014,8 @@ pub struct PipelineElicitationStepConfig {
     #[serde(default = "default_elicitation_timeout_ms")]
     pub timeout_ms: u64,
     /// Optional override for the server-minted request id used as the
-    /// MRTR `inputRequests` correlation key (2026-07-28 modern wire).
-    /// When `None`, the runtime mints a UUID per invocation. When set,
+    /// MRTR `inputRequests` correlation key. When `None`, the runtime
+    /// mints a UUID per invocation. When set,
     /// the operator's value is used verbatim — useful for tooling that
     /// expects a known key (e.g., conformance suites, integration tests).
     /// **Caveat:** must be unique across concurrent invocations of this
@@ -1105,7 +1101,7 @@ pub struct PipelineRootsListStepConfig {
 /// downstream `transform` steps can read each result.
 ///
 /// Capability pruning: inputs whose required client capability wasn't
-/// advertised are dropped from the emitted set (the modern wire's
+/// advertised are dropped from the emitted set (the MRTR
 /// "only emit inputRequests the client supports" contract). If every
 /// input is pruned the step completes immediately with an empty
 /// output instead of suspending.
@@ -1199,10 +1195,9 @@ fn default_log_level() -> String {
 /// the next step immediately after the notification is queued.
 ///
 /// The progress token is read from the inbound request's
-/// `_meta.io.modelcontextprotocol/progressToken` (modern wire) or
-/// `_meta.progressToken` (legacy). When the caller didn't supply
-/// one, the step skips emission (silently — no progress token means
-/// the client didn't ask for streaming progress).
+/// `_meta.io.modelcontextprotocol/progressToken`. When the caller
+/// didn't supply one, the step skips emission (silently — no progress
+/// token means the client didn't ask for streaming progress).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 pub struct PipelineProgressStepConfig {
     pub id: String,

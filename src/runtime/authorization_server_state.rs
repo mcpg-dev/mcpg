@@ -686,18 +686,14 @@ pub mod keys {
         ))
     }
 
-    /// The link offered to a principal on one MCP session, told of its
-    /// completion or not (`link_by/h(principal || session || notify)`).
-    pub fn pending_link(principal: &str, session: &str, notify: bool) -> RecordKey<LinkRefRecord> {
+    /// The link offered to a principal on one MCP session
+    /// (`link_by/h(principal || session)`).
+    pub fn pending_link(principal: &str, session: &str) -> RecordKey<LinkRefRecord> {
         RecordKey::new(format_args!(
             "link_by/{}",
             handle(
                 HandleKind::Principal,
-                &[
-                    principal.as_bytes(),
-                    session.as_bytes(),
-                    if notify { b"notify" } else { b"silent" },
-                ]
+                &[principal.as_bytes(), session.as_bytes()]
             )
         ))
     }
@@ -1200,10 +1196,6 @@ pub struct LinkRecord {
     /// The MCP session the link was offered on.
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Whether that session is told when the link completes
-    /// (`notifications/elicitation/complete`).
-    #[serde(default)]
-    pub notify: bool,
     /// Until when the link may be completed, in Unix seconds.
     pub exp: u64,
 }

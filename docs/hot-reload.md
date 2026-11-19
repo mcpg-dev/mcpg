@@ -44,7 +44,7 @@ The admin endpoint is auth-gated by the existing `admin.auth` block (`disabled` 
 5. Atomically swaps the runtime via `ArcSwap`. In-flight requests on the old runtime complete safely — they hold an `Arc` to the previous runtime until they finish.
 6. Emits an audit event tagged `source: "sighup"` / `source: "admin_api"` / `source: "file_watch"` / `source: "secrets_watch"` (one of four) so the rotation is on record.
 
-The session store is held outside the runtime in `AppState` and is **not rebuilt**. Active sessions, their replay buffers, and their session-keyed quotas survive the reload.
+The session store is held outside the runtime in `AppState` and is **not rebuilt**. Active session rows, their listen streams, and their session-keyed quotas survive the reload.
 
 ---
 
@@ -52,7 +52,7 @@ The session store is held outside the runtime in `AppState` and is **not rebuilt
 
 | Block | What changes | Notes |
 |---|---|---|
-| `mcp.capabilities.{tools,prompts,resources,resource_templates}[]` | Tools / prompts / resources / resource templates appear, disappear, or change shape. | Triggers `notifications/{tools,prompts,resources}/list_changed` to active sessions. |
+| `mcp.capabilities.{tools,prompts,resources,resource_templates}[]` | Tools / prompts / resources / resource templates appear, disappear, or change shape. | Triggers `notifications/{tools,prompts,resources}/list_changed` on every `subscriptions/listen` stream that asked for it. |
 | `mcp.capabilities.*[].governance` | Trust floor + CEL `allow_if`. | Next dispatch sees the new policy. |
 | `mcp.capabilities.*[].retry` | Retry attempts / backoff / status codes. | New rules apply on next call. |
 | `mcp.capabilities.*[].watch` | Resource subscription strategy. | Active subscriptions are re-registered. |
@@ -72,7 +72,7 @@ The session store is held outside the runtime in `AppState` and is **not rebuilt
 | `${secret.NAME}` values under `gateway.secrets.dir` | Every reference is re-read from `<dir>/<NAME>` on reload; the runtime's `secrets_digest` (reported to the control plane) is recomputed. | The secrets-watcher triggers this reload automatically; SIGHUP / admin / file-watch pick up rotated values too. |
 | `cluster` (kind unchanged) | Coordinator config (URL, key prefix, pool size). | The cluster plugin re-initialises with new params. |
 | `mcp.capabilities.tasks.store`, `mcp.configurations.{sessions,pipelines,subscriptions}.store`, `mcp.configurations.{delivery,cancellation}.bus` | Capability-state overrides. Default `kind: cluster` (inherits from the backend); override to `kind: memory` / `file` to pin in-process. | Switching from in-process to a clustered backend mid-flight loses local-only state — see "Caveats" below. |
-| `mcp.capabilities.tasks.{default_ttl_ms, max_tasks_per_session, result_wait_ms, reaper_interval_ms}` | Task retention policy. | Applied to existing + new task entries. |
+| `mcp.capabilities.tasks.{default_ttl_ms, max_tasks_per_session, reaper_interval_ms}` | Task retention policy. | Applied to existing + new task entries. |
 | `mcp.configurations.subscriptions.max_per_session` | Per-session subscription quota. | New subscriptions fail if the new (lower) cap is exceeded. |
 | `feature_flags.debug_tools_enabled`, `debug.tools.*` | Debug capability surface — master switch (moved to `feature_flags` in Layout #6) + command/network probe profiles. | Tools appear / disappear from `tools/list`. |
 | `observability.logs.level`, `observability.logs.sinks[]` | Log severity floor + sink fan-out. | Old log sinks flush + close; new sinks open. |
@@ -97,9 +97,9 @@ The session store is held outside the runtime in `AppState` and is **not rebuilt
 | `gateway.server.transport` (http ↔ stdio) | Transport mode picks the entire serve path; can't swap mid-process. | Restart. |
 | `gateway.server.mcp_path`, `gateway.server.health_path` | Routes are bound at boot; changing them mid-flight would break in-flight handles. | Restart. |
 | `gateway.server.allowed_origins` | CORS layer is set up at boot. | Restart. |
-| `gateway.server.replay_window_limit`, `gateway.server.session_idle_timeout_ms`, `gateway.server.max_sessions_per_tenant` | Read on reload but discarded — the session store is preserved across reloads, so its config is sticky. | Drain sessions (or restart) to apply. |
+| `gateway.server.session_idle_timeout_ms`, `gateway.server.max_sessions_per_tenant` | Read on reload but discarded — the session store is preserved across reloads, so its config is sticky. | Restart to apply. |
 | `gateway.server.allow_private_backends` | Read at command-tool / network-probe build time, baked into the runtime config. | Restart. |
-| `gateway.server.{request_timeout_ms, shutdown_timeout_ms, completion_rate_limit_per_sec, max_request_body_mb, server_ping_interval_ms, extra_resource_uri_schemes}` | Wired into HTTP-layer middleware at boot. | Restart. |
+| `gateway.server.{request_timeout_ms, shutdown_timeout_ms, completion_rate_limit_per_sec, max_request_body_mb, extra_resource_uri_schemes}` | Wired into HTTP-layer middleware at boot. | Restart. |
 | `cluster.kind` | Switching backends (e.g. `redis` → `nats`) mid-flight is unsafe — in-flight cluster state would diverge. The `kind` field is read on reload but switching it produces undefined behavior. | Drain via the LB, restart. |
 | `observability.metrics.sinks[]` | Metrics recorder bridge is attached once at boot via `attach_metrics_bridge` and not re-attached on reload. | Restart. |
 | `observability.traces.{enabled, service_name, propagate_context, sinks[]}` | Telemetry bridge is attached once at boot via `attach_telemetry_bridge`. | Restart. |
@@ -188,7 +188,7 @@ Cost is one `read()` per file in the directory per interval — the same profile
 After any of the four triggers, watch for:
 
 - An audit event with `source: "sighup"` / `"admin_api"` / `"file_watch"` / `"secrets_watch"` (the audit channel emits a config-rotated event automatically). The `file_watch` variant additionally carries `paths_changed: [...]` so auditors see which file in a layered set actually changed; the `secrets_watch` variant carries `keys_changed: [...]` — key names only.
-- A `tools/list_changed` notification on every active session if `mcp.capabilities.*[]` shape changed.
+- A `tools/list_changed` notification on every listen stream that asked for it, if `mcp.capabilities.*[]` shape changed.
 - Health endpoint stays at 200 throughout — no listener bounce.
 - `mcpg config check` against the new file set should already have been green before the trigger.
 

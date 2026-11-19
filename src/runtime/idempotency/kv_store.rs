@@ -345,7 +345,7 @@ impl IdempotencyStore for KvBackedIdempotencyStore {
 
         // Second phase — claim the slot. The configured default TTL
         // applies unless the caller passed a tighter override
-        // (tasks/create binds idempotency lifetime to the task's
+        // (a task binds idempotency lifetime to the task's
         // TTL — `min(idempotency_ttl, task_ttl)` — so the record
         // never outlives the task it points at).
         let now = Utc::now();

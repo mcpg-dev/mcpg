@@ -14,7 +14,7 @@ MCPG supports two deployment topologies:
 
 **Single-instance**: All state in-memory. InProcess delivery bus. Simplest deployment.
 
-**Multi-instance**: Shared state via NATS KV or Redis. NATS or Redis delivery bus. Load balancer distributes requests across instances. Any instance can handle any request for any session.
+**Multi-instance**: Shared state via NATS KV or Redis. NATS or Redis delivery bus. Load balancer distributes requests across instances. Any instance can handle any request, task or paused call.
 
 Every distributed mechanism degenerates to in-process equivalents in single-instance mode — the same code paths run in both topologies.
 
@@ -31,89 +31,62 @@ shape.
 
 ## Session Store
 
-The `SessionStore` trait defines session lifecycle operations. Four backends are implemented.
+The `SessionStore` trait holds the gateway's internal per-caller session rows.
+The MCP wire has no session; a row carries the state some features need —
+`subscriptions/listen` streams, tasks, paused calls and the delivery-bus key —
+and its owner. A row holds no stream or replay state.
 
 ### SessionStore Trait
 
 ```rust
 pub trait SessionStore: Send + Sync {
-    fn create_session(...) -> SessionSnapshot;
-    fn session_protocol_version(session_id: &str) -> Option<String>;
-    fn load_session(...) -> Result<SessionSnapshot, SessionAccessError>;
-    fn transition_session_to_operational(session_id: &str) -> Result<()>;
-    fn set_session_log_level(...) -> Result<()>;
-    fn terminate_session(session_id: &str) -> bool;
-    fn open_sse_stream(...) -> Result<Vec<SseEventRecord>, StreamAccessError>;
-    fn stream_protocol_response(...) -> Result<Vec<SseEventRecord>>;
-    fn stream_raw_message(...) -> Result<Vec<SseEventRecord>>;
+    fn create_session(&self) -> SessionSnapshot;
+    fn create_session_with_id(&self, session_id: &str) -> SessionSnapshot;
+    fn bind_session_owner(&self, session_id: &str, owner_principal: Option<&str>);
+    fn load_session(&self, session_id: &str) -> Option<SessionSnapshot>;
+    fn terminate_session(&self, session_id: &str) -> Option<EndedSession>;
+    fn claim_tenant_slot(&self, session_id: &str, cap: usize) -> Option<bool>;
+    fn list_sessions(&self) -> Vec<SessionSnapshot>;
+    // …lifetime, end notification, liveness and active-count helpers
 }
 ```
 
-### Session Lifecycle
+`SessionSnapshot` is `{ session_id, created_at, owner_principal }`.
 
-```
-Initialize → AwaitingInitialized → Initialized notification → Operational → Terminate
-```
+### Session Rows
 
-**Session phases**:
-- `AwaitingInitialized` — After `initialize` response sent, waiting for `initialized` notification
-- `Operational` — Ready for tool calls, capability queries
-
-### SSE Stream Management
-
-Each session can have one active SSE stream. Streams maintain:
-- **Replay window**: Configurable number of recent events (default: 16)
-- **Event IDs**: Format `stream-{N}:ordinal` for resumability
-- **Last-Event-Id**: Client sends for cursor-based replay on reconnect
+- A verified caller's row id is derived from its principal and client name
+  (`sessions.synthetic_session_key`, or a key derived from
+  `cluster.state_encryption_key_env`), so every replica resolves the same row.
+- `claim_tenant_slot` counts derived rows and anonymous rows across the fleet
+  (`session-t:` keys) for `server.max_sessions_per_tenant`. A row that only
+  one replica uses (an identified caller without a derived id) counts on
+  that replica.
+- An ended row is recorded under `session-end:`, so every replica releases the
+  listen streams, leases and admission the row held.
 
 ### Backends
 
-#### InMemorySessionStore
-- `Mutex<HashMap<String, Session>>` for sessions
-- `Mutex<HashMap<String, StreamState>>` for streams
-- Auto-expires idle sessions
-- Suitable for development and single-instance production
-
-#### FileBackedSessionStore
-- Persists sessions to disk in JSONL format
-- Recovers sessions on startup
-- Configurable `data_dir`
-- Suitable for single-instance with durability
-
-#### NatsKvSessionStore
-- Uses NATS JetStream KV bucket
-- Key pattern: `{prefix}.{session_id}`
-- Async operations (wrapped in `tokio::task::block_in_place`)
-- Suitable for multi-instance clusters
-
-#### RedisSessionStore
-- Uses Redis with TTL-based expiration
-- Key pattern: `{prefix}:{session_id}`
-- Async multiplexed connections
-- Suitable for multi-instance clusters
+One implementation, `KvBackedSessionStore`, runs over the key-value primitive
+the sessions capability resolves: in-memory (`MemoryKv`) for `single_node`, a
+directory of files (`FileKv`) with `kind: file`, NATS JetStream KV or Redis
+from the cluster coordinator. Idle rows expire after
+`gateway.server.session_idle_timeout_ms`.
 
 ### Configuration
 
-Layout D'' P5 lifted session-store config under
-`mcp.configurations.sessions.store:` (a per-capability override).
-When omitted, the session store inherits from the cluster
-backend (`kind: cluster`) — so a `cluster.kind: redis`
-deploy automatically gets `RedisSessionStore` without an explicit
-override.
+`mcp.configurations.sessions.store:` is a per-capability override. When
+omitted, the session store uses the cluster coordinator's key-value primitive
+(`kind: cluster`), so a `cluster.kind: redis` deployment keeps its rows in
+Redis without an override.
 
 ```yaml
 mcp:
   configurations:
     sessions:
       store:
-        kind: memory          # memory | file | nats_kv | redis | cluster
-        # file:
-        #   data_dir: "/var/lib/mcpg/sessions"
-        # nats_kv:
-        #   bucket: "mcpg_sessions"
-        #   key_prefix: "sess"
-        # redis:
-        #   key_prefix: "mcpg:sess"
+        kind: file            # cluster | memory | file
+        dir: "/var/lib/mcpg/sessions"
 ```
 
 ---
@@ -179,54 +152,75 @@ PipelineExecutionState {
 
 ## Task Store
 
-The `TaskStore` trait manages background task lifecycle for MCP 2025-11-25 task-augmented tool calls.
+The `TaskStore` trait manages the lifecycle of tasks the `io.modelcontextprotocol/tasks` extension materializes from `tools/call`.
 
 ### TaskStore Trait
 
 ```rust
-pub trait TaskStore: Send + Sync {
+pub trait TaskStore: Send + Sync + std::fmt::Debug {
+    fn retention_policy(&self) -> TaskRetentionPolicy;
+    fn set_observer(&self, observer: Arc<dyn TaskObserver>);
     fn create_task(&self, session_id: &str, original_request_id: Value,
-                   tool_name: &str, ttl_ms: Option<u64>) -> TaskRecord;
+                   tool_name: &str) -> Result<TaskRecord, TaskStoreError>;
     fn get_task(&self, task_id: &str, session_id: &str) -> Result<TaskRecord, TaskStoreError>;
-    fn update_task_status(&self, task_id: &str, status: TaskStatus,
+    fn update_task_status(&self, task_id: &str, session_id: &str, status: TaskStatus,
                           status_message: Option<String>) -> Result<(), TaskStoreError>;
-    fn store_task_result(&self, task_id: &str, result: Value,
-                         is_error: bool) -> Result<(), TaskStoreError>;
-    fn get_task_result(&self, task_id: &str, session_id: &str) -> Result<(Value, bool), TaskStoreError>;
+    fn set_task_poll_interval(&self, task_id: &str, session_id: &str,
+                              poll_interval_ms: Option<u64>) -> Result<(), TaskStoreError>;
+    fn set_task_awaiting_input(&self, task_id: &str, session_id: &str,
+                               request_state: String,
+                               input_requests: Value) -> Result<(), TaskStoreError>;
+    fn task_request_state(&self, task_id: &str,
+                          session_id: &str) -> Result<Option<String>, TaskStoreError>;
+    fn store_task_terminal(&self, task_id: &str, status: TaskStatus,
+                           envelope: TerminalEnvelope) -> Result<(), TaskStoreError>;
     fn cancel_task(&self, task_id: &str, session_id: &str) -> Result<TaskRecord, TaskStoreError>;
-    fn list_tasks(&self, session_id: &str, cursor: Option<&str>,
-                  limit: usize) -> Result<(Vec<Task>, Option<String>), TaskStoreError>;
+    fn list_tasks(&self, session_id: &str) -> Result<Vec<Task>, TaskStoreError>;
     fn gc_expired_tasks(&self) -> usize;
 }
 ```
 
-### Session Authorization Binding
+The TTL comes from the store's `retention_policy()`
+(`mcp.capabilities.tasks.default_ttl_ms`), and `create_task` returns
+`QuotaExceeded` when the owner already holds
+`mcp.capabilities.tasks.max_tasks_per_session` tasks.
 
-All accessor methods require `session_id` and enforce that only the owning session can query, cancel, or retrieve tasks. Cross-session access returns `TaskStoreError::Forbidden`.
+### Owner Binding
+
+The `session_id` a task is keyed on is the caller's task-owner key: the
+principal for an identified caller, so every replica answers `tasks/get`
+for the same principal, and the session row for an anonymous or stdio
+caller.
+Every accessor enforces that only the owner can query, update or cancel a
+task. Cross-owner access returns `TaskStoreError::Forbidden`.
 
 ### Task Lifecycle
 
 ```
-create_task() → Working → update_task_status(Completed/Failed) → store_task_result()
-                  │
-                  └── cancel_task() → Cancelled
+create_task() → Working ─┬─ set_task_awaiting_input() → InputRequired → (tasks/update resumes) → Working
+                         ├─ store_task_terminal(Completed/Failed, envelope)
+                         └─ cancel_task() → Cancelled
 ```
 
 Tasks have a configurable TTL (default: 30 minutes). Expired tasks are garbage-collected by `gc_expired_tasks()`.
 
 ### Backends
 
-| Backend | State Storage | Key Pattern |
-|---|---|---|
-| `InMemoryTaskStore` | `Mutex<HashMap>` | Direct string keys |
-| `NatsKvTaskStore` | NATS JetStream KV | `{prefix}.task.{id}` |
-| `RedisTaskStore` | Redis with TTL | `{prefix}:task:{id}` |
+One implementation, `KvBackedTaskStore`, runs over the key-value primitive
+the task capability resolves (`mcp.capabilities.tasks.store`, else the
+cluster coordinator's):
+in-memory for `single_node`, NATS JetStream KV or Redis in a cluster.
+
+| Key | Value |
+|---|---|
+| `task:{task_id}` | the JSON-encoded `TaskRecord`, with the task's TTL |
+| `task-s:{owner}:{task_id}` | the owner's task index (per-owner limit, session-end cleanup) |
 
 ---
 
 ## Delivery Bus
 
-The `DeliveryBus` trait routes server-initiated messages to the instance holding the client's SSE stream.
+The `DeliveryBus` trait routes notifications to the instance holding the client's `subscriptions/listen` stream.
 
 ### DeliveryBus Trait
 
@@ -245,17 +239,21 @@ The delivery bus is selected automatically based on available infrastructure:
 2. **Redis** (if `cluster.kind: redis`) — channel: `mcpg:deliver:{session_id}`
 3. **InProcess** (fallback) — tokio broadcast channels
 
-### Pending Delivery Fallback
+### Pending Deliveries
 
-If `publish` is called but no subscriber is connected (e.g., client temporarily disconnected), the message is stored as a **pending delivery** in the pipeline store. When the client reconnects via SSE, pending deliveries are drained and replayed.
+A `log` or `progress` pipeline step stores its notification as a **pending
+delivery** on the request's session row. After a `tools/call` returns, the
+transport drains them with `take_pending_deliveries(session_id)` and, when
+there are any, answers with a per-request SSE stream (notifications first,
+then the result).
 
 ### Message Types
 
 ```rust
 enum DeliveryKind {
-    ServerRequest,        // elicitation/create, sampling/createMessage
-    DeferredToolResult,   // tools/call result after suspension
-    PipelineError,        // Pipeline error during background execution
+    ProgressNotification, // notifications/progress
+    ResourceUpdated,      // notifications/resources/updated
+    Notification,         // list_changed, notifications/tasks, notifications/message
 }
 ```
 

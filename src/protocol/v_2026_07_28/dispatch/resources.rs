@@ -1,55 +1,45 @@
-//! `resources` dispatch arms for MCP revision `2026-07-28`.
+//! `resources/list`, `resources/templates/list` and `resources/read`
+//! dispatch arms.
 
 use crate::protocol::shared::jsonrpc::{ProtocolHttpResponse, ProtocolResponse};
 use crate::protocol::v_2026_07_28::dispatch::support::{
     handler_internal_error, serialize_jsonrpc_success,
 };
 use crate::protocol::v_2026_07_28::wire::resources::{
-    ResourceDescriptor as ModernResourceDescriptor, ResourceReadParams as ModernResourceReadParams,
-    ResourceTemplate as ModernResourceTemplate,
-    ResourceTemplatesListParams as ModernResourceTemplatesListParams,
-    ResourceTemplatesListResult as ModernResourceTemplatesListResult,
-    ResourcesListParams as ModernResourcesListParams,
-    ResourcesListResult as ModernResourcesListResult,
+    ResourceDescriptor, ResourceReadParams, ResourceTemplate, ResourceTemplatesListParams,
+    ResourceTemplatesListResult, ResourcesListParams, ResourcesListResult,
 };
 use crate::protocol::v_2026_07_28::wire::tools::CacheScope;
-use crate::runtime::RequestContext;
-use crate::runtime::shared_services::SharedServices;
+use crate::runtime::{GatewayRuntime, RequestContext};
 use serde_json::Value;
 
-/// Default `ttlMs` advertised on modern `resources/list` results.
+/// Default `ttlMs` advertised on `resources/list` results.
 /// 30 seconds — resources can change moderately fast (operator
 /// edits, dynamic bindings); the short TTL backstops staleness.
 pub(crate) const DEFAULT_RESOURCES_LIST_TTL_MS: u64 = 30_000;
 
-/// Default `ttlMs` advertised on modern `resources/templates/list`.
+/// Default `ttlMs` advertised on `resources/templates/list`.
 /// 10 minutes — templates change as slowly as prompts.
 pub(crate) const DEFAULT_RESOURCE_TEMPLATES_LIST_TTL_MS: u64 = 600_000;
 
-/// Dispatch `resources/list` on the modern wire.
+/// Dispatch `resources/list`.
 pub(crate) async fn dispatch_resources_list(
     ctx: &RequestContext,
-    services: &SharedServices,
+    runtime: &GatewayRuntime,
     request_id: Value,
-    params: ModernResourcesListParams,
+    params: ResourcesListParams,
 ) -> ProtocolHttpResponse {
-    let Some(runtime_handle) = services.runtime() else {
-        return handler_internal_error(Some(request_id), "gateway runtime is shutting down");
-    };
-    let runtime = runtime_handle.load();
-
     let (page, next_cursor) = runtime
         .enumerate_resources_page(ctx, params.cursor.as_deref())
         .await;
-    let modern_resources: Vec<ModernResourceDescriptor> =
-        page.iter().map(legacy_resource_to_modern).collect();
+    let resources: Vec<ResourceDescriptor> = page.iter().map(resource_descriptor).collect();
 
     let event = mcpg_plugin_host::audit_events::list_call_event(
         crate::runtime::plugin_identity_from_request(ctx),
         ctx.request_id.as_str(),
         ctx.session_id.as_deref(),
         "resource",
-        modern_resources.len() as u64,
+        resources.len() as u64,
         match ctx.transport {
             crate::runtime::TransportKind::Http => "http",
             crate::runtime::TransportKind::Stdio => "stdio",
@@ -58,9 +48,9 @@ pub(crate) async fn dispatch_resources_list(
     let registry = runtime.plugin_registry_handle();
     let _ = registry.emit_audit_event(&event).await;
 
-    let result = ModernResourcesListResult {
+    let result = ResourcesListResult {
         result_type: crate::protocol::shared::caching::default_result_type_complete(),
-        resources: modern_resources,
+        resources,
         next_cursor,
         ttl_ms: DEFAULT_RESOURCES_LIST_TTL_MS,
         // Per-principal filtered — private-cacheable only (see tools/list).
@@ -83,31 +73,23 @@ pub(crate) async fn dispatch_resources_list(
     serialize_jsonrpc_success(request_id, &result_value, "resources/list")
 }
 
-/// Dispatch `resources/templates/list` on the modern wire.
+/// Dispatch `resources/templates/list`.
 pub(crate) async fn dispatch_resources_templates_list(
     ctx: &RequestContext,
-    services: &SharedServices,
+    runtime: &GatewayRuntime,
     request_id: Value,
-    params: ModernResourceTemplatesListParams,
+    params: ResourceTemplatesListParams,
 ) -> ProtocolHttpResponse {
-    let Some(runtime_handle) = services.runtime() else {
-        return handler_internal_error(Some(request_id), "gateway runtime is shutting down");
-    };
-    let runtime = runtime_handle.load();
-
     let (page, next_cursor) =
         runtime.enumerate_resource_templates_page(ctx, params.cursor.as_deref());
-    let modern_templates: Vec<ModernResourceTemplate> = page
-        .iter()
-        .map(legacy_resource_template_to_modern)
-        .collect();
+    let resource_templates: Vec<ResourceTemplate> = page.iter().map(resource_template).collect();
 
     let event = mcpg_plugin_host::audit_events::list_call_event(
         crate::runtime::plugin_identity_from_request(ctx),
         ctx.request_id.as_str(),
         ctx.session_id.as_deref(),
         "resource_template",
-        modern_templates.len() as u64,
+        resource_templates.len() as u64,
         match ctx.transport {
             crate::runtime::TransportKind::Http => "http",
             crate::runtime::TransportKind::Stdio => "stdio",
@@ -116,9 +98,9 @@ pub(crate) async fn dispatch_resources_templates_list(
     let registry = runtime.plugin_registry_handle();
     let _ = registry.emit_audit_event(&event).await;
 
-    let result = ModernResourceTemplatesListResult {
+    let result = ResourceTemplatesListResult {
         result_type: crate::protocol::shared::caching::default_result_type_complete(),
-        resource_templates: modern_templates,
+        resource_templates,
         next_cursor,
         ttl_ms: DEFAULT_RESOURCE_TEMPLATES_LIST_TTL_MS,
         // Per-principal filtered — private-cacheable only (see tools/list).
@@ -140,49 +122,29 @@ pub(crate) async fn dispatch_resources_templates_list(
     serialize_jsonrpc_success(request_id, &result_value, "resources/templates/list")
 }
 
-/// Dispatch `resources/read` on the modern wire.
+/// Dispatch `resources/read`.
 ///
-/// The read pipeline (policy, federation, MCP-Apps `_meta.ui` clamp)
-/// is version-blind, so delegate to the legacy
-/// `handle_protocol_operation`, then project the success into the
-/// modern `CacheableResult` envelope — stamping `resultType:"complete"`
-/// plus the required `ttlMs` + `cacheScope` that the legacy shape
-/// lacks (RES-03 / SEP-2549/2322). A suspended (MRTR) or error
-/// response passes through unchanged.
+/// The runtime's read (policy, federation, MCP-Apps `_meta.ui` clamp)
+/// answers it; the success is stamped into the `CacheableResult`
+/// envelope (SEP-2549/2322). An error passes through unchanged.
 pub(crate) async fn dispatch_resources_read(
     ctx: &RequestContext,
-    services: &SharedServices,
+    runtime: &GatewayRuntime,
     request_id: Value,
-    params: ModernResourceReadParams,
+    params: ResourceReadParams,
 ) -> ProtocolHttpResponse {
-    let Some(runtime_handle) = services.runtime() else {
-        return handler_internal_error(Some(request_id), "gateway runtime is shutting down");
-    };
-    let runtime = runtime_handle.load();
-
-    let legacy_params = crate::protocol::v_2025_11_25::wire::resources::ResourceReadParams {
+    let read = crate::protocol::ResourceReadParams {
         uri: params.uri,
         meta: params.meta,
     };
-    let legacy_op =
-        crate::protocol::v_2025_11_25::wire::operations::ProtocolOperation::Capabilities(
-            crate::protocol::v_2025_11_25::wire::operations::CapabilityOperation::ResourcesRead {
-                request_id,
-                params: legacy_params,
-            },
-        );
-
-    let response = runtime.handle_protocol_operation(legacy_op, ctx).await;
-    stamp_modern_resource_read(response)
+    stamp_resource_read(runtime.handle_resource_read(request_id, read, ctx).await)
 }
 
-/// Project a backend [`crate::backends::ResourceDescriptor`] into
-/// the modern wire shape. Carries `annotations` through (RES-08); adds
-/// `cache_scope: None` so the page-level scope applies.
-pub(crate) fn legacy_resource_to_modern(
-    r: &crate::backends::ResourceDescriptor,
-) -> ModernResourceDescriptor {
-    ModernResourceDescriptor {
+/// Project a backend [`crate::backends::ResourceDescriptor`] into the
+/// wire shape. Carries `annotations` through; `cache_scope: None` so the
+/// page-level scope applies.
+pub(crate) fn resource_descriptor(r: &crate::backends::ResourceDescriptor) -> ResourceDescriptor {
+    ResourceDescriptor {
         uri: r.uri.clone(),
         name: r.name.clone(),
         title: r.title.clone(),
@@ -196,13 +158,11 @@ pub(crate) fn legacy_resource_to_modern(
     }
 }
 
-/// Project a legacy [`crate::protocol::ResourceTemplate`] into the
-/// modern wire shape. Carries `annotations` through (RES-08);
-/// field-set otherwise identical.
-pub(crate) fn legacy_resource_template_to_modern(
-    t: &crate::protocol::ResourceTemplate,
-) -> ModernResourceTemplate {
-    ModernResourceTemplate {
+/// Project the catalog's [`crate::protocol::ResourceTemplate`] into the
+/// wire shape. Carries `annotations` through; the field set is otherwise
+/// identical.
+pub(crate) fn resource_template(t: &crate::protocol::ResourceTemplate) -> ResourceTemplate {
+    ResourceTemplate {
         uri_template: t.uri_template.clone(),
         name: t.name.clone(),
         title: t.title.clone(),
@@ -214,17 +174,12 @@ pub(crate) fn legacy_resource_template_to_modern(
     }
 }
 
-/// Project a delegated `resources/read` success into the modern
-/// `CacheableResult` envelope (SEP-2549/2322): stamp
-/// `resultType:"complete"` plus the required `ttlMs` + `cacheScope`
-/// (already-present values are preserved). The read pipeline (policy,
-/// federation, MCP-Apps `_meta.ui` clamp) runs unchanged in the
-/// runtime; this only enriches the result envelope so the modern
-/// wire's `resources/read` matches `resources/list`. A suspended
-/// (MRTR) or error response passes through untouched.
-pub(crate) fn stamp_modern_resource_read(
-    mut response: ProtocolHttpResponse,
-) -> ProtocolHttpResponse {
+/// Stamp a `resources/read` success into the `CacheableResult` envelope
+/// (SEP-2549/2322): `resultType:"complete"` plus the required `ttlMs` +
+/// `cacheScope` (already-present values are preserved), so
+/// `resources/read` matches `resources/list`. A result that already names
+/// its `resultType`, and an error, pass through untouched.
+pub(crate) fn stamp_resource_read(mut response: ProtocolHttpResponse) -> ProtocolHttpResponse {
     if let ProtocolResponse::JsonRpcSuccess(success) = &mut response.response
         && let Some(obj) = success.result.as_object_mut()
         && !obj.contains_key("resultType")

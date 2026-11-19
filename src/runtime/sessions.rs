@@ -1,57 +1,141 @@
 use super::*;
 
-/// The `clientInfo.name` of a session minted for stateless requests,
-/// which carry their own client per request.
-pub(crate) const SYNTHETIC_CLIENT_NAME: &str = "mcpg.stateless.synthetic";
+/// What [`GatewayRuntime::ensure_session`] gives the dispatch: the context
+/// bound to its session, or the answer that no session row can be created
+/// now (`sessions.max_sessions`, or the caller's `max_sessions_per_tenant`),
+/// which the transport turns into backpressure.
+pub(crate) enum SessionOutcome {
+    Ready(RequestContext),
+    CapacityExhausted,
+}
+
+/// A locally-registered cancellation token plus the identity that owns
+/// the in-flight request/task it can interrupt. The cancellation-bus
+/// subscriber checks an incoming event's principal/session against these
+/// before firing the token, so one principal cannot abort another's
+/// in-flight work by guessing its request/task id.
+#[derive(Clone)]
+pub(crate) struct RegisteredCancellation {
+    pub(super) token: tokio_util::sync::CancellationToken,
+    /// Session that owns the in-flight work. `None` when the owner had
+    /// no session.
+    pub(super) owner_session: Option<String>,
+    /// Principal (OIDC `sub` claim or equivalent) that owns the work.
+    /// `None` for an unauthenticated owner.
+    pub(super) owner_principal: Option<String>,
+}
+
+/// Decide whether a resuming caller owns a suspended pipeline. Ownership
+/// requires the same principal; for an identified owner the session must
+/// also match. An anonymous owner (`None` principal) is matched by
+/// principal alone — its session is per-request ephemeral, so replay of
+/// anonymous resumes is covered by the requestState single-use guard
+/// rather than a session comparison. Missing/empty sessions never satisfy
+/// the identified-owner case.
+pub(super) fn resumer_owns_pipeline(
+    owner_principal: Option<&str>,
+    owner_session: &str,
+    resumer_principal: Option<&str>,
+    resumer_session: Option<&str>,
+) -> bool {
+    let principal_match = owner_principal == resumer_principal;
+    let session_match = owner_principal.is_none()
+        || (!owner_session.is_empty() && resumer_session == Some(owner_session));
+    principal_match && session_match
+}
+
+/// Decide whether a caller may operate on a session. The caller's
+/// trust-qualified principal key (see `synthetic_principal_key` — embeds
+/// trust tier + provider + issuer, so a header-asserted `alice` can't
+/// match a verified `alice`) must equal the session creator's. An
+/// anonymous-owned session (`None`) is matched only by an anonymous
+/// caller, and an identified caller cannot claim an anonymous session
+/// (or vice versa).
+pub(super) fn session_owner_matches(owner_key: Option<&str>, caller_key: Option<&str>) -> bool {
+    owner_key == caller_key
+}
+
+/// Decide whether a cancellation event's requester owns the in-flight
+/// work the token interrupts. Mirrors [`resumer_owns_pipeline`]: the
+/// requester must be the same principal; an identified owner must also
+/// share the session. Anonymous owners are matched by principal alone.
+pub(super) fn cancellation_requester_is_owner(
+    registered: &RegisteredCancellation,
+    event: &cancellation_bus::CancellationEvent,
+) -> bool {
+    let principal_match = registered.owner_principal.as_deref() == event.principal_id.as_deref();
+    let session_match = registered.owner_principal.is_none()
+        || registered
+            .owner_session
+            .as_deref()
+            .is_some_and(|owner| owner == event.session_id);
+    principal_match && session_match
+}
+
+/// `ctx` bound to the session `session_id`.
+fn bound_to(mut ctx: RequestContext, session_id: String) -> RequestContext {
+    ctx.session_id = Some(session_id);
+    ctx
+}
 
 impl GatewayRuntime {
-    /// returns Err when adding a session for `principal_id` would
-    /// breach the per-tenant cap; otherwise records the new session and
-    /// returns Ok. The cap counts the fleet when the session store keeps
-    /// a count every replica shares, else this replica's sessions.
+    /// Count `session_id` toward the sessions of `owner`, its
+    /// trust-qualified principal key (`None` counts toward `anonymous`).
+    /// `Err` when the owner already holds `max_sessions_per_tenant`
+    /// sessions. With `fleet_count`, the count is the fleet's when the
+    /// session store keeps one every replica shares; otherwise, and for a
+    /// row only this replica uses, it is this replica's. A session already
+    /// counted counts once.
     pub(crate) fn try_acquire_tenant_session(
         &self,
         session_id: &str,
-        principal_id: Option<&str>,
+        owner: Option<&str>,
+        fleet_count: bool,
     ) -> Result<(), ()> {
         if self.max_sessions_per_tenant == 0 {
             return Ok(());
         }
-        let tenant = principal_id.unwrap_or("anonymous").to_owned();
-        match self
-            .session_store
-            .claim_tenant_slot(session_id, self.max_sessions_per_tenant)
-        {
-            Some(true) => return Ok(()),
-            Some(false) => {
-                metrics::counter!(
-                    "mcpg_tenant_session_quota_rejected_total",
-                    "tenant" => tenant,
-                )
-                .increment(1);
-                return Err(());
-            }
-            None => {}
-        }
-        let mut n = self
-            .tenant_session_counts
-            .entry(tenant.clone())
-            .or_insert(0);
-        if *n >= self.max_sessions_per_tenant {
+        let tenant = owner.unwrap_or("anonymous");
+        let refused = || -> Result<(), ()> {
             metrics::counter!(
                 "mcpg_tenant_session_quota_rejected_total",
-                "tenant" => tenant.clone(),
+                "tenant" => tenant.to_owned(),
             )
             .increment(1);
-            return Err(());
+            Err(())
+        };
+        if fleet_count {
+            match self
+                .session_store
+                .claim_tenant_slot(session_id, self.max_sessions_per_tenant)
+            {
+                Some(true) => return Ok(()),
+                Some(false) => return refused(),
+                None => {}
+            }
         }
-        *n += 1;
-        drop(n); // release shard before acquiring another
-        self.session_tenants.insert(session_id.to_owned(), tenant);
+        use dashmap::mapref::entry::Entry;
+        // Lock order: the session's entry, then the tenant's count; the
+        // release takes them one at a time.
+        let Entry::Vacant(counted) = self.session_tenants.entry(session_id.to_owned()) else {
+            return Ok(());
+        };
+        let mut held = self
+            .tenant_session_counts
+            .entry(tenant.to_owned())
+            .or_insert(0);
+        if *held >= self.max_sessions_per_tenant {
+            drop(held);
+            return refused();
+        }
+        *held += 1;
+        drop(held);
+        counted.insert(tenant.to_owned());
         Ok(())
     }
 
-    /// Decrement the tenant counter on session terminate.
+    /// Give back the count [`Self::try_acquire_tenant_session`] took for
+    /// `session_id` on this replica.
     pub(crate) fn release_tenant_session(&self, session_id: &str) {
         if let Some((_, tenant)) = self.session_tenants.remove(session_id)
             && let Some(mut n) = self.tenant_session_counts.get_mut(&tenant)
@@ -62,93 +146,6 @@ impl GatewayRuntime {
                 self.tenant_session_counts.remove(&tenant);
             }
         }
-    }
-
-    /// Per-session request-id uniqueness tracker.
-    /// Returns `Err` when `id` has already been seen on this session.
-    /// Backed by a HashSet for O(1) membership plus a VecDeque for
-    /// FIFO eviction. An earlier 1024-entry window could wrap on very
-    /// long sessions; the cap is now 64 KiB and on eviction we
-    /// increment `mcpg_request_id_window_evicted_total` so operators
-    /// see the risk surface (a wrapped window can let a stale id replay).
-    const SEEN_ID_CAP_PER_SESSION: usize = 65_536;
-    /// Upper bound on how many per-session windows are held at once.
-    ///
-    /// A window is keyed on the client-supplied session header and created
-    /// before the session has been resolved, so a caller presenting a fresh
-    /// fabricated session id on every request accumulates windows that no
-    /// cleanup path can reclaim — with no session row,
-    /// `cascade_session_cleanup` never fires for them. This is the same leak
-    /// the `session_ephemeral` guard above already avoids for row-less
-    /// sessions; the cap covers the ids that were never minted at all.
-    const MAX_TRACKED_SESSION_WINDOWS: usize = 100_000;
-    pub(crate) fn record_client_request_id(
-        &self,
-        session_id: Option<&str>,
-        session_ephemeral: bool,
-        id: &Value,
-    ) -> Result<(), ()> {
-        if self.relax_request_id_uniqueness {
-            return Ok(()); // benchmark/load-test mode: fixed-id replay is allowed
-        }
-        // An ephemeral row-less session carries a fresh synthetic id per
-        // request, so its JSON-RPC id-space cannot collide within the
-        // "session" and recording it would leak a tracker entry that
-        // terminate_session (which never runs for row-less sessions) can
-        // never reclaim.
-        if session_ephemeral {
-            return Ok(());
-        }
-        let sid = match session_id {
-            Some(s) => s.to_owned(),
-            None => return Ok(()), // pre-session ids (initialize) are unique by construction
-        };
-        let id_str = match id {
-            Value::String(s) => s.clone(),
-            Value::Number(n) => n.to_string(),
-            // null/bool/object/array are already rejected by validate_jsonrpc_id
-            _ => return Ok(()),
-        };
-        // Refuse to open a NEW window once the map is full; sessions that
-        // already have one keep deduplicating normally. Skipping is a
-        // degradation of duplicate detection under flood, which is strictly
-        // better than unbounded caller-controlled growth.
-        if self.seen_request_ids.len() >= Self::MAX_TRACKED_SESSION_WINDOWS
-            && !self.seen_request_ids.contains_key(&sid)
-        {
-            metrics::counter!("mcpg_request_id_window_capacity_skipped_total").increment(1);
-            return Ok(());
-        }
-        let mut entry = self.seen_request_ids.entry(sid).or_default();
-        if entry.insert(id_str, Self::SEEN_ID_CAP_PER_SESSION) {
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
-
-    /// Drop a session's id tracker on terminate so a new session with
-    /// the same id starts with a clean id-space.
-    pub(crate) fn forget_session_request_ids(&self, session_id: &str) {
-        self.seen_request_ids.remove(session_id);
-    }
-
-    /// Legacy (`2025-11-25`) session-wide `logging/setLevel` floor for
-    /// `session_id`, used to gate pipeline `log` steps (LOG-2). Returns
-    /// `None` on the modern wire (per-request gate instead), when there
-    /// is no session, or when the session can't be loaded.
-    pub(crate) fn legacy_session_log_level(
-        &self,
-        ctx: &RequestContext,
-    ) -> Option<crate::protocol::LoggingLevel> {
-        if ctx.negotiated_version == crate::protocol::version::ProtocolVersion::V_2026_07_28 {
-            return None;
-        }
-        let session_id = ctx.session_id.as_deref()?;
-        self.session_store
-            .load_session(Some(session_id), false)
-            .ok()
-            .map(|snapshot| snapshot.log_level)
     }
 
     /// SEP-defined pagination contract: an opaque cursor that does not
@@ -168,277 +165,173 @@ impl GatewayRuntime {
         }
     }
 
-    /// Modern stateless mode. When a modern (`V_2026_07_28`)
-    /// request arrives without an `Mcp-Session-Id`, mint an
-    /// ephemeral operational session bound only to this request so
-    /// the legacy session-requiring code paths
-    /// (`load_session_cached(require_operational=true)`,
-    /// `subscribe_session_delivery`, etc.) still work without the
-    /// client needing to do a legacy `initialize` handshake first.
+    /// Bind a request to the session its continuations (tasks, MRTR
+    /// resumes, `subscriptions/listen`, deliveries) live under. No client
+    /// names a session: the runtime derives or mints it from the caller.
     ///
-    /// The synthetic session is created in `Operational` phase
-    /// immediately and is naturally evicted by the session store's
-    /// TTL. Pure stateless dispatch — fan-out + per-tenant
-    /// bookkeeping with no per-request session row — is a deeper
-    /// architectural change and a separate follow-up.
+    /// - A context that already carries a session id keeps it; only the
+    ///   stdio transport sets one, its process session. The read keeps the
+    ///   row alive, and a row the idle reaper took is created again under
+    ///   the same id.
+    /// - A verified caller, when a synthetic-session key is configured,
+    ///   gets the row whose id every replica derives from its principal
+    ///   key (and the client the request names), so its tasks and listen
+    ///   streams are found on any replica.
+    /// - Any other identified caller gets one row per principal on this
+    ///   replica.
+    /// - An anonymous caller has no stable key, so its session is
+    ///   ephemeral: an id for this request with no row; a continuation
+    ///   creates the row ([`Self::materialize_ephemeral_session`]).
     ///
-    /// Returns the (possibly updated) context. Pass-through when
-    /// the session header is already present or when the version
-    /// is legacy.
-    pub(crate) fn ensure_modern_session(&self, ctx: &RequestContext) -> ModernSessionOutcome {
-        if ctx.session_id.is_some() {
-            return ModernSessionOutcome::Ready(ctx.clone());
-        }
-        if ctx.negotiated_version != crate::protocol::version::ProtocolVersion::V_2026_07_28 {
-            return ModernSessionOutcome::Ready(ctx.clone());
-        }
-
-        // Deterministic, coordination-free continuity. When a shared
-        // `sessions.synthetic_session_key` is configured (identical across
-        // replicas), derive the synthetic session id from the principal via
-        // HMAC so every replica computes the SAME id. The session row is
-        // persisted to cluster KV, so `tasks/create` on replica A is
-        // visible to `tasks/get` on B. HMAC (not a bare hash) keeps the id
-        // unguessable, and the derivation input is the trust-qualified
-        // principal key (trust tier + provider + issuer + subject), so a
-        // header-asserted `alice` cannot re-derive a verified `alice`'s
-        // session id. Restricted to Verified callers: cross-replica
-        // continuity is a guarantee only cryptographic identity earns; a
-        // header-asserted caller (only seen when the operator opted into
-        // `server.trust_subject_header`) falls through to per-instance
-        // continuity below. The client the request names joins the input,
-        // so two hosts on one credential hold two sessions (and two sets
-        // of subscriptions); a request naming no client keeps the
-        // principal's own session.
-        if ctx.identity.trust_level() == RequestTrustLevel::Verified
-            && let Some(principal_key) = ctx.identity.synthetic_principal_key()
-            && let Some(key) = self.synthetic_session_key()
-        {
-            let input = match &ctx.client {
-                Some(client) => format!("{principal_key}\u{1f}client:{}", client.name),
-                None => principal_key,
-            };
-            let sid = Self::derive_synthetic_session_id(&key, &input);
-            // Already operational on this replica or another (KV read-back)?
-            if self.session_store.load_session(Some(&sid), false).is_ok() {
-                metrics::counter!("mcpg_modern_stateless_sessions_reused_total").increment(1);
-                let mut new_ctx = ctx.clone();
-                new_ctx.session_id = Some(sid);
-                return ModernSessionOutcome::Ready(new_ctx);
-            }
-            let snap = self.session_store.create_session_with_id(
-                &sid,
-                crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION,
-                &Self::modern_synthetic_init_params(),
-            );
-            // The store signals `sessions.max_sessions` rejection with an
-            // empty-id snapshot; surface honest backpressure instead of
-            // dispatching against a session that was never stored.
-            if snap.session_id.is_empty() {
-                return ModernSessionOutcome::CapacityExhausted;
-            }
-            self.session_store.bind_session_owner(
-                &snap.session_id,
-                ctx.identity.synthetic_principal_key().as_deref(),
-            );
-            if let Err(error) = self
-                .session_store
-                .transition_session_to_operational(&snap.session_id)
+    /// Every row is owned by the caller's trust-qualified principal key
+    /// and counts toward its `max_sessions_per_tenant`: a derived row and
+    /// an anonymous row across the fleet, a per-replica row on its replica.
+    pub(crate) fn ensure_session(&self, ctx: RequestContext) -> SessionOutcome {
+        if let Some(session_id) = ctx.session_id.as_deref() {
+            if self.session_store.load_session(session_id).is_none()
+                && !self.materialize_ephemeral_session(session_id)
             {
-                tracing::warn!(
-                    error = ?error,
-                    "modern stateless mode: failed to transition synthetic session to Operational"
-                );
-            } else {
-                metrics::counter!("mcpg_modern_stateless_sessions_minted_total").increment(1);
+                return SessionOutcome::CapacityExhausted;
             }
-            let mut new_ctx = ctx.clone();
-            new_ctx.session_id = Some(snap.session_id);
-            return ModernSessionOutcome::Ready(new_ctx);
+            return SessionOutcome::Ready(ctx);
+        }
+        let Some(principal_key) = ctx.identity.synthetic_principal_key() else {
+            metrics::counter!("mcpg_sessions_ephemeral_total").increment(1);
+            return SessionOutcome::Ready(
+                ctx.with_ephemeral_session(Self::ephemeral_session_snapshot()),
+            );
+        };
+
+        // Derived across replicas: HMAC over the trust-qualified principal
+        // key, so a header-asserted `alice` cannot re-derive a verified
+        // `alice`'s id and no client can compute another principal's.
+        // Only a verified caller earns continuity across replicas. The
+        // client the request names joins the input, so two hosts on one
+        // credential hold two sessions; a request naming no client keeps
+        // the principal's own session.
+        if ctx.identity.trust_level() == RequestTrustLevel::Verified
+            && let Some(sid) = self.derived_session_id(
+                &principal_key,
+                ctx.client.as_ref().map(|client| client.name.as_str()),
+            )
+        {
+            if self.session_store.load_session(&sid).is_some() {
+                metrics::counter!("mcpg_sessions_reused_total").increment(1);
+                return SessionOutcome::Ready(bound_to(ctx, sid));
+            }
+            let created = self.session_store.create_session_with_id(&sid);
+            if !self.admit_session(&created, Some(principal_key.as_str()), true) {
+                return SessionOutcome::CapacityExhausted;
+            }
+            return SessionOutcome::Ready(bound_to(ctx, created.session_id));
         }
 
-        // No shared key — fall back to the per-instance alias map. When the
-        // request carries an authenticated principal, reuse the per-principal
-        // synthetic session so two requests from the same client on THIS
-        // replica share a session id (task / subscription continuity within
-        // one instance; cross-replica continuity needs the key above). The
-        // alias is keyed on the trust-qualified principal key so a
-        // header-asserted `alice` and a verified `alice` never share an
-        // alias. Anonymous traffic still mints per-request — no stable key.
-        if let Some(principal_key) = ctx.identity.synthetic_principal_key()
-            && let Some(existing) = self.modern_session_aliases.get(&principal_key)
-        {
-            // Verify the alias still resolves in the session store
-            // — TTL eviction can outlive the alias map entry. If
-            // the store dropped the session, fall through to mint
-            // a fresh one and refresh the alias.
+        // One row per principal on this replica. The alias is keyed on the
+        // trust-qualified principal key, so a header-asserted `alice` and a
+        // verified `alice` never share one.
+        if let Some(existing) = self.session_aliases.get(&principal_key) {
             let candidate = existing.clone();
             drop(existing); // release the DashMap ref before re-entry below
-            if self
-                .session_store
-                .load_session(Some(&candidate), false)
-                .is_ok()
-            {
-                metrics::counter!("mcpg_modern_stateless_sessions_reused_total").increment(1);
-                let mut new_ctx = ctx.clone();
-                new_ctx.session_id = Some(candidate);
-                return ModernSessionOutcome::Ready(new_ctx);
+            // TTL eviction can outlive the alias entry: a stale alias is
+            // replaced by a fresh row.
+            if self.session_store.load_session(&candidate).is_some() {
+                metrics::counter!("mcpg_sessions_reused_total").increment(1);
+                return SessionOutcome::Ready(bound_to(ctx, candidate));
             }
-            // Stale alias — drop it so the create-and-refresh
-            // path below installs a fresh mapping.
-            self.modern_session_aliases.remove(&principal_key);
+            self.session_aliases.remove(&principal_key);
         }
-
-        // Authenticated principal without cross-replica key: mint a
-        // stored session and stash the per-instance alias so subsequent
-        // requests from the same principal reuse it (task / subscription
-        // continuity within this replica).
-        if let Some(principal_key) = ctx.identity.synthetic_principal_key() {
-            let synthetic_params = Self::modern_synthetic_init_params();
-            let snap = self.session_store.create_session(
-                crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION,
-                &synthetic_params,
-            );
-            if snap.session_id.is_empty() {
-                return ModernSessionOutcome::CapacityExhausted;
-            }
-            self.session_store
-                .bind_session_owner(&snap.session_id, ctx.identity.principal_id());
-            // Best-effort transition to Operational so downstream
-            // `load_session_cached(require_operational=true)` calls
-            // succeed. A failure here means the store entry never
-            // landed — the resulting dispatch will surface the legacy
-            // SessionAccessError, which is preferable to silent
-            // success.
-            if let Err(error) = self
-                .session_store
-                .transition_session_to_operational(&snap.session_id)
-            {
-                tracing::warn!(
-                    error = ?error,
-                    "modern stateless mode: failed to transition synthetic session to Operational"
-                );
-            } else {
-                metrics::counter!("mcpg_modern_stateless_sessions_minted_total").increment(1);
-            }
-            self.modern_session_aliases
-                .insert(principal_key, snap.session_id.clone());
-            let mut new_ctx = ctx.clone();
-            new_ctx.session_id = Some(snap.session_id);
-            return ModernSessionOutcome::Ready(new_ctx);
+        // Every replica that serves the principal holds such a row, so the
+        // row counts on this replica only: a fleet count would refuse the
+        // principal on every replica but the first.
+        let created = self.session_store.create_session();
+        if !self.admit_session(&created, Some(principal_key.as_str()), false) {
+            return SessionOutcome::CapacityExhausted;
         }
-
-        // Anonymous traffic: no principal key means no continuity is
-        // possible (the next request cannot re-derive this id, the id is
-        // never sent to the client, and the modern wire ignores inbound
-        // `Mcp-Session-Id`), so the session is fully ephemeral — no store
-        // row at all. Every session-keyed structure on the dispatch path
-        // (deliveries, request-id dedup, cancellation) works on the id
-        // string, and `load_session_cached` is pre-seeded with the
-        // synthetic snapshot. Continuation points materialize the row on
-        // demand (see [`Self::materialize_ephemeral_session`]).
-        metrics::counter!("mcpg_modern_stateless_sessions_ephemeral_total").increment(1);
-        ModernSessionOutcome::Ready(
-            ctx.clone()
-                .with_ephemeral_session(Self::ephemeral_session_snapshot()),
-        )
+        self.session_aliases
+            .insert(principal_key, created.session_id.clone());
+        SessionOutcome::Ready(bound_to(ctx, created.session_id))
     }
 
-    /// Synthetic Operational snapshot backing an ephemeral (row-less)
-    /// session — the same shape a stored synthetic session would have
-    /// after `create_session` + `transition_session_to_operational`.
+    /// Bind the row a create returned to `owner` and count it toward the
+    /// owner's `max_sessions_per_tenant` (across the fleet with
+    /// `fleet_count`). `false` when the store refused the row (an empty
+    /// id), when another principal owns it, or when the owner is at its
+    /// cap; a row over the cap is removed again.
+    fn admit_session(
+        &self,
+        created: &SessionSnapshot,
+        owner: Option<&str>,
+        fleet_count: bool,
+    ) -> bool {
+        let session_id = created.session_id.as_str();
+        if session_id.is_empty() {
+            return false;
+        }
+        // An owner is bound once and never replaced. The slot of a fleet
+        // count is keyed by the row's owner, so it is bound before the claim.
+        match created.owner_principal.as_deref() {
+            Some(bound) if Some(bound) != owner => return false,
+            None if owner.is_some() => self.session_store.bind_session_owner(session_id, owner),
+            _ => {}
+        }
+        if self
+            .try_acquire_tenant_session(session_id, owner, fleet_count)
+            .is_err()
+        {
+            self.session_store.terminate_session(session_id);
+            return false;
+        }
+        metrics::counter!("mcpg_sessions_minted_total").increment(1);
+        true
+    }
+
+    /// The snapshot an ephemeral (row-less) session runs under.
     pub(crate) fn ephemeral_session_snapshot() -> SessionSnapshot {
-        Self::ephemeral_session_snapshot_for(
-            crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION,
-        )
-    }
-
-    /// [`Self::ephemeral_session_snapshot`] at a specific negotiated
-    /// protocol revision (the legacy session-optional lane pins the
-    /// request's own version so downstream version-aware code branches
-    /// consistently).
-    pub(crate) fn ephemeral_session_snapshot_for(protocol_version: &str) -> SessionSnapshot {
-        let params = Self::modern_synthetic_init_params();
         SessionSnapshot {
             session_id: uuid::Uuid::new_v4().to_string(),
-            protocol_version: protocol_version.to_owned(),
-            client_info: params.client_info,
-            client_capabilities: params.capabilities,
-            phase: session_store::SessionPhase::Operational,
-            log_level: crate::protocol::LoggingLevel::Info,
             created_at: Utc::now(),
             owner_principal: None,
         }
     }
 
-    /// Create the real session-store row for an ephemeral session at the
-    /// point a continuation outlives the request: a materialized task, an
-    /// MRTR suspension awaiting resume, or a `subscriptions/listen`
-    /// stream. Ephemeral sessions are minted only for anonymous callers,
-    /// so the row has no owner to bind. Idempotent
-    /// (`create_session_with_id` returns an existing row unchanged); a
-    /// store that refuses the row (session cap) is logged and the
-    /// continuation proceeds degraded — exactly the pre-existing behavior
-    /// for a stored session evicted mid-flight.
-    pub(crate) fn materialize_ephemeral_session(&self, session_id: &str) {
-        let snap = self.session_store.create_session_with_id(
+    /// Create the row of an ephemeral session at the point a continuation
+    /// outlives the request: a materialized task, an MRTR suspension
+    /// awaiting resume, or a `subscriptions/listen` stream; and the stdio
+    /// transport's process session. Ephemeral sessions are minted only for
+    /// anonymous callers, so the row has no owner and counts toward the
+    /// `anonymous` cap. Idempotent (`create_session_with_id` returns an
+    /// existing row unchanged). `false` when the store or the cap refuses
+    /// the row; the caller then answers with backpressure or goes on
+    /// without a stored row.
+    pub(crate) fn materialize_ephemeral_session(&self, session_id: &str) -> bool {
+        let created = self.session_store.create_session_with_id(session_id);
+        if self.admit_session(&created, None, true) {
+            return true;
+        }
+        tracing::warn!(
             session_id,
-            crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION,
-            &Self::modern_synthetic_init_params(),
+            "an ephemeral session got no row: the session store or the session cap refused it"
         );
-        if snap.session_id.is_empty() {
-            tracing::warn!(
-                session_id,
-                "session capacity exhausted while materializing an ephemeral session; \
-                 continuation proceeds without a stored row"
-            );
-            return;
-        }
-        if let Err(error) = self
-            .session_store
-            .transition_session_to_operational(session_id)
-        {
-            tracing::warn!(
-                error = ?error,
-                session_id,
-                "failed to transition materialized ephemeral session to Operational"
-            );
-        } else {
-            metrics::counter!("mcpg_modern_stateless_sessions_minted_total").increment(1);
-        }
+        false
     }
 
-    /// The synthetic `InitializeParams` minted for a modern stateless
-    /// session (shared by the deterministic + per-instance paths).
-    pub(crate) fn modern_synthetic_init_params() -> crate::protocol::InitializeParams {
-        crate::protocol::InitializeParams {
-            protocol_version: crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION
-                .to_owned(),
-            capabilities: Default::default(),
-            client_info: crate::protocol::ImplementationInfo {
-                name: SYNTHETIC_CLIENT_NAME.to_owned(),
-                title: None,
-                version: env!("CARGO_PKG_VERSION").to_owned(),
-                description: Some(
-                    "ephemeral session minted for a modern stateless request".to_owned(),
-                ),
-                website_url: None,
-                icons: None,
-            },
-        }
+    /// The synthetic-session id of a verified `principal_key` and the client
+    /// the request names, under the key the shared services hold. `None`
+    /// when no key is configured or the services are not yet wired.
+    fn derived_session_id(&self, principal_key: &str, client: Option<&str>) -> Option<String> {
+        let services = self.shared_services.load();
+        let keyed = services.as_ref()?.synthetic_session_mac.as_deref()?;
+        Some(Self::synthetic_session_id(keyed, principal_key, client))
     }
 
     /// Resolve the operator-configured 32-byte synthetic-session key
-    /// (`sessions.synthetic_session_key`, base64). `None` when unset,
-    /// not yet wired (no `shared_services`), or malformed (wrong length /
-    /// bad base64) — callers then fall back to per-instance ids. The
-    /// boot-time wiring logs a WARN on a malformed key + on the
-    /// clustered-without-key case, so a silent `None` here only
-    /// happens on the intended per-instance default.
-    pub(crate) fn synthetic_session_key(&self) -> Option<[u8; 32]> {
+    /// (`sessions.synthetic_session_key`, base64) of `snapshot`. `None` when
+    /// unset or malformed (wrong length / bad base64) — callers then fall
+    /// back to per-instance ids. The boot-time wiring logs a WARN on a
+    /// malformed key + on the clustered-without-key case, so a silent `None`
+    /// here only happens on the intended per-instance default.
+    pub(crate) fn synthetic_session_key(snapshot: &crate::config::AppConfig) -> Option<[u8; 32]> {
         use base64::Engine;
-        let services = self.shared_services.load();
-        let snapshot = &services.as_ref()?.config_snapshot;
         // 1. Explicit operator key wins. A malformed explicit key falls
         // through to derivation/None rather than silently using bad material;
         // the boot wiring already WARNs.
@@ -456,9 +349,9 @@ impl GatewayRuntime {
             return Some(key);
         }
         // 2. Clustered fallback: derive a domain-separated sub-key from the
-        // cluster-stable secret so deterministic per-principal synthetic
-        // sessions (and thus cross-replica modern resume) work by default
-        // whenever cluster state-encryption is configured — no separate
+        // cluster-stable secret so derived per-principal sessions (and thus
+        // cross-replica resume) work by default whenever cluster
+        // state-encryption is configured — no separate
         // sessions.synthetic_session_key needed. The id stays principal-derived
         // (HMAC over the trust-qualified principal key), so a different
         // principal still derives a different session id and is rejected.
@@ -471,27 +364,81 @@ impl GatewayRuntime {
         ))
     }
 
-    /// Derive the deterministic synthetic session id for a principal:
-    /// `mcpg-m-<hex(HMAC-SHA256(key, "mcpg:modern-session:" || principal_key))>`.
-    /// `principal_key` is the trust-qualified key from
+    /// The synthetic session id of `principal_key` under `key`, for a
+    /// request that names no client.
+    #[cfg(test)]
+    pub(crate) fn derive_synthetic_session_id(key: &[u8; 32], principal_key: &str) -> String {
+        Self::synthetic_session_id(&Self::synthetic_session_mac(key), principal_key, None)
+    }
+
+    /// The HMAC state keyed with `key` that has taken in the domain prefix,
+    /// built once so each derivation only adds the principal.
+    pub(crate) fn synthetic_session_mac(key: &[u8; 32]) -> hmac_sha256::HMAC {
+        let mut mac = hmac_sha256::HMAC::new(key);
+        mac.update(b"mcpg:modern-session:");
+        mac
+    }
+
+    /// Derive the deterministic synthetic session id for a principal from
+    /// the state [`Self::synthetic_session_mac`] keyed:
+    /// `mcpg-m-<hex(HMAC-SHA256(key, "mcpg:modern-session:" || principal_key))>`,
+    /// with `"\u{1f}client:" || name` after `principal_key` when the request
+    /// names a client. `principal_key` is the trust-qualified key from
     /// [`RequestIdentity::synthetic_principal_key`] (trust tier + provider +
     /// issuer + subject), so the derivation binds to *how* the caller was
     /// authenticated — a header-asserted `alice` cannot re-derive a verified
     /// `alice`'s id. HMAC (not a bare hash) so the id is not computable by a
     /// client that knows another principal's id; the domain-separation prefix
     /// keeps the id space disjoint from any other HMAC use of the same key.
-    pub(crate) fn derive_synthetic_session_id(key: &[u8; 32], principal_key: &str) -> String {
-        use std::fmt::Write;
-        let mut msg = Vec::with_capacity(20 + principal_key.len());
-        msg.extend_from_slice(b"mcpg:modern-session:");
-        msg.extend_from_slice(principal_key.as_bytes());
-        let mac = hmac_sha256::HMAC::mac(&msg, key);
+    pub(crate) fn synthetic_session_id(
+        keyed: &hmac_sha256::HMAC,
+        principal_key: &str,
+        client: Option<&str>,
+    ) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut mac = keyed.clone();
+        mac.update(principal_key);
+        if let Some(client) = client {
+            mac.update("\u{1f}client:");
+            mac.update(client);
+        }
         let mut id = String::with_capacity(7 + 64);
         id.push_str("mcpg-m-");
-        for byte in mac {
-            let _ = write!(id, "{byte:02x}");
+        for byte in mac.finalize() {
+            id.push(char::from(HEX[usize::from(byte >> 4)]));
+            id.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
         id
+    }
+
+    /// True when `request_context` may operate on `session_id`. With
+    /// owner-binding disabled this is always true (possession-only).
+    /// Otherwise the caller's trust-qualified principal key must match the
+    /// session creator's (an anonymous-owned session is matched only by an
+    /// anonymous caller); an unknown/expired session is treated as
+    /// not-owned so a caller cannot probe its existence.
+    pub(crate) fn caller_owns_session(
+        &self,
+        session_id: &str,
+        request_context: &RequestContext,
+    ) -> bool {
+        if !self.bind_session_owner {
+            return true;
+        }
+        let Some(snapshot) = self.session_store.load_session(session_id) else {
+            return false;
+        };
+        let owner = snapshot.owner_principal;
+        let caller = request_context.identity.synthetic_principal_key();
+        if session_owner_matches(owner.as_deref(), caller.as_deref()) {
+            return true;
+        }
+        metrics::counter!("mcpg_session_owner_mismatch_total").increment(1);
+        tracing::warn!(
+            session_id = %session_id,
+            "session operation denied: caller principal does not own the session"
+        );
+        false
     }
 
     /// Terminate a session and clean up after it here, and — when this
@@ -507,24 +454,18 @@ impl GatewayRuntime {
 
     /// The cleanup after a session ended, whose store copy and rows are
     /// already gone. Every replica drops what it keeps for the session
-    /// itself: its tenant count, progress state, completion-limiter bucket,
-    /// request-id tracker, and its holds on the session's subscriptions. The
-    /// replica that recorded the end also does what the replicas share,
-    /// once: it removes the session's subscriptions, cancels its non-terminal
-    /// tasks, records the duration metric and the audit event, and tells the
-    /// other replicas.
+    /// itself: its tenant count, progress state, buffered notifications,
+    /// and its holds on the session's subscriptions. The replica that
+    /// recorded the end also does what the replicas share, once: it removes
+    /// the session's subscriptions, cancels its non-terminal tasks, records
+    /// the duration metric and the audit event, and tells the other
+    /// replicas.
     pub(crate) fn finish_ended_session(&self, ended: &EndedSession) {
         let session_id = ended.session_id.as_str();
-        // decrement the tenant counter.
         self.release_tenant_session(session_id);
-        // prune progress monotonicity state for this session.
         self.execution_dispatcher
             .clear_progress_state_for_session(session_id);
-        // prune the completion rate-limit token bucket keyed by session_id.
-        self.completion_limiter.remove(session_id);
-        // drop the request-id uniqueness tracker so a new session reusing the
-        // id starts with a clean id-space.
-        self.forget_session_request_ids(session_id);
+        self.discard_pending_deliveries(session_id);
         // Through the service, not the store: dropping the rows alone leaves
         // the watch engine still counting this session as a subscriber, so its
         // watcher keeps polling a resource nobody is listening to for the life
@@ -539,7 +480,7 @@ impl GatewayRuntime {
         // their TTL; the session ending is a valid terminal signal. `cancel_task`
         // is a no-op on already-terminal tasks.
         let reason = ended.reason.as_str();
-        if let Ok((tasks, _)) = self.task_store.list_tasks(session_id, None, usize::MAX) {
+        if let Ok(tasks) = self.task_store.list_tasks(session_id) {
             for task in tasks {
                 if matches!(
                     task.status,
@@ -572,7 +513,6 @@ impl GatewayRuntime {
             }
         }
 
-        metrics::gauge!("mcpg_active_sessions").decrement(1.0);
         if ended.reason == session_store::SessionEndReason::IdleExpired {
             metrics::counter!("mcpg_sessions_idle_expired_total").increment(1);
         }
@@ -589,18 +529,16 @@ impl GatewayRuntime {
             reason = %reason,
             "session ended"
         );
-        // Audit: fire-and-forget through the async audit fan-out. Auditors
-        // join opened ↔ ended by `details.session_id`.
+        // Audit: fire-and-forget through the async audit fan-out.
         let registry = Arc::clone(&self.plugin_registry);
         let session_id_owned = session_id.to_owned();
-        let client_name = snapshot.client_info.name.clone();
         let reason_owned = reason.to_owned();
         tokio::spawn(async move {
             let event = mcpg_plugin_host::audit_events::session_terminated_event(
                 &session_id_owned,
                 duration,
                 &reason_owned,
-                Some(&client_name),
+                None,
             );
             let _ = registry.emit_audit_event(&event).await;
         });
@@ -609,9 +547,10 @@ impl GatewayRuntime {
     /// Clean up after a session that ended without a call to
     /// [`Self::terminate_session`] (delivered on the channel installed by
     /// [`Self::install_session_end_notifier`], or told by another replica).
-    /// Guards the narrow reuse window: if a live session now holds this id (a
-    /// client re-created it, or a deterministic-modern id was re-derived), its
-    /// id-keyed state is legitimate and must not be wiped.
+    /// Guards the narrow reuse window: if a live session now holds this id
+    /// (the runtime minted it again, as a derived id comes back for the
+    /// same principal), its id-keyed state is legitimate and must not be
+    /// wiped.
     pub(crate) fn on_session_end(&self, ended: &EndedSession) {
         if self
             .session_store
@@ -650,8 +589,214 @@ impl GatewayRuntime {
     ) {
         self.session_store.set_end_notifier(notifier);
     }
+}
 
-    pub fn session_protocol_version(&self, session_id: &str) -> Option<String> {
-        self.session_store.session_protocol_version(session_id)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::session_store::active_sessions_probe::ActiveSessions;
+
+    fn runtime(max_sessions_per_tenant: usize) -> GatewayRuntime {
+        let mut runtime = GatewayRuntime::new(
+            "mcpg",
+            "0.1.0",
+            "127.0.0.1:8787",
+            "/health",
+            "/mcp",
+            "info",
+            vec![crate::config::SinkConfig {
+                kind: "stdout".to_owned(),
+                config: serde_json::json!({"format": "json"}),
+                level: None,
+            }],
+            true,
+        );
+        runtime.set_max_sessions_per_tenant(max_sessions_per_tenant);
+        runtime.set_bind_session_owner(true);
+        runtime
+    }
+
+    fn verified(subject: &str) -> RequestIdentity {
+        RequestIdentity::Verified {
+            subject_id: subject.to_owned(),
+            issuer: "https://idp.example".to_owned(),
+            auth_provider: "oidc".to_owned(),
+            source: "test".to_owned(),
+            roles: Vec::new(),
+            groups: Vec::new(),
+            scopes: Vec::new(),
+            attributes: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn anonymous() -> RequestIdentity {
+        RequestIdentity::Anonymous {
+            source: "test".to_owned(),
+        }
+    }
+
+    fn context(identity: RequestIdentity) -> RequestContext {
+        RequestContext::new(GatewayRequestId::new(), None, identity, TransportKind::Http)
+    }
+
+    fn session_of(outcome: SessionOutcome) -> String {
+        match outcome {
+            SessionOutcome::Ready(ctx) => ctx.session_id.expect("a session is bound"),
+            SessionOutcome::CapacityExhausted => panic!("the session cap refused the caller"),
+        }
+    }
+
+    #[test]
+    fn the_session_cap_counts_rows_per_principal() {
+        let runtime = runtime(1);
+        let alice = context(verified("alice"));
+        let first = session_of(runtime.ensure_session(alice.clone()));
+        assert_eq!(
+            session_of(runtime.ensure_session(alice.clone())),
+            first,
+            "the principal's row is reused, not counted again"
+        );
+
+        // A second row for alice: the alias is gone, the first row lives on.
+        runtime.session_aliases.clear();
+        assert!(
+            matches!(
+                runtime.ensure_session(alice.clone()),
+                SessionOutcome::CapacityExhausted
+            ),
+            "alice is at her cap of one row"
+        );
+        assert_eq!(
+            runtime.session_store.active_session_count(),
+            1,
+            "the refused row is removed again"
+        );
+
+        let bob = context(verified("bob"));
+        session_of(runtime.ensure_session(bob));
+
+        assert!(runtime.materialize_ephemeral_session("anon-1"));
+        assert!(
+            runtime.materialize_ephemeral_session("anon-1"),
+            "materializing a row twice counts it once"
+        );
+        assert!(
+            !runtime.materialize_ephemeral_session("anon-2"),
+            "anonymous rows count toward one cap"
+        );
+        assert_eq!(runtime.session_store.active_session_count(), 3);
+
+        assert!(runtime.session_store.terminate_session(&first).is_some());
+        runtime.release_tenant_session(&first);
+        session_of(runtime.ensure_session(alice.clone()));
+    }
+
+    #[test]
+    fn without_a_cap_every_principal_mints_freely() {
+        let runtime = runtime(0);
+        let alice = context(verified("alice"));
+        for _ in 0..3 {
+            runtime.session_aliases.clear();
+            session_of(runtime.ensure_session(alice.clone()));
+        }
+        assert_eq!(runtime.session_store.active_session_count(), 3);
+    }
+
+    /// Without a synthetic-session key the row is still owned by the
+    /// caller's trust-qualified principal key, the key the owner check
+    /// compares: the owner passes it and a foreign principal does not.
+    #[test]
+    fn the_owner_is_the_principal_key_without_a_synthetic_key() {
+        let runtime = runtime(0);
+        let alice = context(verified("alice"));
+        let sid = session_of(runtime.ensure_session(alice.clone()));
+        assert_eq!(
+            runtime
+                .session_store
+                .load_session(&sid)
+                .unwrap()
+                .owner_principal,
+            alice.identity.synthetic_principal_key()
+        );
+        assert!(runtime.caller_owns_session(&sid, &alice));
+        assert!(!runtime.caller_owns_session(&sid, &context(verified("bob"))));
+        assert!(!runtime.caller_owns_session(&sid, &context(anonymous())));
+        let header_alice = context(RequestIdentity::HttpHeader {
+            subject_id: "alice".to_owned(),
+            source: "test".to_owned(),
+        });
+        assert!(
+            !runtime.caller_owns_session(&sid, &header_alice),
+            "a header-asserted alice is not the verified alice"
+        );
+        assert!(
+            !runtime.materialize_ephemeral_session(&sid),
+            "an owned row is never rebound to an anonymous owner"
+        );
+        assert!(runtime.caller_owns_session(&sid, &alice));
+
+        assert!(runtime.materialize_ephemeral_session("anon-1"));
+        assert!(runtime.caller_owns_session("anon-1", &context(anonymous())));
+        assert!(!runtime.caller_owns_session("anon-1", &alice));
+        assert!(
+            !runtime.caller_owns_session("never-minted", &alice),
+            "an unknown session is not owned"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_context_that_names_its_session_keeps_it() {
+        let runtime = runtime(1);
+        let mut stdio = context(anonymous());
+        stdio.session_id = Some("process-session".to_owned());
+        assert!(runtime.materialize_ephemeral_session("process-session"));
+        assert_eq!(
+            session_of(runtime.ensure_session(stdio.clone())),
+            "process-session"
+        );
+        assert_eq!(runtime.session_store.active_session_count(), 1);
+
+        // The idle reaper took the row: the next request creates it again.
+        assert!(runtime.terminate_session("process-session"));
+        assert_eq!(
+            session_of(runtime.ensure_session(stdio.clone())),
+            "process-session"
+        );
+        assert_eq!(runtime.session_store.active_session_count(), 1);
+        assert!(runtime.caller_owns_session("process-session", &stdio));
+    }
+
+    #[test]
+    fn an_anonymous_caller_runs_without_a_row() {
+        let runtime = runtime(1);
+        let first = session_of(runtime.ensure_session(context(anonymous())));
+        let second = session_of(runtime.ensure_session(context(anonymous())));
+        assert_ne!(first, second, "every anonymous request is its own session");
+        assert_eq!(runtime.session_store.active_session_count(), 0);
+    }
+
+    /// `mcpg_active_sessions` comes back to where it started once every row
+    /// the runtime minted has ended, refused rows included.
+    #[tokio::test]
+    async fn the_active_sessions_gauge_balances_across_mint_and_end() {
+        let runtime = runtime(1);
+        let probe = ActiveSessions::default();
+        probe.watch(|| {
+            let alice = context(verified("alice"));
+            let row = session_of(runtime.ensure_session(alice.clone()));
+            session_of(runtime.ensure_session(alice.clone()));
+            runtime.session_aliases.clear();
+            assert!(matches!(
+                runtime.ensure_session(alice.clone()),
+                SessionOutcome::CapacityExhausted
+            ));
+            assert!(runtime.materialize_ephemeral_session("anon-1"));
+            assert_eq!(probe.net(), 2, "alice's row and the anonymous row");
+
+            assert!(runtime.terminate_session(&row));
+            assert!(runtime.terminate_session("anon-1"));
+            assert!(!runtime.terminate_session("anon-1"));
+            assert_eq!(probe.net(), 0);
+        });
     }
 }

@@ -163,6 +163,12 @@ pub struct PluginLogBridgeHandle {
 }
 
 impl PluginLogBridgeHandle {
+    /// Whether a record can reach a plugin sink: an operator-listed sink
+    /// takes it, or a per-plugin filter redirects it or counts its drop.
+    pub fn feeds_plugins(&self, per_plugin_filters: &HashMap<String, SignalFilter>) -> bool {
+        !self.global_allowed_plugin_ids.is_empty() || !per_plugin_filters.is_empty()
+    }
+
     /// Spawn the forwarder task, connecting accumulated + future
     /// events to the operator-listed log sinks. Consumes the
     /// handle — the receiver lives inside the spawned task from
@@ -563,6 +569,25 @@ mod tests {
             Some("dev.mcpg.cluster.nats")
         );
         assert_eq!(records[0].message, "nats cluster: KV sweep failed");
+    }
+
+    #[test]
+    fn records_feed_plugins_only_through_a_listed_sink_or_a_per_plugin_filter() {
+        let no_filters = HashMap::new();
+        let (_, unlisted) = new_bridge(
+            Arc::new(HashSet::new()),
+            crate::observability::signal_router::new_target_map(),
+            Arc::new(std::sync::OnceLock::new()),
+        );
+        assert!(!unlisted.feeds_plugins(&no_filters));
+        let filters = HashMap::from([("core".to_owned(), SignalFilter::default())]);
+        assert!(unlisted.feeds_plugins(&filters));
+        let (_, listed) = new_bridge(
+            Arc::new(HashSet::from(["dev.acme.logs".to_owned()])),
+            crate::observability::signal_router::new_target_map(),
+            Arc::new(std::sync::OnceLock::new()),
+        );
+        assert!(listed.feeds_plugins(&no_filters));
     }
 
     #[test]

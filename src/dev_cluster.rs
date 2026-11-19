@@ -2,8 +2,8 @@
 //!
 //! `up` boots one NATS JetStream container (via docker or podman) plus N
 //! gateway nodes — re-invocations of this same executable — that coordinate
-//! through it, so cross-node behaviour (a session minted on one node served
-//! by another) is observable with nothing but curl. `down` stops everything;
+//! through it, so cross-node behaviour (a tool call paused on one node and
+//! resumed on another) is observable with nothing but curl. `down` stops everything;
 //! `status` reports what is alive. Everything the harness writes — the
 //! generated config, the state key, pidfiles, logs, per-node audit trails —
 //! lives under `<state-dir>/dev-cluster` (`MCPG_STATE_DIR` overrides the
@@ -944,36 +944,37 @@ fn print_up_summary(
     println!("  state dir   : {}", dir.display());
     println!("  logs        : {}/node-*/gateway.log", dir.display());
     println!();
+    let version = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
+    let headers = |method: &str, name: Option<&str>| {
+        let name = name
+            .map(|name| format!(" -H 'mcp-name: {name}'"))
+            .unwrap_or_default();
+        format!(
+            "-H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \\\n    \
+             -H 'mcp-protocol-version: {version}' -H 'mcp-method: {method}'{name}"
+        )
+    };
+    let whoami = |port: u16, id: u32| {
+        format!(
+            "  curl -sX POST http://127.0.0.1:{port}/mcp \\\n    {} \\\n    \
+             -d '{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"cluster.whoami\",\"arguments\":{{}}}}}}'",
+            headers("tools/call", Some("cluster.whoami"))
+        )
+    };
     println!("Feel the cluster — the nodes are ONE gateway:");
     println!();
-    println!("  # 1) Mint an MCP session on node-1 and complete the handshake via {second_id} …");
+    println!("  # 1) Discover the gateway on node-1 …");
     println!(
-        "  SID=$(curl -siX POST http://127.0.0.1:{first}/mcp \\\n    \
-         -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \\\n    \
-         -d '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"curl\",\"version\":\"0\"}}}}}}' \\\n    \
-         | tr -d '\\r' | awk 'tolower($1)==\"mcp-session-id:\"{{print $2}}')"
-    );
-    println!(
-        "  curl -so /dev/null -X POST http://127.0.0.1:{second}/mcp \\\n    \
-         -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \\\n    \
-         -H \"mcp-session-id: $SID\" -d '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}}'"
+        "  curl -sX POST http://127.0.0.1:{first}/mcp \\\n    {} \\\n    \
+         -d '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/protocolVersion\":\"{version}\",\"io.modelcontextprotocol/clientInfo\":{{\"name\":\"curl\",\"version\":\"0\"}},\"io.modelcontextprotocol/clientCapabilities\":{{}}}}}}}}'",
+        headers("server/discover", None)
     );
     println!();
-    println!("  # 2) … then call a tool on {last_id}: the session lives in NATS, not in node-1.");
     println!(
-        "  curl -sX POST http://127.0.0.1:{last}/mcp \\\n    \
-         -H 'content-type: application/json' -H 'accept: application/json' \\\n    \
-         -H \"mcp-session-id: $SID\" \\\n    \
-         -d '{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"cluster.whoami\",\"arguments\":{{}}}}}}'"
+        "  # 2) … then call a tool on {last_id} and on {second_id}: a different member answers."
     );
-    println!();
-    println!("  # 3) Same session against {second_id} — a different member answers.");
-    println!(
-        "  curl -sX POST http://127.0.0.1:{second}/mcp \\\n    \
-         -H 'content-type: application/json' -H 'accept: application/json' \\\n    \
-         -H \"mcp-session-id: $SID\" \\\n    \
-         -d '{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"cluster.whoami\",\"arguments\":{{}}}}}}'"
-    );
+    println!("{}", whoami(last, 2));
+    println!("{}", whoami(second, 3));
     println!();
     println!(
         "  (For a paused tool call resumed on a different node, call `cluster.ask` — \n   \

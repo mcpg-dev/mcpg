@@ -604,8 +604,6 @@ impl Stream {
             let ctx = RequestContext::new(
                 GatewayRequestId::new(),
                 None,
-                None,
-                None,
                 self.identity.clone(),
                 TransportKind::Http,
             );

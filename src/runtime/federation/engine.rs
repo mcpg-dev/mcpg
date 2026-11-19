@@ -19,36 +19,28 @@ use crate::backends::{
     ResourceDescriptor, ResourceRoute, ToolDescriptor,
 };
 use crate::config::federation::{AuthConfig, SubjectToken};
-use crate::config::{AuthMode, FederationConfig, SynthesizeMode, UpstreamTransport};
-use crate::protocol::{
-    ClientCapabilities, JSONRPC_VERSION, ListChangedNotification, ResourceTemplate,
-    ResourceUpdatedNotification, ResourceUpdatedParams,
-};
+use crate::config::{AuthMode, FederationConfig, SynthesizeMode};
+use crate::protocol::{JSONRPC_VERSION, ListChangedNotification, ResourceTemplate};
 use crate::runtime::RequestTrustLevel;
 use crate::runtime::delivery_bus::DeliveryBus;
 use crate::runtime::events::catalog::{FederatedEventType, FederatedEvents};
 use crate::runtime::pipeline_store::{DeliveryKind, DeliveryMessage};
 use crate::runtime::policy::{FederatedToolPolicies, FederationGovernance};
-use crate::runtime::session_store::{SessionPhase, SessionStore};
-use crate::runtime::subscription_store::SubscriptionStore;
+use crate::runtime::session_store::SessionStore;
 use mcpg_plugin_host::PluginRegistry;
 use mcpg_plugin_host::credential_cache_clustered::CredentialCacheKind;
 use mcpg_plugin_protocol::credential::{CredentialError, CredentialIssuer};
 use mcpg_plugin_protocol::types::PluginIdentity;
 
-use super::bridge::ServerRequestBridge;
 use super::idp_sessions::{self, IdpSessionSource, SubjectTokenOutcome};
 use super::upstream::{
-    McpUpstream, UpstreamConnectOptions, UpstreamError, UpstreamServerRequestHandler,
+    McpUpstream, SubscriptionSpec, ToolCallOptions, UpstreamConnectOptions, UpstreamError,
     connect_upstream,
 };
 use super::wire::{UpstreamPrompt, UpstreamResource, UpstreamResourceTemplate, UpstreamTool};
 
 /// Time budget for a capability-import connect + list round-trip.
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long a bridged server-request waits for the downstream client (P3).
-const BRIDGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Most event types imported from one upstream.
 const MAX_IMPORTED_EVENT_TYPES: usize = 1_000;
@@ -76,9 +68,7 @@ async fn list_upstream_events(
         );
         Ok(Vec::new())
     };
-    if !upstream.wire_is_modern()
-        || advertises_events(upstream.server_capabilities()) == Some(false)
-    {
+    if advertises_events(upstream.server_capabilities()) == Some(false) {
         return not_served();
     }
     let mut events = match upstream.list_events().await {
@@ -100,15 +90,6 @@ async fn list_upstream_events(
         events.truncate(MAX_IMPORTED_EVENT_TYPES);
     }
     Ok(events)
-}
-
-/// Mint a fresh, namespaced id for a bridged server-request. The `fed-` prefix
-/// keeps it disjoint from the gateway's pipeline server-request ids and from
-/// any upstream-chosen id. The random UUID makes the id unguessable
-/// (defense-in-depth; the authoritative guard is the per-waiter
-/// session-ownership check in [`ServerRequestBridge::deliver_response`]).
-fn next_bridge_id() -> String {
-    format!("fed-{}", uuid::Uuid::new_v4())
 }
 
 /// Map an upstream resource URI to the gateway-side URI MCPG re-serves
@@ -164,8 +145,8 @@ pub struct FederationCaller<'a> {
     /// ([`RequestIdentity::synthetic_principal_key`](crate::runtime::RequestIdentity));
     /// `None` for anonymous callers.
     pub principal: Option<&'a str>,
-    /// Downstream mcpg session id (capability lookup + server-request
-    /// bridge routing; satellite-key fallback for anonymous callers).
+    /// Downstream mcpg session id: the session a connect link is offered
+    /// on.
     pub session_id: Option<&'a str>,
     /// Inbound `Authorization` bearer (`pass_through` forwarding; the
     /// RFC 8693 subject token for the impersonation modes).
@@ -209,10 +190,15 @@ impl Satellite {
     }
 }
 
+/// The first element of the key an anonymous caller's satellite is kept
+/// under. Principal keys start with their trust tier, so none equals it.
+const ANONYMOUS_SATELLITE_KEY: &str = "_anon";
+
 /// First element of the satellite map key: the caller's principal
-/// (stable across that principal's sessions and replicas), falling back
-/// to the session id for anonymous callers (unique per anonymous modern
-/// request, per-session on legacy). For the auth modes whose upstream
+/// (stable across that principal's sessions and replicas), or
+/// [`ANONYMOUS_SATELLITE_KEY`], which every anonymous caller shares: the
+/// upstream wire keeps no state per caller, and an anonymous session lasts
+/// one request. For the auth modes whose upstream
 /// credential derives from the caller's own bearer, a fingerprint of
 /// that bearer joins the key so two tokens of the same principal (e.g.
 /// different scopes, or a mid-session rotation) never share an upstream
@@ -229,8 +215,7 @@ fn satellite_caller_key(
 ) -> String {
     let mut key = caller
         .principal
-        .or(caller.session_id)
-        .unwrap_or_default()
+        .unwrap_or(ANONYMOUS_SATELLITE_KEY)
         .to_owned();
     let auth = &fed.upstream.auth;
     if auth.mode == AuthMode::OauthImpersonation
@@ -322,18 +307,15 @@ struct FederationCredentials {
 struct FederationNotifier {
     session_store: Arc<dyn SessionStore>,
     delivery_bus: Arc<dyn DeliveryBus>,
-    subscription_store: Arc<dyn SubscriptionStore>,
 }
 
 impl FederationNotifier {
-    /// Broadcast the given `*/list_changed` methods to every operational
-    /// client session (mirrors the config-reload broadcast in `app::mod`).
+    /// Broadcast the given `*/list_changed` methods to every session this
+    /// replica holds; the listen streams of each pick out what they asked
+    /// for (mirrors the config-reload broadcast in `app::mod`).
     async fn broadcast_list_changed(&self, methods: &[&'static str]) {
         let sessions = self.session_store.list_sessions();
-        for session in sessions
-            .iter()
-            .filter(|s| s.phase == SessionPhase::Operational)
-        {
+        for session in &sessions {
             for method in methods {
                 let notification = ListChangedNotification {
                     jsonrpc: JSONRPC_VERSION,
@@ -343,7 +325,6 @@ impl FederationNotifier {
                     let message = DeliveryMessage {
                         kind: DeliveryKind::Notification,
                         jsonrpc_message,
-                        delivery_id: String::new(),
                     };
                     if let Err(e) = self
                         .delivery_bus
@@ -358,98 +339,6 @@ impl FederationNotifier {
                 }
             }
         }
-    }
-
-    /// Forward an upstream `resources/updated` to every MCPG client subscribed
-    /// to the (already-prefixed) federated URI. Mirrors the watch engine's
-    /// resource-update fan-out.
-    async fn forward_resource_updated(&self, prefixed_uri: &str) {
-        let subscribers = self.subscription_store.subscribers_for(prefixed_uri);
-        if subscribers.is_empty() {
-            return;
-        }
-        let notification = ResourceUpdatedNotification {
-            jsonrpc: JSONRPC_VERSION,
-            method: "notifications/resources/updated",
-            params: ResourceUpdatedParams {
-                uri: prefixed_uri.to_owned(),
-            },
-        };
-        let Ok(jsonrpc_message) = serde_json::to_value(&notification) else {
-            return;
-        };
-        for session_id in &subscribers {
-            let message = DeliveryMessage {
-                kind: DeliveryKind::ResourceUpdated,
-                jsonrpc_message: jsonrpc_message.clone(),
-                delivery_id: String::new(),
-            };
-            if let Err(e) = self.delivery_bus.publish(session_id, message).await {
-                tracing::debug!(
-                    session = %session_id, uri = %prefixed_uri, error = %e,
-                    "federation resource_updated publish failed"
-                );
-            }
-        }
-    }
-}
-
-/// Bridges an upstream server→client request to the downstream client during a
-/// federated tool call (P3). Built per dispatch from the engine's bridge +
-/// the calling session's capabilities. Declines anything the downstream client
-/// didn't advertise (never surface a request it can't handle).
-struct FederatedBridgeHandler {
-    bridge: Option<Arc<ServerRequestBridge>>,
-    session_id: Option<String>,
-    caps: ClientCapabilities,
-}
-
-#[async_trait::async_trait]
-impl UpstreamServerRequestHandler for FederatedBridgeHandler {
-    async fn handle(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
-        let (Some(bridge), Some(session_id)) = (self.bridge.as_ref(), self.session_id.as_ref())
-        else {
-            return Err((
-                -32601,
-                format!("server-request '{method}' cannot be bridged (no client session)"),
-            ));
-        };
-        // Bridge only the server-request methods the downstream client
-        // advertised (never surface a request it can't handle).
-        let supported = match method {
-            "elicitation/create" => self.caps.supports_elicitation(),
-            "sampling/createMessage" => self.caps.supports_sampling(),
-            "roots/list" => self.caps.supports_roots(),
-            _ => false,
-        };
-        if !supported {
-            return Err((
-                -32601,
-                format!("server-request '{method}' not supported by the downstream client"),
-            ));
-        }
-        bridge
-            .ask_client(session_id, next_bridge_id(), method, params, BRIDGE_TIMEOUT)
-            .await
-            .map_err(|e| (-32603, e.to_string()))
-    }
-
-    async fn forward_notification(&self, method: &str, params: Value) {
-        // Relay only progress; other upstream notifications aren't surfaced to
-        // the client. (Upstream and downstream progress tokens are not yet
-        // translated — forwarded as-is; token mapping is a follow-up.)
-        if method != "notifications/progress" {
-            return;
-        }
-        let (Some(bridge), Some(session_id)) = (self.bridge.as_ref(), self.session_id.as_ref())
-        else {
-            return;
-        };
-        let jsonrpc_message =
-            json!({ "jsonrpc": JSONRPC_VERSION, "method": method, "params": params });
-        bridge
-            .forward_notification(session_id, jsonrpc_message)
-            .await;
     }
 }
 
@@ -567,7 +456,7 @@ impl ChangedKinds {
 
 pub(crate) struct FederationEngine {
     federations: Vec<FederationConfig>,
-    /// Shared with `CapabilityRegistry` (D2): the engine `store`s a fresh
+    /// Shared with `CapabilityRegistry`: the engine `store`s a fresh
     /// overlay after import / refresh; the registry reads it atomically.
     overlay: Arc<ArcSwap<FederatedCatalog>>,
     /// Loop-detection id sent as `Mcpg-Upstream-Via` on every upstream
@@ -577,8 +466,8 @@ pub(crate) struct FederationEngine {
     /// shared with the `PreDispatchPolicyGate` so synthetic tools enforce
     /// their federation's `minimum_trust` / `required_scopes` / `allow_if`.
     policy: Arc<ArcSwap<FederatedToolPolicies>>,
-    /// Per-(mcpg session, federation) upstream sessions used for
-    /// dispatch (D5), separate from the transient import sessions.
+    /// Per-(caller, federation) upstream connections used for dispatch,
+    /// separate from the transient import connections.
     satellites: DashMap<(String, String), Satellite>,
     /// Credential subsystem handle. `Some` in production (wired from the
     /// runtime), `None` in unit tests. Required only by federations using
@@ -590,10 +479,6 @@ pub(crate) struct FederationEngine {
     /// Client-notification sink. `Some` in production; `None` in unit tests
     /// (re-import still happens, the client broadcast is just skipped).
     notifier: Option<Arc<FederationNotifier>>,
-    /// Server-request bridge (P3): ask the downstream client a server-request
-    /// (sampling/elicitation/roots) on behalf of an upstream and await the
-    /// reply. `Some` in production; `None` in unit tests without bridging.
-    server_request_bridge: Option<Arc<ServerRequestBridge>>,
     /// Per-federation last-import cache (keyed by federation name), so a
     /// single upstream's refresh republishes the overlay without re-listing
     /// the others.
@@ -601,15 +486,9 @@ pub(crate) struct FederationEngine {
     /// Where every republish puts the imported MCP Events types, for the
     /// events core. `None` in unit tests that do not import events.
     event_types: Option<Arc<tokio::sync::watch::Sender<FederatedEvents>>>,
-    /// Wire detected per `protocol_version: auto` federation (name →
-    /// modern?). Written after any successful probing connect; read by
-    /// `connect_opts` so later satellites / listeners skip the probe.
-    /// Cleared by engine replacement (config reload) — the next connect
-    /// re-probes.
-    detected_wires: DashMap<String, bool>,
     /// When true, MCPG advertises the SEP-1865
-    /// `io.modelcontextprotocol/ui` extension on every outgoing upstream
-    /// `initialize` (including the transient import session). A
+    /// `io.modelcontextprotocol/ui` extension in the client capabilities of
+    /// every upstream connection (including the transient import one). A
     /// spec-compliant upstream checks this client capability before
     /// emitting UI-enabled tools, so without it federated servers
     /// withhold their UI tools. Mirrors
@@ -660,10 +539,8 @@ impl FederationEngine {
             credentials: None,
             idp_sessions: None,
             notifier: None,
-            server_request_bridge: None,
             imported: Mutex::new(HashMap::new()),
             event_types: None,
-            detected_wires: DashMap::new(),
             apps_advertise_upstream: false,
             tunnel_federation: None,
         }
@@ -683,8 +560,8 @@ impl FederationEngine {
     }
 
     /// Opt into advertising the SEP-1865 `io.modelcontextprotocol/ui`
-    /// extension on outgoing upstream `initialize` requests, so
-    /// federated servers emit their UI-enabled tools.
+    /// extension on every upstream connection, so federated servers emit
+    /// their UI-enabled tools.
     #[must_use]
     pub fn with_apps_upstream_advertisement(mut self, enabled: bool) -> Self {
         self.apps_advertise_upstream = enabled;
@@ -727,29 +604,12 @@ impl FederationEngine {
         mut self,
         session_store: Arc<dyn SessionStore>,
         delivery_bus: Arc<dyn DeliveryBus>,
-        subscription_store: Arc<dyn SubscriptionStore>,
     ) -> Self {
         self.notifier = Some(Arc::new(FederationNotifier {
             session_store,
             delivery_bus,
-            subscription_store,
         }));
         self
-    }
-
-    /// Attach the server-request bridge (P3) so upstream-initiated
-    /// sampling/elicitation/roots requests can be bridged to the downstream
-    /// client and awaited in-task.
-    #[must_use]
-    pub fn with_server_request_bridge(mut self, bridge: Arc<ServerRequestBridge>) -> Self {
-        self.server_request_bridge = Some(bridge);
-        self
-    }
-
-    /// The server-request bridge, if wired. The HTTP response intake routes a
-    /// matching server-request response here before the pipeline-resume path.
-    pub(crate) fn server_request_bridge(&self) -> Option<&Arc<ServerRequestBridge>> {
-        self.server_request_bridge.as_ref()
     }
 
     /// Whether any upstream is configured.
@@ -902,8 +762,7 @@ impl FederationEngine {
 
     async fn import_one(&self, fed: &FederationConfig) -> Result<ImportedParts, UpstreamError> {
         let bearer = self.catalog_bearer(fed).await?;
-        let upstream = connect_upstream(self.connect_opts(fed, None, bearer).await?).await?;
-        self.record_detected_wire(fed, upstream.as_ref());
+        let upstream = connect_upstream(self.connect_opts(fed, bearer)?).await?;
         let listed_tools = if fed.import.tools {
             upstream.list_tools().await
         } else {
@@ -1001,92 +860,41 @@ impl FederationEngine {
                 self.bearer_for(fed, caller).await?
             }
         };
-        let upstream = connect_upstream(self.connect_opts(fed, None, bearer).await?).await?;
-        self.record_detected_wire(fed, upstream.as_ref());
-        Ok(upstream)
-    }
-
-    /// Record the wire a probing connect resolved so later connects to
-    /// this federation (satellites, listeners, refreshes) skip the probe.
-    fn record_detected_wire(&self, fed: &FederationConfig, upstream: &dyn McpUpstream) {
-        if fed.upstream.protocol_version.is_auto() {
-            self.detected_wires
-                .insert(fed.name.clone(), upstream.wire_is_modern());
-        }
-    }
-
-    /// The `(modern, probe)` pair a connect to `fed` should use: pinned
-    /// versions never probe; `auto` probes once and then reuses the
-    /// detected wire; stdio never probes (legacy-only transport).
-    fn wire_hint(&self, fed: &FederationConfig) -> (bool, bool) {
-        if fed.upstream.protocol_version.pinned().is_some() {
-            return (fed.upstream.protocol_version.is_modern(), false);
-        }
-        match self.detected_wires.get(&fed.name) {
-            Some(modern) => (*modern, false),
-            None => (
-                false,
-                matches!(fed.upstream.transport, UpstreamTransport::StreamableHttp),
-            ),
-        }
+        connect_upstream(self.connect_opts(fed, bearer)?).await
     }
 
     /// Whether `source` should have `resources/updated` synthesized by
     /// polling (the watch engine asks on the first downstream subscribe).
-    /// `Some(interval_ms)` = poll at that cadence; `None` = don't. `auto`
-    /// polls exactly the push-less upstreams: the modern stateless wire
-    /// (its listener carries only `*/list_changed`) and stdio (no
-    /// standalone notification channel at all).
+    /// `Some(interval_ms)` = poll at that cadence; `None` = don't. An
+    /// upstream's listen stream carries only `*/list_changed`, so a
+    /// federated resource's updates come from polling it.
     pub(crate) fn synthesized_poll_interval_ms(&self, source: &str) -> Option<u64> {
         let fed = self.federations.iter().find(|f| f.name == source)?;
-        let poll = match fed.synthesize.resources_updated {
-            SynthesizeMode::Off => false,
-            SynthesizeMode::Poll => true,
-            SynthesizeMode::Auto => match fed.upstream.transport {
-                UpstreamTransport::Stdio => true,
-                UpstreamTransport::StreamableHttp => {
-                    if fed.upstream.protocol_version.is_auto() {
-                        self.detected_wires
-                            .get(source)
-                            .is_some_and(|modern| *modern)
-                    } else {
-                        fed.upstream.protocol_version.is_modern()
-                    }
-                }
-            },
-        };
-        poll.then_some(fed.synthesize.poll_interval_ms)
+        match fed.synthesize.resources_updated {
+            SynthesizeMode::Poll => Some(fed.synthesize.poll_interval_ms),
+            SynthesizeMode::Off => None,
+        }
     }
 
-    async fn connect_opts(
+    fn connect_opts(
         &self,
         fed: &FederationConfig,
-        session_id: Option<&str>,
         bearer_token: Option<String>,
     ) -> Result<UpstreamConnectOptions, UpstreamError> {
-        // Advertise to the upstream the bridgeable client capabilities the
-        // downstream session actually has (P3), so it knows it may issue
-        // sampling/elicitation/roots. Empty for import/listener sessions.
-        let mut client_capabilities =
-            serde_json::to_value(self.downstream_caps(session_id)).unwrap_or_else(|_| json!({}));
-        // SEP-1865: advertise MCP Apps support upstream so the server
-        // emits its UI-enabled tools. Applies to the import session too
-        // (that's when tools are listed), independent of any downstream
-        // client session.
+        // MCPG answers no server-to-client request for an upstream, so it
+        // advertises no client capability but MCP Apps (SEP-1865), which
+        // makes the upstream emit its UI-enabled tools; the import
+        // connection carries it too, since that is when tools are listed.
+        let mut client_capabilities = serde_json::Map::new();
         if self.apps_advertise_upstream {
-            let obj = client_capabilities
-                .as_object_mut()
-                .expect("client capabilities serialise to a JSON object");
-            let extensions = obj.entry("extensions").or_insert_with(|| json!({}));
-            if let Some(ext_obj) = extensions.as_object_mut() {
-                ext_obj.insert(
-                    crate::protocol::shared::apps::EXTENSION_ID.to_owned(),
-                    crate::protocol::shared::apps::capability_value(&[]),
-                );
-            }
+            let mut extensions = serde_json::Map::new();
+            extensions.insert(
+                crate::protocol::shared::apps::EXTENSION_ID.to_owned(),
+                crate::protocol::shared::apps::capability_value(&[]),
+            );
+            client_capabilities.insert("extensions".to_owned(), Value::Object(extensions));
         }
         let (url, tunnel_token) = self.resolve_upstream_url(fed)?;
-        let (modern, probe) = self.wire_hint(fed);
         Ok(UpstreamConnectOptions {
             url,
             tunnel_token,
@@ -1095,14 +903,13 @@ impl FederationEngine {
             max_response_bytes: fed.response.max_response_bytes,
             timeout: IMPORT_TIMEOUT,
             gateway_via: self.gateway_via.clone(),
-            client_capabilities,
+            client_capabilities: Value::Object(client_capabilities),
+            discover: true,
             transport: fed.upstream.transport,
             headers: fed.upstream.headers.clone(),
             command: fed.upstream.command.clone(),
             args: fed.upstream.args.clone(),
             env: fed.upstream.env.clone(),
-            modern,
-            probe,
             tap: None,
             capture_stdio_stderr: false,
             signer: None,
@@ -1146,20 +953,6 @@ impl FederationEngine {
             format!("{base}/federate/{name}/{path}")
         };
         Ok((url, tf.token.clone()))
-    }
-
-    /// The downstream client's MCP capabilities for `session_id`, via the
-    /// notifier's session store. Empty (bridge nothing) when there's no
-    /// notifier, no session, or the session can't be loaded.
-    fn downstream_caps(&self, session_id: Option<&str>) -> ClientCapabilities {
-        let (Some(notifier), Some(sid)) = (self.notifier.as_ref(), session_id) else {
-            return ClientCapabilities::default();
-        };
-        notifier
-            .session_store
-            .load_session(Some(sid), false)
-            .map(|s| s.client_capabilities)
-            .unwrap_or_default()
     }
 
     /// Bearer credential for a dispatch session (tool call, resource
@@ -1536,9 +1329,9 @@ impl FederationEngine {
     }
 
     /// Dispatch a federated tool call: get-or-create the caller's satellite
-    /// for `(caller, source)` and forward the call, bridging any upstream
-    /// server-requests (sampling/elicitation/roots) back to the downstream
-    /// client (P3).
+    /// for `(caller, source)` and forward the call. The caller's progress
+    /// token travels upstream as `_meta.progressToken`, so the upstream
+    /// reports progress under it.
     pub async fn call_tool(
         &self,
         source: &str,
@@ -1549,16 +1342,17 @@ impl FederationEngine {
     ) -> Result<Value, UpstreamError> {
         let satellite = self.get_or_connect_satellite(source, caller).await?;
         // The upstream tool's declared `inputSchema` drives SEP-2243
-        // `Mcp-Param-{Name}` promotion on the modern wire (ignored on the
-        // legacy wire).
+        // `Mcp-Param-{Name}` promotion.
         let input_schema = self.upstream_input_schema(source, upstream_name);
         satellite
-            .call_tool_bridged(
+            .call_tool_with(
                 upstream_name,
                 args,
-                input_schema.as_ref(),
-                &self.bridge_handler(caller.session_id),
-                progress_token,
+                &ToolCallOptions {
+                    input_schema: input_schema.as_ref(),
+                    progress_token,
+                    ..ToolCallOptions::default()
+                },
             )
             .await
     }
@@ -1567,7 +1361,7 @@ impl FederationEngine {
     /// last successful import of its owning federation (keyed by `source`
     /// → `upstream_name`). `None` when the federation/tool is unknown
     /// (e.g. before the first import). Used only to promote SEP-2243
-    /// `Mcp-Param-{Name}` headers on the modern wire.
+    /// `Mcp-Param-{Name}` headers.
     fn upstream_input_schema(&self, source: &str, upstream_name: &str) -> Option<Value> {
         let imported = self.imported.lock().ok()?;
         let parts = imported.get(source)?;
@@ -1580,8 +1374,7 @@ impl FederationEngine {
         })
     }
 
-    /// Dispatch a federated resource read, bridging any upstream
-    /// server-requests to the downstream client (P3-C). Returns the upstream
+    /// Dispatch a federated resource read. Returns the upstream
     /// `resources/read` result.
     pub async fn read_resource(
         &self,
@@ -1590,13 +1383,10 @@ impl FederationEngine {
         caller: FederationCaller<'_>,
     ) -> Result<Value, UpstreamError> {
         let satellite = self.get_or_connect_satellite(source, caller).await?;
-        satellite
-            .read_resource_bridged(upstream_uri, &self.bridge_handler(caller.session_id))
-            .await
+        satellite.read_resource(upstream_uri).await
     }
 
-    /// Dispatch a federated prompt fetch, bridging any upstream server-requests
-    /// to the downstream client (P3-C). Returns the upstream `prompts/get`
+    /// Dispatch a federated prompt fetch. Returns the upstream `prompts/get`
     /// result.
     pub async fn get_prompt(
         &self,
@@ -1606,19 +1396,7 @@ impl FederationEngine {
         caller: FederationCaller<'_>,
     ) -> Result<Value, UpstreamError> {
         let satellite = self.get_or_connect_satellite(source, caller).await?;
-        satellite
-            .get_prompt_bridged(upstream_name, args, &self.bridge_handler(caller.session_id))
-            .await
-    }
-
-    /// Build the per-dispatch server-request bridge handler for `session_id`
-    /// (the engine's bridge + the session's advertised capabilities).
-    fn bridge_handler(&self, session_id: Option<&str>) -> FederatedBridgeHandler {
-        FederatedBridgeHandler {
-            bridge: self.server_request_bridge.clone(),
-            session_id: session_id.map(str::to_owned),
-            caps: self.downstream_caps(session_id),
-        }
+        satellite.get_prompt(upstream_name, args).await
     }
 
     async fn get_or_connect_satellite(
@@ -1650,12 +1428,12 @@ impl FederationEngine {
             entry.touch();
             return Ok(Arc::clone(&entry.upstream));
         }
-        let upstream = connect_upstream(
-            self.connect_opts(fed, caller.session_id, bearer.clone())
-                .await?,
-        )
-        .await?;
-        self.record_detected_wire(fed, upstream.as_ref());
+        // A satellite reads no upstream capabilities, so it skips
+        // `server/discover`; its first call fails if the upstream does not
+        // serve this revision.
+        let mut opts = self.connect_opts(fed, bearer.clone())?;
+        opts.discover = false;
+        let upstream = connect_upstream(opts).await?;
         // Check-then-insert can race two concurrent first calls; the
         // loser's session is dropped and idle-reaped upstream — bounded
         // and acceptable. A displaced STALE-bearer satellite is torn down
@@ -1672,7 +1450,7 @@ impl FederationEngine {
     }
 
     /// Close + drop satellites idle longer than `idle`. Driven by a
-    /// background sweeper wired at boot (increment C).
+    /// background sweeper wired at boot.
     pub async fn sweep_idle(&self, idle: Duration) {
         let now = Instant::now();
         let stale: Vec<(String, String)> = self
@@ -1697,9 +1475,7 @@ impl FederationEngine {
     /// federations are left behind and re-established lazily — carrying one
     /// with stale auth or a stale target would be a correctness/security bug.
     /// Best-effort: a satellite created on `prior` during the reload window may
-    /// be missed and simply re-established on the next call. The detected
-    /// wires of unchanged `auto` federations carry over the same way so a
-    /// reload does not re-probe every upstream.
+    /// be missed and simply re-established on the next call.
     pub(crate) fn adopt_satellites(&self, prior: &FederationEngine) {
         let unchanged = |fed_name: &String| {
             matches!(
@@ -1722,12 +1498,6 @@ impl FederationEngine {
                     ),
                 );
                 carried += 1;
-            }
-        }
-        for entry in prior.detected_wires.iter() {
-            if unchanged(entry.key()) {
-                self.detected_wires
-                    .insert(entry.key().clone(), *entry.value());
             }
         }
         if carried > 0 {
@@ -1775,16 +1545,16 @@ impl FederationEngine {
         self.republish();
     }
 
-    /// Spawn one persistent notification-listener task per federation (P2-D).
-    /// Each opens the upstream's server→client SSE stream and, on a
+    /// Spawn one persistent notification-listener task per federation. Each
+    /// holds a `subscriptions/listen` stream on the upstream and, on a
     /// `*/list_changed` push, refreshes the overlay and forwards the change to
     /// MCPG's own clients. Tasks hold a `Weak` so they exit when the engine is
     /// dropped (e.g. replaced on a config reload), like the idle sweeper.
     pub fn spawn_listeners(self: &Arc<Self>) {
         for fed in &self.federations {
-            // stdio has no separate notification channel (notifications are
-            // drained during call cycles) — a listener would just park holding
-            // an idle child, so skip it. TTL refresh (below) still applies.
+            // A stdio upstream holds no listen stream (its one pipe serves
+            // every call), so it has no listener. TTL refresh (below) still
+            // applies.
             if matches!(
                 fed.upstream.transport,
                 crate::config::UpstreamTransport::Stdio
@@ -1799,7 +1569,7 @@ impl FederationEngine {
 
     /// Spawn one TTL poll-refresh task per federation: a
     /// fallback that re-imports `cache.capability_ttl_secs` apart even when the
-    /// upstream never pushes `list_changed` (e.g. no standalone SSE stream).
+    /// upstream never pushes `list_changed` (e.g. a stdio upstream).
     /// A refresh whose fingerprint diff shows the catalog moved broadcasts
     /// the changed `*/list_changed` kinds to connected clients — for a
     /// push-less upstream this poll IS the `list_changed` source.
@@ -1834,8 +1604,8 @@ impl FederationEngine {
     }
 
     /// Reconnecting listen loop for one federation. Backs off (capped) when
-    /// the stream ends or the upstream has no standalone SSE stream, and exits
-    /// once the engine is gone.
+    /// the stream ends or the upstream refuses it, and exits once the engine
+    /// is gone.
     async fn run_listener(weak: Weak<Self>, fed_name: String) {
         const MAX_BACKOFF: Duration = Duration::from_secs(60);
         let mut backoff = Duration::from_secs(1);
@@ -1862,26 +1632,20 @@ impl FederationEngine {
         }
     }
 
-    /// Open one notification stream and process pushes until it ends.
+    /// Open one `subscriptions/listen` stream on the upstream for its catalog
+    /// changes, and its event-type changes when this federation imports MCP
+    /// Events, and process pushes until it ends.
     async fn listen_once(&self, fed: &FederationConfig) -> Result<(), UpstreamError> {
         use futures::StreamExt;
         let bearer = self.catalog_bearer(fed).await?;
-        let upstream = connect_upstream(self.connect_opts(fed, None, bearer).await?).await?;
-        self.record_detected_wire(fed, upstream.as_ref());
-        let events = fed.import.events
-            && upstream.wire_is_modern()
-            && advertises_events(upstream.server_capabilities()) != Some(false);
-        // The trait returns a boxed (Unpin) stream, so no `pin_mut!` needed.
-        let mut stream = if events {
-            upstream
-                .open_subscriptions(&super::upstream::SubscriptionSpec {
-                    events_list_changed: true,
-                    ..super::upstream::SubscriptionSpec::all_list_changed()
-                })
-                .await?
-        } else {
-            upstream.open_notifications().await?
+        let upstream = connect_upstream(self.connect_opts(fed, bearer)?).await?;
+        let spec = SubscriptionSpec {
+            events_list_changed: fed.import.events
+                && advertises_events(upstream.server_capabilities()) != Some(false),
+            ..SubscriptionSpec::all_list_changed()
         };
+        // The trait returns a boxed (Unpin) stream, so no `pin_mut!` needed.
+        let mut stream = upstream.open_subscriptions(&spec).await?;
         while let Some(notif) = stream.next().await {
             self.handle_notification(fed, &notif).await;
         }
@@ -1891,10 +1655,8 @@ impl FederationEngine {
 
     /// React to one upstream notification. `*/list_changed` refreshes the
     /// overlay (re-import) and forwards the same kind to MCPG's clients;
-    /// the events core announces a change of the event types itself.
-    /// `resources/updated` re-prefixes the URI and forwards it to subscribers.
-    /// Other methods are ignored (the engine advertises no
-    /// server-request capability upstream).
+    /// the events core announces a change of the event types itself. Other
+    /// methods are ignored.
     async fn handle_notification(&self, fed: &FederationConfig, notif: &Value) {
         let Some(method) = notif.get("method").and_then(Value::as_str) else {
             return;
@@ -1921,26 +1683,6 @@ impl FederationEngine {
             {
                 notifier.broadcast_list_changed(&changed.methods()).await;
             }
-        } else if method == "notifications/resources/updated" {
-            let Some(notifier) = &self.notifier else {
-                return;
-            };
-            let Some(upstream_uri) = notif
-                .get("params")
-                .and_then(|p| p.get("uri"))
-                .and_then(Value::as_str)
-            else {
-                return;
-            };
-            // The client subscribed to the *gateway-side* URI; re-apply
-            // the same mapping used at import (scheme-aware for `ui://`)
-            // so the update reaches the right subscriptions.
-            let prefixed = federated_resource_uri(fed, upstream_uri);
-            tracing::info!(
-                federation = %fed.name, uri = %prefixed,
-                "upstream resource updated; forwarding to subscribers"
-            );
-            notifier.forward_resource_updated(&prefixed).await;
         }
     }
 
@@ -2221,7 +1963,7 @@ pub(crate) const ISSUER_SUBJECT_ATTRIBUTES: [&str; 7] = idp_sessions::VAULT_ATTR
 /// credential-cache key and the issuer trust gate both read them) with
 /// the caller's bearer attached as the RFC 8693 `subject_token`
 /// attribute (the key the token-exchange issuers read). Callers without
-/// a resolved identity (legacy paths, tests) degrade to a minimal
+/// a resolved identity (tests) degrade to a minimal
 /// header-asserted identity — which credential issuers requiring
 /// `verified` trust will refuse, exactly as an unverified caller should
 /// never be impersonated.
@@ -2256,7 +1998,6 @@ mod idp_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::super::upstream::StreamableHttpUpstream;
     use super::*;
     use crate::backends::CapabilityRegistry;
     use axum::Json;
@@ -2265,22 +2006,48 @@ mod tests {
     use axum::{Router, http::StatusCode};
     use serde_json::Value;
 
+    /// The `server/discover` result of a mock upstream that serves MCP
+    /// 2026-07-28 and advertises `capabilities`.
+    pub(super) fn discover_result(capabilities: Value) -> Value {
+        json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "serverInfo": { "name": "mock", "version": "1" },
+            "capabilities": capabilities,
+            "ttlMs": 60_000,
+            "cacheScope": "public"
+        })
+    }
+
+    /// An SSE response carrying `frames`, one JSON-RPC message each.
+    fn event_stream(frames: &[Value]) -> Response {
+        let body: String = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect();
+        let mut resp = Response::new(axum::body::Body::from(body));
+        resp.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/event-stream".parse().unwrap(),
+        );
+        resp
+    }
+
+    /// A mock upstream: `server/discover`, a `subscriptions/listen` stream
+    /// that pushes one `tools/list_changed` and ends, `tools/list`, and a
+    /// `tools/call` that echoes the tool and the `Authorization` it got.
     async fn mock_handler(headers: axum::http::HeaderMap, Json(body): Json<Value>) -> Response {
         let method = body.get("method").and_then(Value::as_str).unwrap_or("");
         let id = body.get("id").cloned();
         match method {
-            "initialize" => {
-                let mut resp = Json(json!({
-                    "jsonrpc": "2.0", "id": id,
-                    "result": { "protocolVersion": "2025-11-25", "capabilities": {},
-                                "serverInfo": { "name": "mock", "version": "1" } }
-                }))
-                .into_response();
-                resp.headers_mut()
-                    .insert("mcp-session-id", "s1".parse().unwrap());
-                resp
-            }
-            "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+            "server/discover" => Json(json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": discover_result(json!({ "tools": { "listChanged": true } }))
+            }))
+            .into_response(),
+            "subscriptions/listen" => event_stream(&[json!({
+                "jsonrpc": "2.0", "method": "notifications/tools/list_changed"
+            })]),
             "tools/list" => Json(json!({
                 "jsonrpc": "2.0", "id": id,
                 "result": { "tools": [
@@ -2315,12 +2082,15 @@ mod tests {
         }
     }
 
-    async fn spawn_mock() -> String {
-        let app = Router::new().route("/mcp", post(mock_handler));
+    async fn serve(app: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         format!("http://{addr}/mcp")
+    }
+
+    async fn spawn_mock() -> String {
+        serve(Router::new().route("/mcp", post(mock_handler))).await
     }
 
     pub(super) fn empty_policy() -> Arc<ArcSwap<FederatedToolPolicies>> {
@@ -2350,6 +2120,22 @@ filter: {{ exclude_tools: ["internal_*"] }}
             request_id: None,
             connect_link: None,
         }
+    }
+
+    /// The upstream connection each satellite holds, by satellite key, as
+    /// the address of its handle: a satellite that reconnected holds
+    /// another one.
+    pub(super) fn connections(
+        engine: &FederationEngine,
+    ) -> std::collections::BTreeMap<(String, String), usize> {
+        engine
+            .satellites
+            .iter()
+            .map(|entry| {
+                let handle = Arc::as_ptr(&entry.value().upstream) as *const () as usize;
+                (entry.key().clone(), handle)
+            })
+            .collect()
     }
 
     fn engine_with_tunnel(tf: Option<TunnelFederation>) -> FederationEngine {
@@ -2541,44 +2327,32 @@ import: {{ resources: true }}
         }
     }
 
-    #[tokio::test]
-    async fn connect_opts_advertises_apps_upstream_when_enabled() {
+    #[test]
+    fn connect_opts_advertises_apps_upstream_when_enabled() {
         let registry = CapabilityRegistry::default();
         let engine =
             FederationEngine::new(vec![], registry.federated_overlay(), empty_policy(), "via")
                 .with_apps_upstream_advertisement(true);
         let fed = fed_config("https://x/mcp");
-        let opts = engine
-            .connect_opts(&fed, None, None)
-            .await
-            .expect("connect opts build");
+        let opts = engine.connect_opts(&fed, None).expect("connect opts build");
         // The Apps capability is advertised upstream so the server emits
-        // its UI tools — including on this (import) session.
+        // its UI tools — including on this (import) connection.
         assert_eq!(
             opts.client_capabilities["extensions"]["io.modelcontextprotocol/ui"]["mimeTypes"],
             json!(["text/html;profile=mcp-app"])
         );
     }
 
-    #[tokio::test]
-    async fn connect_opts_omits_apps_upstream_by_default() {
+    /// MCPG answers no server-to-client request for an upstream, so by
+    /// default it advertises no client capability at all.
+    #[test]
+    fn connect_opts_advertises_no_client_capability_by_default() {
         let registry = CapabilityRegistry::default();
         let engine =
             FederationEngine::new(vec![], registry.federated_overlay(), empty_policy(), "via");
         let fed = fed_config("https://x/mcp");
-        let opts = engine
-            .connect_opts(&fed, None, None)
-            .await
-            .expect("connect opts build");
-        let has_ui = opts
-            .client_capabilities
-            .get("extensions")
-            .and_then(|e| e.get("io.modelcontextprotocol/ui"))
-            .is_some();
-        assert!(
-            !has_ui,
-            "apps capability must not be advertised upstream by default"
-        );
+        let opts = engine.connect_opts(&fed, None).expect("connect opts build");
+        assert_eq!(opts.client_capabilities, json!({}));
     }
 
     #[test]
@@ -2749,8 +2523,8 @@ import: {{ resources: true }}
             empty_policy(),
             "via-1",
         );
-        // Two principals presenting the SAME session id (e.g. a shared or
-        // stolen `Mcp-Session-Id`) each get their own upstream session.
+        // Two principals under the SAME session id each get their own
+        // upstream connection.
         for principal in ["verified::idp::iss::alice", "verified::idp::iss::bob"] {
             engine
                 .call_tool(
@@ -2791,6 +2565,41 @@ import: {{ resources: true }}
                     None,
                     FederationCaller {
                         principal: Some("verified::idp::iss::alice"),
+                        session_id: Some(session),
+                        bearer: None,
+                        identity: None,
+                        request_id: None,
+                        connect_link: None,
+                    },
+                    None,
+                )
+                .await
+                .expect("call_tool");
+        }
+        assert_eq!(engine.satellites.len(), 1);
+    }
+
+    /// Every anonymous request runs under a session of its own, and every
+    /// anonymous caller shares one satellite: a call opens no connection
+    /// of its own.
+    #[tokio::test]
+    async fn anonymous_callers_share_one_satellite() {
+        let url = spawn_mock().await;
+        let registry = CapabilityRegistry::default();
+        let engine = FederationEngine::new(
+            vec![fed_config(&url)],
+            registry.federated_overlay(),
+            empty_policy(),
+            "via-1",
+        );
+        for session in ["ephemeral-1", "ephemeral-2", "ephemeral-3"] {
+            engine
+                .call_tool(
+                    "notion",
+                    "search",
+                    None,
+                    FederationCaller {
+                        principal: None,
                         session_id: Some(session),
                         bearer: None,
                         identity: None,
@@ -2858,7 +2667,7 @@ import: {{ resources: true }}
         );
         assert_eq!(with_principal, "verified::idp::iss::alice");
 
-        let session_fallback = satellite_caller_key(
+        let anonymous = satellite_caller_key(
             &fed,
             &FederationCaller {
                 principal: None,
@@ -2870,7 +2679,7 @@ import: {{ resources: true }}
             },
             &[],
         );
-        assert_eq!(session_fallback, "sess-1");
+        assert_eq!(anonymous, ANONYMOUS_SATELLITE_KEY);
 
         let mut pass_through = fed.clone();
         pass_through.upstream.auth.mode = crate::config::AuthMode::PassThrough;
@@ -3241,8 +3050,7 @@ import: {{ resources: true }}
         (Arc::new(registry), cache)
     }
 
-    /// `(method, Authorization)` pairs an auth-gated mock accepted; the
-    /// GET notification stream records as method `GET`.
+    /// `(method, Authorization)` pairs an auth-gated mock accepted.
     pub(super) type SeenAuth = Arc<Mutex<Vec<(String, String)>>>;
 
     pub(super) fn seen_for(seen: &SeenAuth, method: &str) -> Vec<String> {
@@ -3256,13 +3064,11 @@ import: {{ resources: true }}
 
     /// A mock that answers 401 to every request without an
     /// `Authorization` header, as enterprise-managed upstreams do for
-    /// `initialize` and `tools/list`. Accepted requests are recorded and
-    /// served by `mock_handler`; the GET stream pushes one
-    /// `tools/list_changed`.
+    /// `server/discover` and `tools/list`. Accepted requests are recorded
+    /// and served by `mock_handler`.
     pub(super) async fn spawn_auth_gated_mock() -> (String, SeenAuth) {
         let seen = SeenAuth::default();
         let post_seen = Arc::clone(&seen);
-        let get_seen = Arc::clone(&seen);
         let app = Router::new().route(
             "/mcp",
             post(
@@ -3285,37 +3091,9 @@ import: {{ resources: true }}
                         mock_handler(headers, Json(body)).await
                     }
                 },
-            )
-            .get(move |headers: axum::http::HeaderMap| {
-                let seen = Arc::clone(&get_seen);
-                async move {
-                    let Some(auth) = headers
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_owned)
-                    else {
-                        return StatusCode::UNAUTHORIZED.into_response();
-                    };
-                    seen.lock()
-                        .expect("seen lock")
-                        .push(("GET".to_owned(), auth));
-                    let frame = format!(
-                        "data: {}\n\n",
-                        json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" })
-                    );
-                    let mut resp = Response::new(axum::body::Body::from(frame));
-                    resp.headers_mut().insert(
-                        axum::http::header::CONTENT_TYPE,
-                        "text/event-stream".parse().unwrap(),
-                    );
-                    resp
-                }
-            }),
+            ),
         );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{addr}/mcp"), seen)
+        (serve(app).await, seen)
     }
 
     /// An `oauth_impersonation` federation (per-call bearer from
@@ -3504,7 +3282,7 @@ import: {{ resources: true }}
             imported,
             "the listener's list_changed re-import never landed"
         );
-        let streamed = seen_for(&seen, "GET");
+        let streamed = seen_for(&seen, "subscriptions/listen");
         assert!(!streamed.is_empty());
         assert!(streamed.iter().all(|auth| auth == "Bearer import-tok"));
         assert!(
@@ -3960,31 +3738,9 @@ import: {{ resources: true }}
         assert!(!needs_import_credential(&fed, &unauthorized));
     }
 
-    /// Mock that serves the normal POST endpoint plus a GET SSE stream which
-    /// pushes one `notifications/tools/list_changed` frame then ends.
-    async fn spawn_mock_with_list_changed_push() -> String {
-        async fn push_handler() -> Response {
-            let frame = format!(
-                "data: {}\n\n",
-                json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" })
-            );
-            let mut resp = Response::new(axum::body::Body::from(frame));
-            resp.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                "text/event-stream".parse().unwrap(),
-            );
-            resp
-        }
-        let app = Router::new().route("/mcp", post(mock_handler).get(push_handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}/mcp")
-    }
-
     #[tokio::test]
     async fn listener_reimports_on_upstream_list_changed() {
-        let url = spawn_mock_with_list_changed_push().await;
+        let url = spawn_mock().await;
         let registry = CapabilityRegistry::default();
         let engine = Arc::new(FederationEngine::new(
             vec![fed_config(&url)],
@@ -4013,478 +3769,59 @@ import: {{ resources: true }}
         );
     }
 
+    /// The caller's progress token travels upstream as
+    /// `_meta.progressToken`, and the result an upstream streams after its
+    /// progress is the call's result.
     #[tokio::test]
-    async fn resource_updated_is_reprefixed_and_forwarded_to_subscriber() {
-        use crate::runtime::delivery_bus::BusBackedDeliveryBus;
-        use crate::runtime::session_store::{KvBackedSessionStore, SessionStoreConfig};
-        use crate::runtime::subscription_store::KvBackedSubscriptionStore;
-
-        let delivery_bus: Arc<dyn DeliveryBus> = Arc::new(BusBackedDeliveryBus::new_in_memory());
-        let subscription_store: Arc<dyn SubscriptionStore> =
-            Arc::new(KvBackedSubscriptionStore::new_in_memory(100));
-        let session_store: Arc<dyn SessionStore> = Arc::new(KvBackedSessionStore::new_in_memory(
-            SessionStoreConfig::default(),
-        ));
-
-        // A client subscribed to the PREFIXED federated URI, listening on its
-        // delivery stream.
-        let prefixed = "mcp://notion/notes/1";
-        subscription_store
-            .subscribe("sess-1", prefixed, None)
-            .unwrap();
-        let mut rx = delivery_bus.subscribe("sess-1").await;
-
-        let mut fed = fed_config("http://127.0.0.1:1/mcp");
-        fed.naming.resource_uri_prefix = Some("mcp://notion/".into());
+    async fn call_tool_passes_the_callers_progress_token_upstream() {
+        let tokens: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let seen = Arc::clone(&tokens);
+        let app = Router::new().route(
+            "/mcp",
+            post(
+                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        if body.get("method").and_then(Value::as_str) != Some("tools/call") {
+                            return mock_handler(headers, Json(body)).await;
+                        }
+                        let token = body["params"]["_meta"]["progressToken"].clone();
+                        seen.lock().expect("tokens lock").push(token.clone());
+                        event_stream(&[
+                            json!({ "jsonrpc": "2.0", "method": "notifications/progress",
+                                    "params": { "progressToken": token, "progress": 50, "total": 100 } }),
+                            json!({ "jsonrpc": "2.0", "id": body["id"],
+                                    "result": { "content": [{ "type": "text", "text": "done" }],
+                                                "isError": false } }),
+                        ])
+                    }
+                },
+            ),
+        );
+        let url = serve(app).await;
         let registry = CapabilityRegistry::default();
         let engine = FederationEngine::new(
-            vec![fed.clone()],
+            vec![fed_config(&url)],
             registry.federated_overlay(),
             empty_policy(),
             "via-1",
-        )
-        .with_notifier(session_store, delivery_bus, subscription_store);
+        );
 
-        // Upstream pushes `resources/updated` for the UNPREFIXED uri; the
-        // gateway re-prefixes it so the subscription matches.
-        let notif = json!({
-            "jsonrpc": "2.0", "method": "notifications/resources/updated",
-            "params": { "uri": "notes/1" }
-        });
-        engine.handle_notification(&fed, &notif).await;
-
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let result = engine
+            .call_tool(
+                "notion",
+                "work",
+                None,
+                caller(Some("sess-1"), None),
+                Some(&json!("client-tok")),
+            )
             .await
-            .expect("delivery within timeout")
-            .expect("a delivery message");
-        assert_eq!(
-            msg.jsonrpc_message["method"],
-            "notifications/resources/updated"
-        );
-        assert_eq!(msg.jsonrpc_message["params"]["uri"], prefixed);
-    }
-
-    /// Mock whose `tools/call` answers with an SSE stream: an
-    /// `elicitation/create` server-request followed by the terminal result.
-    /// Any POSTed JSON-RPC response (the client's answer) is acked.
-    async fn spawn_mock_with_elicitation() -> String {
-        async fn handler(Json(body): Json<Value>) -> Response {
-            let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-            let id = body.get("id").cloned();
-            match method {
-                "initialize" => {
-                    let mut resp = Json(json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": { "protocolVersion": "2025-11-25", "capabilities": {},
-                                    "serverInfo": { "name": "mock", "version": "1" } }
-                    }))
-                    .into_response();
-                    resp.headers_mut()
-                        .insert("mcp-session-id", "s1".parse().unwrap());
-                    resp
-                }
-                "tools/call" => {
-                    let call_id = id.unwrap_or(json!(1));
-                    let frames = format!(
-                        "data: {}\n\ndata: {}\n\n",
-                        json!({ "jsonrpc": "2.0", "id": "u1", "method": "elicitation/create",
-                                "params": { "message": "name?" } }),
-                        json!({ "jsonrpc": "2.0", "id": call_id,
-                                "result": { "content": [{ "type": "text", "text": "elicited:ada" }],
-                                            "isError": false } }),
-                    );
-                    let mut resp = Response::new(axum::body::Body::from(frames));
-                    resp.headers_mut().insert(
-                        axum::http::header::CONTENT_TYPE,
-                        "text/event-stream".parse().unwrap(),
-                    );
-                    resp
-                }
-                // notifications/initialized + the client's elicitation answer.
-                _ => StatusCode::ACCEPTED.into_response(),
-            }
-        }
-        let app = Router::new().route("/mcp", post(handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}/mcp")
-    }
-
-    #[tokio::test]
-    async fn call_tool_bridges_upstream_elicitation_to_client() {
-        use crate::runtime::delivery_bus::BusBackedDeliveryBus;
-        let url = spawn_mock_with_elicitation().await;
-        let upstream = StreamableHttpUpstream::connect(UpstreamConnectOptions {
-            url,
-            bearer_token: None,
-            tunnel_token: None,
-            allow_private: true,
-            max_response_bytes: 1 << 20,
-            timeout: Duration::from_secs(5),
-            gateway_via: "via-1".into(),
-            client_capabilities: json!({ "elicitation": {} }),
-            transport: crate::config::UpstreamTransport::StreamableHttp,
-            headers: std::collections::BTreeMap::new(),
-            command: None,
-            args: Vec::new(),
-            env: std::collections::BTreeMap::new(),
-            modern: false,
-            probe: false,
-            tap: None,
-            capture_stdio_stderr: false,
-            signer: None,
-        })
-        .await
-        .expect("connect");
-
-        // A bridge + a fake client that answers the elicitation it receives.
-        let bus: Arc<dyn DeliveryBus> = Arc::new(BusBackedDeliveryBus::new_in_memory());
-        let bridge = Arc::new(ServerRequestBridge::new(Arc::clone(&bus)));
-        let mut rx = bus.subscribe("sess-1").await;
-        let answerer = Arc::clone(&bridge);
-        tokio::spawn(async move {
-            if let Some(msg) = rx.recv().await {
-                let id = msg.jsonrpc_message["id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
-                answerer
-                    .deliver_response(
-                        &id,
-                        "sess-1",
-                        Some(json!({ "action": "accept", "content": { "name": "ada" } })),
-                        None,
-                    )
-                    .await;
-            }
-        });
-
-        struct Bridger {
-            bridge: Arc<ServerRequestBridge>,
-        }
-        #[async_trait::async_trait]
-        impl UpstreamServerRequestHandler for Bridger {
-            async fn handle(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
-                // Downstream-facing id differs from the upstream's request id.
-                self.bridge
-                    .ask_client(
-                        "sess-1",
-                        "fed-test-1".into(),
-                        method,
-                        params,
-                        Duration::from_secs(5),
-                    )
-                    .await
-                    .map_err(|e| (-32603, e.to_string()))
-            }
-        }
-        let handler = Bridger {
-            bridge: Arc::clone(&bridge),
-        };
-
-        let result = upstream
-            .call_tool_bridged("ask", None, None, &handler, None)
-            .await
-            .expect("bridged call");
-        // The terminal result arrives only after the interleaved elicitation
-        // was bridged to the client and answered.
-        assert_eq!(
-            result["content"][0]["text"], "elicited:ada",
-            "expected terminal result after bridging, got {result:?}"
-        );
-    }
-
-    /// Subscribe to `session`'s delivery stream (so no publish is missed) and
-    /// spawn a task answering every bridged server-request with `answer` (the
-    /// fake downstream client). Must be awaited before any bridging begins.
-    async fn spawn_answering_client(
-        bridge: Arc<ServerRequestBridge>,
-        bus: &Arc<dyn DeliveryBus>,
-        session: &str,
-        answer: Value,
-    ) {
-        let mut rx = bus.subscribe(session).await;
-        let session = session.to_owned();
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                if let Some(id) = msg.jsonrpc_message["id"].as_str() {
-                    bridge
-                        .deliver_response(id, &session, Some(answer.clone()), None)
-                        .await;
-                }
-            }
-        });
-    }
-
-    #[tokio::test]
-    async fn bridge_handler_gates_on_downstream_caps() {
-        use crate::runtime::delivery_bus::BusBackedDeliveryBus;
-        let bus: Arc<dyn DeliveryBus> = Arc::new(BusBackedDeliveryBus::new_in_memory());
-        let bridge = Arc::new(ServerRequestBridge::new(Arc::clone(&bus)));
-        spawn_answering_client(Arc::clone(&bridge), &bus, "sess-1", json!({ "ok": true })).await;
-
-        // The session advertised sampling + roots, but NOT elicitation.
-        let caps: ClientCapabilities =
-            serde_json::from_value(json!({ "sampling": {}, "roots": {} })).unwrap();
-        let handler = FederatedBridgeHandler {
-            bridge: Some(Arc::clone(&bridge)),
-            session_id: Some("sess-1".into()),
-            caps,
-        };
-
-        // Advertised methods bridge through to the answering client.
-        assert!(
-            handler
-                .handle("sampling/createMessage", json!({}))
-                .await
-                .is_ok()
-        );
-        assert!(handler.handle("roots/list", json!({})).await.is_ok());
-        // Un-advertised + unknown methods are declined (-32601), never surfaced.
-        assert_eq!(
-            handler
-                .handle("elicitation/create", json!({}))
-                .await
-                .unwrap_err()
-                .0,
-            -32601
-        );
-        assert_eq!(
-            handler.handle("foo/bar", json!({})).await.unwrap_err().0,
-            -32601
-        );
-    }
-
-    /// Mock whose `resources/read` interleaves a `sampling/createMessage`
-    /// server-request before the terminal read result.
-    async fn spawn_mock_resource_with_sampling() -> String {
-        async fn handler(Json(body): Json<Value>) -> Response {
-            let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-            let id = body.get("id").cloned();
-            match method {
-                "initialize" => {
-                    let mut resp = Json(json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": { "protocolVersion": "2025-11-25", "capabilities": {},
-                                    "serverInfo": { "name": "mock", "version": "1" } }
-                    }))
-                    .into_response();
-                    resp.headers_mut()
-                        .insert("mcp-session-id", "s1".parse().unwrap());
-                    resp
-                }
-                "resources/read" => {
-                    let read_id = id.unwrap_or(json!(1));
-                    let frames = format!(
-                        "data: {}\n\ndata: {}\n\n",
-                        json!({ "jsonrpc": "2.0", "id": "u9", "method": "sampling/createMessage",
-                                "params": { "messages": [] } }),
-                        json!({ "jsonrpc": "2.0", "id": read_id,
-                                "result": { "contents": [{ "uri": "notes/1", "text": "read-after-sampling" }] } }),
-                    );
-                    let mut resp = Response::new(axum::body::Body::from(frames));
-                    resp.headers_mut().insert(
-                        axum::http::header::CONTENT_TYPE,
-                        "text/event-stream".parse().unwrap(),
-                    );
-                    resp
-                }
-                _ => StatusCode::ACCEPTED.into_response(),
-            }
-        }
-        let app = Router::new().route("/mcp", post(handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}/mcp")
-    }
-
-    #[tokio::test]
-    async fn read_resource_bridges_upstream_sampling() {
-        use crate::runtime::delivery_bus::BusBackedDeliveryBus;
-        let url = spawn_mock_resource_with_sampling().await;
-        let upstream = StreamableHttpUpstream::connect(UpstreamConnectOptions {
-            url,
-            bearer_token: None,
-            tunnel_token: None,
-            allow_private: true,
-            max_response_bytes: 1 << 20,
-            timeout: Duration::from_secs(5),
-            gateway_via: "via-1".into(),
-            client_capabilities: json!({ "sampling": {} }),
-            transport: crate::config::UpstreamTransport::StreamableHttp,
-            headers: std::collections::BTreeMap::new(),
-            command: None,
-            args: Vec::new(),
-            env: std::collections::BTreeMap::new(),
-            modern: false,
-            probe: false,
-            tap: None,
-            capture_stdio_stderr: false,
-            signer: None,
-        })
-        .await
-        .expect("connect");
-
-        let bus: Arc<dyn DeliveryBus> = Arc::new(BusBackedDeliveryBus::new_in_memory());
-        let bridge = Arc::new(ServerRequestBridge::new(Arc::clone(&bus)));
-        spawn_answering_client(
-            Arc::clone(&bridge),
-            &bus,
-            "sess-1",
-            json!({ "role": "assistant", "content": { "type": "text", "text": "sampled" } }),
-        )
-        .await;
-
-        struct Bridger {
-            bridge: Arc<ServerRequestBridge>,
-        }
-        #[async_trait::async_trait]
-        impl UpstreamServerRequestHandler for Bridger {
-            async fn handle(&self, method: &str, params: Value) -> Result<Value, (i64, String)> {
-                self.bridge
-                    .ask_client(
-                        "sess-1",
-                        next_bridge_id(),
-                        method,
-                        params,
-                        Duration::from_secs(5),
-                    )
-                    .await
-                    .map_err(|e| (-32603, e.to_string()))
-            }
-        }
-        let handler = Bridger {
-            bridge: Arc::clone(&bridge),
-        };
-
-        let result = upstream
-            .read_resource_bridged("notes/1", &handler)
-            .await
-            .expect("bridged read");
-        assert_eq!(
-            result["contents"][0]["text"], "read-after-sampling",
-            "expected read result after bridging the interleaved sampling, got {result:?}"
-        );
-    }
-
-    /// Mock whose `tools/call` emits a `notifications/progress` before the result.
-    async fn spawn_mock_with_progress() -> String {
-        async fn handler(Json(body): Json<Value>) -> Response {
-            let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-            let id = body.get("id").cloned();
-            match method {
-                "initialize" => {
-                    let mut resp = Json(json!({
-                        "jsonrpc": "2.0", "id": id,
-                        "result": { "protocolVersion": "2025-11-25", "capabilities": {},
-                                    "serverInfo": { "name": "mock", "version": "1" } }
-                    }))
-                    .into_response();
-                    resp.headers_mut()
-                        .insert("mcp-session-id", "s1".parse().unwrap());
-                    resp
-                }
-                "tools/call" => {
-                    let call_id = id.unwrap_or(json!(1));
-                    // Report progress under the token the client passed in
-                    // `_meta.progressToken` (proves pass-through correlation).
-                    let token = body
-                        .get("params")
-                        .and_then(|p| p.get("_meta"))
-                        .and_then(|m| m.get("progressToken"))
-                        .cloned()
-                        .unwrap_or(json!("none"));
-                    let frames = format!(
-                        "data: {}\n\ndata: {}\n\n",
-                        json!({ "jsonrpc": "2.0", "method": "notifications/progress",
-                                "params": { "progressToken": token, "progress": 50, "total": 100 } }),
-                        json!({ "jsonrpc": "2.0", "id": call_id,
-                                "result": { "content": [{ "type": "text", "text": "done" }],
-                                            "isError": false } }),
-                    );
-                    let mut resp = Response::new(axum::body::Body::from(frames));
-                    resp.headers_mut().insert(
-                        axum::http::header::CONTENT_TYPE,
-                        "text/event-stream".parse().unwrap(),
-                    );
-                    resp
-                }
-                _ => StatusCode::ACCEPTED.into_response(),
-            }
-        }
-        let app = Router::new().route("/mcp", post(handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}/mcp")
-    }
-
-    #[tokio::test]
-    async fn call_tool_forwards_upstream_progress_to_client() {
-        use crate::runtime::delivery_bus::BusBackedDeliveryBus;
-        let url = spawn_mock_with_progress().await;
-        let upstream = StreamableHttpUpstream::connect(UpstreamConnectOptions {
-            url,
-            bearer_token: None,
-            tunnel_token: None,
-            allow_private: true,
-            max_response_bytes: 1 << 20,
-            timeout: Duration::from_secs(5),
-            gateway_via: "via-1".into(),
-            client_capabilities: json!({}),
-            transport: crate::config::UpstreamTransport::StreamableHttp,
-            headers: std::collections::BTreeMap::new(),
-            command: None,
-            args: Vec::new(),
-            env: std::collections::BTreeMap::new(),
-            modern: false,
-            probe: false,
-            tap: None,
-            capture_stdio_stderr: false,
-            signer: None,
-        })
-        .await
-        .expect("connect");
-
-        let bus: Arc<dyn DeliveryBus> = Arc::new(BusBackedDeliveryBus::new_in_memory());
-        let bridge = Arc::new(ServerRequestBridge::new(Arc::clone(&bus)));
-        let mut rx = bus.subscribe("sess-1").await;
-
-        struct ProgressForwarder {
-            bridge: Arc<ServerRequestBridge>,
-        }
-        #[async_trait::async_trait]
-        impl UpstreamServerRequestHandler for ProgressForwarder {
-            async fn handle(&self, _m: &str, _p: Value) -> Result<Value, (i64, String)> {
-                Err((-32601, "no requests in this test".into()))
-            }
-            async fn forward_notification(&self, method: &str, params: Value) {
-                let jsonrpc = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-                self.bridge.forward_notification("sess-1", jsonrpc).await;
-            }
-        }
-        let handler = ProgressForwarder {
-            bridge: Arc::clone(&bridge),
-        };
-
-        // Pass the client's progress token; the upstream echoes it on progress.
-        let result = upstream
-            .call_tool_bridged("work", None, None, &handler, Some(&json!("client-tok")))
-            .await
-            .expect("bridged call");
+            .expect("call_tool");
         assert_eq!(result["content"][0]["text"], "done");
-
-        // The interleaved progress reached the client's delivery stream, under
-        // the client's own token (correlatable).
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("delivery within timeout")
-            .expect("a delivery message");
-        assert_eq!(msg.jsonrpc_message["method"], "notifications/progress");
-        assert_eq!(msg.jsonrpc_message["params"]["progressToken"], "client-tok");
-        assert_eq!(msg.jsonrpc_message["params"]["progress"], 50);
+        assert_eq!(
+            *tokens.lock().expect("tokens lock"),
+            vec![json!("client-tok")]
+        );
     }
 
     #[tokio::test]
@@ -5279,87 +4616,29 @@ import: {{ resources: true }}
         );
         new.adopt_satellites(&old);
 
+        let anonymous = ANONYMOUS_SATELLITE_KEY.to_owned();
         assert!(
             new.satellites
-                .contains_key(&("s".to_owned(), "aaa".to_owned())),
+                .contains_key(&(anonymous.clone(), "aaa".to_owned())),
             "unchanged federation's satellite should be carried across reload"
         );
         assert!(
-            !new.satellites
-                .contains_key(&("s".to_owned(), "bbb".to_owned())),
+            !new.satellites.contains_key(&(anonymous, "bbb".to_owned())),
             "changed federation's satellite must be dropped"
         );
     }
 
-    /// Mock whose every `initialize` bumps a shared counter, so a test can tell
-    /// whether a dispatch reused a warm satellite or re-established one.
-    async fn spawn_mock_counting_inits(inits: Arc<std::sync::atomic::AtomicUsize>) -> String {
-        use std::sync::atomic::Ordering;
-        let app = Router::new().route(
-            "/mcp",
-            post(move |Json(body): Json<Value>| {
-                let inits = Arc::clone(&inits);
-                async move {
-                    let method = body.get("method").and_then(Value::as_str).unwrap_or("");
-                    let id = body.get("id").cloned();
-                    match method {
-                        "initialize" => {
-                            inits.fetch_add(1, Ordering::Relaxed);
-                            let mut resp = Json(json!({
-                                "jsonrpc": "2.0", "id": id,
-                                "result": { "protocolVersion": "2025-11-25", "capabilities": {},
-                                            "serverInfo": { "name": "mock", "version": "1" } }
-                            }))
-                            .into_response();
-                            resp.headers_mut()
-                                .insert("mcp-session-id", "s1".parse().unwrap());
-                            resp
-                        }
-                        "tools/list" => Json(json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "result": { "tools": [
-                                { "name": "search", "description": "s", "inputSchema": {"type":"object"} }
-                            ] }
-                        }))
-                        .into_response(),
-                        "tools/call" => Json(json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "result": { "content": [{ "type": "text", "text": "ok" }], "isError": false }
-                        }))
-                        .into_response(),
-                        // Unknown request (e.g. the `server/discover`
-                        // wire probe): method-not-found, so the probing
-                        // client falls back to the legacy handshake.
-                        _ if id.is_some() => Json(json!({
-                            "jsonrpc": "2.0", "id": id,
-                            "error": { "code": -32601, "message": "method not found" }
-                        }))
-                        .into_response(),
-                        _ => StatusCode::ACCEPTED.into_response(),
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        format!("http://{addr}/mcp")
-    }
-
     /// The reload-preservation guarantee, end to end at the engine level: a
     /// dispatch satellite established on the old engine and adopted by the new
-    /// one (unchanged federation) is *reused* — the upstream never sees a
-    /// second `initialize`. (A full HTTP-driven `reload_config` e2e is
-    /// impractical: that path rebuilds the plugin registry — environment-
-    /// fragile, see `admin_reload_e2e` — and the per-federation SSE listener's
-    /// reconnect loop makes a global initialize count non-deterministic. This
-    /// drives the real `call_tool` → satellite → `adopt_satellites` → reuse
-    /// path deterministically instead.)
+    /// one (unchanged federation) is *reused* — its upstream connection stays
+    /// the one the old engine opened. (A full HTTP-driven `reload_config` e2e
+    /// is impractical: that path rebuilds the plugin registry — environment-
+    /// fragile, see `admin_reload_e2e`. This drives the real `call_tool` →
+    /// satellite → `adopt_satellites` → reuse path deterministically
+    /// instead.)
     #[tokio::test]
     async fn adopted_satellite_is_reused_without_reconnecting() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let inits = Arc::new(AtomicUsize::new(0));
-        let url = spawn_mock_counting_inits(Arc::clone(&inits)).await;
+        let url = spawn_mock().await;
         let cfg = |name: &str, url: &str| -> FederationConfig {
             serde_yaml::from_str(&format!(
                 "name: {name}\nupstream:\n  url: \"{url}\"\n  upstream_safety: {{ allow_private_backends: true, allow_insecure_http: true }}\nnaming: {{ tool_prefix: \"{name}.\" }}"
@@ -5367,7 +4646,7 @@ import: {{ resources: true }}
             .expect("parse fed config")
         };
 
-        // Establish a dispatch satellite on the old engine (one initialize).
+        // Establish a dispatch satellite on the old engine (one connect).
         let reg = CapabilityRegistry::default();
         let old = FederationEngine::new(
             vec![cfg("aaa", &url)],
@@ -5378,11 +4657,8 @@ import: {{ resources: true }}
         old.call_tool("aaa", "search", None, caller(Some("s"), None), None)
             .await
             .expect("establish satellite");
-        assert_eq!(
-            inits.load(Ordering::Relaxed),
-            1,
-            "satellite established with exactly one initialize"
-        );
+        let established = connections(&old);
+        assert_eq!(established.len(), 1, "one satellite established");
 
         // Reload: the new engine adopts the unchanged federation's satellite.
         let reg2 = CapabilityRegistry::default();
@@ -5394,14 +4670,13 @@ import: {{ resources: true }}
         );
         new.adopt_satellites(&old);
 
-        // Dispatching on the new engine reuses the carried session — no second
-        // initialize handshake to the upstream.
+        // Dispatching on the new engine reuses the carried connection.
         new.call_tool("aaa", "search", None, caller(Some("s"), None), None)
             .await
             .expect("reuse carried satellite");
         assert_eq!(
-            inits.load(Ordering::Relaxed),
-            1,
+            connections(&new),
+            established,
             "carried satellite reused across reload, not reconnected"
         );
     }
@@ -5428,7 +4703,7 @@ import: {{ resources: true }}
         let imported = sink.borrow().clone();
         assert!(
             imported.types.is_empty(),
-            "a legacy upstream serves no MCP Events"
+            "an upstream that advertises no MCP Events serves none"
         );
         assert!(!imported.pending, "the import settled");
         assert!(

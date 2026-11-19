@@ -1,8 +1,8 @@
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::super::*;
 use crate::config::personal_agent::{OPERATIONS_EXTENSION, OPERATIONS_VERSION};
-use crate::protocol::ToolCallParams;
+use crate::protocol::{ProtocolHttpResponse, ProtocolResponse, ToolCallParams};
 use crate::runtime::personal_agent::PersonalAgentCaller;
 use crate::runtime::personal_agent_operations::{
     ExecutionOutcome, OperationError, OperationRecord, OperationsService, result_text,
@@ -115,7 +115,6 @@ impl GatewayRuntime {
         };
         Some(ProtocolHttpResponse {
             http_status: 200,
-            session_id_header: None,
             response: ProtocolResponse::JsonRpcSuccess(crate::protocol::JsonRpcSuccess {
                 jsonrpc: "2.0",
                 id: request_id.clone(),
@@ -210,10 +209,9 @@ impl GatewayRuntime {
             name: record.tool.clone(),
             arguments: Some(record.terms.clone()),
             meta: Some(Value::Object(meta)),
-            task: None,
         };
         let response = self
-            .handle_tools_call(json!(key), params, &request_context)
+            .handle_tools_call(json!(key), params, false, &request_context)
             .await;
         let outcome = match response.response {
             ProtocolResponse::JsonRpcSuccess(success) => {

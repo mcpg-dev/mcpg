@@ -82,14 +82,8 @@ fn a_slot_holds_a_link_only_while_its_request_may_answer_with_one() {
     slot.offer(elicitation("link-1"));
     assert_eq!(slot.take_offered(), None, "a closed slot takes no link");
 
-    assert!(slot.open(Some("sess-1".to_owned())));
-    assert_eq!(
-        slot.request(),
-        Some(LinkRequest {
-            resume: None,
-            notify_session: Some("sess-1".to_owned()),
-        })
-    );
+    assert!(slot.open());
+    assert_eq!(slot.request(), Some(LinkRequest { resume: None }));
     slot.offer(elicitation("link-1"));
     assert_eq!(
         slot.request(),
@@ -108,18 +102,17 @@ fn a_retry_resumes_its_link_and_a_declined_one_stays_shut() {
     let resumed = ConnectLinkSlot::default();
     resumed.resume("link-7".to_owned());
     assert_eq!(resumed.request(), None, "resuming is not yet open");
-    assert!(resumed.open(None));
+    assert!(resumed.open());
     assert_eq!(
         resumed.request(),
         Some(LinkRequest {
             resume: Some("link-7".to_owned()),
-            notify_session: None,
         })
     );
 
     let declined = ConnectLinkSlot::default();
     declined.decline();
-    assert!(!declined.open(Some("sess-1".to_owned())));
+    assert!(!declined.open());
     assert_eq!(declined.request(), None);
     declined.offer(elicitation("link-1"));
     assert_eq!(declined.take_offered(), None);
@@ -131,7 +124,7 @@ fn neither_a_slot_nor_an_elicitation_shows_its_link() {
     let slot = ConnectLinkSlot::default();
     slot.resume("secret-link-id".to_owned());
     assert!(!format!("{slot:?}").contains("secret-link-id"));
-    slot.open(None);
+    slot.open();
     slot.offer(elicitation("secret-link-id"));
     assert!(!format!("{slot:?}").contains("secret-link-id"));
     assert!(!format!("{:?}", elicitation("secret-link-id")).contains("secret-link-id"));

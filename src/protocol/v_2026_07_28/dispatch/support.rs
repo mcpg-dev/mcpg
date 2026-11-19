@@ -1,4 +1,4 @@
-//! `support` dispatch arms for MCP revision `2026-07-28`.
+//! Envelope helpers the dispatch arms share.
 
 use crate::protocol::shared::error::{INVALID_PARAMS_CODE, INVALID_REQUEST_CODE};
 use crate::protocol::shared::jsonrpc::{
@@ -8,7 +8,7 @@ use crate::protocol::shared::jsonrpc::{
 use serde_json::Value;
 
 /// Common JSON-RPC success envelope wrapping a serialisable result.
-/// Used by the modern list arms to keep the per-arm code small.
+/// Used by the list arms to keep the per-arm code small.
 pub(crate) fn serialize_jsonrpc_success<T: serde::Serialize>(
     request_id: Value,
     result: &T,
@@ -20,7 +20,7 @@ pub(crate) fn serialize_jsonrpc_success<T: serde::Serialize>(
             tracing::error!(
                 error = %error,
                 operation = operation_label,
-                "failed to serialize modern result"
+                "failed to serialize result"
             );
             return handler_internal_error(
                 Some(request_id),
@@ -30,7 +30,6 @@ pub(crate) fn serialize_jsonrpc_success<T: serde::Serialize>(
     };
     ProtocolHttpResponse {
         http_status: 200,
-        session_id_header: None,
         response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
             jsonrpc: JSONRPC_VERSION,
             id: request_id,
@@ -40,14 +39,14 @@ pub(crate) fn serialize_jsonrpc_success<T: serde::Serialize>(
 }
 
 /// Stamp the SEP-2322 `resultType:"complete"` discriminator onto a
-/// delegated success response that was built by the version-blind
-/// runtime pipeline (which has no notion of the modern envelope).
+/// success response the runtime pipeline built, which carries the
+/// result body only.
 ///
 /// Only applied to a `JsonRpcSuccess` whose `result` is a JSON object
-/// that does not already carry a `resultType` — so a runtime-minted
-/// MRTR `InputRequiredResult` (`resultType:"input_required"`) or a
-/// future task shape (`"task"`) is left untouched. Error envelopes
-/// and the 202 notification-accepted response pass through unchanged.
+/// that does not already carry a `resultType` — so an MRTR
+/// `InputRequiredResult` (`resultType:"input_required"`) or a task
+/// (`"task"`) is left untouched. Error envelopes and the 202
+/// notification-accepted response pass through unchanged.
 pub(crate) fn stamp_complete_result_type(
     mut response: ProtocolHttpResponse,
 ) -> ProtocolHttpResponse {
@@ -79,7 +78,6 @@ pub(crate) fn handler_client_error(
 ) -> ProtocolHttpResponse {
     ProtocolHttpResponse {
         http_status,
-        session_id_header: None,
         response: ProtocolResponse::JsonRpcError(JsonRpcError {
             jsonrpc: JSONRPC_VERSION,
             id: jsonrpc_id,
@@ -112,7 +110,7 @@ pub(crate) fn map_request_state_decode_error(
             jsonrpc_id,
             200,
             INVALID_REQUEST_CODE,
-            &format!("MRTR requestState no longer resolvable: {error}"),
+            &format!("MRTR requestState is not resolvable: {error}"),
         ),
         E::InvalidPrefix(_) | E::InvalidPayload(_) | E::AuthenticationFailed => {
             handler_client_error(

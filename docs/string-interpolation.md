@@ -35,8 +35,7 @@ backend:
 (list), `attributes` (map).
 
 `client_name` and `client_version` are the MCP client as it named itself:
-the session's `initialize` `clientInfo`, or the stateless request's
-`_meta["io.modelcontextprotocol/clientInfo"]`. They are null when the client
+the request's `_meta["io.modelcontextprotocol/clientInfo"]`. They are null when the client
 named none. A client chooses them freely, so record them (a header, an audit
 column); do not authorize on them.
 

@@ -2,36 +2,40 @@
 //! entity-kind fan-out, gated by the operator's
 //! `observability.metrics.sinks[].kind` allow-list.
 //!
-//! A per-plugin gate sits on top: each bridged handle captures the
-//! source `module_path` at register time, and the forwarder
-//! consults a `target_prefix → plugin_id` map plus a
-//! `plugin_id → SignalFilter` map. Filtered events are dropped
-//! before reaching the global allow-list — events that pass the
-//! filter route through the global fan-out unchanged.
+//! A per-plugin gate sits on top: each bridged series keeps the
+//! `module_path` of its call site, and the forwarder consults a
+//! `target_prefix → plugin_id` map plus a `plugin_id → SignalFilter`
+//! map. Filtered events are dropped before reaching the global
+//! allow-list — events that pass the filter route through the
+//! global fan-out unchanged.
 //!
 //! # Architecture
 //!
 //! - [`PluginMetricsRecorder`] implements [`metrics::Recorder`].
-//!   `register_*` reads `Metadata::module_path()` for the
-//!   call-site crate, looks up the prefix in `target_to_plugin_id`,
-//!   and bakes the resolved source plugin id into the returned
-//!   handle. The per-emission cost is a clone of the resolved id
-//!   (a String) plus the `MetricPoint` build, on top of the
-//!   drop-on-overflow `try_send`.
+//!   `register_*` returns the cached handle of the series that the
+//!   key and the call site's `Metadata::module_path()` name, and
+//!   builds it on first use. An emission queues the shared series,
+//!   the sample and a timestamp with a drop-on-overflow `try_send`;
+//!   it allocates nothing.
 //! - [`MetricsBridgeHandle`] holds the receiver + the global
-//!   allow-list + the per-plugin filter table. `attach(runtime)`
-//!   spawns the forwarder; events sent before attach buffer in
-//!   the channel up to `BRIDGE_CHANNEL_CAPACITY`.
-//! - The forwarder loop checks `should_emit(source, filters,
-//!   None)` — metrics has no level — and skips dispatch when the
-//!   per-plugin override has the metrics signal disabled.
+//!   allow-list + the target map. `attach(runtime)` spawns the
+//!   forwarder; events sent before attach buffer in the channel up
+//!   to `BRIDGE_CHANNEL_CAPACITY`.
+//! - The forwarder resolves each sample's source plugin id from the
+//!   series' module path, checks `route_event(source, filters, None,
+//!   …)` — metrics has no level — and builds the wire-shape
+//!   `MetricPoint` only for a sample it delivers.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
 };
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use mcpg_plugin_protocol::metrics::{MetricKind, MetricPoint, MetricValue};
 use metrics::{
     Counter, Gauge, Histogram, Key, KeyName, Metadata, Recorder, SetRecorderError, SharedString,
@@ -40,7 +44,8 @@ use metrics::{
 use tokio::sync::mpsc;
 
 use crate::observability::signal_router::{
-    RouteDecision, SharedTargetMap, SignalFilter, route_event, source_from_target,
+    CORE_PSEUDO_ID, RouteDecision, SharedTargetMap, SignalFilter, route_event,
+    source_ref_from_target,
 };
 use crate::runtime::GatewayRuntime;
 
@@ -50,21 +55,83 @@ use crate::runtime::GatewayRuntime;
 /// flood; matches the `log_bridge` capacity for symmetry.
 const BRIDGE_CHANNEL_CAPACITY: usize = 16384;
 
+/// Bound on cached series. A key past it gets an uncached handle, so
+/// a label with unbounded values cannot grow the cache without limit.
+const MAX_CACHED_SERIES: usize = 4096;
+
 use crate::observability::dispatch_guard;
 
-/// One queued event: the wire-shape `MetricPoint` plus the
-/// source-plugin-id captured at register time. The forwarder uses
-/// the source id to pick which allow-list to fan to.
+/// One queued event: the series it belongs to, the sample and the
+/// emit time. The forwarder resolves the source plugin id and builds
+/// the wire-shape `MetricPoint` from it.
 struct BridgedMetric {
-    point: MetricPoint,
-    source_plugin_id: String,
+    series: Arc<Series>,
+    sample: Sample,
+    timestamp_ns: u64,
+    /// The target map was empty when the sample was emitted: plugin
+    /// registration had not filled it, so the sample is the gateway's.
+    before_targets: bool,
+}
+
+/// One sample, typed by the handle trait method that produced it.
+#[derive(Debug, Clone, Copy)]
+enum Sample {
+    Counter(i64),
+    Gauge(f64),
+    Histogram(f64),
+}
+
+/// The name, labels and call-site module path of one series, copied
+/// out of the metrics-rs key once, when the series is first registered.
+struct Series {
+    name: String,
+    labels: BTreeMap<String, String>,
+    module_path: Option<String>,
+}
+
+impl BridgedMetric {
+    /// The plugin id the sample is attributed to: the module path's
+    /// crate looked up in `targets`, `core` when unknown or absent, or
+    /// when the sample came before the map was filled.
+    fn source_plugin_id<'m>(&self, targets: &'m HashMap<String, String>) -> &'m str {
+        match self.series.module_path.as_deref() {
+            Some(module_path) if !self.before_targets => {
+                source_ref_from_target(module_path, targets)
+            }
+            _ => CORE_PSEUDO_ID,
+        }
+    }
+
+    fn to_point(&self) -> MetricPoint {
+        let (kind, value) = match self.sample {
+            Sample::Counter(value) => (MetricKind::Counter, MetricValue::I64 { value }),
+            Sample::Gauge(value) => (MetricKind::Gauge, MetricValue::F64 { value }),
+            // One observation: count=1 / sum=value / observations=[value],
+            // so sinks that need bucketed aggregates have the sample.
+            Sample::Histogram(value) => (
+                MetricKind::Histogram,
+                MetricValue::Histogram {
+                    count: 1,
+                    sum: value,
+                    observations: vec![value],
+                },
+            ),
+        };
+        MetricPoint {
+            name: self.series.name.clone(),
+            unit: None,
+            kind,
+            value,
+            labels: self.series.labels.clone(),
+            timestamp_ns: self.timestamp_ns,
+        }
+    }
 }
 
 /// Build the bridge: returns the global-recorder candidate + the
 /// app-level handle whose `attach` spins the forwarder task. The
-/// `target_to_plugin_id` map is consulted at register-* time to
-/// resolve each call site's source plugin id; `per_plugin_filters`
-/// is consulted at forward time to resolve per-source routing.
+/// forwarder consults `target_to_plugin_id` to resolve each sample's
+/// source plugin id and `per_plugin_filters` to route it.
 pub fn new_bridge(
     global_allowed_plugin_ids: Arc<HashSet<String>>,
     target_to_plugin_id: SharedTargetMap,
@@ -72,12 +139,14 @@ pub fn new_bridge(
     let (tx, rx) = mpsc::channel::<BridgedMetric>(BRIDGE_CHANNEL_CAPACITY);
     (
         PluginMetricsRecorder {
-            tx: tx.clone(),
-            target_to_plugin_id,
+            tx,
+            series: Arc::default(),
+            targets: Arc::clone(&target_to_plugin_id),
         },
         MetricsBridgeHandle {
             rx: Some(rx),
             global_allowed_plugin_ids,
+            target_to_plugin_id,
         },
     )
 }
@@ -94,27 +163,70 @@ pub fn install_recorder(
 }
 
 /// `metrics::Recorder` impl that funnels every emission into the
-/// bridge channel. Cloning the recorder is cheap — `mpsc::Sender`
-/// is `Clone` + bounded — but `metrics::set_global_recorder`
-/// consumes the value, so cloning is reserved for tests.
+/// bridge channel. Clones share the channel and the series cache,
+/// but `metrics::set_global_recorder` consumes the value, so cloning
+/// is reserved for tests.
 #[derive(Clone)]
 pub struct PluginMetricsRecorder {
     tx: mpsc::Sender<BridgedMetric>,
-    target_to_plugin_id: SharedTargetMap,
+    series: Arc<SeriesCache>,
+    targets: SharedTargetMap,
+}
+
+/// Bridged handles by key. A key holds one handle per call-site
+/// module path, because the module path decides the source plugin id.
+#[derive(Default)]
+struct SeriesCache {
+    handles: DashMap<Key, Vec<Arc<BridgedHandle>>>,
+    len: AtomicUsize,
+}
+
+impl SeriesCache {
+    fn find(&self, key: &Key, module_path: Option<&str>) -> Option<Arc<BridgedHandle>> {
+        let handles = self.handles.get(key)?;
+        handles
+            .iter()
+            .find(|h| h.series.module_path.as_deref() == module_path)
+            .cloned()
+    }
+
+    /// Cache `handle` unless the cache is full. Returns the handle the
+    /// series resolves to from now on: the one a concurrent first
+    /// registration cached, when there is one.
+    fn insert(&self, key: &Key, handle: Arc<BridgedHandle>) -> Arc<BridgedHandle> {
+        if self.len.load(Ordering::Relaxed) >= MAX_CACHED_SERIES {
+            return handle;
+        }
+        let mut handles = self.handles.entry(key.clone()).or_default();
+        let module_path = handle.series.module_path.as_deref();
+        if let Some(cached) = handles
+            .iter()
+            .find(|h| h.series.module_path.as_deref() == module_path)
+        {
+            return Arc::clone(cached);
+        }
+        handles.push(Arc::clone(&handle));
+        self.len.fetch_add(1, Ordering::Relaxed);
+        handle
+    }
 }
 
 impl PluginMetricsRecorder {
-    /// Resolve a metrics-rs call-site `module_path` into the
-    /// source plugin id we attribute the emit to. Empty / unknown
-    /// targets fall back to the `core` pseudo-id. Reads via
-    /// `ArcSwap::load()` so post-init map population takes effect
-    /// on subsequent registrations.
-    fn resolve_source(&self, module_path: Option<&str>) -> String {
-        let Some(mp) = module_path else {
-            return "core".into();
-        };
-        let map = self.target_to_plugin_id.load();
-        source_from_target(mp, &map)
+    fn handle(&self, key: &Key, meta: &Metadata<'_>) -> Arc<BridgedHandle> {
+        let module_path = meta.module_path();
+        if let Some(handle) = self.series.find(key, module_path) {
+            return handle;
+        }
+        let handle = Arc::new(BridgedHandle {
+            tx: self.tx.clone(),
+            series: Arc::new(Series {
+                name: key.name().to_owned(),
+                labels: key_labels(key),
+                module_path: module_path.map(str::to_owned),
+            }),
+            targets: Arc::clone(&self.targets),
+        });
+        self.series.insert(key, handle)
     }
 }
 
@@ -124,30 +236,15 @@ impl Recorder for PluginMetricsRecorder {
     fn describe_histogram(&self, _: KeyName, _: Option<Unit>, _: SharedString) {}
 
     fn register_counter(&self, key: &Key, meta: &Metadata<'_>) -> Counter {
-        Counter::from_arc(Arc::new(BridgedCounter {
-            tx: self.tx.clone(),
-            name: key.name().to_owned(),
-            labels: key_labels(key),
-            source_plugin_id: self.resolve_source(meta.module_path()),
-        }))
+        Counter::from_arc(self.handle(key, meta))
     }
 
     fn register_gauge(&self, key: &Key, meta: &Metadata<'_>) -> Gauge {
-        Gauge::from_arc(Arc::new(BridgedGauge {
-            tx: self.tx.clone(),
-            name: key.name().to_owned(),
-            labels: key_labels(key),
-            source_plugin_id: self.resolve_source(meta.module_path()),
-        }))
+        Gauge::from_arc(self.handle(key, meta))
     }
 
     fn register_histogram(&self, key: &Key, meta: &Metadata<'_>) -> Histogram {
-        Histogram::from_arc(Arc::new(BridgedHistogram {
-            tx: self.tx.clone(),
-            name: key.name().to_owned(),
-            labels: key_labels(key),
-            source_plugin_id: self.resolve_source(meta.module_path()),
-        }))
+        Histogram::from_arc(self.handle(key, meta))
     }
 }
 
@@ -164,45 +261,29 @@ fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// try_send wrapper for metrics-bridge producers.
+/// Count of samples a saturated channel refused.
 ///
-/// Drops silently on a saturated channel and accumulates the count
-/// in `METRICS_BRIDGE_OVERFLOWS` (a process-wide AtomicU64). The
-/// counter MUST NOT be emitted via `metrics::counter!` here —
-/// `BridgedCounter::increment` is the very call site we're guarding,
-/// so re-entering through the metrics-rs recorder on a saturated
-/// channel infinite-loops the stack. The forwarder task drains the
-/// atomic into `mcpg_observability_bridge_overflow_total{signal=
-/// "metrics"}` from the consumer side, which is naturally
-/// non-reentrant (it runs only after a `recv().await` returns,
-/// i.e. the channel had room).
+/// The count MUST NOT be emitted via `metrics::counter!` on the
+/// producer side — `BridgedHandle::send` is the very call site we're
+/// guarding, so re-entering through the metrics-rs recorder on a
+/// saturated channel infinite-loops the stack. The forwarder task
+/// drains the atomic into `mcpg_observability_bridge_overflow_total{
+/// signal="metrics"}` from the consumer side, which is naturally
+/// non-reentrant (it runs only after a receive returns, i.e. the
+/// channel had room).
 ///
 /// Log + telemetry bridges don't have this constraint — their
 /// overflow goes via `metrics::counter!` directly because their
 /// `try_send` and the metrics-bridge `try_send` are independent
 /// channels.
-static METRICS_BRIDGE_OVERFLOWS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-fn try_send_metric(tx: &mpsc::Sender<BridgedMetric>, msg: BridgedMetric) {
-    // A metric emitted while any bridge is dispatching to a sink is
-    // self-referential (the dispatch-accounting counters, a sink emitting
-    // from its own `emit`). Re-enqueueing it would feed the forwarder its
-    // own output and spin the bridge channel hot, so drop it here.
-    if dispatch_guard::in_dispatch() {
-        return;
-    }
-    if tx.try_send(msg).is_err() {
-        METRICS_BRIDGE_OVERFLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
+static METRICS_BRIDGE_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 
 /// Drain accumulated metrics-bridge overflows into the observability
 /// counter. Called from the forwarder task between recvs — the
 /// channel just had a slot freed, so re-entering through
 /// `metrics::counter!` is safe.
 fn drain_metrics_bridge_overflows() {
-    let n = METRICS_BRIDGE_OVERFLOWS.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let n = METRICS_BRIDGE_OVERFLOWS.swap(0, Ordering::Relaxed);
     if n > 0 {
         metrics::counter!(
             "mcpg_observability_bridge_overflow_total",
@@ -212,36 +293,44 @@ fn drain_metrics_bridge_overflows() {
     }
 }
 
-/// Per-key counter handler. Holds the resolved name + label set +
-/// source-plugin-id so the per-emission cost is just `MetricPoint`
-/// construction + `try_send` (no map lookups on the hot path).
-struct BridgedCounter {
+/// The handle every `register_*` call for one series returns. It
+/// implements all three handle traits; the trait method called
+/// decides the sample's kind.
+struct BridgedHandle {
     tx: mpsc::Sender<BridgedMetric>,
-    name: String,
-    labels: BTreeMap<String, String>,
-    source_plugin_id: String,
+    series: Arc<Series>,
+    targets: SharedTargetMap,
 }
 
-impl metrics::CounterFn for BridgedCounter {
+impl BridgedHandle {
+    /// Queue one sample. Drops silently on a saturated channel and
+    /// counts the drop in `METRICS_BRIDGE_OVERFLOWS`.
+    fn send(&self, sample: Sample) {
+        // A metric emitted while any bridge is dispatching to a sink is
+        // self-referential (the dispatch-accounting counters, a sink emitting
+        // from its own `emit`). Re-enqueueing it would feed the forwarder its
+        // own output and spin the bridge channel hot, so drop it here.
+        if dispatch_guard::in_dispatch() {
+            return;
+        }
+        let msg = BridgedMetric {
+            series: Arc::clone(&self.series),
+            sample,
+            timestamp_ns: now_ns(),
+            before_targets: self.series.module_path.is_some() && self.targets.load().is_empty(),
+        };
+        if self.tx.try_send(msg).is_err() {
+            METRICS_BRIDGE_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl metrics::CounterFn for BridgedHandle {
     fn increment(&self, value: u64) {
         // metrics-rs counters are u64; we widen to i64 + cap so a
         // pathological u64::MAX increment (rare in practice) still
         // round-trips through the wire's signed slot.
-        let signed = i64::try_from(value).unwrap_or(i64::MAX);
-        try_send_metric(
-            &self.tx,
-            BridgedMetric {
-                point: MetricPoint {
-                    name: self.name.clone(),
-                    unit: None,
-                    kind: MetricKind::Counter,
-                    value: MetricValue::I64 { value: signed },
-                    labels: self.labels.clone(),
-                    timestamp_ns: now_ns(),
-                },
-                source_plugin_id: self.source_plugin_id.clone(),
-            },
-        );
+        self.send(Sample::Counter(i64::try_from(value).unwrap_or(i64::MAX)));
     }
 
     fn absolute(&self, value: u64) {
@@ -252,91 +341,30 @@ impl metrics::CounterFn for BridgedCounter {
         // will over-count, but that's the documented mismatch
         // between metrics-rs counter semantics and exporter-side
         // accumulators.
-        self.increment(value);
+        metrics::CounterFn::increment(self, value);
     }
 }
 
-struct BridgedGauge {
-    tx: mpsc::Sender<BridgedMetric>,
-    name: String,
-    labels: BTreeMap<String, String>,
-    source_plugin_id: String,
-}
-
-impl metrics::GaugeFn for BridgedGauge {
+impl metrics::GaugeFn for BridgedHandle {
     fn increment(&self, value: f64) {
         // Gauge increment is "delta" — the consuming sink composes
         // the delta with the prior value. The Prometheus plugin
         // resolves gauge sequences on the receive side.
-        try_send_metric(
-            &self.tx,
-            BridgedMetric {
-                point: MetricPoint {
-                    name: self.name.clone(),
-                    unit: None,
-                    kind: MetricKind::Gauge,
-                    value: MetricValue::F64 { value },
-                    labels: self.labels.clone(),
-                    timestamp_ns: now_ns(),
-                },
-                source_plugin_id: self.source_plugin_id.clone(),
-            },
-        );
+        self.send(Sample::Gauge(value));
     }
 
     fn decrement(&self, value: f64) {
-        self.increment(-value);
+        self.send(Sample::Gauge(-value));
     }
 
     fn set(&self, value: f64) {
-        try_send_metric(
-            &self.tx,
-            BridgedMetric {
-                point: MetricPoint {
-                    name: self.name.clone(),
-                    unit: None,
-                    kind: MetricKind::Gauge,
-                    value: MetricValue::F64 { value },
-                    labels: self.labels.clone(),
-                    timestamp_ns: now_ns(),
-                },
-                source_plugin_id: self.source_plugin_id.clone(),
-            },
-        );
+        self.send(Sample::Gauge(value));
     }
 }
 
-struct BridgedHistogram {
-    tx: mpsc::Sender<BridgedMetric>,
-    name: String,
-    labels: BTreeMap<String, String>,
-    source_plugin_id: String,
-}
-
-impl metrics::HistogramFn for BridgedHistogram {
+impl metrics::HistogramFn for BridgedHandle {
     fn record(&self, value: f64) {
-        // Single observation — the receiving plugin merges into
-        // its accumulator. `MetricValue::Histogram` carries
-        // count=1 / sum=value / observations=[value] so sinks that
-        // need bucketed aggregates have the per-sample data.
-        try_send_metric(
-            &self.tx,
-            BridgedMetric {
-                point: MetricPoint {
-                    name: self.name.clone(),
-                    unit: None,
-                    kind: MetricKind::Histogram,
-                    value: MetricValue::Histogram {
-                        count: 1,
-                        sum: value,
-                        observations: vec![value],
-                    },
-                    labels: self.labels.clone(),
-                    timestamp_ns: now_ns(),
-                },
-                source_plugin_id: self.source_plugin_id.clone(),
-            },
-        );
+        self.send(Sample::Histogram(value));
     }
 }
 
@@ -351,6 +379,7 @@ impl metrics::HistogramFn for BridgedHistogram {
 pub struct MetricsBridgeHandle {
     rx: Option<mpsc::Receiver<BridgedMetric>>,
     global_allowed_plugin_ids: Arc<HashSet<String>>,
+    target_to_plugin_id: SharedTargetMap,
 }
 
 impl MetricsBridgeHandle {
@@ -365,6 +394,7 @@ impl MetricsBridgeHandle {
         tokio::spawn(forward_metrics(
             rx,
             runtime,
+            self.target_to_plugin_id,
             self.global_allowed_plugin_ids,
             per_plugin_filters,
         ));
@@ -378,19 +408,21 @@ impl MetricsBridgeHandle {
 async fn forward_metrics(
     mut rx: mpsc::Receiver<BridgedMetric>,
     runtime: Arc<ArcSwap<GatewayRuntime>>,
+    target_to_plugin_id: SharedTargetMap,
     global_allowed_plugin_ids: Arc<HashSet<String>>,
     per_plugin_filters: Arc<HashMap<String, SignalFilter>>,
 ) {
     while let Some(msg) = rx.recv().await {
-        // Surface accumulated producer-side overflow
-        // (`try_send_metric` couldn't enqueue) now that the channel
-        // has room. Doing it from the consumer side avoids the
-        // recursion the producer side would hit.
+        // Surface accumulated producer-side overflow (`send` couldn't
+        // enqueue) now that the channel has room. Doing it from the
+        // consumer side avoids the recursion the producer side would hit.
         drain_metrics_bridge_overflows();
+        let targets = target_to_plugin_id.load_full();
+        let source = msg.source_plugin_id(&targets);
         // Gate (enabled) + sink redirection. metrics has no level
         // (event_level: None), so the level floor is ignored.
         let decision = route_event(
-            &msg.source_plugin_id,
+            source,
             &per_plugin_filters,
             None,
             &global_allowed_plugin_ids,
@@ -402,7 +434,7 @@ async fn forward_metrics(
                 // intentional filtering apart from a bug.
                 metrics::counter!(
                     "mcpg_observability_dropped_total",
-                    "source_plugin_id" => msg.source_plugin_id.clone(),
+                    "source_plugin_id" => source.to_owned(),
                     "signal" => "metrics",
                     "reason" => reason.as_label(),
                 )
@@ -410,16 +442,18 @@ async fn forward_metrics(
                 continue;
             }
             RouteDecision::UseGlobal => {
+                let point = msg.to_point();
                 dispatch_guard::with_scope(
                     rt.plugin_registry()
-                        .emit_metric_event_filtered(&msg.point, &global_allowed_plugin_ids),
+                        .emit_metric_event_filtered(&point, &global_allowed_plugin_ids),
                 )
                 .await;
             }
             RouteDecision::Override(sinks) => {
+                let point = msg.to_point();
                 dispatch_guard::with_scope(
                     rt.plugin_registry()
-                        .emit_metric_event_filtered(&msg.point, &sinks),
+                        .emit_metric_event_filtered(&point, &sinks),
                 )
                 .await;
             }
@@ -457,22 +491,14 @@ mod tests {
         counter.increment(3);
         let pts = drain(handle.rx.as_mut().unwrap());
         assert_eq!(pts.len(), 1);
-        assert_eq!(pts[0].point.name, "requests_total");
-        assert_eq!(pts[0].source_plugin_id, "core");
-    }
-
-    fn sample_metric() -> BridgedMetric {
-        BridgedMetric {
-            point: MetricPoint {
-                name: "mcpg_metrics_sink_records_total".to_owned(),
-                unit: None,
-                kind: MetricKind::Counter,
-                value: MetricValue::I64 { value: 1 },
-                labels: BTreeMap::new(),
-                timestamp_ns: 0,
-            },
-            source_plugin_id: "core".to_owned(),
-        }
+        let point = pts[0].to_point();
+        assert_eq!(point.name, "requests_total");
+        assert_eq!(
+            point.labels,
+            BTreeMap::from([("path".to_owned(), "/x".to_owned())])
+        );
+        assert_eq!(point.kind, MetricKind::Counter);
+        assert_eq!(pts[0].source_plugin_id(&HashMap::new()), "core");
     }
 
     #[tokio::test]
@@ -482,16 +508,20 @@ mod tests {
         // emits). Re-enqueueing it feeds the forwarder its own output and
         // spins the bridge channel hot, so it must be dropped. A metric
         // emitted outside the scope enqueues normally.
-        let (tx, mut rx) = mpsc::channel::<BridgedMetric>(8);
+        let (rec, mut handle) = new_bridge(Arc::new(HashSet::new()), empty_targets());
+        let key = Key::from_name("mcpg_metrics_sink_records_total");
+        let meta = Metadata::new("t", metrics::Level::INFO, None);
+        let counter = rec.register_counter(&key, &meta);
+        let rx = handle.rx.as_mut().unwrap();
 
-        try_send_metric(&tx, sample_metric());
+        counter.increment(1);
         assert!(
             rx.try_recv().is_ok(),
             "a metric emitted outside a sink dispatch must enqueue"
         );
 
         dispatch_guard::with_scope(async {
-            try_send_metric(&tx, sample_metric());
+            counter.increment(1);
         })
         .await;
         assert!(
@@ -521,7 +551,109 @@ mod tests {
         counter.increment(1);
         let pts = drain(handle.rx.as_mut().unwrap());
         assert_eq!(pts.len(), 1);
-        assert_eq!(pts[0].source_plugin_id, "dev.mcpg.observability.audit");
+        let targets = handle.target_to_plugin_id.load();
+        assert_eq!(
+            pts[0].source_plugin_id(&targets),
+            "dev.mcpg.observability.audit"
+        );
+    }
+
+    #[test]
+    fn a_sample_emitted_before_the_target_map_fills_is_the_gateways() {
+        let targets = empty_targets();
+        let (rec, mut handle) = new_bridge(Arc::new(HashSet::new()), Arc::clone(&targets));
+        let key = Key::from_name("emit_total");
+        let meta = Metadata::new(
+            "t",
+            metrics::Level::INFO,
+            Some("mcpg_plugin_observability_audit::write"),
+        );
+        let counter = rec.register_counter(&key, &meta);
+        counter.increment(1);
+        crate::observability::signal_router::swap_target_map(
+            &targets,
+            HashMap::from([(
+                "mcpg_plugin_observability_audit".to_owned(),
+                "dev.mcpg.observability.audit".to_owned(),
+            )]),
+        );
+        counter.increment(1);
+
+        let pts = drain(handle.rx.as_mut().unwrap());
+        assert_eq!(pts.len(), 2);
+        let targets = handle.target_to_plugin_id.load();
+        assert_eq!(pts[0].source_plugin_id(&targets), "core");
+        assert_eq!(
+            pts[1].source_plugin_id(&targets),
+            "dev.mcpg.observability.audit"
+        );
+    }
+
+    #[test]
+    fn register_returns_one_cached_series_per_key_and_module_path() {
+        let mut targets: HashMap<String, String> = HashMap::new();
+        targets.insert(
+            "mcpg_plugin_observability_audit".into(),
+            "dev.mcpg.observability.audit".into(),
+        );
+        let (rec, mut handle) = new_bridge(
+            Arc::new(HashSet::new()),
+            Arc::new(arc_swap::ArcSwap::from_pointee(targets)),
+        );
+        let key = || Key::from_parts("calls_total", vec![metrics::Label::new("tool", "echo")]);
+        let core = Metadata::new("t", metrics::Level::INFO, Some("mcpg::runtime"));
+        let plugin = Metadata::new(
+            "t",
+            metrics::Level::INFO,
+            Some("mcpg_plugin_observability_audit::write"),
+        );
+
+        rec.register_counter(&key(), &core).increment(1);
+        rec.register_histogram(&key(), &core).record(0.5);
+        rec.register_counter(&key(), &plugin).increment(1);
+
+        let pts = drain(handle.rx.as_mut().unwrap());
+        assert_eq!(pts.len(), 3);
+        assert!(
+            Arc::ptr_eq(&pts[0].series, &pts[1].series),
+            "the same key from the same module path reuses its series"
+        );
+        assert!(
+            !Arc::ptr_eq(&pts[0].series, &pts[2].series),
+            "another module path gets its own series"
+        );
+        assert_eq!(pts[0].to_point().kind, MetricKind::Counter);
+        assert_eq!(pts[1].to_point().kind, MetricKind::Histogram);
+        let targets = handle.target_to_plugin_id.load();
+        assert_eq!(pts[0].source_plugin_id(&targets), "core");
+        assert_eq!(
+            pts[2].source_plugin_id(&targets),
+            "dev.mcpg.observability.audit"
+        );
+        assert_eq!(rec.series.len.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_full_series_cache_hands_out_uncached_handles() {
+        let (rec, mut handle) = new_bridge(Arc::new(HashSet::new()), empty_targets());
+        let meta = Metadata::new("t", metrics::Level::INFO, None);
+        let key = |i: usize| {
+            Key::from_parts("calls_total", vec![metrics::Label::new("n", i.to_string())])
+        };
+        for i in 0..MAX_CACHED_SERIES {
+            drop(rec.register_counter(&key(i), &meta));
+        }
+        assert_eq!(rec.series.len.load(Ordering::Relaxed), MAX_CACHED_SERIES);
+
+        rec.register_counter(&key(MAX_CACHED_SERIES), &meta)
+            .increment(1);
+        rec.register_counter(&key(MAX_CACHED_SERIES), &meta)
+            .increment(2);
+
+        let pts = drain(handle.rx.as_mut().unwrap());
+        assert_eq!(pts.len(), 2, "an uncached handle still emits");
+        assert!(!Arc::ptr_eq(&pts[0].series, &pts[1].series));
+        assert_eq!(rec.series.len.load(Ordering::Relaxed), MAX_CACHED_SERIES);
     }
 
     #[test]
@@ -533,8 +665,9 @@ mod tests {
         g.set(7.5);
         let pts = drain(handle.rx.as_mut().unwrap());
         assert_eq!(pts.len(), 1);
-        assert_eq!(pts[0].point.kind, MetricKind::Gauge);
-        match &pts[0].point.value {
+        let point = pts[0].to_point();
+        assert_eq!(point.kind, MetricKind::Gauge);
+        match &point.value {
             MetricValue::F64 { value } => assert!((*value - 7.5).abs() < f64::EPSILON),
             other => panic!("expected F64, got {other:?}"),
         }
@@ -549,7 +682,7 @@ mod tests {
         g.decrement(2.0);
         let pts = drain(handle.rx.as_mut().unwrap());
         assert_eq!(pts.len(), 1);
-        match &pts[0].point.value {
+        match &pts[0].to_point().value {
             MetricValue::F64 { value } => assert!((*value + 2.0).abs() < f64::EPSILON),
             other => panic!("expected F64, got {other:?}"),
         }
@@ -564,8 +697,9 @@ mod tests {
         h.record(42.0);
         let pts = drain(handle.rx.as_mut().unwrap());
         assert_eq!(pts.len(), 1);
-        assert_eq!(pts[0].point.kind, MetricKind::Histogram);
-        match &pts[0].point.value {
+        let point = pts[0].to_point();
+        assert_eq!(point.kind, MetricKind::Histogram);
+        match &point.value {
             MetricValue::Histogram {
                 count,
                 sum,
@@ -584,11 +718,12 @@ mod tests {
         // Overflow does not go via metrics::counter! (would recurse
         // through the bridge); it accumulates in the
         // METRICS_BRIDGE_OVERFLOWS atomic instead.
-        let baseline = METRICS_BRIDGE_OVERFLOWS.load(std::sync::atomic::Ordering::Relaxed);
+        let baseline = METRICS_BRIDGE_OVERFLOWS.load(Ordering::Relaxed);
         let (tx, mut rx) = mpsc::channel::<BridgedMetric>(1);
         let rec = PluginMetricsRecorder {
             tx,
-            target_to_plugin_id: empty_targets(),
+            series: Arc::default(),
+            targets: empty_targets(),
         };
         let key = Key::from_parts("ops", Vec::<metrics::Label>::new());
         let meta = Metadata::new("t", metrics::Level::INFO, None);
@@ -603,8 +738,7 @@ mod tests {
             drained.len()
         );
         // 10 emits, capacity 1 → ≥ 9 overflows recorded.
-        let overflows =
-            METRICS_BRIDGE_OVERFLOWS.load(std::sync::atomic::Ordering::Relaxed) - baseline;
+        let overflows = METRICS_BRIDGE_OVERFLOWS.load(Ordering::Relaxed) - baseline;
         assert!(
             overflows >= 9,
             "expected ≥9 overflows accumulated, got {overflows}"
@@ -620,7 +754,7 @@ mod tests {
         c.increment(u64::MAX);
         let pts = drain(handle.rx.as_mut().unwrap());
         assert_eq!(pts.len(), 1);
-        match &pts[0].point.value {
+        match &pts[0].to_point().value {
             MetricValue::I64 { value } => assert_eq!(*value, i64::MAX),
             other => panic!("expected I64, got {other:?}"),
         }

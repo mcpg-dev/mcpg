@@ -1,8 +1,7 @@
 use super::*;
 
 impl GatewayRuntime {
-    /// The session store: who owns each session and the protocol version it
-    /// speaks.
+    /// The session store: the internal session rows and who owns each.
     pub(crate) fn session_store(&self) -> &Arc<dyn SessionStore> {
         &self.session_store
     }
@@ -12,21 +11,11 @@ impl GatewayRuntime {
         &self.delivery_bus
     }
 
-    /// Install the multi-version protocol registry. Bootstrap calls
-    /// this AFTER the runtime is wrapped in `ArcSwap` because the
-    /// paired `SharedServices` needs the swap handle to downgrade
-    /// into its `Weak` runtime field. After this call,
-    /// [`Self::handle_request`]'s Protocol arm dispatches through
-    /// `registry.get(negotiated_version).dispatch(...)`; before the
-    /// call the runtime falls through to the legacy direct path.
-    /// Must be paired with [`Self::set_shared_services`].
-    pub(crate) fn set_protocol_registry(&self, registry: Arc<ProtocolRegistry>) {
-        self.protocol_registry.store(Some(registry));
-    }
-
-    /// Install the [`SharedServices`] bundle that `ProtocolHandler`
-    /// implementations consume during dispatch. Paired with
-    /// [`Self::set_protocol_registry`].
+    /// Install the [`SharedServices`] bundle [`crate::protocol::Handler`]
+    /// consumes during dispatch. Bootstrap calls this after the runtime
+    /// is wrapped in its `ArcSwap`, because the bundle downgrades that
+    /// swap handle into its `Weak` runtime field. Until then
+    /// [`Self::handle_protocol_message`] answers `-32603`.
     pub(crate) fn set_shared_services(&self, services: Arc<SharedServices>) {
         self.shared_services.store(Some(services));
     }
@@ -97,8 +86,8 @@ impl GatewayRuntime {
     }
 
     /// Snapshot of the idempotency advertisement currently
-    /// installed, used by the initialize handler and by tests that
-    /// want to assert on the negotiated capability shape.
+    /// installed, used by `server/discover` and by tests that
+    /// want to assert on the advertised capability shape.
     pub fn idempotency_capability(&self) -> Option<&serde_json::Value> {
         self.idempotency_capability.as_ref()
     }
@@ -353,12 +342,9 @@ impl GatewayRuntime {
     /// nodes — a tool_gate plugin tracking per-principal state,
     /// a policy engine keeping rule-cache hashes, etc. The
     /// gateway's own session / task / pipeline / subscription /
-    /// replay stores DON'T go through this seam: they use the
-    /// separate `mcpg-backend-api` trait family (shipped
-    /// pre-entity-kind) because their surface is richer than
-    /// KV get/put (SSE streaming, CAS, sequence-counted
-    /// appends). That's a unification candidate for a future
-    /// architectural refactor, not a per-consumer migration.
+    /// request-state stores DON'T go through this seam: they use the
+    /// separate `mcpg-backend-api` trait family because their surface
+    /// is richer than KV get/put (CAS, sequence-counted appends).
     ///
     /// Thin passthrough to `registry.store_for_role`; lives on
     /// the runtime so consumer code doesn't have to reach
@@ -403,7 +389,7 @@ impl GatewayRuntime {
     }
 
     /// The resource-subscription registry. Exposed for the transports:
-    /// the modern `subscriptions/listen` stream owns its registrations and
+    /// the `subscriptions/listen` stream owns its registrations and
     /// releases them when the stream ends.
     pub fn subscription_store(
         &self,
@@ -412,7 +398,7 @@ impl GatewayRuntime {
     }
 
     /// Resource subscriptions — store rows, watch-engine refcounts, and the
-    /// holders that keep both alive. Both wires subscribe through this rather
+    /// holders that keep both alive. Every subscribe goes through this rather
     /// than touching [`Self::subscription_store`] directly, which is left for
     /// read-only queries (notification fan-out, diagnostics).
     pub fn subscriptions(&self) -> &std::sync::Arc<subscriptions::SubscriptionService> {
@@ -424,7 +410,7 @@ impl GatewayRuntime {
     }
 
     /// Plugin-registry handle for handlers that need to emit
-    /// audit events directly (modern dispatch arms).
+    /// audit events directly (the protocol dispatch arms).
     pub(crate) fn plugin_registry_handle(&self) -> Arc<mcpg_plugin_host::PluginRegistry> {
         Arc::clone(&self.plugin_registry)
     }

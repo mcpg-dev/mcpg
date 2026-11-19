@@ -24,4 +24,3 @@ pub mod secret_env;
 pub mod secret_file;
 pub mod store_memory;
 pub mod telemetry_debug;
-pub mod transport_memory;

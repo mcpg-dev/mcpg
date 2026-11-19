@@ -161,9 +161,8 @@ impl AuditConfig {
 
 fn default_audit_sinks() -> Vec<AuditSinkConfig> {
     // Default: the built-in local-file audit sink. Operators who
-    // ship their own audit sink REPLACE this entry (the legacy
-    // `disable_builtins: true` toggle is gone — list the kind to
-    // enable, omit it to disable).
+    // ship their own audit sink REPLACE this entry: list the kind to
+    // enable it, omit it to disable it.
     vec![AuditSinkConfig {
         kind: "dev.mcpg.builtin.audit.local-file".to_owned(),
         config: serde_json::json!({}),

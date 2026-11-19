@@ -42,10 +42,8 @@ pub struct SubscriberIdentity {
 impl SubscriberIdentity {
     /// Snapshot the caller's identity for a subscription made on `session_id`.
     ///
-    /// Both wires subscribe through this, so the filter sees the same shape
-    /// whichever one the subscription came in on — `trust_level` in particular
-    /// is a lowercased debug rendering the filter compares by string, which two
-    /// independent builders would eventually disagree about.
+    /// `trust_level` is a lowercased debug rendering, which the notification
+    /// filter compares as a string.
     pub fn from_request_context(
         session_id: &str,
         request_context: &crate::runtime::RequestContext,

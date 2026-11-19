@@ -46,7 +46,7 @@ cluster:
   password: "${env.MCPG_REDIS_PASSWORD}"
   key_prefix: "mcpg:prod"
   # Required for any non-single_node cluster: seals all Redis-held capability
-  # state (sessions incl. SSE replay, pipelines, tasks, …) with
+  # state (sessions, pipelines, tasks, …) with
   # XChaCha20-Poly1305. Names the env var (no `${env.…}` — the key itself
   # never sits in the config); the var must hold a URL-safe-base64 32-byte
   # key: openssl rand -base64 32 | tr '+/' '-_'

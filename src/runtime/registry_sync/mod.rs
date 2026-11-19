@@ -1547,7 +1547,10 @@ mcp:
         assert_eq!(federations.len(), 1, "deleted + packages-only excluded");
         assert_eq!(federations[0].name, "acme--com.acme--crm");
         assert_eq!(federations[0].upstream.url, "https://crm.acme.example/mcp");
-        assert!(federations[0].upstream.protocol_version.is_auto());
+        assert_eq!(
+            federations[0].upstream.transport,
+            crate::config::UpstreamTransport::StreamableHttp
+        );
         // Tombstones are dropped from the cached entry base.
         assert!(
             outcome

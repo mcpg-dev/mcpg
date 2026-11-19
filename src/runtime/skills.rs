@@ -23,25 +23,6 @@ use crate::protocol::shared::skills::{
 /// Longest `description` the Agent Skills specification allows.
 const MAX_DESCRIPTION_CHARS: usize = 1024;
 
-/// The wire a Skills request arrived on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkillsWire {
-    /// `2025-11-25`: session-bound, no `resultType`.
-    Legacy,
-    /// `2026-07-28`: stateless, results carry `resultType`.
-    Modern,
-}
-
-impl SkillsWire {
-    /// The HTTP status of a `-32601` on this wire.
-    pub fn not_found_status(self) -> u16 {
-        match self {
-            Self::Legacy => 200,
-            Self::Modern => 404,
-        }
-    }
-}
-
 /// One served skill.
 #[derive(Debug, Clone)]
 pub struct Skill {

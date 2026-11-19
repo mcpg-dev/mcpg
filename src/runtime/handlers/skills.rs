@@ -7,7 +7,15 @@ use crate::protocol::shared::caching::{CacheScope, DEFAULT_LIST_TTL_MS, RESULT_T
 use crate::protocol::shared::skills::{
     GetSkillResult, ListSkillsResult, ReadDirectoryResult, SkillsOperation, capability_value,
 };
-use crate::runtime::skills::{SkillCatalog, SkillsWire};
+use crate::protocol::{
+    BlobResourceContents, JSONRPC_VERSION, JsonRpcSuccess, ProtocolHttpResponse, ProtocolResponse,
+    ResourceContents, ResourceReadResult, ResourceTextContents,
+};
+use crate::runtime::skills::SkillCatalog;
+
+/// HTTP status of a `-32601` answer: SEP-2575 answers a method that does
+/// not exist with 404.
+const METHOD_NOT_FOUND_STATUS: u16 = 404;
 
 impl GatewayRuntime {
     /// Install the skills this runtime serves.
@@ -42,13 +50,12 @@ impl GatewayRuntime {
         &self,
         operation: SkillsOperation,
         request_context: &RequestContext,
-        wire: SkillsWire,
     ) -> ProtocolHttpResponse {
         let request_id = operation.request_id().clone();
         let method = operation.method();
         let Some(catalog) = self.skills.clone() else {
             return skills_error(
-                wire.not_found_status(),
+                METHOD_NOT_FOUND_STATUS,
                 request_id,
                 -32601,
                 format!("Method not found: {method}"),
@@ -58,18 +65,13 @@ impl GatewayRuntime {
             && !catalog.directory_read()
         {
             return skills_error(
-                wire.not_found_status(),
+                METHOD_NOT_FOUND_STATUS,
                 request_id,
                 -32601,
                 format!("Method not found: {method}"),
             );
         }
-        if wire == SkillsWire::Legacy
-            && let Err(error) = request_context.load_session_cached(&*self.session_store, true)
-        {
-            return self.map_session_error_to_protocol_response(error, Some(request_id));
-        }
-        let result_type = (wire == SkillsWire::Modern).then(|| RESULT_TYPE_COMPLETE.to_owned());
+        let result_type = RESULT_TYPE_COMPLETE.to_owned();
         metrics::counter!("mcpg_skills_requests_total", "method" => method).increment(1);
 
         match operation {
@@ -114,9 +116,9 @@ impl GatewayRuntime {
                         result_type,
                         skills: page,
                         next_cursor,
-                        ttl_ms: Some(DEFAULT_LIST_TTL_MS),
+                        ttl_ms: DEFAULT_LIST_TTL_MS,
                         // Filtered per caller, like `resources/list`.
-                        cache_scope: Some(cache_scope_label(CacheScope::Private)),
+                        cache_scope: CacheScope::Private,
                     },
                 )
             }
@@ -287,7 +289,6 @@ impl GatewayRuntime {
         };
         Some(ProtocolHttpResponse {
             http_status: 200,
-            session_id_header: None,
             response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
                 jsonrpc: JSONRPC_VERSION,
                 id: request_id.clone(),
@@ -297,20 +298,12 @@ impl GatewayRuntime {
     }
 }
 
-fn cache_scope_label(scope: CacheScope) -> String {
-    serde_json::to_value(scope)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_else(|| "private".to_owned())
-}
-
 fn skills_success<T: serde::Serialize>(
     request_id: serde_json::Value,
     result: &T,
 ) -> ProtocolHttpResponse {
     ProtocolHttpResponse {
         http_status: 200,
-        session_id_header: None,
         response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
             jsonrpc: JSONRPC_VERSION,
             id: request_id,

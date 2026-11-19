@@ -315,12 +315,51 @@ fn compute_deadline(ttl: Option<Duration>) -> (Option<SystemTime>, Option<Instan
 /// `a.foo` but not `a.foo.bar`; `subscribe("a.>")` matches both.
 /// Queue groups are ignored — there's no cross-replica fan-out
 /// in-process to balance, so every subscriber gets every message.
+///
+/// A pattern's channel lives while a subscription holds it: the last one
+/// to go removes it, so short-lived topics (one per session) do not pile
+/// up, and a publish scans only the patterns someone listens on.
 #[derive(Debug, Default)]
 pub struct MemoryBus {
     /// Per-pattern broadcast channels. Sized at 256 by default;
     /// override via [`MemoryBus::with_capacity`].
     senders: Arc<DashMap<String, broadcast::Sender<Bytes>>>,
     capacity: usize,
+}
+
+/// The stream of one [`MemoryBus`] subscription. Dropping it removes the
+/// pattern's channel when no other subscription holds it.
+struct TopicSubscription {
+    stream: Option<Subscription>,
+    /// Weak: the channels go with the bus, which ends every stream on it.
+    senders: std::sync::Weak<DashMap<String, broadcast::Sender<Bytes>>>,
+    pattern: String,
+}
+
+impl futures::Stream for TopicSubscription {
+    type Item = Result<Message, ClusterError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match self.get_mut().stream.as_mut() {
+            Some(stream) => stream.as_mut().poll_next(cx),
+            None => std::task::Poll::Ready(None),
+        }
+    }
+}
+
+impl Drop for TopicSubscription {
+    fn drop(&mut self) {
+        // The receiver goes first, so the count leaves it out. The removal
+        // holds the entry's lock, which a subscribe also takes while it adds
+        // its receiver, so no new receiver is left on a channel that is gone.
+        drop(self.stream.take());
+        if let Some(senders) = self.senders.upgrade() {
+            senders.remove_if(&self.pattern, |_, sender| sender.receiver_count() == 0);
+        }
+    }
 }
 
 impl MemoryBus {
@@ -338,11 +377,10 @@ impl MemoryBus {
         }
     }
 
-    fn sender_for(&self, topic: &str) -> broadcast::Sender<Bytes> {
-        self.senders
-            .entry(topic.to_owned())
-            .or_insert_with(|| broadcast::channel(self.capacity).0)
-            .clone()
+    /// Patterns that hold a channel.
+    #[cfg(test)]
+    fn live_patterns(&self) -> usize {
+        self.senders.len()
     }
 }
 
@@ -372,8 +410,13 @@ impl PubSub for MemoryBus {
         pattern: &str,
         _queue_group: Option<&str>,
     ) -> Result<Subscription, ClusterError> {
-        let sender = self.sender_for(pattern);
-        let receiver = sender.subscribe();
+        // The receiver is added while the entry's lock is held: see
+        // `TopicSubscription`'s drop.
+        let receiver = self
+            .senders
+            .entry(pattern.to_owned())
+            .or_insert_with(|| broadcast::channel(self.capacity).0)
+            .subscribe();
         let pattern_owned = pattern.to_owned();
         let stream =
             tokio_stream::wrappers::BroadcastStream::new(receiver).map(move |item| match item {
@@ -389,7 +432,11 @@ impl PubSub for MemoryBus {
                     })
                 }
             });
-        Ok(Box::pin(stream))
+        Ok(Box::pin(TopicSubscription {
+            stream: Some(Box::pin(stream)),
+            senders: Arc::downgrade(&self.senders),
+            pattern: pattern.to_owned(),
+        }))
     }
 }
 
@@ -534,6 +581,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(&msg.payload[..], b"deep");
+    }
+
+    /// A pattern's channel lives while a subscription holds it: the last
+    /// subscription to go removes it, and the one left keeps receiving.
+    #[tokio::test]
+    async fn the_last_subscription_of_a_pattern_removes_its_channel() {
+        let bus = MemoryBus::new();
+        for session in 0..50 {
+            let sub = bus
+                .subscribe(&format!("mcpg.delivery.{session}"), None)
+                .await
+                .unwrap();
+            drop(sub);
+        }
+        assert_eq!(bus.live_patterns(), 0, "short-lived topics do not pile up");
+
+        let first = bus.subscribe("t.a", None).await.unwrap();
+        let mut second = bus.subscribe("t.a", None).await.unwrap();
+        drop(first);
+        assert_eq!(bus.live_patterns(), 1);
+        bus.publish("t.a", Bytes::from_static(b"still"))
+            .await
+            .unwrap();
+        let msg = tokio::time::timeout(Duration::from_millis(500), second.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&msg.payload[..], b"still");
+        drop(second);
+        assert_eq!(bus.live_patterns(), 0);
     }
 
     #[test]

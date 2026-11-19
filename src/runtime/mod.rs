@@ -23,10 +23,8 @@ pub mod inspector_identity;
 pub(crate) use identity::identity_plugin;
 pub use identity::oidc;
 pub mod invocation;
-pub mod message_dispatcher;
 pub mod personal_agent;
 pub mod personal_agent_operations;
-pub mod ping_driver;
 pub(crate) mod policy;
 #[cfg(feature = "governance-quotas")]
 pub mod quota_gate;
@@ -36,7 +34,6 @@ pub use reapers::{pipeline_reaper, task_reaper};
 pub mod admission;
 pub mod redact;
 pub mod safe_dns;
-mod seen_request_ids;
 pub(crate) mod session_fleet;
 pub mod shared_services;
 pub mod skills;
@@ -56,7 +53,6 @@ mod idempotency_ops;
 mod policy_eval;
 pub mod registry_sync;
 mod sessions;
-mod streaming;
 pub mod subscriptions;
 mod types;
 mod util;
@@ -92,17 +88,11 @@ const CLUSTER_UP_HEALTHY: u8 = 1;
 
 use crate::backends::{BackendInvocationRoute, CapabilityRegistry, PromptRoute, ResourceRoute};
 use crate::config::{BackendConfig, SinkConfig};
-use crate::protocol::registry::ProtocolRegistry;
 use crate::protocol::shared::messages::ProtocolMessage;
 use crate::protocol::{
-    BlobResourceContents, CapabilityFlag, CapabilityOperation, CompletionResult, EmptyResult,
-    ImplementationInfo, InitializeResult, JSONRPC_VERSION, JsonRpcError, JsonRpcErrorBody,
-    JsonRpcSuccess, LifecycleOperation, ListCapability, LoggingOperation, PromptGetResult,
-    PromptMessage, PromptMessageContent, PromptsListResult, ProtocolHttpResponse,
-    ProtocolOperation, ProtocolResponse, ResourceCapability, ResourceContents, ResourceReadResult,
-    ResourceTemplatesListResult, ResourceTextContents, ResourcesListResult, SESSION_ID_HEADER,
-    SUPPORTED_PROTOCOL_VERSION, ServerCapabilities, TaskOperation, TasksCapability,
-    TasksListResult, ToolsListResult,
+    BlobResourceContents, JSONRPC_VERSION, JsonRpcError, JsonRpcErrorBody, JsonRpcSuccess,
+    PromptGetResult, PromptMessage, ProtocolHttpResponse, ProtocolResponse, ResourceContents,
+    ResourceReadResult, ResourceTextContents,
 };
 use crate::runtime::shared_services::SharedServices;
 
@@ -113,15 +103,13 @@ use cursor::{
 use delivery_bus::DeliveryBus;
 use execution::{BackendInvocationRequest, ExecutionDispatcher};
 pub use execution::{CommandToolRuntimeConfig, NetworkToolRuntimeConfig, RuntimeDebugConfig};
-use handlers::modern_task_status_notification;
+use handlers::task_status_notification;
 use policy::{PolicyRoute, PreDispatchPolicyGate, PreDispatchPolicyOutcome, ToolPolicyContext};
 pub use policy::{PolicySurface, ToolAccessPolicyConfig, ToolTrustRule};
-use seen_request_ids::{
-    RegisteredCancellation, SeenRequestIds, cancellation_requester_is_owner, resumer_owns_pipeline,
-    session_owner_matches,
-};
-use session_store::{EndedSession, SessionAccessError, SessionStore};
-pub use session_store::{SessionSnapshot, SessionStoreConfig, SseEventRecord, StreamAccessError};
+use session_store::{EndedSession, SessionStore};
+pub use session_store::{SessionSnapshot, SessionStoreConfig};
+pub(crate) use sessions::SessionOutcome;
+use sessions::{RegisteredCancellation, cancellation_requester_is_owner, resumer_owns_pipeline};
 use subscription_store::SubscriptionStore;
 
 /// Unique identifier for a single gateway request, used for correlation across logs, metrics, and traces.
@@ -291,6 +279,12 @@ impl RequestIdentity {
         }
     }
 
+    /// True when `owner_key` is a key [`Self::synthetic_principal_key`]
+    /// returns, not the session id that owns an anonymous caller's task.
+    pub(crate) fn is_principal_key(owner_key: &str) -> bool {
+        owner_key.starts_with("verified::") || owner_key.starts_with("header_asserted::")
+    }
+
     pub fn roles(&self) -> &[String] {
         match self {
             RequestIdentity::Verified { roles, .. } => roles,
@@ -313,21 +307,12 @@ impl RequestIdentity {
     }
 
     pub fn attributes(&self) -> &std::collections::BTreeMap<String, String> {
-        static EMPTY: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
-            std::sync::OnceLock::new();
+        static EMPTY: OnceLock<std::collections::BTreeMap<String, String>> = OnceLock::new();
         match self {
             RequestIdentity::Verified { attributes, .. } => attributes,
             _ => EMPTY.get_or_init(std::collections::BTreeMap::new),
         }
     }
-}
-
-/// Serde default for `RequestContext::negotiated_version` — the
-/// registry's compile-time default. Used both for fresh
-/// constructions and for in-place deserialization of contexts
-/// persisted before the field was added.
-fn default_negotiated_version() -> crate::protocol::version::ProtocolVersion {
-    crate::protocol::registry::ProtocolRegistry::COMPILE_TIME_DEFAULT
 }
 
 /// Per-request metadata carried through the entire gateway pipeline: identity,
@@ -337,45 +322,33 @@ fn default_negotiated_version() -> crate::protocol::version::ProtocolVersion {
 pub struct RequestContext {
     pub request_id: GatewayRequestId,
     pub upstream_request_id: Option<String>,
+    /// The internal session this request is bound to, set by
+    /// [`GatewayRuntime::ensure_session`] at dispatch.
     pub session_id: Option<String>,
-    pub resume_cursor: Option<ResumeCursor>,
     pub identity: RequestIdentity,
     pub transport: TransportKind,
     pub started_at: DateTime<Utc>,
-    /// Protocol revision negotiated for this request. Stamped by
-    /// the transport after `ProtocolRegistry::select(...)`; threaded
-    /// through `handle_protocol_operation` so version-blind code
-    /// paths can branch on it (e.g., MRTR's `InputRequiredResult`
-    /// inline body vs the legacy SSE+202 suspension envelope).
-    /// Defaults to the registry's `COMPILE_TIME_DEFAULT`
-    /// (`V_2025_11_25`) when constructed outside the transport
-    /// (tests, stdio).
-    #[serde(default = "default_negotiated_version")]
-    pub negotiated_version: crate::protocol::version::ProtocolVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_context: Option<crate::transports::TraceContext>,
-    /// SEP-2575 stateless: per-request client capabilities the modern
-    /// wire carries in `_meta.io.modelcontextprotocol/clientCapabilities`.
-    /// Populated by the transport on parse and consulted by
-    /// `client_capabilities_for_context` ahead of the session-derived
-    /// caps. `None` ⇒ fall back to session caps (the legacy default).
+    /// The client capabilities the request carries in
+    /// `_meta["io.modelcontextprotocol/clientCapabilities"]`. `None` when
+    /// it names none; the request then has the default (empty) capabilities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub modern_request_capabilities: Option<crate::protocol::ClientCapabilities>,
+    pub request_capabilities: Option<crate::protocol::ClientCapabilities>,
     /// Raw inbound bearer token (from `Authorization: Bearer …`),
     /// captured by the HTTP transport for `auth.mode: pass_through`
     /// federation dispatch. `#[serde(skip)]` — kept in-memory only,
     /// never persisted (pipeline store) or logged.
     #[serde(skip)]
     pub inbound_bearer: Option<String>,
-    /// The session id was minted for this request only and has NO row in
-    /// the session store: `load_session_cached` is pre-seeded with a
-    /// synthetic Operational snapshot, and every session-keyed structure
-    /// (deliveries, request-id dedup, cancellation) works on the id
-    /// string alone. Continuation points (task materialization, MRTR
-    /// suspension, `subscriptions/listen`) create the real row on demand
-    /// via `GatewayRuntime::materialize_ephemeral_session`. Anonymous
-    /// modern stateless requests run this way so sustained traffic
-    /// performs zero session-store operations.
+    /// The session id was minted for this request only and has no row in
+    /// the session store. Every session-keyed structure (deliveries,
+    /// cancellation) works on the id string alone, and a continuation
+    /// point (task materialization, MRTR suspension,
+    /// `subscriptions/listen`) creates the row on demand via
+    /// `GatewayRuntime::materialize_ephemeral_session`. Anonymous requests
+    /// run this way, so sustained anonymous traffic performs no
+    /// session-store operations.
     #[serde(default)]
     pub session_ephemeral: bool,
     /// The link a federated call of this request offers a caller with no
@@ -402,43 +375,30 @@ pub struct RequestContext {
     /// a transport without a peer address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_ip: Option<std::net::IpAddr>,
-    /// The client a stateless request names in
-    /// `_meta["io.modelcontextprotocol/clientInfo"]`. A session-bound
-    /// request leaves it unset; [`Self::client`] then reads the session's
-    /// `initialize` client.
+    /// The client the request names in
+    /// `_meta["io.modelcontextprotocol/clientInfo"]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<mcpg_plugin_protocol::ClientInfo>,
-    // Per-request session-snapshot cache. The first `load_session_cached`
-    // call populates the OnceLock; subsequent calls within the same
-    // request lifecycle skip the SessionStore Mutex / Redis RTT.
-    // `Arc<OnceLock<...>>` so a Clone of RequestContext shares the cache —
-    // continuations that build a fresh `RequestContext::new` start with a
-    // fresh empty cache (correct: a continuation is logically a new
-    // request, even if it inherits identity/session_id).
-    #[serde(skip)]
-    cached_session: Arc<OnceLock<Result<Arc<SessionSnapshot>, SessionAccessError>>>,
 }
 
 impl RequestContext {
+    /// A context with no session yet: dispatch binds one through
+    /// [`GatewayRuntime::ensure_session`].
     pub fn new(
         request_id: GatewayRequestId,
         upstream_request_id: Option<String>,
-        session_id: Option<String>,
-        resume_cursor: Option<ResumeCursor>,
         identity: RequestIdentity,
         transport: TransportKind,
     ) -> Self {
         Self {
             request_id,
             upstream_request_id,
-            session_id,
-            resume_cursor,
+            session_id: None,
             identity,
             transport,
             started_at: Utc::now(),
-            negotiated_version: default_negotiated_version(),
             trace_context: None,
-            modern_request_capabilities: None,
+            request_capabilities: None,
             inbound_bearer: None,
             session_ephemeral: false,
             connect_link: Arc::default(),
@@ -447,64 +407,32 @@ impl RequestContext {
             realtime_admission: false,
             client_ip: None,
             client: None,
-            cached_session: Arc::new(OnceLock::new()),
         }
     }
 
-    /// The MCP client that sent this request, as it named itself: the
-    /// stateless request's own `clientInfo`, else the `initialize`
-    /// `clientInfo` of the session this request already loaded. `None`
-    /// for a client that named none and for the synthetic stateless
-    /// session's placeholder.
+    /// The MCP client that sent this request, as its `clientInfo` names
+    /// it. `None` for a request that names none.
     pub fn client(&self) -> Option<mcpg_plugin_protocol::ClientInfo> {
-        if let Some(client) = &self.client {
-            return Some(client.clone());
-        }
-        let info = &self.cached_session.get()?.as_ref().ok()?.client_info;
-        if info.name.is_empty() || info.name == sessions::SYNTHETIC_CLIENT_NAME {
-            return None;
-        }
-        Some(mcpg_plugin_protocol::ClientInfo {
-            name: info.name.clone(),
-            version: (!info.version.is_empty()).then(|| info.version.clone()),
-        })
+        self.client.clone()
     }
 
-    /// Bind this context to an ephemeral (row-less) session: the id is
-    /// installed and the per-request session cache is pre-seeded with the
-    /// synthetic snapshot, so every `load_session_cached` call resolves
-    /// without touching the session store.
+    /// Bind this context to the ephemeral (row-less) session `snapshot`
+    /// names.
     pub(crate) fn with_ephemeral_session(mut self, snapshot: SessionSnapshot) -> Self {
-        self.session_id = Some(snapshot.session_id.clone());
+        self.session_id = Some(snapshot.session_id);
         self.session_ephemeral = true;
-        let cache = OnceLock::new();
-        let _ = cache.set(Ok(Arc::new(snapshot)));
-        self.cached_session = Arc::new(cache);
         self
     }
 
-    /// Override the negotiated protocol version. Transports call
-    /// this after `ProtocolRegistry::select(...)` resolves the
-    /// inbound version to a handler.
-    pub fn with_negotiated_version(
-        mut self,
-        version: crate::protocol::version::ProtocolVersion,
-    ) -> Self {
-        self.negotiated_version = version;
-        self
-    }
-
-    /// Install the per-request `_meta.io.modelcontextprotocol/clientCapabilities`
-    /// for modern stateless requests. The runtime's
-    /// `client_capabilities_for_context` prefers this value over the
-    /// session-bound capabilities so each modern call announces its
-    /// own surface (the synthetic session minted for stateless
-    /// traffic carries empty caps).
-    pub fn with_modern_request_capabilities(
+    /// Install the client capabilities the request carries in
+    /// `_meta["io.modelcontextprotocol/clientCapabilities"]`. The pipeline
+    /// steps that send a request to the client (elicitation, sampling,
+    /// roots) are gated on them.
+    pub fn with_request_capabilities(
         mut self,
         capabilities: crate::protocol::ClientCapabilities,
     ) -> Self {
-        self.modern_request_capabilities = Some(capabilities);
+        self.request_capabilities = Some(capabilities);
         self
     }
 
@@ -513,52 +441,6 @@ impl RequestContext {
     pub fn with_inbound_bearer(mut self, bearer: Option<String>) -> Self {
         self.inbound_bearer = bearer;
         self
-    }
-
-    /// Load the session snapshot bound to this request's `session_id`,
-    /// caching the underlying lookup so repeat calls within the same
-    /// request lifecycle skip the SessionStore Mutex round-trip
-    /// (in-memory) or network RTT (Redis/NATS). The first call drives
-    /// the underlying `store.load_session(session_id, false)` (raw
-    /// shape, ignoring `require_operational`); each call applies its
-    /// own `require_operational` filter against the cached snapshot's
-    /// `phase`. Errors (`MissingSessionId`, `UnknownSession`) are
-    /// cached too — re-asking the store would yield the same answer.
-    ///
-    /// **Side-effect note.** The cached path skips the in-memory
-    /// store's `session.touch()` + `persist_session()` for subsequent
-    /// reads. This is intentional: a single MCP request issuing N
-    /// internal capability lookups should count as one session
-    /// "touch", not N. The first `load_session_cached` per request
-    /// performs the touch; later reads serve from cache.
-    ///
-    /// Returns owned `SessionSnapshot` (cloned from the cached `Arc`)
-    /// to match the existing `SessionStore::load_session` API; future
-    /// API churn could return `Arc<SessionSnapshot>` to drop the clone
-    /// cost as well.
-    pub(crate) fn load_session_cached(
-        &self,
-        store: &dyn SessionStore,
-        require_operational: bool,
-    ) -> Result<SessionSnapshot, SessionAccessError> {
-        // Populate the cache on first miss. `OnceLock::get_or_init`
-        // takes `FnOnce() -> T`, so we map the store call into the
-        // cached `Result<Arc<SessionSnapshot>, _>` shape directly.
-        let cached = self.cached_session.get_or_init(|| {
-            store
-                .load_session(self.session_id.as_deref(), false)
-                .map(Arc::new)
-        });
-        match cached {
-            Ok(snap) => {
-                if require_operational && snap.phase != session_store::SessionPhase::Operational {
-                    Err(SessionAccessError::NotInitialized)
-                } else {
-                    Ok((**snap).clone())
-                }
-            }
-            Err(e) => Err(e.clone()),
-        }
     }
 
     pub fn with_trace_context(
@@ -599,15 +481,10 @@ impl RequestContext {
         }
     }
 
-    /// Owner key for task authorization (SEP-2663 / CPN-4). Binds a
-    /// task to the request **principal** so a task created on one
-    /// cluster replica is pollable from another (the principal is the
-    /// same everywhere; the per-replica synthetic session is not).
-    /// Falls back to the session id only for anonymous callers that
-    /// have no stable principal — those tasks remain per-replica
-    /// (documented residual; an anonymous caller cannot federate its
-    /// own task across instances because it presents no stable
-    /// identity).
+    /// Owner key for task authorization (SEP-2663). Binds a task to the
+    /// request **principal**, so a task created on one cluster replica
+    /// is pollable from another. Falls back to the session id for an
+    /// anonymous caller, which presents no stable principal.
     pub fn task_owner_key(&self) -> Option<String> {
         self.identity
             .synthetic_principal_key()
@@ -633,120 +510,22 @@ impl RequestContext {
     }
 }
 
-/// Opaque cursor from the `Last-Event-Id` SSE header, enabling stream resumption
-/// after a disconnect without replaying already-delivered events.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResumeCursor {
-    pub last_event_id: String,
-}
-
-/// Fully-resolved gateway request ready for dispatch to the runtime.
-#[derive(Debug, Clone, Serialize)]
-pub struct GatewayRequest {
-    pub context: RequestContext,
-    pub operation: GatewayOperation,
-}
-
-impl GatewayRequest {
-    pub fn new(context: RequestContext, operation: GatewayOperation) -> Self {
-        Self { context, operation }
-    }
-}
-
-/// Top-level operation discriminant: either a diagnostics probe or an MCP protocol operation.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum GatewayOperation {
-    Diagnostics(DiagnosticsOperation),
-    Protocol(ProtocolOperation),
-}
-
-impl GatewayOperation {
-    pub fn label(&self) -> &'static str {
-        match self {
-            GatewayOperation::Diagnostics(DiagnosticsOperation::Readiness) => {
-                "diagnostics.readiness"
-            }
-            GatewayOperation::Diagnostics(DiagnosticsOperation::Runtime) => "diagnostics.runtime",
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialize { .. },
-            )) => "protocol.lifecycle.initialize",
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )) => "protocol.lifecycle.initialized",
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Ping { .. },
-            )) => "protocol.lifecycle.ping",
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::NotificationAccepted,
-            )) => "protocol.lifecycle.notification_accepted",
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::NotificationCancelled { .. },
-            )) => "protocol.lifecycle.notification_cancelled",
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::ElicitationComplete { .. },
-            )) => "protocol.lifecycle.elicitation_complete",
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::RootsListChanged,
-            )) => "protocol.lifecycle.roots_list_changed",
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ToolsList { .. },
-            )) => "protocol.capabilities.tools_list",
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::PromptsList { .. },
-            )) => "protocol.capabilities.prompts_list",
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::PromptsGet { .. },
-            )) => "protocol.capabilities.prompts_get",
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesList { .. },
-            )) => "protocol.capabilities.resources_list",
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesRead { .. },
-            )) => "protocol.capabilities.resources_read",
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesSubscribe { .. },
-            )) => "protocol.capabilities.resources_subscribe",
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesUnsubscribe { .. },
-            )) => "protocol.capabilities.resources_unsubscribe",
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesTemplatesList { .. },
-            )) => "protocol.capabilities.resources_templates_list",
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ToolsCall { .. },
-            )) => "protocol.capabilities.tools_call",
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::Complete { .. },
-            )) => "protocol.capabilities.completion_complete",
-            GatewayOperation::Protocol(ProtocolOperation::Tasks(TaskOperation::Get { .. })) => {
-                "protocol.tasks.get"
-            }
-            GatewayOperation::Protocol(ProtocolOperation::Tasks(TaskOperation::Result {
-                ..
-            })) => "protocol.tasks.result",
-            GatewayOperation::Protocol(ProtocolOperation::Tasks(TaskOperation::Cancel {
-                ..
-            })) => "protocol.tasks.cancel",
-            GatewayOperation::Protocol(ProtocolOperation::Tasks(TaskOperation::List {
-                ..
-            })) => "protocol.tasks.list",
-            GatewayOperation::Protocol(ProtocolOperation::Logging(
-                LoggingOperation::SetLevel { .. },
-            )) => "protocol.logging.set_level",
-            GatewayOperation::Protocol(ProtocolOperation::Skills(_)) => "protocol.skills",
-            GatewayOperation::Protocol(ProtocolOperation::ServerRequestResponse { .. }) => {
-                "protocol.server_request_response"
-            }
-        }
-    }
-}
-
+/// A diagnostics probe. MCP messages enter through
+/// [`GatewayRuntime::handle_protocol_message`].
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticsOperation {
     Readiness,
     Runtime,
+}
+
+impl DiagnosticsOperation {
+    pub fn label(&self) -> &'static str {
+        match self {
+            DiagnosticsOperation::Readiness => "diagnostics.readiness",
+            DiagnosticsOperation::Runtime => "diagnostics.runtime",
+        }
+    }
 }
 
 /// Gateway response envelope pairing the originating request ID with the response payload.
@@ -756,23 +535,22 @@ pub struct GatewayResponse {
     pub payload: GatewayResponsePayload,
 }
 
-/// Discriminated response body: readiness/runtime diagnostics or an MCP protocol HTTP response.
+/// The body of a diagnostics probe's answer.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "body", rename_all = "snake_case")]
 pub enum GatewayResponsePayload {
     Readiness(ReadinessSnapshot),
     Runtime(RuntimeSnapshot),
-    Protocol(ProtocolHttpResponse),
 }
 
 /// Central gateway runtime holding all shared state: session store, capability
 /// registry, plugin chain, execution dispatcher, and cluster infrastructure.
 /// Built once at startup and shared via `Arc` across all request handlers.
 ///
-/// Session lifecycle: create (Initialize) -> initialized (notifications/initialized)
-/// -> operational (all capability methods) -> terminated (DELETE or idle timeout).
-/// The session store tracks the current phase; requests against a non-operational
-/// session receive a protocol error.
+/// Sessions are internal: [`Self::ensure_session`] binds every request to
+/// one, keyed by the caller's principal (a fresh row-less one for an
+/// anonymous caller), and a session ends on idle timeout or when an
+/// operator terminates it.
 pub struct GatewayRuntime {
     pub service_name: String,
     pub service_version: String,
@@ -797,10 +575,10 @@ pub struct GatewayRuntime {
     /// the record TTL. Opt-in (default false). Wired from
     /// `idempotency.replay_revalidation` at boot + reload.
     idempotency_replay_revalidation: bool,
-    /// When true, session-scoped HTTP operations (GET→SSE, DELETE,
-    /// subscriptions, POST→SSE continuation) require the caller's
-    /// principal to match the session's creator. Opt-in (default false).
-    /// Wired from `sessions.bind_session_owner` at boot + reload.
+    /// When true, session-scoped operations (`subscriptions/listen`)
+    /// require the caller's principal to match the session's creator.
+    /// Opt-in (default false). Wired from `sessions.bind_session_owner`
+    /// at boot + reload.
     bind_session_owner: bool,
     capability_registry: Arc<CapabilityRegistry>,
     /// (backend_name, plugin_kind) pairs for bindings that may
@@ -836,11 +614,10 @@ pub struct GatewayRuntime {
     #[cfg(feature = "governance-quotas")]
     quota_gate: Option<std::sync::Arc<crate::runtime::quota_gate::QuotaGate>>,
     /// Pre-rendered `dev.mcpg/idempotency` capability advertisement
-    /// the initialize handler embeds under
-    /// `result.capabilities.extensions[…]`. `None` when the
-    /// `idempotency.enabled` feature flag is off — the handshake
-    /// then omits the extension entirely so SEP-2133-aware clients
-    /// fall through to non-idempotent calls. Populated from
+    /// `server/discover` declares under `capabilities.extensions[…]`.
+    /// `None` when the `idempotency.enabled` feature flag is off —
+    /// discovery then omits the extension entirely so SEP-2133-aware
+    /// clients fall through to non-idempotent calls. Populated from
     /// [`crate::config::IdempotencyConfig`] at boot; defaults to `None`
     /// when idempotency is disabled.
     idempotency_capability: Option<serde_json::Value>,
@@ -850,19 +627,10 @@ pub struct GatewayRuntime {
     /// pattern-matching on `Option`. The dispatcher gates access on
     /// `idempotency_capability.is_some()` to keep the no-op cost zero.
     idempotency_store: std::sync::Arc<dyn idempotency::IdempotencyStore>,
-    /// Pre-rendered `io.modelcontextprotocol/ui` (SEP-1865 MCP Apps)
-    /// capability advertisement embedded under
-    /// `result.capabilities.extensions[…]` on the legacy `initialize`
-    /// handshake. `None` when `mcp.configurations.apps.enabled` is off
-    /// (the handshake then omits the extension). Populated from
-    /// [`crate::config::apps::AppsConfig`] at boot. The modern
-    /// `server/discover` builder reads the config snapshot directly
-    /// instead (see `build_discover_result`).
-    apps_capability: Option<serde_json::Value>,
-    /// Whether MCPG advertises the Apps capability on its outgoing
-    /// (client→upstream) `initialize`, so federated servers emit
-    /// UI-enabled tools. Mirrors
-    /// `apps.federate_upstream` (inherits `enabled`).
+    /// Whether MCPG declares the Apps extension in the client
+    /// capabilities it sends to federated upstreams, so they emit
+    /// UI-enabled tools. Mirrors `apps.federate_upstream` (inherits
+    /// `enabled`).
     apps_federate_upstream: bool,
     /// The skills `mcp.skills` serves over the Skills extension. `None`
     /// when no source is configured: the extension is then not declared
@@ -946,9 +714,8 @@ pub struct GatewayRuntime {
     subscription_store: Arc<dyn SubscriptionStore>,
     pub watch_engine: watch_engine::WatchEngine,
     /// Owns resource subscriptions: the store rows, the watch engine's per-URI
-    /// refcounts, and the holders that keep both alive. Every subscribe /
-    /// unsubscribe on either wire goes through it, so the three cannot drift
-    /// apart.
+    /// refcounts, and the holders that keep both alive. Every subscribe and
+    /// release goes through it, so the three cannot drift apart.
     subscription_service: Arc<subscriptions::SubscriptionService>,
     backend_health: backend_health::BackendHealthMap,
     cancellation_bus: Arc<dyn cancellation_bus::CancellationBus>,
@@ -969,28 +736,19 @@ pub struct GatewayRuntime {
     /// [`Self::start_cluster_listeners`], stopped when a reload retires the
     /// runtime.
     cluster_listeners: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    /// Per-session completion rate limiter. `None` means disabled.
-    /// Perf: DashMap avoids Mutex contention on the tools/call hot path.
+    /// Completion rate limiter: one token bucket per key.
+    /// `completion_rate_limit_per_sec` of `None` disables it.
+    /// Perf: DashMap avoids Mutex contention on the completion hot path.
     completion_limiter: dashmap::DashMap<String, (u64, std::time::Instant)>,
     completion_rate_limit_per_sec: Option<u64>,
-    /// Per-tenant active-session counter. 0 disables the cap.
-    /// Perf: DashMap for lock-free reads during initialize.
+    /// Session rows held per principal on this replica, for the
+    /// `max_sessions_per_tenant` cap when the session store keeps no
+    /// fleet-wide count. 0 disables the cap.
     tenant_session_counts: dashmap::DashMap<String, usize>,
     max_sessions_per_tenant: usize,
-    /// Tracks which tenant owns a session for counter decrement on terminate.
+    /// The principal each counted session belongs to, so its count drops
+    /// when the session ends.
     session_tenants: dashmap::DashMap<String, String>,
-    /// Per-session set of seen client request ids. Duplicate ids are
-    /// rejected. Bounded per session — oldest ids age out when full.
-    /// Perf: DashMap avoids global Mutex contention; each session's
-    /// window is only accessed by that session's request path, and
-    /// membership is an O(1) HashSet lookup (the VecDeque only orders
-    /// FIFO eviction).
-    seen_request_ids: dashmap::DashMap<String, SeenRequestIds>,
-    /// When true, skip the per-session request-id uniqueness check in
-    /// [`Self::record_client_request_id`]. Opt-in, off by default; only
-    /// load generators replaying a fixed request body set it (see
-    /// `server.relax_request_id_uniqueness`).
-    relax_request_id_uniqueness: bool,
     /// Emit the per-request access log (`request received` / `request
     /// completed`). Default true; `server.access_log = false` suppresses it
     /// to shed two structured-log events per request on hot deployments.
@@ -1026,100 +784,42 @@ pub struct GatewayRuntime {
     /// loaded, which a reload keeps, and the refusal every tool call gets
     /// while a withheld tool gate waits for a licence.
     pub(crate) license_state: std::sync::Arc<crate::license_gate::LicenseRuntimeState>,
-    /// Multi-version protocol dispatcher. Installed at boot via
-    /// [`Self::set_protocol_registry`] after the runtime is wrapped
-    /// in `ArcSwap` (so we can downgrade the swap handle into
-    /// `SharedServices.runtime`). Until installation requests fall
-    /// through to the legacy direct path
-    /// ([`Self::handle_protocol_operation`]). Once installed,
-    /// [`Self::handle_request`]'s Protocol arm routes through
-    /// [`crate::protocol::shared::traits::ProtocolHandler::dispatch`].
-    ///
-    /// Stored via `ArcSwapOption` so post-construction installation
-    /// works without `&mut self` (the runtime is already shared by
-    /// the time we have a swap handle for `SharedServices` to
-    /// downgrade).
-    pub(crate) protocol_registry: ArcSwapOption<ProtocolRegistry>,
-    /// Bundle of version-blind services handed to every
-    /// `ProtocolHandler` during dispatch. Paired with
-    /// `protocol_registry` — both populated or both empty. Installed
-    /// at boot via [`Self::set_shared_services`].
+    /// Bundle of services [`crate::protocol::Handler`] receives at dispatch
+    /// beside the runtime. Installed at boot via
+    /// [`Self::set_shared_services`], after the runtime is built, so it
+    /// lives in an `ArcSwapOption`.
     pub(crate) shared_services: ArcSwapOption<SharedServices>,
 
-    /// Modern stateless mode — stable mapping from authenticated
-    /// principal id → synthetic
-    /// session id, so two requests from the same principal land on
-    /// the SAME synthetic session and get task / subscription
-    /// continuity. Empty for anonymous traffic (which still mints
-    /// per-request synthetic sessions; documented gap).
-    pub(crate) modern_session_aliases: dashmap::DashMap<String, String>,
-}
-
-/// Outcome of [`GatewayRuntime::ensure_modern_session`]: the (possibly
-/// session-stamped) context, or an explicit signal that the session store
-/// refused a new row (`sessions.max_sessions`) so the transport answers
-/// with honest backpressure instead of dispatching against a session that
-/// was never stored.
-pub(crate) enum ModernSessionOutcome {
-    Ready(RequestContext),
-    CapacityExhausted,
+    /// Principal key → the session [`Self::ensure_session`] minted for it
+    /// on this replica, so two requests of one principal share a session
+    /// (task and subscription continuity) when no synthetic-session key
+    /// derives the id. Anonymous callers have no entry.
+    pub(crate) session_aliases: dashmap::DashMap<String, String>,
 }
 
 impl GatewayRuntime {
-    /// Entry point for all gateway operations. Enforces per-session request-id
-    /// uniqueness, then dispatches to diagnostics or protocol handling. Emits
-    /// operation-scoped metrics (request count, duration histogram).
-    #[tracing::instrument(skip(self, request), fields(operation = request.operation.label()))]
-    pub async fn handle_request(&self, request: GatewayRequest) -> GatewayResponse {
+    /// Entry point for a diagnostics probe. Emits operation-scoped
+    /// metrics (request count, duration histogram).
+    #[tracing::instrument(skip(self, context), fields(operation = operation.label()))]
+    pub async fn handle_request(
+        &self,
+        context: RequestContext,
+        operation: DiagnosticsOperation,
+    ) -> GatewayResponse {
         let start = std::time::Instant::now();
-        let GatewayRequest { context, operation } = request;
         let operation_label = operation.label();
         self.record_request_received(&context, operation_label);
 
-        let transport_label = match &context.transport {
-            TransportKind::Http => "http",
-            TransportKind::Stdio => "stdio",
-        };
+        let transport_label = transport_label(&context.transport);
 
         metrics::counter!("mcpg_requests_total", "operation" => operation_label, "transport" => transport_label).increment(1);
 
         let payload = match operation {
-            GatewayOperation::Diagnostics(DiagnosticsOperation::Readiness) => {
+            DiagnosticsOperation::Readiness => {
                 GatewayResponsePayload::Readiness(self.readiness_snapshot())
             }
-            GatewayOperation::Diagnostics(DiagnosticsOperation::Runtime) => {
+            DiagnosticsOperation::Runtime => {
                 GatewayResponsePayload::Runtime(self.runtime_snapshot())
-            }
-            GatewayOperation::Protocol(protocol_operation) => {
-                // reject client-initiated requests whose JSON-RPC
-                // id has already been used on the same MCP session.
-                if let Some(req_id) = client_request_id(&protocol_operation) {
-                    if self
-                        .record_client_request_id(
-                            context.session_id.as_deref(),
-                            context.session_ephemeral,
-                            &req_id,
-                        )
-                        .is_err()
-                    {
-                        metrics::counter!("mcpg_duplicate_request_id_total").increment(1);
-                        GatewayResponsePayload::Protocol(protocol_http_error(
-                            400,
-                            Some(req_id.clone()),
-                            -32600,
-                            "duplicate request id on this session",
-                            None,
-                        ))
-                    } else {
-                        GatewayResponsePayload::Protocol(
-                            self.dispatch_protocol(protocol_operation, &context).await,
-                        )
-                    }
-                } else {
-                    GatewayResponsePayload::Protocol(
-                        self.dispatch_protocol(protocol_operation, &context).await,
-                    )
-                }
             }
         };
 
@@ -1134,97 +834,45 @@ impl GatewayRuntime {
         }
     }
 
-    /// Entry point for already-parsed protocol messages — used by
-    /// the modern HTTP transport path where the
-    /// version is negotiated *before* parsing so the right
-    /// `ProtocolHandler::parse` runs.
-    ///
-    /// Mirrors [`Self::handle_request`]'s cross-cutting concerns
-    /// (metrics, audit, request-id uniqueness) but operates on a
-    /// version-erased [`ProtocolMessage`] instead of a legacy
-    /// `ProtocolOperation`. Dispatch goes straight to
-    /// `handler.dispatch(ctx, message, services)` for the
-    /// `message.negotiated_version`; if either the registry or
-    /// services are missing (boot incomplete) the caller gets a
-    /// `-32603` diagnostic.
+    /// Entry point for a parsed MCP request or notification. Emits the
+    /// same request metrics and access log as [`Self::handle_request`],
+    /// then dispatches through [`crate::protocol::Handler`]. Answers
+    /// `-32603` while the shared services are not installed (boot
+    /// incomplete).
     pub async fn handle_protocol_message(
         &self,
-        context: RequestContext,
+        context: &RequestContext,
         message: ProtocolMessage,
-    ) -> GatewayResponse {
+    ) -> ProtocolHttpResponse {
         let start = std::time::Instant::now();
         let operation_label = message.label;
-        self.record_request_received(&context, operation_label);
+        self.record_request_received(context, operation_label);
 
-        let transport_label = match &context.transport {
-            TransportKind::Http => "http",
-            TransportKind::Stdio => "stdio",
-        };
+        let transport_label = transport_label(&context.transport);
 
         metrics::counter!("mcpg_requests_total", "operation" => operation_label, "transport" => transport_label).increment(1);
 
-        // 2026-07-28 asks only that an id differ from the sender's other
-        // requests still in flight, and on HTTP every response rides its own
-        // request, so ids are remembered on the session-bound wire alone.
-        let remembers_ids =
-            message.negotiated_version != crate::protocol::version::ProtocolVersion::V_2026_07_28;
-        let payload = if let Some(req_id) = message.jsonrpc_id.clone()
-            && remembers_ids
-        {
-            if self
-                .record_client_request_id(
-                    context.session_id.as_deref(),
-                    context.session_ephemeral,
-                    &req_id,
-                )
-                .is_err()
-            {
-                metrics::counter!("mcpg_duplicate_request_id_total").increment(1);
-                GatewayResponsePayload::Protocol(protocol_http_error(
-                    400,
-                    Some(req_id),
-                    -32600,
-                    "duplicate request id on this session",
-                    None,
-                ))
-            } else {
-                GatewayResponsePayload::Protocol(
-                    self.dispatch_protocol_message(&context, message).await,
-                )
-            }
-        } else {
-            GatewayResponsePayload::Protocol(
-                self.dispatch_protocol_message(&context, message).await,
-            )
-        };
+        let response = self.dispatch_protocol_message(context, message).await;
 
-        self.record_request_completed(&context, operation_label);
+        self.record_request_completed(context, operation_label);
 
         let elapsed = start.elapsed().as_secs_f64();
         metrics::histogram!("mcpg_request_duration_seconds", "operation" => operation_label, "transport" => transport_label).record(elapsed);
 
-        GatewayResponse {
-            request_id: context.request_id,
-            payload,
-        }
+        response
     }
 
-    /// Look up the handler for `message.negotiated_version` in the
-    /// registry installed on this runtime, and call its `dispatch`.
-    /// `-32603` envelope when registry/services aren't installed or
-    /// when no handler is registered for the negotiated version.
+    /// Hand `message` to [`crate::protocol::Handler`] with the installed
+    /// shared services; a `-32603` envelope while they are not installed.
     async fn dispatch_protocol_message(
         &self,
         context: &RequestContext,
         message: ProtocolMessage,
     ) -> ProtocolHttpResponse {
-        let (Some(registry), Some(services)) = (
-            self.protocol_registry.load_full(),
-            self.shared_services.load_full(),
-        ) else {
+        let Some(services) = self.shared_services.load_full() else {
             tracing::error!(
                 request_id = context.request_id.as_str(),
-                "handle_protocol_message reached without registry+services installed; \
+                "handle_protocol_message reached without the shared services installed; \
                  this is a boot ordering bug"
             );
             return protocol_http_error(
@@ -1235,174 +883,9 @@ impl GatewayRuntime {
                 None,
             );
         };
-
-        let version = message.negotiated_version;
-        let Some(handler) = registry.get(version).cloned() else {
-            tracing::warn!(
-                version = %version,
-                "no ProtocolHandler registered for negotiated version"
-            );
-            return protocol_http_error(
-                500,
-                message.jsonrpc_id,
-                -32603,
-                "no handler registered for the negotiated protocol version",
-                None,
-            );
-        };
-
-        handler.dispatch(context, message, services.as_ref()).await
-    }
-
-    /// Dispatch a parsed `ProtocolOperation`, routing through the
-    /// multi-version `ProtocolRegistry` when one is installed and
-    /// falling back to direct
-    /// [`Self::handle_protocol_operation`] otherwise (tests and any
-    /// path that constructed a `GatewayRuntime` without calling
-    /// [`Self::set_protocol_registry`] /
-    /// [`Self::set_shared_services`]).
-    ///
-    /// The registry path is identical in behaviour to the direct
-    /// path for the 2025-11-25 handler — the handler downcasts back
-    /// to `ProtocolOperation` and calls `handle_protocol_operation`
-    /// via the [`SharedServices`] runtime handle. This level of
-    /// indirection is the seam that lets a modern handler
-    /// (DRAFT-2026-v1) be swapped in without touching the runtime.
-    async fn dispatch_protocol(
-        &self,
-        operation: ProtocolOperation,
-        context: &RequestContext,
-    ) -> ProtocolHttpResponse {
-        let (Some(registry), Some(services)) = (
-            self.protocol_registry.load_full(),
-            self.shared_services.load_full(),
-        ) else {
-            // No registry/services installed yet (boot incomplete or
-            // a test that didn't wire them). Fall through to the
-            // legacy direct-dispatch path so behaviour is preserved
-            // for every existing test and call site.
-            return self.handle_protocol_operation(operation, context).await;
-        };
-
-        // This method's operand is a `v_2025_11_25::ProtocolOperation` (built
-        // just below from `map_client_message_to_operation`), so the handler it
-        // needs is the legacy one by construction — not whatever the registry
-        // currently defaults to. Naming the version explicitly keeps a future
-        // change of `COMPILE_TIME_DEFAULT` from routing a legacy operation into
-        // the modern handler, where the downcast fails and every stdio request
-        // answers -32603.
-        let version = crate::protocol::version::ProtocolVersion::V_2025_11_25;
-        let Some(handler) = registry.get(version).cloned() else {
-            tracing::warn!(
-                version = %version,
-                "no ProtocolHandler registered for negotiated version; \
-                 falling back to direct dispatch"
-            );
-            return self.handle_protocol_operation(operation, context).await;
-        };
-
-        let label = operation.label();
-        let jsonrpc_id = operation.client_request_id();
-        let message = ProtocolMessage {
-            label,
-            inner: Box::new(operation),
-            jsonrpc_id,
-            mcp_method: None,
-            negotiated_version: version,
-        };
-        handler.dispatch(context, message, services.as_ref()).await
-    }
-
-    /// Route an MCP protocol operation to the correct handler.
-    ///
-    /// Lifecycle operations drive the session state machine (initialize -> initialized -> ping/cancel).
-    /// Capability operations (tools/call, prompts/get, resources/read, etc.) require an operational
-    /// session and go through: schema validation -> rate limit -> policy gate -> plugin chain ->
-    /// backend dispatch -> post-dispatch plugins -> response.
-    pub(crate) async fn handle_protocol_operation(
-        &self,
-        operation: ProtocolOperation,
-        request_context: &RequestContext,
-    ) -> ProtocolHttpResponse {
-        match operation {
-            ProtocolOperation::Lifecycle(operation) => {
-                self.handle_lifecycle_operation(operation, request_context)
-                    .await
-            }
-            ProtocolOperation::Capabilities(CapabilityOperation::ToolsCall {
-                request_id,
-                params,
-            }) => {
-                self.handle_tools_call(request_id, params, request_context)
-                    .await
-            }
-            ProtocolOperation::Capabilities(CapabilityOperation::Complete {
-                request_id,
-                params,
-            }) => {
-                self.handle_completion(request_id, params, request_context)
-                    .await
-            }
-            ProtocolOperation::Capabilities(operation) => {
-                self.handle_capabilities_list_operation(operation, request_context)
-                    .await
-            }
-            ProtocolOperation::Tasks(operation) => {
-                self.handle_tasks_operation(operation, request_context)
-                    .await
-            }
-            ProtocolOperation::Skills(operation) => {
-                self.handle_skills_operation(operation, request_context, skills::SkillsWire::Legacy)
-                    .await
-            }
-            ProtocolOperation::Logging(LoggingOperation::SetLevel { request_id, params }) => {
-                let level_label = format!("{:?}", params.level).to_ascii_lowercase();
-                match self
-                    .session_store
-                    .set_session_log_level(request_context.session_id.as_deref(), params.level)
-                {
-                    Ok(()) => {
-                        // Audit: client-driven log-level
-                        // change. Optional sensitivity if a future
-                        // client uses level changes for adversarial
-                        // purposes (lowering verbosity to evade
-                        // detection). Cheap to log at typical rates.
-                        let event = mcpg_plugin_host::audit_events::logging_level_set_event(
-                            plugin_identity_from_request(request_context),
-                            request_context.request_id.as_str(),
-                            request_context.session_id.as_deref(),
-                            &level_label,
-                        )
-                        .with_upstream_request_id(request_context.upstream_request_id.clone());
-                        let _ = self.plugin_registry.emit_audit_event(&event).await;
-                        ProtocolHttpResponse {
-                            http_status: 200,
-                            session_id_header: None,
-                            response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
-                                jsonrpc: JSONRPC_VERSION,
-                                id: request_id,
-                                result: serde_json::to_value(EmptyResult {})
-                                    .expect("empty result serialized"),
-                            }),
-                        }
-                    }
-                    Err(error) => {
-                        self.map_session_error_to_protocol_response(error, Some(request_id))
-                    }
-                }
-            }
-            ProtocolOperation::ServerRequestResponse {
-                response_id,
-                result,
-                error,
-            } => match request_context.load_session_cached(&*self.session_store, true) {
-                Ok(_session) => {
-                    self.handle_server_request_response(request_context, response_id, result, error)
-                        .await
-                }
-                Err(error) => self.map_session_error_to_protocol_response(error, None),
-            },
-        }
+        crate::protocol::Handler
+            .dispatch(context, self, message, services.as_ref())
+            .await
     }
 }
 
@@ -1412,6 +895,7 @@ impl GatewayRuntime {
 
 #[cfg(test)]
 mod resume_cancel_ownership_tests {
+    use super::sessions::session_owner_matches;
     use super::*;
 
     #[test]
@@ -1553,25 +1037,22 @@ mod resume_cancel_ownership_tests {
         }
     }
 
-    #[test]
-    fn on_session_end_runs_cleanup_cascade() {
-        // Idle eviction of a session whose client never sent DELETE must run
-        // the same per-session cleanup as explicit terminate: release the
-        // tenant quota slot (else the tenant hard-locks) and drop the
-        // request-id tracker (else it leaks one entry per idle session).
-        let runtime = test_runtime();
-        let sid = "evict-me";
-
-        // Seed the id-keyed runtime state a live session would hold.
-        runtime
-            .tenant_session_counts
-            .insert("tenant-a".to_owned(), 1);
+    /// Seed the principal count a live session `sid` of `tenant` holds.
+    fn count_session(runtime: &GatewayRuntime, sid: &str, tenant: &str) {
+        runtime.tenant_session_counts.insert(tenant.to_owned(), 1);
         runtime
             .session_tenants
-            .insert(sid.to_owned(), "tenant-a".to_owned());
-        let _ = runtime.record_client_request_id(Some(sid), false, &serde_json::json!("req-1"));
-        assert!(runtime.seen_request_ids.contains_key(sid));
-        assert!(runtime.session_tenants.contains_key(sid));
+            .insert(sid.to_owned(), tenant.to_owned());
+    }
+
+    #[test]
+    fn on_session_end_runs_cleanup_cascade() {
+        // Idle eviction runs the same per-session cleanup as an explicit
+        // terminate: it releases the principal's count, else the principal
+        // hard-locks at its cap.
+        let runtime = test_runtime();
+        let sid = "evict-me";
+        count_session(&runtime, sid, "tenant-a");
 
         // The store holds no live session under this id, so the cascade runs.
         assert!(!runtime.session_store.contains_active_session(sid));
@@ -1585,10 +1066,6 @@ mod resume_cancel_ownership_tests {
             !runtime.tenant_session_counts.contains_key("tenant-a"),
             "tenant counter must be decremented (and pruned at zero)"
         );
-        assert!(
-            !runtime.seen_request_ids.contains_key(sid),
-            "request-id tracker must be dropped on idle eviction"
-        );
     }
 
     /// A replica that did not record the end drops what it keeps for the
@@ -1598,21 +1075,19 @@ mod resume_cancel_ownership_tests {
     fn an_end_recorded_elsewhere_still_cleans_up_here() {
         let runtime = test_runtime();
         let sid = "ended-elsewhere";
-        let _ = runtime.record_client_request_id(Some(sid), false, &serde_json::json!("req-1"));
+        count_session(&runtime, sid, "tenant-c");
         runtime.on_session_end(&idle_end(sid, false));
-        assert!(!runtime.seen_request_ids.contains_key(sid));
+        assert!(!runtime.session_tenants.contains_key(sid));
+        assert!(!runtime.tenant_session_counts.contains_key("tenant-c"));
     }
 
     #[test]
     fn on_session_end_skips_reused_live_session() {
-        // If a live session now holds the evicted id (client re-created it, or
-        // a deterministic-modern id was re-derived), its id-keyed state is
-        // legitimate and must NOT be wiped.
+        // If a live session now holds the evicted id (a principal-derived id
+        // was derived again), its id-keyed state is legitimate and must NOT
+        // be wiped.
         let runtime = test_runtime();
-        let params = GatewayRuntime::modern_synthetic_init_params();
-        let snap = runtime
-            .session_store
-            .create_session_with_id("reused-id", "2025-11-25", &params);
+        let snap = runtime.session_store.create_session_with_id("reused-id");
         assert_eq!(snap.session_id, "reused-id");
         runtime
             .session_tenants
@@ -1631,6 +1106,14 @@ mod resume_cancel_ownership_tests {
         assert!(runtime.tenant_session_counts.contains_key("tenant-b"));
     }
 
+    /// A context of `identity` bound to `session_id`.
+    fn context_in(session_id: &str, identity: RequestIdentity) -> RequestContext {
+        let mut context =
+            RequestContext::new(GatewayRequestId::new(), None, identity, TransportKind::Http);
+        context.session_id = Some(session_id.to_owned());
+        context
+    }
+
     fn suspended_anonymous_pipeline(
         session_id: &str,
         jsonrpc_id: Value,
@@ -1644,15 +1127,11 @@ mod resume_cancel_ownership_tests {
             current_step_index: 0,
             completed_steps: std::collections::BTreeMap::new(),
             original_args: serde_json::json!({}),
-            request_context: RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.to_owned()),
-                None,
+            request_context: context_in(
+                session_id,
                 RequestIdentity::Anonymous {
                     source: "test".to_owned(),
                 },
-                TransportKind::Http,
             ),
             created_at: chrono::Utc::now(),
             suspended_at: Some(chrono::Utc::now()),
@@ -1666,107 +1145,11 @@ mod resume_cancel_ownership_tests {
         }
     }
 
-    /// Reconnect dedupe: a terminal result delivered LIVE leaves its
-    /// backlog row in the coordinator KV. When the client reconnects echoing
-    /// the delivery-tagged Last-Event-Id, the row is pruned so the later drain
-    /// does NOT replay it (no double-delivery).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn reconnect_with_delivery_cursor_prunes_acked_backlog_row() {
-        let runtime = test_runtime();
-        let session_id = "sess-ack";
-        let msg = pipeline_store::DeliveryMessage {
-            kind: pipeline_store::DeliveryKind::DeferredToolResult,
-            jsonrpc_message: serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}}),
-            delivery_id: String::new(),
-        };
-        let delivery_id = runtime
-            .pipeline_store
-            .store_pending_delivery(session_id, &msg)
-            .unwrap();
-
-        // The client received it live; it reconnects echoing the tagged id.
-        let cursor = format!("stream-0:5@{delivery_id}");
-        runtime.ack_deliveries_from_cursor(session_id, &cursor);
-
-        // The acked row is gone → the reconnect drain replays nothing.
-        let drained = runtime.take_pending_deliveries(session_id);
-        assert!(
-            drained.is_empty(),
-            "an acked live-delivered result must not be replayed on reconnect"
-        );
-    }
-
-    /// The mirror case: a result that was NEVER delivered live (the client's
-    /// Last-Event-Id carries no delivery suffix, or none at all) must STILL be
-    /// drained on reconnect (no lost-delivery).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn reconnect_without_delivery_cursor_still_delivers_backlog() {
-        let runtime = test_runtime();
-        let session_id = "sess-noack";
-        let msg = pipeline_store::DeliveryMessage {
-            kind: pipeline_store::DeliveryKind::DeferredToolResult,
-            jsonrpc_message: serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"ok":true}}),
-            delivery_id: String::new(),
-        };
-        runtime
-            .pipeline_store
-            .store_pending_delivery(session_id, &msg)
-            .unwrap();
-
-        // A plain (non-delivery) cursor acks nothing.
-        runtime.ack_deliveries_from_cursor(session_id, "stream-0:5");
-
-        let drained = runtime.take_pending_deliveries(session_id);
-        assert_eq!(
-            drained.len(),
-            1,
-            "a never-delivered result must be drained on reconnect"
-        );
-    }
-
-    /// Prefix ack: one delivery-tagged Last-Event-Id acknowledges every
-    /// delivery up to and including it (deliveries stream in sequence order),
-    /// so the reconnect drain replays exactly the missed suffix, in order.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn reconnect_with_delivery_cursor_drains_only_the_missed_suffix() {
-        let runtime = test_runtime();
-        let session_id = "sess-suffix";
-        let mut ids = Vec::new();
-        for n in 1..=4u64 {
-            let msg = pipeline_store::DeliveryMessage {
-                kind: pipeline_store::DeliveryKind::DeferredToolResult,
-                jsonrpc_message: serde_json::json!({"jsonrpc":"2.0","id":n,"result":{}}),
-                delivery_id: String::new(),
-            };
-            ids.push(
-                runtime
-                    .pipeline_store
-                    .store_pending_delivery(session_id, &msg)
-                    .unwrap(),
-            );
-        }
-
-        // The client received the first two live; its last event id names the
-        // second delivery.
-        runtime.ack_deliveries_from_cursor(session_id, &format!("stream-0:7@{}", ids[1]));
-
-        let drained = runtime.drain_deliveries_for_reconnect(session_id);
-        let markers: Vec<u64> = drained
-            .iter()
-            .map(|m| m.jsonrpc_message["id"].as_u64().unwrap())
-            .collect();
-        assert_eq!(
-            markers,
-            vec![3, 4],
-            "the reconnect drain is exactly the missed suffix, in order"
-        );
-    }
-
     /// Cancelling a SUSPENDED pipeline (no live token on any replica) must
-    /// reach the persisted state: deliver a terminal cancelled error to the
-    /// caller and delete the state + pending request.
+    /// reach the persisted state: claim it and delete the state + pending
+    /// request, so a later resume finds nothing to drive.
     #[tokio::test(flavor = "multi_thread")]
-    async fn cancel_suspended_pipeline_delivers_terminal_error_and_deletes() {
+    async fn cancel_suspended_pipeline_claims_and_deletes() {
         let runtime = test_runtime();
         let state = suspended_anonymous_pipeline("sess-c", Value::Number(7.into()));
         let pipeline_id = state.pipeline_id.clone();
@@ -1783,10 +1166,6 @@ mod resume_cancel_ownership_tests {
             })
             .unwrap();
 
-        // Subscribe to the delivery bus before cancelling so we observe the
-        // terminal error frame.
-        let mut rx = runtime.subscribe_session_delivery("sess-c").await;
-
         // Anonymous cancel for the same session + rendered id "7".
         let event = cancellation_bus::CancellationEvent {
             target_id: "7".to_owned(),
@@ -1796,17 +1175,6 @@ mod resume_cancel_ownership_tests {
             reason: Some("user".to_owned()),
         };
         runtime.cancel_suspended_pipeline(&event).await;
-
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .expect("terminal error delivered")
-            .expect("a delivery message");
-        assert_eq!(msg.kind, pipeline_store::DeliveryKind::PipelineError);
-        assert_eq!(msg.jsonrpc_message["id"], serde_json::json!(7));
-        assert_eq!(
-            msg.jsonrpc_message["error"]["code"],
-            serde_json::json!(-32800)
-        );
 
         // State + pending request are gone.
         assert!(
@@ -1857,17 +1225,13 @@ mod resume_cancel_ownership_tests {
     /// recognised as the owner when its `notifications/cancelled` lands on
     /// another — the event carries the raw `principal_id`, so the owner check
     /// must compare on the same key (not the trust-qualified synthetic key).
-    /// This is the cross-replica legacy-cancel path validated live on nats.
     #[tokio::test(flavor = "multi_thread")]
     async fn cancel_suspended_pipeline_owned_by_identified_principal_is_authorized() {
         let runtime = test_runtime();
         let mut state = suspended_anonymous_pipeline("sess-e", Value::Number(9.into()));
         // Re-stamp the persisted owner as a Verified principal `alice`.
-        state.request_context = RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some("sess-e".to_owned()),
-            None,
+        state.request_context = context_in(
+            "sess-e",
             RequestIdentity::Verified {
                 subject_id: "alice".to_owned(),
                 issuer: "iss".to_owned(),
@@ -1878,7 +1242,6 @@ mod resume_cancel_ownership_tests {
                 scopes: vec![],
                 attributes: Default::default(),
             },
-            TransportKind::Http,
         );
         let pipeline_id = state.pipeline_id.clone();
         runtime.pipeline_store.save_pipeline(&state).unwrap();
@@ -1908,88 +1271,53 @@ mod resume_cancel_ownership_tests {
 mod request_scoped_meta_tests {
     use super::*;
     use crate::protocol::v_2026_07_28::wire::meta::LogLevel;
-    use crate::protocol::version::ProtocolVersion;
     use serde_json::json;
 
-    const MODERN: ProtocolVersion = ProtocolVersion::V_2026_07_28;
-    const LEGACY: ProtocolVersion = ProtocolVersion::V_2025_11_25;
-
-    // --- progress token (PROG-2 / RPN-3): namespaced on modern, bare on legacy ---
+    // --- progress token: the namespaced key, else the bare one ---
 
     #[test]
-    fn modern_progress_token_read_from_namespaced_key() {
+    fn progress_token_read_from_namespaced_key() {
         let meta = json!({ "io.modelcontextprotocol/progressToken": "p-9" });
-        let tok = extract_request_progress_token(Some(&meta), MODERN).unwrap();
+        let tok = extract_request_progress_token(Some(&meta)).unwrap();
         assert_eq!(tok, Some(json!("p-9")));
     }
 
     #[test]
-    fn modern_progress_token_falls_back_to_bare_key() {
-        // A transitional client that sent the bare key on the modern
-        // wire still tokens progress.
+    fn progress_token_falls_back_to_bare_key() {
         let meta = json!({ "progressToken": 7 });
-        let tok = extract_request_progress_token(Some(&meta), MODERN).unwrap();
+        let tok = extract_request_progress_token(Some(&meta)).unwrap();
         assert_eq!(tok, Some(json!(7)));
-    }
-
-    #[test]
-    fn legacy_progress_token_ignores_namespaced_key() {
-        // On 2025-11-25 the namespaced key is not a thing — only the
-        // bare key is honored, byte-identical to pre-Phase-5 behaviour.
-        let meta = json!({ "io.modelcontextprotocol/progressToken": "p-9" });
-        let tok = extract_request_progress_token(Some(&meta), LEGACY).unwrap();
-        assert_eq!(tok, None);
-
-        let bare = json!({ "progressToken": "p-1" });
-        assert_eq!(
-            extract_request_progress_token(Some(&bare), LEGACY).unwrap(),
-            Some(json!("p-1"))
-        );
     }
 
     #[test]
     fn malformed_progress_token_is_rejected() {
         let meta = json!({ "progressToken": { "bad": true } });
-        assert!(extract_request_progress_token(Some(&meta), MODERN).is_err());
+        assert!(extract_request_progress_token(Some(&meta)).is_err());
     }
 
-    // --- log level (LOG-1, SEP-2575): modern-only, namespaced ---
+    // --- log level (SEP-2575): namespaced ---
 
     #[test]
-    fn modern_log_level_parsed_from_namespaced_key() {
+    fn log_level_parsed_from_namespaced_key() {
         let meta = json!({ "io.modelcontextprotocol/logLevel": "warning" });
-        let lvl = extract_request_log_level(Some(&meta), MODERN).unwrap();
+        let lvl = extract_request_log_level(Some(&meta)).unwrap();
         assert_eq!(lvl, Some(LogLevel::Warning));
     }
 
     #[test]
-    fn modern_log_level_absent_is_none() {
+    fn log_level_absent_is_none() {
         // None ⇒ the emission site applies the spec MUST (suppress all).
         let meta = json!({});
-        assert_eq!(
-            extract_request_log_level(Some(&meta), MODERN).unwrap(),
-            None
-        );
-        assert_eq!(extract_request_log_level(None, MODERN).unwrap(), None);
-    }
-
-    #[test]
-    fn legacy_never_reads_log_level() {
-        // Even if a (non-spec) logLevel key rides along, the legacy wire
-        // ignores it — it keeps the session logging/setLevel model.
-        let meta = json!({ "io.modelcontextprotocol/logLevel": "error" });
-        assert_eq!(
-            extract_request_log_level(Some(&meta), LEGACY).unwrap(),
-            None
-        );
+        assert_eq!(extract_request_log_level(Some(&meta)).unwrap(), None);
+        assert_eq!(extract_request_log_level(None).unwrap(), None);
     }
 
     #[test]
     fn malformed_log_level_is_rejected() {
         let bad_str = json!({ "io.modelcontextprotocol/logLevel": "louder" });
-        assert!(extract_request_log_level(Some(&bad_str), MODERN).is_err());
+        assert!(extract_request_log_level(Some(&bad_str)).is_err());
         let bad_type = json!({ "io.modelcontextprotocol/logLevel": 3 });
-        assert!(extract_request_log_level(Some(&bad_type), MODERN).is_err());
+        assert!(extract_request_log_level(Some(&bad_type)).is_err());
     }
 
     #[test]

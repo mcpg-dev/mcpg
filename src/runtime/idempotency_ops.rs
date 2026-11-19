@@ -1,4 +1,7 @@
 use super::*;
+use crate::protocol::v_2026_07_28::dispatch::tasks::{task_store_error_to_response, wire_task};
+use crate::protocol::v_2026_07_28::extensions::tasks::wire::CreateTaskResult;
+use crate::protocol::{JSONRPC_VERSION, JsonRpcSuccess, ProtocolHttpResponse, ProtocolResponse};
 
 impl GatewayRuntime {
     /// Emit a `mcpg.idempotency.*` audit event. Helper around the
@@ -95,7 +98,6 @@ impl GatewayRuntime {
         });
         ProtocolHttpResponse {
             http_status: 200,
-            session_id_header: None,
             response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
                 jsonrpc: JSONRPC_VERSION,
                 id: request_id,
@@ -104,24 +106,19 @@ impl GatewayRuntime {
         }
     }
 
-    /// Build the replay response for a
-    /// `tasks/create` cache hit. Unlike the unary
-    /// [`build_idempotency_replay_response`] path, the cached
-    /// envelope here carries only the **task handle** (`task_id` +
-    /// `session_id`) — never the eventual task result. We reach
-    /// into the live task store with the cached handle and
-    /// assemble a fresh `CreateTaskResult` so the caller sees the
-    /// current task status (running / completed / cancelled /
-    /// expired) rather than a stale "running" snapshot from the
-    /// original call.
+    /// Build the replay response for a cache hit of a call accepted as a
+    /// task. Unlike the unary [`build_idempotency_replay_response`] path,
+    /// the cached envelope here carries only the **task handle** — the
+    /// task id and, under the persisted `session_id` key, the task-store
+    /// owner key — never the eventual task result. The live task store
+    /// supplies the task, so the replay is a fresh `resultType:"task"`
+    /// answer with the current status rather than a stale "working"
+    /// snapshot from the original call.
     ///
-    /// If the task store has lost the task (TTL elapsed mid-
-    /// idempotency-window — possible but rare since the
-    /// idempotency record's TTL is bounded by the task's TTL at
-    /// reservation time), we return the cached envelope verbatim
-    /// stamped with the replay marker so the caller still gets a
-    /// deterministic response. The caller's next `tasks/result`
-    /// poll will surface the missing task as `NotFound`.
+    /// When the task store has lost the task (its TTL elapsed inside the
+    /// idempotency window — rare, since the idempotency record's TTL is
+    /// bounded by the task's TTL at reservation time), the replay answers
+    /// as `tasks/get` would: task not found.
     pub(crate) async fn build_tasks_create_replay_response(
         &self,
         request_context: &RequestContext,
@@ -137,7 +134,7 @@ impl GatewayRuntime {
             .get("task_id")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        let cached_session_id = outcome
+        let cached_owner = outcome
             .envelope
             .get("session_id")
             .and_then(|v| v.as_str())
@@ -145,23 +142,14 @@ impl GatewayRuntime {
         // Reach into the live task store — replay returns the
         // current task state, not the snapshot at first-call time.
         let live_task: Option<crate::protocol::Task> =
-            match (cached_task_id.as_deref(), cached_session_id.as_deref()) {
-                (Some(task_id), Some(session_id)) => self
+            match (cached_task_id.as_deref(), cached_owner.as_deref()) {
+                (Some(task_id), Some(owner)) => self
                     .task_store
-                    .get_task(task_id, session_id)
+                    .get_task(task_id, owner)
                     .ok()
                     .map(|rec| rec.task),
                 _ => None,
             };
-        // Build a fresh `CreateTaskResult` from the live task,
-        // falling back to the cached handle when the task itself
-        // has expired between first-call and replay.
-        let mut envelope = match live_task {
-            Some(task) => serde_json::to_value(crate::protocol::CreateTaskResult { task })
-                .unwrap_or(outcome.envelope.clone()),
-            None => outcome.envelope.clone(),
-        };
-        envelope = idempotency::stamp_replay_marker(envelope, completed_dt);
         let _ = self
             .emit_idempotency_audit(
                 "mcpg.idempotency.replay",
@@ -210,13 +198,21 @@ impl GatewayRuntime {
             response_payload: None,
             payload_truncated: false,
         });
+        let Some(task) = live_task else {
+            return task_store_error_to_response(
+                task_store::TaskStoreError::NotFound,
+                Some(request_id),
+                "tools/call",
+            );
+        };
+        let envelope = serde_json::to_value(CreateTaskResult::new(wire_task(&task)))
+            .expect("create task result serialized");
         ProtocolHttpResponse {
             http_status: 200,
-            session_id_header: None,
             response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
                 jsonrpc: JSONRPC_VERSION,
                 id: request_id,
-                result: envelope,
+                result: idempotency::stamp_replay_marker(envelope, completed_dt),
             }),
         }
     }

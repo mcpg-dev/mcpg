@@ -2,17 +2,15 @@ use super::*;
 
 impl GatewayRuntime {
     /// Enumerate the visible + curated tool catalog page for a
-    /// request. Shared by both the legacy `tools/list` dispatch arm
-    /// and the modern handler's `tools/list` implementation.
-    /// Filters by the operator-configured pre-dispatch
-    /// policy, walks the operator-configured catalog provider
-    /// chain, and paginates with the session-bound
-    /// cursor key.
+    /// request (`tools/list`). Filters by the operator-configured
+    /// pre-dispatch policy, walks the operator-configured catalog
+    /// provider chain, and paginates with the session-bound cursor
+    /// key.
     ///
     /// Returns `(page, next_cursor)` where `page` is a `Vec` of
-    /// backend [`crate::backends::ToolDescriptor`] (legacy shape).
-    /// The modern handler converts each entry to its wire shape and
-    /// stamps the SEP-2549 cache fields onto the result envelope.
+    /// backend [`crate::backends::ToolDescriptor`]. The protocol
+    /// handler converts each entry to its wire shape and stamps the
+    /// SEP-2549 cache fields onto the result envelope.
     pub(crate) async fn enumerate_tools_page(
         &self,
         request_context: &RequestContext,
@@ -59,10 +57,9 @@ impl GatewayRuntime {
         self.list_page_size = size.max(1);
     }
 
-    /// Enumerate the prompt catalog page for a request. Mirror of
-    /// [`Self::enumerate_tools_page`] for prompts. Shared by the
-    /// legacy `prompts/list` arm and the modern handler's modern
-    /// `prompts/list`.
+    /// Enumerate the prompt catalog page for a request
+    /// (`prompts/list`). Mirror of [`Self::enumerate_tools_page`] for
+    /// prompts.
     pub(crate) fn enumerate_prompts_page(
         &self,
         request_context: &RequestContext,
@@ -121,18 +118,16 @@ impl GatewayRuntime {
         self.surface_is_visible(request_context, uri, route)
     }
 
-    /// Enumerate the resource catalog page for a request,
-    /// handling the composite (static + dynamic-fanout) cursor
-    /// shape. Shared by the legacy `resources/list` arm and the
-    /// modern handler's `resources/list`.
+    /// Enumerate the resource catalog page for a request
+    /// (`resources/list`), handling the composite (static +
+    /// dynamic-fanout) cursor shape.
     ///
     /// Three cursor cases:
     /// 1. `None` ⇒ page 1: walk static + fan out every dynamic
     ///    provider's first page.
     /// 2. Composite (`c.…`) ⇒ page N: page static if more remains;
     ///    else walk only the providers still mid-stream.
-    /// 3. Bare-offset ⇒ legacy backward-compat: behaves as the
-    ///    pre-composite paginator did.
+    /// 3. Bare offset ⇒ pages the static catalog alone.
     pub(crate) async fn enumerate_resources_page(
         &self,
         request_context: &RequestContext,
@@ -238,8 +233,7 @@ impl GatewayRuntime {
 
     /// Enumerate the resource-template catalog page. Simple wrapper
     /// around [`paginate_list_bound`] with the session-bound cursor
-    /// key. Shared by the legacy `resources/templates/list` arm and
-    /// the modern handler's same method.
+    /// key (`resources/templates/list`).
     pub(crate) fn enumerate_resource_templates_page(
         &self,
         request_context: &RequestContext,

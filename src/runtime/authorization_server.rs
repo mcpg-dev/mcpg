@@ -111,7 +111,7 @@ pub const GRANT_TYPE_JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-be
 /// Grant profile advertised in authorization-server metadata.
 pub const GRANT_PROFILE_ID_JAG: &str = "urn:ietf:params:oauth:grant-profile:id-jag";
 /// MCP extension identifier declared under `capabilities.extensions` of
-/// `initialize` and `server/discover` while this server is installed.
+/// `server/discover` while this server is installed.
 pub const EXTENSION_ID: &str = "io.modelcontextprotocol/enterprise-managed-authorization";
 /// Required `typ` header of an ID-JAG assertion.
 const ID_JAG_TYP: &str = "oauth-id-jag+jwt";

@@ -252,6 +252,12 @@ pub struct PluginTelemetryBridgeHandle {
 }
 
 impl PluginTelemetryBridgeHandle {
+    /// Whether a span event can reach a plugin sink: an operator-listed sink
+    /// takes it, or a per-plugin filter redirects it or counts its drop.
+    pub fn feeds_plugins(&self, per_plugin_filters: &HashMap<String, SignalFilter>) -> bool {
+        !self.global_allowed_plugin_ids.is_empty() || !per_plugin_filters.is_empty()
+    }
+
     pub fn attach(
         mut self,
         runtime: Arc<ArcSwap<GatewayRuntime>>,
@@ -536,6 +542,23 @@ mod tests {
             }
             _ => panic!("first event should be Start"),
         }
+    }
+
+    #[test]
+    fn spans_feed_plugins_only_through_a_listed_sink_or_a_per_plugin_filter() {
+        let no_filters = HashMap::new();
+        let (_, unlisted) = new_bridge(
+            Arc::new(HashSet::new()),
+            crate::observability::signal_router::new_target_map(),
+        );
+        assert!(!unlisted.feeds_plugins(&no_filters));
+        let filters = HashMap::from([("core".to_owned(), SignalFilter::default())]);
+        assert!(unlisted.feeds_plugins(&filters));
+        let (_, listed) = new_bridge(
+            Arc::new(HashSet::from(["dev.acme.traces".to_owned()])),
+            crate::observability::signal_router::new_target_map(),
+        );
+        assert!(listed.feeds_plugins(&no_filters));
     }
 
     #[test]

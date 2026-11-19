@@ -41,9 +41,7 @@ pub use auth_wiring::{
 };
 #[cfg(test)]
 pub(crate) use boot::build_from_config_adjusted;
-pub use boot::{
-    build, build_from_config, build_from_sources, install_protocol_handlers_in_process,
-};
+pub use boot::{build, build_from_config, build_from_sources, install_shared_services_in_process};
 pub(crate) use reload::reapply_config;
 pub use reload::{reload_config, reload_config_from_yaml};
 pub use serve::run;
@@ -58,8 +56,27 @@ pub(crate) use plugin_registry::*;
 pub(crate) use policy_wiring::*;
 pub(crate) use storage_wiring::*;
 
+/// The gateway's shared state. A clone is one reference-count increment: the
+/// router clones the state into every layer, middleware and extractor of
+/// every request.
 #[derive(Clone)]
-pub struct AppState {
+pub struct AppState(Arc<AppStateInner>);
+
+impl std::ops::Deref for AppState {
+    type Target = AppStateInner;
+
+    fn deref(&self) -> &AppStateInner {
+        &self.0
+    }
+}
+
+impl From<AppStateInner> for AppState {
+    fn from(inner: AppStateInner) -> Self {
+        Self(Arc::new(inner))
+    }
+}
+
+pub struct AppStateInner {
     pub config: Arc<ArcSwap<AppConfig>>,
     /// The applied config BEFORE the registry overlay is composed. The
     /// registry syncer re-runs the reload pipeline on this base, and
@@ -79,9 +96,10 @@ pub struct AppState {
     /// [`ConfigSource::File`] is re-read from disk on reload, an
     /// [`ConfigSource::Inline`] (remote-fetched / base64) reuses its boot
     /// snapshot.
-    pub config_sources: Vec<crate::config::ConfigSource>,
-    /// Per-session concurrent SSE stream counter, bounded at
-    /// MAX_SSE_STREAMS_PER_SESSION to prevent FD/memory exhaustion.
+    pub config_sources: Arc<[crate::config::ConfigSource]>,
+    /// Per-session concurrent `subscriptions/listen` stream counter,
+    /// bounded at MAX_SSE_STREAMS_PER_SESSION to prevent FD/memory
+    /// exhaustion.
     pub sse_stream_counts: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     /// Merged JSON value from the `plugins.config_overlay` apply pass
     /// at boot. Subsystems that want dynamic-config values read from
@@ -129,7 +147,7 @@ pub struct AppState {
     pub quota_gate: Arc<ArcSwap<Option<Arc<crate::runtime::quota_gate::QuotaGate>>>>,
 }
 
-/// Maximum concurrent GET SSE streams per session.
+/// Maximum concurrent `subscriptions/listen` streams per session.
 pub const MAX_SSE_STREAMS_PER_SESSION: usize = 3;
 
 #[cfg(test)]

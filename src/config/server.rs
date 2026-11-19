@@ -1,6 +1,6 @@
 //! Top-level `server:` block — HTTP listener, transport mode,
-//! TLS / mTLS, request timeouts, body cap, session quotas, the
-//! binding-backend health prober.
+//! TLS / mTLS, request timeouts, body cap, the per-principal session
+//! cap, the binding-backend health prober.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -18,18 +18,21 @@ pub struct ServerConfig {
     pub mcp_path: String,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
-    #[serde(default = "default_replay_window_limit")]
-    pub replay_window_limit: usize,
-    /// How long a session of the `2025-xx` revisions lives without use, in
-    /// milliseconds. A session ends when it was not used for this long; its
-    /// open streams end with it, and the client's next request gets 404.
+    /// How long an internal session row lives without use, in milliseconds.
+    /// The gateway keeps a row for a caller while it holds state across
+    /// requests: an open `subscriptions/listen` stream, a task, or a request
+    /// that waits for input (`InputRequiredResult`). A row ends when it was
+    /// not used for this long; its listen streams end with it, and the
+    /// unfinished tasks it owns are cancelled. An identified caller's tasks
+    /// belong to its principal, not to a row, and run until they finish or
+    /// reach their TTL.
     ///
     /// When the replicas share the session store, a replica in use writes
-    /// the session's last use at most every quarter of this timeout (at
-    /// least 1 s), so the fleet ends a session only once no replica used it
-    /// for this timeout plus that quarter. The end — this or a `DELETE` —
+    /// the row's last use at most every quarter of this timeout (at least
+    /// 1 s), so the fleet ends a row only once no replica used it for this
+    /// timeout plus that quarter. The end — this or an admin terminate —
     /// reaches every replica at once; a replica that misses the word stops
-    /// serving the session the first time it uses it after that quarter, at
+    /// serving the row the first time it uses it after that quarter, at
     /// most 30 s.
     #[serde(default = "default_session_idle_timeout_ms")]
     pub session_idle_timeout_ms: u64,
@@ -37,22 +40,31 @@ pub struct ServerConfig {
     pub shutdown_timeout_ms: u64,
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
-    /// Per-tenant session quota. 0 = unlimited. The stricter of this and
-    /// the global cap wins.
+    /// Per-principal cap on internal session rows. 0 = unlimited. The
+    /// stricter of this and the global cap wins.
     ///
-    /// A "tenant" is the trust-qualified principal, so the same subject
-    /// string asserted by a header and verified by an IdP are separate
-    /// tenants and cannot exhaust each other's quota.
+    /// An identified caller holds a row from its first request: one row
+    /// per client it names in `_meta` when the caller is verified and a
+    /// synthetic-session key or the cluster state key is set, otherwise one
+    /// row on each replica that serves it. An anonymous caller gets a row
+    /// only for a `subscriptions/listen` stream, a task, or a request that
+    /// waits for input. A request that needs a new row beyond the cap is
+    /// refused.
+    ///
+    /// The principal is trust-qualified, so the same subject string
+    /// asserted by a header and verified by an IdP are separate principals
+    /// and cannot exhaust each other's cap.
     ///
     /// Two limits worth knowing before setting this:
     ///
-    /// - **It counts the fleet when the replicas share the session
-    ///   store** (`cluster.kind` other than `single_node`, and sessions not
-    ///   on a `memory` or `file` store). Each counted session keeps a slot
-    ///   next to its row in the store; a session that ends, on any replica,
-    ///   frees its slot. With a session store of its own per replica the cap
-    ///   counts that replica's sessions, so N replicas admit up to N x this
-    ///   value per tenant.
+    /// - **Derived and anonymous rows count across the fleet when the
+    ///   replicas share the session store** (`cluster.kind` other than
+    ///   `single_node`, and sessions not on a `memory` or `file` store).
+    ///   Each such row keeps a slot next to it in the store; a session that
+    ///   ends, on any replica, frees its slot. A row one replica keeps for
+    ///   an identified caller counts on that replica only, as does every row
+    ///   with a session store of its own per replica, so N replicas admit up
+    ///   to N x this value per principal.
     /// - **Anonymous callers share one bucket**, because an unauthenticated
     ///   request carries nothing to separate them by. Aggregate anonymous
     ///   usage is capped rather than per-caller usage; per-caller
@@ -65,13 +77,10 @@ pub struct ServerConfig {
     /// Matched case-insensitively.
     #[serde(default)]
     pub extra_resource_uri_schemes: Vec<String>,
-    /// Emit a server-initiated `ping` to each active session's SSE stream
-    /// on this cadence. `None` or `0` disables. Reasonable value: 30s.
-    #[serde(default)]
-    pub server_ping_interval_ms: Option<u64>,
-    /// Per-session rate limit on `completion/complete` requests (cap per
+    /// Per-principal rate limit on `completion/complete` requests (cap per
     /// second). `None` disables. Guards against broken autocomplete UIs.
-    /// Counted by the replica that serves the request.
+    /// Anonymous callers share one bucket. Counted by the replica that
+    /// serves the request.
     #[serde(default)]
     pub completion_rate_limit_per_sec: Option<u64>,
     /// Per-IP request-rate cap on the MCP endpoint for requests below
@@ -152,10 +161,10 @@ pub struct ServerConfig {
     /// NAVIGATION to the MCP path — method GET or HEAD, `Accept` includes
     /// `text/html` and does not include `text/event-stream` — is answered
     /// with `303 See Other` to exactly this URL, before identity or any
-    /// other processing. No conformant MCP client matches: JSON-RPC rides
-    /// POST, and SSE GETs send `text/event-stream`, so the redirect only
-    /// claims requests that today dead-end in a 405/406. The value is
-    /// served literally — request data never enters the Location header.
+    /// other processing. No MCP client matches: every MCP request is a
+    /// POST, so the redirect only claims requests the MCP path otherwise
+    /// answers with 405. The value is served literally — request data
+    /// never enters the Location header.
     /// Typical target: a hosted inspector pre-filled with this gateway's
     /// URL. Must be `http`/`https`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,29 +185,6 @@ pub struct ServerConfig {
     /// diverges from the published schema is normally trusted.
     #[serde(default)]
     pub revalidate_mutated_tool_arguments: bool,
-    /// Relax the per-session JSON-RPC request-id uniqueness rule. When
-    /// false (default) a client-supplied `id` that has already been used
-    /// on the same MCP session is rejected with `-32600` (JSON-RPC
-    /// forbids id reuse). Set `true` only for load generators that
-    /// replay a fixed request body (e.g. the fortio proxy-overhead
-    /// benchmark in `tools/bench/fortio/`), where every request carries
-    /// the same `id`. Never enable in production — it removes a
-    /// duplicate-delivery / replay guard.
-    #[serde(default)]
-    pub relax_request_id_uniqueness: bool,
-    /// On the legacy (`2025-11-25`) wire, answer a unary request whose result
-    /// is immediately available and that emitted NO server→client
-    /// notifications (`log` / `progress`) with a single `application/json`
-    /// response instead of a one-frame `text/event-stream` reply. This is
-    /// spec-permitted (Streamable HTTP lets the server pick JSON or SSE) and
-    /// mirrors what the modern (`2026-07-28`) wire already does; it skips the
-    /// per-request SSE stream bookkeeping (replay-window append, priming +
-    /// logging frames, session snapshot) that otherwise runs under the session
-    /// lock, which materially raises tool-call throughput. Default `false`
-    /// (unchanged SSE behaviour). A request that DOES emit notifications, or
-    /// suspends (MRTR), still streams regardless of this flag.
-    #[serde(default)]
-    pub unary_json_fast_path: bool,
     /// Emit the per-request access log (`request received` / `request
     /// completed` INFO events, one pair per request). Default `true` (the
     /// gateway logs every request's lifecycle). Set `false` to suppress the
@@ -211,28 +197,13 @@ pub struct ServerConfig {
     pub access_log: bool,
     /// Enforce the SEP-2575 per-request `_meta` identity triple
     /// (`io.modelcontextprotocol/{protocolVersion, clientInfo,
-    /// clientCapabilities}`) on EVERY id-bearing modern (`2026-07-28`)
-    /// request, not just `server/discover`. When false (the
-    /// default), only `server/discover` requires the triple and other
-    /// modern methods may carry minimal `_meta`. Has no effect
-    /// on the `2025-11-25` wire. Opt-in so existing modern clients are
-    /// unaffected until they adopt the triple.
+    /// clientCapabilities}`) on EVERY id-bearing request, not just
+    /// `server/discover`. When false (the default), only
+    /// `server/discover` requires the triple and other methods may carry
+    /// minimal `_meta`. Opt-in so clients that send only the protocol
+    /// version are served until they adopt the triple.
     #[serde(default)]
-    pub enforce_modern_request_meta: bool,
-    /// Serve the session wire of the `2025-xx` revisions: `initialize`,
-    /// `Mcp-Session-Id`, and the GET stream and DELETE on the MCP path.
-    /// Default `true`. With `false` the gateway serves only the stateless
-    /// `2026-07-28` revision, over HTTP: a POST that negotiates a `2025-xx`
-    /// revision (by header, by `initialize`, or by sending neither header
-    /// nor `_meta` version) is refused with HTTP 400 and JSON-RPC `-32022`
-    /// (`data.supported` is `["2026-07-28"]`), a POST that carries
-    /// `Mcp-Session-Id` is refused with HTTP 400 and `-32600`, GET and DELETE
-    /// answer 405, and `server/discover` lists only `2026-07-28`. The stdio
-    /// transport and `messages`-wire entries of `transports` speak
-    /// `2025-11-25`, so they refuse to start with `false`; `http`-wire
-    /// entries go through the HTTP router and follow this setting.
-    #[serde(default = "crate::config::default_true")]
-    pub legacy_wire: bool,
+    pub enforce_request_meta: bool,
     /// After boot (plugins loaded, config-origin `env://` / `${env.X}`
     /// secrets already captured by the env secret provider's snapshot),
     /// remove those referenced env vars from the live process
@@ -269,21 +240,18 @@ pub struct ServerConfig {
     /// Additional plugin-supplied transports started at boot
     /// alongside the primary HTTP / stdio listener (which
     /// continues to be governed by `transport:` and
-    /// `bind_address:`). Each entry is a [`KindRef`] —
-    /// `kind:` resolves to either a built-in transport
-    /// keyword (today only `dev.mcpg.builtin.transport.memory`
-    /// is wired; `builtin-http` / `builtin-stdio` map to the
-    /// in-tree HTTP / stdio paths and don't need a list entry)
-    /// or a registered Transport plugin id. Each entry starts once,
-    /// with its `config`; transports that fail to start halt the
-    /// boot. Empty list = no extra transports beyond the
-    /// primary listener — today's default.
+    /// `bind_address:`). Each entry is a [`KindRef`] whose `kind:`
+    /// is a registered Transport plugin id (`builtin-http` /
+    /// `builtin-stdio` map to the in-tree HTTP / stdio paths and
+    /// need no list entry). Each entry starts once, with its
+    /// `config`; transports that fail to start halt the boot.
+    /// Empty list (the default) = no extra transports beyond the
+    /// primary listener.
     ///
-    /// A `messages`-wire plugin (websocket, grpc, custom RPC) gets
-    /// the JSON-RPC dispatcher and speaks `2025-11-25`. An
-    /// `http`-wire plugin (a tunnel such as
+    /// A transport plugin (a tunnel such as
     /// `dev.mcpg.transport.ngrok`) hands whole HTTP requests to the
-    /// gateway's own router, and its listen URL becomes the public
+    /// gateway's own router, so it serves the same MCP endpoint as
+    /// the primary listener, and its listen URL becomes the public
     /// address for webhook callbacks while no other is set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transports: Vec<crate::config::wiring::KindRef>,
@@ -322,7 +290,6 @@ impl Default for ServerConfig {
             health_path: default_health_path(),
             mcp_path: default_mcp_path(),
             allowed_origins: Vec::new(),
-            replay_window_limit: default_replay_window_limit(),
             session_idle_timeout_ms: default_session_idle_timeout_ms(),
             shutdown_timeout_ms: default_shutdown_timeout_ms(),
             request_timeout_ms: default_request_timeout_ms(),
@@ -336,13 +303,9 @@ impl Default for ServerConfig {
             browser_redirect_url: None,
             aauth_resource_metadata: None,
             revalidate_mutated_tool_arguments: false,
-            relax_request_id_uniqueness: false,
-            unary_json_fast_path: false,
             access_log: true,
-            enforce_modern_request_meta: false,
-            legacy_wire: true,
+            enforce_request_meta: false,
             scrub_process_env_after_boot: false,
-            server_ping_interval_ms: None,
             max_sessions_per_tenant: 0,
             extra_resource_uri_schemes: Vec::new(),
             max_request_body_mb: default_max_request_body_mb(),
@@ -796,14 +759,16 @@ pub struct CorsConfig {
     /// web. Compared case-insensitively, like the rebinding guard.
     pub allowed_origins: Vec<String>,
     /// Request headers a page may send. Defaults to the set MCP needs —
-    /// content negotiation, the session and protocol headers, the SSE resume
-    /// cursor, bearer auth, the DPoP proof, idempotency and trace context.
-    /// Add to it for a header a plugin reads.
+    /// content negotiation, the protocol version, method and name headers
+    /// (`Mcp-Protocol-Version`, `Mcp-Method`, `Mcp-Name`), bearer auth, the
+    /// DPoP proof, idempotency and trace context. Add to it for a header a
+    /// plugin reads, and for each `Mcp-Param-{Name}` header a client sends
+    /// for a tool parameter: a preflight cannot match those by pattern.
     #[serde(default = "default_cors_allowed_headers")]
     pub allowed_headers: Vec<String>,
     /// Response headers a page may READ. A browser hides every other header
-    /// from script, so the session id, the request id, the auth challenge
-    /// and the DPoP nonce have to be named here to be usable.
+    /// from script, so the protocol version, the request id, the auth
+    /// challenge and the DPoP nonce have to be named here to be usable.
     #[serde(default = "default_cors_expose_headers")]
     pub expose_headers: Vec<String>,
     /// How long a browser may cache the preflight answer, in seconds.
@@ -822,9 +787,9 @@ fn default_cors_allowed_headers() -> Vec<String> {
         "content-type",
         "accept",
         "authorization",
-        "mcp-session-id",
         "mcp-protocol-version",
-        "last-event-id",
+        "mcp-method",
+        "mcp-name",
         "idempotency-key",
         "traceparent",
         "tracestate",
@@ -837,7 +802,6 @@ fn default_cors_allowed_headers() -> Vec<String> {
 
 fn default_cors_expose_headers() -> Vec<String> {
     [
-        "mcp-session-id",
         "mcp-protocol-version",
         "x-mcpg-request-id",
         "www-authenticate",
@@ -898,10 +862,6 @@ fn default_health_path() -> String {
 
 fn default_mcp_path() -> String {
     "/mcp".to_owned()
-}
-
-fn default_replay_window_limit() -> usize {
-    16
 }
 
 fn default_session_idle_timeout_ms() -> u64 {
@@ -997,6 +957,37 @@ mod tests {
         assert_eq!(
             cfg.document()["documentation_uri"],
             "https://gw.example/docs"
+        );
+    }
+
+    #[test]
+    fn cors_defaults_are_exactly_the_mcp_headers() {
+        assert_eq!(
+            default_cors_allowed_headers(),
+            [
+                "content-type",
+                "accept",
+                "authorization",
+                "mcp-protocol-version",
+                "mcp-method",
+                "mcp-name",
+                "idempotency-key",
+                "traceparent",
+                "tracestate",
+                "dpop",
+            ]
+        );
+        assert_eq!(
+            default_cors_expose_headers(),
+            [
+                "mcp-protocol-version",
+                "x-mcpg-request-id",
+                "www-authenticate",
+                "retry-after",
+                "idempotent-replayed",
+                "idempotent-replayed-at",
+                "dpop-nonce",
+            ]
         );
     }
 

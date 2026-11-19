@@ -125,9 +125,6 @@ pub(crate) fn federation_for_entry(
         upstream: UpstreamConfig {
             url,
             transport: UpstreamTransport::StreamableHttp,
-            // server.json carries no MCP revision — the wire adapter's
-            // connect probe detects it per server.
-            protocol_version: crate::config::UpstreamProtocolVersion::Auto,
             command: None,
             args: Vec::new(),
             env: BTreeMap::new(),
@@ -323,7 +320,7 @@ mod tests {
             Some("mcp://com.acme.crm/")
         );
         assert_eq!(fed.upstream.url, "https://crm.acme.example/mcp");
-        assert!(fed.upstream.protocol_version.is_auto());
+        assert_eq!(fed.upstream.transport, UpstreamTransport::StreamableHttp);
         assert!(!fed.upstream.upstream_safety.allow_stdio);
         assert!(!fed.upstream.upstream_safety.allow_insecure_http);
         assert!(fed.import.tools && fed.import.resources && fed.import.prompts);

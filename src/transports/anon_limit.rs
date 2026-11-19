@@ -4,9 +4,9 @@
 //!
 //! An anonymous gateway (`cloud.allow_anonymous: true`, or any request that
 //! resolves to `RequestIdentity::Anonymous`) has no per-tenant identity to
-//! meter against, so before this limiter a single client could flood the
-//! dispatch path unboundedly (the per-session caps only bite after a session
-//! exists). The check runs ONLY when the resolved identity is anonymous —
+//! meter against, so without this limiter a single client could flood the
+//! dispatch path unboundedly (the per-principal caps need a principal). The
+//! check runs ONLY when the resolved identity is anonymous —
 //! authenticated traffic never touches it, so the authed hot path pays
 //! nothing. `POST /oauth/token` is reachable before any identity exists, so
 //! it has a budget of its own, [`OAUTH_TOKEN`], and so do the sign-in pages
@@ -22,9 +22,11 @@
 
 use std::net::IpAddr;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 
 /// Stop tracking idle buckets once the map grows past this, to bound memory
 /// under a spray of distinct source IPs. Evicts buckets idle longer than
@@ -41,6 +43,10 @@ struct Bucket {
 #[derive(Default)]
 pub struct IpRateLimiter {
     buckets: DashMap<IpAddr, Bucket>,
+    /// `buckets.len()` for the size check: `DashMap::len` locks every shard.
+    /// Concurrent inserts during a retain can skew it by a few; the next
+    /// retain re-syncs it.
+    tracked: AtomicUsize,
 }
 
 /// The anonymous `/mcp` budget. See module docs for why a static.
@@ -112,15 +118,22 @@ impl IpRateLimiter {
 
         // Bound memory under an IP spray. Amortised: only when the map is
         // oversized, and DashMap::retain locks shard-by-shard (no global stall).
-        if self.buckets.len() > MAX_TRACKED_IPS {
+        if self.tracked.load(Ordering::Relaxed) > MAX_TRACKED_IPS {
             self.buckets
                 .retain(|_, b| now.saturating_duration_since(b.last).as_secs() < IDLE_EVICT_SECS);
+            self.tracked.store(self.buckets.len(), Ordering::Relaxed);
         }
 
-        let mut entry = self.buckets.entry(ip).or_insert(Bucket {
-            tokens: capacity,
-            last: now,
-        });
+        let mut entry = match self.buckets.entry(ip) {
+            Entry::Occupied(occupied) => occupied.into_ref(),
+            Entry::Vacant(vacant) => {
+                self.tracked.fetch_add(1, Ordering::Relaxed);
+                vacant.insert(Bucket {
+                    tokens: capacity,
+                    last: now,
+                })
+            }
+        };
         let b = entry.value_mut();
         let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
         // Refill against the CURRENT config (limits can hot-reload between
@@ -250,6 +263,29 @@ mod tests {
             limiter.acquire_at(i, 2, 2, t).is_err(),
             "a refund never lifts the bucket past its burst"
         );
+    }
+
+    #[test]
+    fn an_oversized_map_evicts_idle_buckets_and_recounts() {
+        let limiter = IpRateLimiter::default();
+        let t = Instant::now();
+        let spray = |n: usize| IpAddr::V4(Ipv4Addr::from(0x0a64_0000 + n as u32));
+        for n in 0..=MAX_TRACKED_IPS {
+            assert!(limiter.acquire_at(spray(n), 60, 1, t).is_ok());
+        }
+        assert!(limiter.acquire_at(spray(0), 60, 1, t).is_err());
+        assert_eq!(limiter.tracked.load(Ordering::Relaxed), MAX_TRACKED_IPS + 1);
+        assert_eq!(limiter.buckets.len(), MAX_TRACKED_IPS + 1);
+
+        let later = t + Duration::from_secs(IDLE_EVICT_SECS + 1);
+        assert!(limiter.acquire_at(ip(3, 1), 60, 1, later).is_ok());
+        assert_eq!(limiter.buckets.len(), 1, "every sprayed bucket was idle");
+        assert_eq!(limiter.tracked.load(Ordering::Relaxed), 1);
+        assert!(
+            limiter.acquire_at(ip(3, 1), 60, 1, later).is_err(),
+            "the bucket inserted after the eviction keeps its state"
+        );
+        assert_eq!(limiter.tracked.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -358,7 +358,7 @@ async fn a_uri_left_without_live_rows_stops_its_watcher() {
 /// answer for stay.
 #[tokio::test(start_paused = true)]
 async fn rows_of_sessions_that_ended_are_removed() {
-    let uri = "res://legacy";
+    let uri = "res://ended";
     let fleet = Fleet::new(&[uri]);
     let alive: SessionLiveness = Arc::new(|session: &str| match session {
         "session-live" => Some(true),

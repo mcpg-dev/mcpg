@@ -7,8 +7,8 @@
 
 MCPG is a **Model Context Protocol Gateway** — a protocol-authority gateway that sits between MCP clients and downstream backend systems. It owns:
 
-- MCP protocol handling (JSON-RPC 2.0 over Streamable HTTP)
-- Session lifecycle (creation, SSE streaming, resumption, termination)
+- MCP protocol handling (MCP `2026-07-28`, JSON-RPC 2.0 over Streamable HTTP and stdio)
+- Per-caller session rows for listen streams, tasks and paused calls
 - Identity resolution and trust establishment
 - Pre-dispatch authorization (trust levels + CEL expressions)
 - Capability registration and discovery (tools, prompts, resources)
@@ -104,13 +104,14 @@ Client HTTP Request
 ┌─────────────────────────┐
 │  HTTP Transport          │  Parse headers, CORS, Accept validation
 │  (transports/http/)      │  Identity resolution (OIDC → JWKS → Plugin → Header → Anonymous)
-│                          │  Build RequestContext (request_id, session_id, identity)
+│                          │  Build RequestContext (request_id, identity)
+│                          │  Version check (protocol::negotiate)
 └──────────┬──────────────┘
-           │ GatewayRequest
+           │ ProtocolMessage
            ▼
 ┌─────────────────────────┐
-│  Gateway Runtime         │  Session management (create / load / validate phase)
-│  (runtime/mod.rs)        │  Operation routing by GatewayOperation enum
+│  Gateway Runtime         │  ensure_session (the caller's session row)
+│  (runtime/mod.rs)        │  Operation routing by ProtocolOperation
 │  [async]                 │  Capability matching (tool_route, prompt_route, resource_route)
 └──────────┬──────────────┘
            │ ToolRoute / PromptRoute / ResourceRoute
@@ -137,7 +138,8 @@ Client HTTP Request
            ▼
 ┌─────────────────────────┐
 │  Gateway Runtime         │  Wrap result in JSON-RPC response
-│                          │  Stream via SSE (with event IDs for replay)
+│                          │  Inline JSON, or per-request SSE when the call
+│                          │  emitted notifications
 └─────────────────────────┘
 ```
 
@@ -214,7 +216,7 @@ kinds**, each a flat `kind:` discriminator with `id:` plus its own fields:
 | `transform` | CEL expression over context | No |
 | `plugin_transform` | Reshape context via a named transform plugin (e.g. JSONata) | No |
 | `cel_gate` | CEL guard condition | No |
-| `log` | Emit `notifications/message` on the session SSE | No |
+| `log` | Emit `notifications/message` for the request (per-request `logLevel` floor) | No |
 | `progress` | Emit `notifications/progress` (when a `progressToken` is present) | No |
 | `sql_tx` | Nested transactional SQL container on a referenced `sql` backend | No |
 | `sql_await` | Fire-and-wait against a `sql` backend's `await` runtime | No |
@@ -223,7 +225,7 @@ kinds**, each a flat `kind:` discriminator with `id:` plus its own fields:
 | `roots_list` | Server→Client `roots/list` request | **Yes** |
 | `gather` | Multi-entry MRTR — several input requests in one suspension (SEP-2322) | **Yes** |
 
-Suspending steps serialize pipeline state to the pipeline store, send a server-initiated JSON-RPC request to the client via the delivery bus, and resume when the client responds.
+Suspending steps serialize pipeline state to the pipeline store and answer the `tools/call` with an `InputRequiredResult`; the pipeline resumes when the client calls again with the `requestState` and its `inputResponses`.
 
 Pipeline context flows data between steps: CEL expressions in `transform`, `cel_gate` and `input_transform` read `arguments`, `context` and `steps.<step_id>.output`.
 
@@ -246,8 +248,8 @@ happens at the primitive layer, not the capability layer.
 
 Per-capability `<capability>.store: { kind, … }` override opens its
 own connection pool. Recognised override kinds: `memory`, `file`,
-`redis`, `nats`. Tasks are scoped to the session that created them;
-the store enforces session-based authorization on all accessor
+`redis`, `nats`. Tasks are scoped to the principal that created them;
+the store enforces owner-based authorization on all accessor
 methods. Expired tasks / sessions are TTL-driven (entries carry an
 `Instant` deadline; `get` checks before returning; reaper task
 prunes).
@@ -279,7 +281,7 @@ Background task (`runtime/pipeline_reaper.rs`) that periodically sweeps expired 
 
 ## Observability
 
-- **Logging**: Structured JSON or pretty format. Multi-sink (stdout, stderr, file). Per-session log level control.
+- **Logging**: Structured JSON or pretty format. Multi-sink (stdout, stderr, file). Per-request MCP log floor (`_meta` `logLevel`).
 - **Metrics**: Prometheus exporter on `/metrics`. 18+ metrics covering requests, backends, sessions, policy, pipelines, plugins, and reaper.
 - **Tracing**: OpenTelemetry OTLP exporter with per-request span propagation.
 

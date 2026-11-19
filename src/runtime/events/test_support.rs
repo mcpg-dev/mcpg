@@ -414,8 +414,6 @@ pub fn request_context(
     crate::runtime::RequestContext::new(
         crate::runtime::GatewayRequestId::new(),
         None,
-        None,
-        None,
         identity,
         crate::runtime::TransportKind::Http,
     )

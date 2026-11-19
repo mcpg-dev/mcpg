@@ -30,36 +30,6 @@ impl GatewayRuntime {
         .expect("valid runtime config")
     }
 
-    pub fn new_with_store_config(
-        service_name: impl Into<String>,
-        service_version: impl Into<String>,
-        server_bind_address: impl Into<String>,
-        health_path: impl Into<String>,
-        mcp_path: impl Into<String>,
-        log_level: impl Into<String>,
-        log_sinks: Vec<SinkConfig>,
-        logging_initialized: bool,
-        store_config: SessionStoreConfig,
-    ) -> Self {
-        Self::try_new_with_configs(
-            service_name,
-            service_version,
-            server_bind_address,
-            health_path,
-            mcp_path,
-            log_level,
-            log_sinks,
-            logging_initialized,
-            store_config,
-            ToolAccessPolicyConfig::default(),
-            RuntimeDebugConfig {
-                enabled: true,
-                ..RuntimeDebugConfig::default()
-            },
-        )
-        .expect("valid runtime config")
-    }
-
     pub fn new_with_configs(
         service_name: impl Into<String>,
         service_version: impl Into<String>,
@@ -1078,9 +1048,8 @@ impl GatewayRuntime {
                 Arc::clone(&execution_dispatcher),
             );
             // Synthesize a poll watcher for a subscribed federated
-            // resource whose upstream cannot push updates (modern
-            // stateless wire / stdio), per the federation's
-            // `synthesize` config.
+            // resource whose upstream cannot push updates, per the
+            // federation's `synthesize` config.
             let probe_registry = Arc::clone(&capability_registry);
             let probe_dispatcher = Arc::clone(&execution_dispatcher);
             // Watch configs for `resource_templates[]` entries, keyed by
@@ -1160,7 +1129,6 @@ impl GatewayRuntime {
             quota_gate: None,
             idempotency_capability: None,
             idempotency_store: idempotency::noop_idempotency_store(),
-            apps_capability: None,
             apps_federate_upstream: false,
             skills: None,
             realtime_admission: None,
@@ -1196,8 +1164,6 @@ impl GatewayRuntime {
             completion_limiter: dashmap::DashMap::new(),
             completion_rate_limit_per_sec: None,
             cursor_hmac_key: Self::generate_cursor_hmac_key(),
-            seen_request_ids: dashmap::DashMap::new(),
-            relax_request_id_uniqueness: false,
             access_log: true,
             tenant_session_counts: dashmap::DashMap::new(),
             max_sessions_per_tenant: 0,
@@ -1207,9 +1173,8 @@ impl GatewayRuntime {
             cp_quota_status: cp_quota::QuotaStatusHandle::default(),
             cp_rps_limiter: std::sync::Arc::new(cp_quota::RpsLimiter::new()),
             license_state: std::sync::Arc::default(),
-            protocol_registry: ArcSwapOption::const_empty(),
             shared_services: ArcSwapOption::const_empty(),
-            modern_session_aliases: dashmap::DashMap::new(),
+            session_aliases: dashmap::DashMap::new(),
         })
     }
 
@@ -1266,7 +1231,8 @@ impl GatewayRuntime {
         self.cp_rps_limiter = std::sync::Arc::clone(&prior.cp_rps_limiter);
     }
 
-    /// configure the per-tenant session quota at bootstrap.
+    /// Configure the cap on session rows per principal at bootstrap
+    /// (`server.max_sessions_per_tenant`); 0 is no cap.
     pub fn set_max_sessions_per_tenant(&mut self, n: usize) {
         self.max_sessions_per_tenant = n;
     }
@@ -1276,13 +1242,6 @@ impl GatewayRuntime {
     /// `request received` / `request completed` events per request.
     pub fn set_access_log(&mut self, enabled: bool) {
         self.access_log = enabled;
-    }
-
-    /// Opt out of per-session JSON-RPC request-id uniqueness at bootstrap.
-    /// Only load generators that replay a fixed request body set this
-    /// (`server.relax_request_id_uniqueness`); production leaves it off.
-    pub fn set_relax_request_id_uniqueness(&mut self, relax: bool) {
-        self.relax_request_id_uniqueness = relax;
     }
 
     /// Install the operator-configured content store registry.
@@ -1336,10 +1295,10 @@ impl GatewayRuntime {
     }
 
     /// Install the `dev.mcpg/idempotency` extension's capability
-    /// advertisement. The initialize handler embeds the value under
-    /// `result.capabilities.extensions[…]` when set; passing `None`
-    /// (the default) suppresses the advertisement entirely so
-    /// SEP-2133 graceful-degrade kicks in client-side. Wired from
+    /// advertisement. `server/discover` declares the value under
+    /// `capabilities.extensions[…]` when set; passing `None` (the
+    /// default) suppresses the advertisement entirely so SEP-2133
+    /// graceful-degrade kicks in client-side. Wired from
     /// [`crate::config::IdempotencyConfig`] at boot.
     pub fn set_idempotency_capability(&mut self, capability: Option<serde_json::Value>) {
         self.idempotency_capability = capability;
@@ -1365,8 +1324,9 @@ impl GatewayRuntime {
         self.idempotency_replay_revalidation = on;
     }
 
-    /// Enable session-owner binding for session-scoped HTTP operations.
-    /// Wired from `sessions.bind_session_owner` at boot + reload.
+    /// Enable session-owner binding for session-scoped operations
+    /// (`subscriptions/listen`). Wired from `sessions.bind_session_owner`
+    /// at boot + reload.
     pub fn set_bind_session_owner(&mut self, on: bool) {
         self.bind_session_owner = on;
     }

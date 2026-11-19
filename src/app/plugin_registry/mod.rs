@@ -234,27 +234,8 @@ pub(crate) async fn build_plugin_registry(
             .with_context(|| "binding file:// config scheme")?;
     }
 
-    // Register the built-in memory transport.
-    // Registration is unconditional — the plugin is visible in
-    // admin surfaces and available for lookup by name. Starting
-    // a transport is a separate concern that requires a
-    // `MessageDispatcher`; the gateway-side dispatcher impl +
-    // start wiring lands separately. External transport
-    // plugins load via `plugins[]` the same way every
-    // other entity kind does.
-    {
-        let plugin = crate::builtins::transport_memory::MemoryTransport::new();
-        mcpg_plugin_host::FirstPartyRegistrar::new(&mut registry).register(
-            crate::builtins::transport_memory::DESCRIPTOR_YAML,
-            &[],
-            (),
-            |registry, _host| {
-                registry.register_transport(plugin, mcpg_plugin_protocol::PluginTier::Native)
-            },
-        )?;
-    }
-
-    // There is no standalone transport-entry cross-check loop:
+    // Transport plugins load via `plugins[]` the same way every other
+    // entity kind does. There is no standalone transport-entry cross-check loop:
     // `plugin_bindings.transports` doesn't exist. The cross-check
     // happens at the point of use, when a configuration declares a
     // transport via per-entry metadata.

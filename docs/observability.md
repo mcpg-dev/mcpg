@@ -40,9 +40,11 @@ when the operator omits `logs.sinks`. Setting `logs.enabled: false`
 or providing only plugin sinks suppresses the built-in OS-stream
 emitter.
 
-### Per-Session Log Level
+### Per-Request Log Level
 
-The MCP `logging/setLevel` method allows clients to set their session's log level at runtime. Supported levels (ordered):
+A request's `_meta` key `io.modelcontextprotocol/logLevel` sets the floor for
+the `notifications/message` that request emits; a request without it gets
+none. Supported levels (ordered):
 
 ```
 debug < info < notice < warning < error < critical < alert < emergency
@@ -88,7 +90,7 @@ addition to — or instead of — the Prometheus scrape endpoint.
 |---|---|---|---|
 | `mcpg_requests_total` | Counter | `operation`, `transport` | Total requests by operation type |
 | `mcpg_request_duration_seconds` | Histogram | `operation` | Request latency |
-| `mcpg_active_sessions` | Gauge | — | Currently active sessions |
+| `mcpg_active_sessions` | Gauge | — | Currently active per-caller session rows (listen streams, tasks, paused calls) |
 
 ### Backend Execution Metrics
 
@@ -231,14 +233,10 @@ Highlights for SRE alerting:
 - `mcpg_oidc_jwks_circuit_short_circuited_total{issuer}` rising —
   IdP outage; cached keys are still being served within
   `max_staleness` (T15-13).
-- `mcpg_request_id_window_evicted_total` rising — sustained pressure
-  on per-session id tracker; reconsider the 64 Ki cap (T16-03).
 - `mcpg_progress_non_monotonic_dropped_total` rising — pipeline or
   plugin emitting backwards progress (T16-06).
-- `mcpg_tenant_session_quota_rejected_total{tenant}` — tenant has
-  hit `server.max_sessions_per_tenant`.
-- `mcpg_logging_notification_rate_limited_total{logger}` — a log
-  source is exceeding 50 messages/sec/stream (T16-04).
+- `mcpg_tenant_session_quota_rejected_total{tenant}` — a principal has
+  hit `server.max_sessions_per_tenant` session rows.
 - `mcpg_completion_rate_limited_total` — autocomplete UI is
   hammering `completion/complete` (T13-07).
 - `mcpg_sep2260_orphan_server_request_total > 0` — internal bug;
@@ -254,7 +252,7 @@ Highlights for SRE alerting:
 | `mcpg_wasm_plugin_error_deny_total{plugin_id} > 0` | A Wasm gate plugin is crashing. **Page**. |
 | `mcpg_admin_trusted_header_insecure_total > 0` | Admin API in legacy presence-only mode. **Fix config**. |
 | `mcpg_native_plugin_timeout_total{plugin_id} > 0` | Native plugin hung for >30s. **Investigate**. |
-| `mcpg_sse_stream_limit_rejected_total{session_id}` | Client hitting SSE cap (3). Likely reconnect loop. |
+| `mcpg_sse_stream_limit_rejected_total` | A caller hitting the `subscriptions/listen` cap (3 per session row). Likely reconnect loop. |
 | `mcpg_infra_no_auth_warning_total{backend} > 0` | Plaintext NATS/Redis on non-loopback. **Investigate deployment**. |
 | `mcpg_events_egress_blocked_total` rising | MCP Events callbacks refused by the egress policy: someone may be probing for internal addresses through `events/subscribe`. **Investigate**. |
 | `mcpg_events_verification_failures_total{category}` rising against `mcpg_events_verifications_total` | Many subscribes name callbacks that do not answer the challenge. |

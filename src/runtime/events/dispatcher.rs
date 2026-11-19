@@ -366,8 +366,6 @@ fn recheck_context(record: &SubscriptionRecord) -> RequestContext {
     RequestContext::new(
         GatewayRequestId::new(),
         None,
-        None,
-        None,
         record.identity.clone(),
         TransportKind::Http,
     )

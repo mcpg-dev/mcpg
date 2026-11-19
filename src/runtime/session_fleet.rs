@@ -142,31 +142,23 @@ async fn listen(
 mod tests {
     use super::*;
     use crate::builtins::cluster_primitives::{MemoryBus, MemoryKv};
-    use crate::protocol::{ImplementationInfo, InitializeParams, SUPPORTED_PROTOCOL_VERSION};
-    use crate::runtime::session_store::{
-        KvBackedSessionStore, SessionAccessError, SessionStoreConfig,
-    };
-
-    fn init_params() -> InitializeParams {
-        InitializeParams {
-            protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-            capabilities: Default::default(),
-            client_info: ImplementationInfo {
-                name: "fleet-test".to_owned(),
-                title: None,
-                version: "0.0.0".to_owned(),
-                description: None,
-                website_url: None,
-                icons: None,
-            },
-        }
-    }
+    use crate::runtime::session_store::{KvBackedSessionStore, SessionStoreConfig};
 
     /// A replica over the fleet's shared store and bus, hearing the fleet.
     async fn replica(
         kv: &Arc<dyn mcpg_cluster_api::KeyValueStore>,
         bus: &Arc<dyn mcpg_cluster_api::PubSub>,
         config: SessionStoreConfig,
+    ) -> Arc<GatewayRuntime> {
+        replica_with_cap(kv, bus, config, 0).await
+    }
+
+    /// [`replica`], with `max_sessions_per_tenant` set to `cap`.
+    async fn replica_with_cap(
+        kv: &Arc<dyn mcpg_cluster_api::KeyValueStore>,
+        bus: &Arc<dyn mcpg_cluster_api::PubSub>,
+        config: SessionStoreConfig,
+        cap: usize,
     ) -> Arc<GatewayRuntime> {
         let store = KvBackedSessionStore::new(config, Arc::clone(kv))
             .await
@@ -198,6 +190,7 @@ mod tests {
             Arc::new(crate::runtime::delivery_bus::BusBackedDeliveryBus::new_in_memory()),
         )
         .expect("runtime");
+        runtime.set_max_sessions_per_tenant(cap);
         runtime.set_session_fleet(SessionFleet::new(Arc::clone(bus)));
         // The drain `serve` runs for the ends the store finds on its own.
         let (end_tx, mut end_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -216,25 +209,17 @@ mod tests {
         runtime
     }
 
-    fn operational_session(runtime: &GatewayRuntime) -> String {
-        let id = runtime
-            .session_store()
-            .create_session(SUPPORTED_PROTOCOL_VERSION, &init_params())
-            .session_id;
-        runtime
-            .session_store()
-            .transition_session_to_operational(&id)
-            .expect("operational");
-        id
+    fn minted_session(runtime: &GatewayRuntime) -> String {
+        runtime.session_store().create_session().session_id
     }
 
     /// Wait until `peer` hears the ends `teller` tells: the bus keeps nothing
     /// for a subscriber that is not there yet.
     async fn until_heard(teller: &GatewayRuntime, peer: &GatewayRuntime) {
         for _ in 0..200 {
-            let probe = operational_session(teller);
+            let probe = minted_session(teller);
             peer.session_store()
-                .load_session(Some(&probe), false)
+                .load_session(&probe)
                 .expect("the peer reads the probe back");
             assert!(teller.terminate_session(&probe));
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -271,27 +256,29 @@ mod tests {
         let b = replica(&kv, &bus, SessionStoreConfig::default()).await;
         until_heard(&a, &b).await;
 
-        let session_id = operational_session(&a);
+        let session_id = minted_session(&a);
         b.session_store()
-            .load_session(Some(&session_id), true)
+            .load_session(&session_id)
             .expect("B serves the session too");
         let stream_ended = b
             .session_store()
             .session_lifetime(&session_id)
             .expect("B holds a copy")
             .ended();
-        let _ = b.record_client_request_id(Some(&session_id), false, &serde_json::json!("req-1"));
+        let _lease = b
+            .subscriptions()
+            .acquire(&session_id, "file:///watched", None)
+            .await
+            .expect("B holds a subscription of the session");
+        assert_eq!(b.subscriptions().live_keys(), 1);
 
         assert!(a.terminate_session(&session_id));
         tokio::time::timeout(Duration::from_secs(1), stream_ended)
             .await
             .expect("B's stream ends with the session");
-        assert!(matches!(
-            b.session_store().load_session(Some(&session_id), false),
-            Err(SessionAccessError::UnknownSession)
-        ));
+        assert!(b.session_store().load_session(&session_id).is_none());
         eventually("B drops the state it keeps for the session", || {
-            !b.seen_request_ids.contains_key(&session_id)
+            b.subscriptions().live_keys() == 0
         })
         .await;
     }
@@ -309,10 +296,8 @@ mod tests {
         let b = replica(&kv, &bus, config).await;
         until_heard(&a, &b).await;
 
-        let session_id = operational_session(&a);
-        b.session_store()
-            .load_session(Some(&session_id), true)
-            .unwrap();
+        let session_id = minted_session(&a);
+        b.session_store().load_session(&session_id).unwrap();
         let stream_ended = b
             .session_store()
             .session_lifetime(&session_id)
@@ -323,9 +308,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(3_300)).await;
 
         assert!(
-            a.session_store()
-                .load_session(Some(&session_id), true)
-                .is_err(),
+            a.session_store().load_session(&session_id).is_none(),
             "A finds it idle everywhere"
         );
         tokio::time::timeout(Duration::from_secs(1), stream_ended)
@@ -343,15 +326,46 @@ mod tests {
         until_heard(&a, &b).await;
         b.stop_cluster_listeners().await;
 
-        let session_id = operational_session(&a);
-        b.session_store()
-            .load_session(Some(&session_id), true)
-            .unwrap();
+        let session_id = minted_session(&a);
+        b.session_store().load_session(&session_id).unwrap();
         assert!(a.terminate_session(&session_id));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             b.session_store().contains_active_session(&session_id),
             "the copy stays until B next verifies it"
+        );
+    }
+
+    /// A principal with no derived session holds one row on each replica
+    /// that serves it. Under a cap of one row, every replica admits it, and
+    /// an anonymous continuation row still counts across the fleet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_per_replica_row_counts_on_its_replica() {
+        let (kv, bus) = fleet();
+        let a = replica_with_cap(&kv, &bus, SessionStoreConfig::default(), 1).await;
+        let b = replica_with_cap(&kv, &bus, SessionStoreConfig::default(), 1).await;
+        let alice = crate::runtime::RequestContext::new(
+            crate::runtime::GatewayRequestId::new(),
+            None,
+            crate::runtime::RequestIdentity::HttpHeader {
+                subject_id: "alice".to_owned(),
+                source: "test".to_owned(),
+            },
+            crate::runtime::TransportKind::Http,
+        );
+        for replica in [&a, &b, &a, &b] {
+            assert!(
+                matches!(
+                    replica.ensure_session(alice.clone()),
+                    crate::runtime::SessionOutcome::Ready(_)
+                ),
+                "every replica admits the principal"
+            );
+        }
+        assert!(a.materialize_ephemeral_session("anon-1"));
+        assert!(
+            !b.materialize_ephemeral_session("anon-2"),
+            "anonymous rows count across the fleet"
         );
     }
 

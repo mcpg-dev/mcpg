@@ -3,12 +3,10 @@ use super::*;
 impl GatewayRuntime {
     pub fn set_apps_config(
         &mut self,
-        capability: Option<serde_json::Value>,
         federate_upstream: bool,
         policy: Option<crate::protocol::shared::apps::AppsPolicy>,
         registry: &[crate::config::apps::GatewayAppConfig],
     ) {
-        self.apps_capability = capability;
         self.apps_federate_upstream = federate_upstream;
         // Snapshot the bound tools' schemas so omitted columns/fields can
         // be derived by introspection at compile time.
@@ -286,7 +284,6 @@ impl GatewayRuntime {
 
         ProtocolHttpResponse {
             http_status: 200,
-            session_id_header: None,
             response: ProtocolResponse::JsonRpcSuccess(crate::protocol::JsonRpcSuccess {
                 jsonrpc: "2.0",
                 id: request_id,

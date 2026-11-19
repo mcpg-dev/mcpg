@@ -1,17 +1,16 @@
 //! `mcp:` namespace — the MCP protocol surface.
 //!
-//! Carries first-class MCP capabilities (tasks, elicitation, sampling,
-//! roots) plus a `configurations:` sub-tree for runtime-emergent
-//! state operators only configure constraints + persistence on
-//! (sessions, pipelines, subscriptions, delivery, cancellation).
+//! Carries first-class MCP capabilities (tools, prompts, resources,
+//! resource templates, events, tasks) plus a `configurations:`
+//! sub-tree for runtime-emergent state operators only configure
+//! constraints + persistence on (sessions, pipelines, subscriptions,
+//! delivery, cancellation).
 //!
 //! ## Distinction
 //!
-//! - **First-class MCP capabilities** (under `mcp:` directly):
-//!   tasks, elicitation, sampling, roots. The operator declares
-//!   what these surfaces look like. Tasks list the tools that opt
-//!   into task semantics; elicitation/sampling/roots tune the
-//!   gateway's behavior when the protocol-side calls land.
+//! - **First-class MCP capabilities** (under `mcp.capabilities:`):
+//!   the operator declares what these surfaces look like. Tasks list
+//!   the tools that opt into task semantics.
 //! - **Runtime-emergent handling** (under `mcp.configurations:`):
 //!   sessions, pipelines, subscriptions, delivery, cancellation.
 //!   Clients create these at runtime via MCP requests; the
@@ -40,9 +39,8 @@ use super::federation::FederationConfig;
 /// Top-level `mcp:` block — the MCP protocol surface.
 ///
 /// Two children that mirror MCP's own vocabulary:
-/// - `capabilities:` — what the server advertises in the `initialize`
-///   handshake (tools, prompts, resources, resource_templates, tasks,
-///   elicitation, sampling, roots).
+/// - `capabilities:` — what the server advertises in `server/discover`
+///   (tools, prompts, resources, resource_templates, events, tasks).
 /// - `configurations:` — runtime-emergent state handling (sessions,
 ///   pipelines, subscriptions, delivery, cancellation). Operator only
 ///   tunes persistence + constraints; the items themselves are created
@@ -50,7 +48,7 @@ use super::federation::FederationConfig;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
-    /// What this MCP server advertises in the `initialize` handshake.
+    /// What this MCP server advertises in `server/discover`.
     /// Mirrors the protocol spec's `capabilities` vocabulary one-to-one.
     #[serde(default)]
     pub capabilities: McpCapabilitiesConfig,
@@ -85,22 +83,20 @@ pub struct McpConfig {
     pub registry: crate::config::registry::ServedRegistryConfig,
 
     /// How the server presents itself to clients: `serverInfo` in
-    /// `server/discover` and in the `initialize` result. Every field is
-    /// optional; an unset field keeps MCPG's own value. `version` is always
-    /// the gateway's.
+    /// `server/discover`. Every field is optional; an unset field keeps
+    /// MCPG's own value. `version` is always the gateway's.
     #[serde(default)]
     pub server_info: McpServerInfoConfig,
 
-    /// The `instructions` a client receives in `server/discover` and in the
-    /// `initialize` result, typically shown to the model: what this server
-    /// is for and how to use its tools. At most 64 KiB. Unset keeps MCPG's
-    /// own text.
+    /// The `instructions` a client receives in `server/discover`, typically
+    /// shown to the model: what this server is for and how to use its
+    /// tools. At most 64 KiB. Unset keeps MCPG's own text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 
     /// How many entries one page of `tools/list`, `prompts/list`,
-    /// `resources/list` and `resources/templates/list` holds, on every wire;
-    /// a client follows `nextCursor` for the rest. 1 to 1 000; unset is 100.
+    /// `resources/list` and `resources/templates/list` holds; a client
+    /// follows `nextCursor` for the rest. 1 to 1 000; unset is 100.
     /// A client that reads only the first page sees only this many.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 1_000))]
@@ -159,10 +155,9 @@ pub struct McpServerInfoConfig {
 
 /// `mcp.capabilities:` — the MCP protocol-advertised surface.
 ///
-/// Matches the protocol's `initialize` handshake's `capabilities`
-/// vocabulary: tools / prompts / resources / resource_templates,
-/// plus the gateway-side feature configs that govern protocol
-/// behaviour (tasks, elicitation, sampling, roots).
+/// Matches the `capabilities` vocabulary of `server/discover`:
+/// tools / prompts / resources / resource_templates / events, plus
+/// the task configuration that governs task-augmented tool calls.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct McpCapabilitiesConfig {
@@ -203,21 +198,6 @@ pub struct McpCapabilitiesConfig {
     /// list.
     #[serde(default)]
     pub tasks: TasksConfig,
-
-    /// MCP elicitation — server-initiated prompt requests the gateway
-    /// emits during pipeline execution.
-    #[serde(default)]
-    pub elicitation: McpElicitationConfig,
-
-    /// MCP sampling — server-initiated LLM completion requests
-    /// forwarded back to the client.
-    #[serde(default)]
-    pub sampling: McpSamplingConfig,
-
-    /// MCP roots-list — gateway requests roots from the client (e.g.
-    /// for resource scoping).
-    #[serde(default)]
-    pub roots: McpRootsConfig,
 }
 
 impl McpConfig {
@@ -373,10 +353,9 @@ impl McpCapabilitiesConfig {
     /// Whether the gateway exposes any argument-completion source — a
     /// prompt argument with static `completions`, or a resource
     /// template with `variable_completions`. Drives whether the
-    /// `completions` server capability is advertised (PR-02); mirrors
-    /// the runtime `CapabilityRegistry::has_completions` gate so the
-    /// modern `server/discover` advertisement matches the legacy
-    /// `initialize` one.
+    /// `completions` server capability is advertised in
+    /// `server/discover`; mirrors the runtime
+    /// `CapabilityRegistry::has_completions` gate.
     pub(crate) fn has_completions(&self) -> bool {
         let prompt_completions = self.prompts.iter().any(|p| {
             p.prompt_arguments.as_ref().is_some_and(|args| {
@@ -396,15 +375,6 @@ impl McpCapabilitiesConfig {
         self.tasks
             .validate()
             .map_err(|e| anyhow::anyhow!("mcp.capabilities.tasks: {e}"))?;
-        self.elicitation
-            .validate()
-            .map_err(|e| anyhow::anyhow!("mcp.capabilities.elicitation: {e}"))?;
-        self.sampling
-            .validate()
-            .map_err(|e| anyhow::anyhow!("mcp.capabilities.sampling: {e}"))?;
-        self.roots
-            .validate()
-            .map_err(|e| anyhow::anyhow!("mcp.capabilities.roots: {e}"))?;
         Ok(())
     }
 
@@ -471,10 +441,9 @@ pub struct McpConfigurationsConfig {
     /// capability advertisement and the dispatcher dedupe path.
     #[serde(default)]
     pub idempotency: IdempotencyConfig,
-    /// MRTR `requestState` codec configuration (2026-07-28 modern
-    /// wire). Inert when no modern client
-    /// connects; absent encryption_key the codec uses an ephemeral
-    /// key at boot.
+    /// MRTR `requestState` codec configuration: how the gateway seals
+    /// the state of a request that waits for input. Absent
+    /// `encryption_key`, the codec uses an ephemeral key at boot.
     #[serde(default)]
     pub request_state: RequestStateConfig,
     /// `io.modelcontextprotocol/ui` (SEP-1865 MCP Apps) extension
@@ -485,8 +454,7 @@ pub struct McpConfigurationsConfig {
     pub apps: AppsConfig,
     /// `io.modelcontextprotocol/events` (MCP Events, experimental)
     /// extension config. Off by default; `enabled: true` serves the
-    /// `events/*` methods on the `2026-07-28` wire and advertises them in
-    /// `server/discover`.
+    /// `events/*` methods and advertises them in `server/discover`.
     #[serde(default)]
     pub events: crate::config::events::EventsConfig,
 }
@@ -524,108 +492,15 @@ impl McpConfigurationsConfig {
     }
 }
 
-/// `mcp.elicitation:` — gateway behavior for server-initiated
-/// elicitation prompts. Today carries only `timeout_ms`; future
-/// per-elicitation-type config can grow here.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct McpElicitationConfig {
-    /// Maximum time the gateway waits for the client's response
-    /// to an elicitation prompt before giving up. Default 60 000.
-    #[serde(default = "default_elicitation_timeout_ms")]
-    pub timeout_ms: u64,
-}
-
-impl Default for McpElicitationConfig {
-    fn default() -> Self {
-        Self {
-            timeout_ms: default_elicitation_timeout_ms(),
-        }
-    }
-}
-
-impl McpElicitationConfig {
-    pub(crate) fn validate(&self) -> Result<()> {
-        crate::config::require_positive("mcp.elicitation", "timeout_ms", self.timeout_ms)?;
-        Ok(())
-    }
-}
-
-fn default_elicitation_timeout_ms() -> u64 {
-    60_000
-}
-
-/// `mcp.sampling:` — gateway behavior for server-initiated sampling
-/// (LLM completion) requests forwarded to the client.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct McpSamplingConfig {
-    /// Maximum time the gateway waits for the client's sampling
-    /// response. Default 60 000.
-    #[serde(default = "default_sampling_timeout_ms")]
-    pub timeout_ms: u64,
-}
-
-impl Default for McpSamplingConfig {
-    fn default() -> Self {
-        Self {
-            timeout_ms: default_sampling_timeout_ms(),
-        }
-    }
-}
-
-impl McpSamplingConfig {
-    pub(crate) fn validate(&self) -> Result<()> {
-        crate::config::require_positive("mcp.sampling", "timeout_ms", self.timeout_ms)?;
-        Ok(())
-    }
-}
-
-fn default_sampling_timeout_ms() -> u64 {
-    60_000
-}
-
-/// `mcp.roots:` — gateway behavior for server-initiated roots-list
-/// requests forwarded to the client.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct McpRootsConfig {
-    /// Maximum time the gateway waits for the client's roots-list
-    /// response. Default 30 000.
-    #[serde(default = "default_roots_timeout_ms")]
-    pub timeout_ms: u64,
-}
-
-impl Default for McpRootsConfig {
-    fn default() -> Self {
-        Self {
-            timeout_ms: default_roots_timeout_ms(),
-        }
-    }
-}
-
-impl McpRootsConfig {
-    pub(crate) fn validate(&self) -> Result<()> {
-        crate::config::require_positive("mcp.roots", "timeout_ms", self.timeout_ms)?;
-        Ok(())
-    }
-}
-
-fn default_roots_timeout_ms() -> u64 {
-    30_000
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn mcp_config_defaults_round_trip() {
-        let cfg = McpConfig::default();
-        cfg.validate().expect("default mcp config valid");
-        assert_eq!(cfg.capabilities.elicitation.timeout_ms, 60_000);
-        assert_eq!(cfg.capabilities.sampling.timeout_ms, 60_000);
-        assert_eq!(cfg.capabilities.roots.timeout_ms, 30_000);
+    fn mcp_config_defaults_validate() {
+        McpConfig::default()
+            .validate()
+            .expect("default mcp config valid");
     }
 
     #[test]
@@ -679,52 +554,11 @@ mod tests {
     }
 
     #[test]
-    fn mcp_elicitation_zero_timeout_rejected() {
-        let cfg = McpConfig {
-            capabilities: McpCapabilitiesConfig {
-                elicitation: McpElicitationConfig { timeout_ms: 0 },
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("elicitation"), "{err}");
-    }
-
-    #[test]
-    fn mcp_sampling_zero_timeout_rejected() {
-        let cfg = McpConfig {
-            capabilities: McpCapabilitiesConfig {
-                sampling: McpSamplingConfig { timeout_ms: 0 },
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("sampling"), "{err}");
-    }
-
-    #[test]
-    fn mcp_roots_zero_timeout_rejected() {
-        let cfg = McpConfig {
-            capabilities: McpCapabilitiesConfig {
-                roots: McpRootsConfig { timeout_ms: 0 },
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("roots"), "{err}");
-    }
-
-    #[test]
     fn mcp_serde_round_trip() {
         let yaml = r#"
 capabilities:
   tasks:
     default_ttl_ms: 3600000
-  elicitation:
-    timeout_ms: 30000
 configurations:
   subscriptions:
     max_per_session: 50
@@ -732,7 +566,6 @@ configurations:
         let cfg: McpConfig = serde_yaml::from_str(yaml).expect("parse");
         cfg.validate().expect("valid");
         assert_eq!(cfg.capabilities.tasks.default_ttl_ms, 3600000);
-        assert_eq!(cfg.capabilities.elicitation.timeout_ms, 30_000);
         assert_eq!(cfg.configurations.subscriptions.max_per_session, 50);
     }
 }

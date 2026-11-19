@@ -1,9 +1,9 @@
-//! The gateway's HTTP server for `http`-wire transport plugins.
+//! The gateway's HTTP server for transport plugins.
 //!
 //! A plugin such as `dev.mcpg.transport.ngrok` owns the connections and
 //! hands the gateway whole HTTP requests. Each one runs through the same
 //! router the gateway's own listener serves, so identity, OAuth discovery,
-//! per-IP rate limits, SSE and both MCP revisions behave the same.
+//! per-IP rate limits, SSE and MCP 2026-07-28 behave the same.
 
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -23,7 +23,7 @@ use tower::ServiceExt as _;
 use crate::transports::attested::{AttestedPeer, AttestedPeerArc};
 use crate::transports::tls::TlsInfoArc;
 
-/// The largest request body an `http`-wire transport may hand over. MCP
+/// The largest request body a transport plugin may hand over. MCP
 /// request bodies are small JSON documents.
 pub const MAX_INGRESS_BODY_BYTES: usize = 4 * 1024 * 1024;
 
@@ -32,7 +32,7 @@ pub const MAX_INGRESS_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// limit.
 const UNKNOWN_CLIENT: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
 
-/// Serves one `http`-wire transport's requests through the gateway router.
+/// Serves one transport plugin's requests through the gateway router.
 pub struct GatewayHttpIngress {
     router: Router,
     /// The transport's plugin id; a peer it attests is recorded under it.

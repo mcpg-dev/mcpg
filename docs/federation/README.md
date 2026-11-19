@@ -6,11 +6,9 @@
 > prefixes — with MCPG's full governance stack (trust, CEL, payment,
 > guardrails, rate limits, observability) applied uniformly.
 >
-> Federation is also MCPG's **protocol-version adapter**: the wire served
-> to each client and the wire spoken to each upstream are independent, and
-> `upstream.protocol_version: auto` (default) detects the upstream's
-> revision at connect — so one entry fronts a `2025-11-25` or `2026-07-28`
-> remote for clients on either revision.
+> MCPG speaks MCP `2026-07-28` to every upstream: each connect sends
+> `server/discover` and fails when the upstream does not list
+> `2026-07-28` in `supportedVersions`.
 >
 > 📖 **Operators:** start with the [**Federation Operator Guide**](./guide.md) —
 > configuration reference, every auth mode + transport, runtime behaviour, best
@@ -49,8 +47,8 @@ v2 re-grounds the design on the current code and settles that question.
 | D1 | The federation **engine** lives **in-gateway** (like `pipeline`), not as a cdylib plugin. The MCP-client *wire transport* may be factored behind a trait and optionally extracted to a cdylib later. **No new ABI/entity-kind/vtable for Phases 1–3.** |
 | D2 | Runtime capability mutation = a **federated overlay** on `CapabilityRegistry`, owned by a **preserved-across-reload** federation engine. Not full rebuild-and-swap (would cycle the upstream sessions), not in-place mutation of the native slice. |
 | D3 | Config: a new **`mcp.federations: [...]`** list (a *capability source*), not an `mcp.capabilities.tools[]` entry and not `backend: { kind: mcp }`. |
-| D4 | Upstream protocol version: **strict by default, negotiated opt-in, never translate.** MCPG-as-client speaks the versions it already implements as server. |
-| D5 | **Per-client satellite** upstream sessions, lazy, instance-local; reuse `PipelineStore` for bridge state + cross-instance resume. |
+| D4 | Upstream protocol version: **never translate.** MCPG-as-client speaks the one version it implements as server, `2026-07-28`. |
+| D5 | **Per-client satellite** upstream connections, lazy, instance-local. |
 | D6 | The "expand one source → N synthetic capabilities under a prefix" mechanism is a **single shared primitive** with the OpenAPI-import path; build it once. |
 
 ## Phase 1 implementation status
@@ -60,13 +58,13 @@ end-to-end tests):
 
 - **Config** — `mcp.federations: [...]` (`config/federation.rs`) + cross-validation.
 - **Outbound MCP client** — `McpUpstream` / `StreamableHttpUpstream`
-  (`runtime/federation/upstream.rs`): initialize, tools/list, tools/call over
+  (`libs/mcp-client`, `upstream.rs`): server/discover, tools/list, tools/call over
   Streamable HTTP with the net-core-style DNS-rebinding guard + capped body reads.
 - **Capability import + overlay** — `FederationEngine::import_all` →
   `CapabilityRegistry` federated overlay (D2); federated tools surface in
   `tools/list`, prefixed + source-tagged in `_meta`.
 - **Dispatch** — `BackendInvocationRoute::Federated` → engine `call_tool` via
-  per-client satellites (D5), bridged onto the sync dispatch path.
+  per-client satellites (D5), run on the sync dispatch path.
 - **Live wiring** — `GatewayRuntime::wire_federations` builds + attaches the
   engine at boot and on config reload, with a background idle-satellite sweeper.
 - **Governance inheritance** — federated tools enforce their federation's
@@ -87,7 +85,7 @@ end-to-end tests):
 - **Carry-across-reload preservation** — on config reload the new engine
   adopts the prior engine's import cache and republishes it under the reloaded
   config's governance (`adopt_imported`; no flicker, no stale rule), live
-  upstream sessions for unchanged federations are carried to the new engine
+  upstream connections for unchanged federations are carried to the new engine
   (`adopt_satellites`; changed/removed ones re-establish), and the upstream
   re-import is skipped when the federation config is unchanged.
 - **End-to-end tests** — `tests/federation_e2e.rs`: list + dispatch + source
@@ -95,15 +93,15 @@ end-to-end tests):
   federation, anonymous caller); and **one MCPG federating another real MCPG
   instance** (exercising both the serving and client sides).
 
-Phase-2+ surfaces (`list_changed`, notification forwarding, resources / prompts,
-server-request bridging) are tracked in the progress section below.
+Phase-2+ surfaces (`list_changed`, notification forwarding, resources / prompts)
+are tracked in the progress section below.
 
 Reload preservation is verified by `adopt_satellites_carries_only_unchanged_federations`
 (carry-vs-drop) and `adopted_satellite_is_reused_without_reconnecting` (the carried
-session is reused — no second upstream `initialize`). A full HTTP-driven
+connection is reused — no second upstream `server/discover`). A full HTTP-driven
 `reload_config` e2e is impractical: that path rebuilds the plugin registry
-(environment-fragile — cf. `admin_reload_e2e`) and the per-federation SSE listener's
-reconnect loop makes a global initialize count non-deterministic, so the guarantee is
+(environment-fragile — cf. `admin_reload_e2e`) and the per-federation listener's
+reconnect loop makes a global connect count non-deterministic, so the guarantee is
 verified deterministically at the engine-integration level instead.
 
 ## Phase 2 progress
@@ -156,10 +154,10 @@ verified deterministically at the engine-integration level instead.
   (`docs/plugin-protocol/abi-changelog.md`); `oauth-id-jag` and `oauth-token-exchange`
   send the token only to the endpoint and client that issued it. A caller without one is
   refused before any request (`UpstreamError::NotLinked`), and a client that declares
-  `elicitation.url` is offered a link to `/oauth/connect` bound to the caller's principal:
-  `-32042` on `2025-11-25`, an `InputRequiredResult` on `2026-07-28`. Upstream sessions
-  key on the principal and the token kind, and the credential cache on the stored
-  sign-in, so rotations cost no new exchange.
+  `elicitation.url` is offered a link to `/oauth/connect` bound to the caller's principal,
+  as an `InputRequiredResult`. Upstream connections key on the principal and the token
+  kind, and the credential cache on the stored sign-in, so rotations cost no new
+  exchange.
   Tests: `runtime::federation::engine::idp_tests`,
   `a_signed_in_user_reaches_a_cross_app_access_resource_with_their_stored_sign_in`,
   `a_caller_without_a_stored_sign_in_is_given_a_link_and_the_retry_succeeds`,
@@ -167,16 +165,15 @@ verified deterministically at the engine-integration level instead.
   `a_stored_sign_in_federation_refuses_a_caller_without_one_before_the_upstream`,
   `a_caller_without_a_principal_is_offered_no_link`.
 - **`list_changed` runtime refresh + notification forwarding** ✅ — a persistent
-  per-federation listener opens the upstream's server→client SSE stream (GET) and
-  reacts to pushes: on `notifications/{tools,resources,prompts}/list_changed` it
-  refreshes the overlay (re-import) and broadcasts the same `list_changed` to MCPG's
-  operational clients; on `notifications/resources/updated` it re-prefixes the URI
-  and forwards it to that resource's subscribers. Listener tasks are `Weak`-held
-  (exit on engine drop) with capped reconnect backoff. Decoupled from delivery
-  internals via a `FederationNotifier` (session_store + delivery_bus +
-  subscription_store) wired from the runtime. Tests:
-  `listener_reimports_on_upstream_list_changed`,
-  `resource_updated_is_reprefixed_and_forwarded_to_subscriber`.
+  per-federation listener opens a `subscriptions/listen` stream on the upstream
+  (the three `*ListChanged` targets): on
+  `notifications/{tools,resources,prompts}/list_changed` it refreshes the overlay
+  (re-import) and broadcasts the same `list_changed` to MCPG's clients.
+  `notifications/resources/updated` for a subscribed federated resource comes from
+  the `synthesize` poll watcher. Listener tasks are `Weak`-held (exit on engine
+  drop) with capped reconnect backoff. Decoupled from delivery internals via a
+  `FederationNotifier` (session_store + delivery_bus + subscription_store) wired
+  from the runtime. Test: `listener_reimports_on_upstream_list_changed`.
 - **Per-federation incremental re-import** ✅ — a `list_changed` (or TTL refresh)
   re-imports just the signaling federation via `reimport_one` + `republish`
   (rebuilds the overlay from a per-federation import cache), preserving every
@@ -184,18 +181,16 @@ verified deterministically at the engine-integration level instead.
   `reimport_one_preserves_other_federations`.
 - **`capability_ttl_secs` poll-refresh** ✅ — `spawn_refreshers` runs one
   `Weak`-held timer per federation that re-imports every
-  `cache.capability_ttl_secs` as a fallback for upstreams without a standalone
-  SSE stream.
+  `cache.capability_ttl_secs` as a fallback for upstreams without
+  `subscriptions/listen`.
 
 ## Phasing (unchanged from v1, re-anchored)
 
 1. **P1 (MVP)** — tools only, HTTP Streamable upstream, per-client
-   satellites, auth `none`/`service_token`/`pass_through`, TTL refresh,
-   no bridging.
+   satellites, auth `none`/`service_token`/`pass_through`, TTL refresh.
 2. **P2** — resources / templates / prompts, `resources/updated`
-   forwarding, `*/list_changed` runtime refresh, OAuth auth modes.
-3. **P3** — server-initiated request bridging (sampling / elicitation /
-   roots), progress forwarding.
-4. **P4** — stdio + legacy-SSE upstream transports, wildcard per-tenant.
+   synthesis, `*/list_changed` runtime refresh, OAuth auth modes.
+3. **P3** — progress forwarding.
+4. **P4** — stdio upstream transport, wildcard per-tenant.
 
 Each phase is independently shippable behind a feature flag.

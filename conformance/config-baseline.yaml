@@ -6,15 +6,14 @@
 #
 # Minimal config: just enough to boot MCPG as an HTTP MCP server
 # on 127.0.0.1:8787/mcp. No fixture tools / prompts / resources
-# defined. Lifecycle / initialize / negotiation scenarios pass, but
+# defined. Discovery / negotiation scenarios pass, but
 # fixture-coupled scenarios (tools-call-*, resources-read-*,
 # prompts-get-*) fail by design — the catalog lives in
 # config-everything.yaml.
 #
-# Versions: this config is shared between both protocol revisions.
-# Version selection happens per-request (via `Mcp-Protocol-Version`
+# Every request names its protocol version (the `Mcp-Protocol-Version`
 # header or `_meta.io.modelcontextprotocol/protocolVersion`); the
-# conformance suite drives this via its `--spec-version` flag.
+# conformance suite sets it from its `--spec-version` flag.
 
 gateway:
   # The injected mock cdylib is built locally and unsigned; the

@@ -1,37 +1,23 @@
-//! [`ProtocolHandler`] implementation for MCP revision `2026-07-28`.
+//! The request [`Handler`] for MCP revision `2026-07-28`.
 //!
-//! Mirrors [`v_2025_11_25::handler::Handler`] in shape but with a
-//! different method surface:
-//!
-//! - `parse()` calls the modern
-//!   [`map_client_message_to_operation`](super::wire::routing::map_client_message_to_operation)
-//!   which routes the modern method set (`server/discover`,
-//!   modern `tools/*`, `prompts/*`, `resources/*` with cache
-//!   shapes) and rejects legacy methods.
-//! - `validate_transport_headers()` enforces the SEP-2243 header
-//!   contract: `Mcp-Method` is required and must equal the body
-//!   method; `Mcp-Name` is required (and body-validated) for
-//!   `tools/call` / `prompts/get` / `resources/read`; recognized
-//!   `Mcp-Param-{Name}` headers are body-validated. Header values use
-//!   the `=?base64?…?=` sentinel for non-ASCII. The
-//!   [`wire::promote_param_headers`](super::wire::promote_param_headers)
-//!   helper performs the server-side
-//!   param→header promotion (with constraint-validated
-//!   exclude-on-violation) for relays to header-routing
-//!   intermediaries.
-//! - `dispatch()` handles `server/discover` natively and routes the
-//!   capability methods through the existing pipeline / backend
-//!   machinery, applying the modern result shapes (cache fields,
-//!   modern `ToolCallResult`, etc.).
-//! - `build_suspension_response()` (a `ProtocolHandler` trait method)
-//!   is unused by this wire: modern suspension is emitted inline as
-//!   MRTR's `InputRequiredResult` body from the runtime tools/call
-//!   tail, not through the legacy SSE delivery-bus envelope.
-//!
-//! The handler is registered with the runtime [`ProtocolRegistry`]
-//! so the modern wire is selectable.
+//! For one request the transport runs, in order:
+//! 1. [`negotiate`](crate::protocol::negotiate) — the protocol-version
+//!    check.
+//! 2. [`Handler::validate_transport_headers`] — the SEP-2243 header
+//!    contract: `Mcp-Method` is required and must equal the body method;
+//!    `Mcp-Name` is required (and body-validated) for `tools/call` /
+//!    `prompts/get` / `resources/read`; recognized `Mcp-Param-{Name}`
+//!    headers are body-validated. Header values use the `=?base64?…?=`
+//!    sentinel for non-ASCII. Methods MCP `2026-07-28` does not define
+//!    answer HTTP 404 + `-32601` here.
+//! 3. [`Handler::long_lived_stream_plan`] — a `subscriptions/listen` or
+//!    `events/stream` request is answered with a stream the transport
+//!    writes, not a finite response.
+//! 4. [`Handler::parse`] — the body into a typed [`ProtocolMessage`].
+//! 5. [`Handler::dispatch`] — `server/discover` is built here; every other
+//!    method goes to its dispatch arm, which calls the runtime and shapes
+//!    the result (cache fields, `resultType`, MRTR `InputRequiredResult`).
 
-use async_trait::async_trait;
 use axum::http::HeaderMap;
 use serde_json::Value;
 
@@ -40,7 +26,6 @@ use crate::protocol::shared::jsonrpc::{
     JSONRPC_VERSION, JsonRpcSuccess, ProtocolHttpResponse, ProtocolResponse, parse_client_message,
 };
 use crate::protocol::shared::messages::{ProtocolMessage, TransportRejection};
-use crate::protocol::shared::traits::ProtocolHandler;
 use crate::protocol::v_2026_07_28::dispatch::completion::dispatch_completion_complete;
 use crate::protocol::v_2026_07_28::dispatch::events::dispatch_events_extension;
 use crate::protocol::v_2026_07_28::dispatch::lifecycle::build_discover_result;
@@ -64,43 +49,48 @@ use crate::protocol::v_2026_07_28::wire::{
     METHOD_HEADER, PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION, header_mismatch,
     name_source_field, validate_name_header, validate_param_headers,
 };
-use crate::protocol::version::ProtocolVersion;
-use crate::runtime::RequestContext;
 use crate::runtime::shared_services::SharedServices;
+use crate::runtime::{GatewayRuntime, RequestContext};
 
-/// Per-version handler for MCP revision `2026-07-28`.
-///
-/// Stateless: zero-sized, every service handed in via
-/// [`SharedServices`] at dispatch time.
-#[derive(Debug, Clone, Default)]
-pub struct Handler;
+/// A request the transport answers with a long-lived stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPlan {
+    /// `subscriptions/listen`: the server-initiated notifications the
+    /// request names.
+    SubscriptionsListen,
+    /// `events/stream`: one MCP Events push subscription.
+    EventsStream,
+}
 
-impl Handler {
-    /// Construct the handler. The single instance is registered into
-    /// the [`ProtocolRegistry`](crate::protocol::registry::ProtocolRegistry)
-    /// at boot.
-    pub fn new() -> Self {
-        Self
+impl StreamPlan {
+    /// The JSON-RPC method of the plan, for metrics and logs.
+    pub fn method(self) -> &'static str {
+        match self {
+            Self::SubscriptionsListen => {
+                crate::protocol::v_2026_07_28::wire::subscriptions::METHOD_SUBSCRIPTIONS_LISTEN
+            }
+            Self::EventsStream => {
+                crate::protocol::v_2026_07_28::extensions::events::wire::METHOD_STREAM_EVENTS
+            }
+        }
     }
 }
 
-#[async_trait]
-impl ProtocolHandler for Handler {
-    fn version_string(&self) -> &'static str {
-        SUPPORTED_PROTOCOL_VERSION
-    }
+/// The request handler for MCP revision `2026-07-28`.
+///
+/// Zero-sized: the runtime and the [`SharedServices`] are handed in at
+/// dispatch time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Handler;
 
-    fn version(&self) -> ProtocolVersion {
-        ProtocolVersion::V_2026_07_28
+impl Handler {
+    pub fn new() -> Self {
+        Self
     }
 
     /// `subscriptions/listen` and an `events/stream` request (one with an
     /// id) are long-lived POST-SSE responses.
-    fn long_lived_stream_plan(
-        &self,
-        body: &Value,
-    ) -> Option<crate::protocol::shared::traits::StreamPlan> {
-        use crate::protocol::shared::traits::StreamPlan;
+    pub fn long_lived_stream_plan(&self, body: &Value) -> Option<StreamPlan> {
         match body.get("method").and_then(Value::as_str)? {
             crate::protocol::v_2026_07_28::wire::subscriptions::METHOD_SUBSCRIPTIONS_LISTEN => {
                 Some(StreamPlan::SubscriptionsListen)
@@ -118,7 +108,7 @@ impl ProtocolHandler for Handler {
     /// so intermediaries can route without parsing the body, and makes
     /// the server validate the mirror against the body:
     ///
-    /// - `Mcp-Method` is REQUIRED on every modern request and MUST
+    /// - `Mcp-Method` is REQUIRED on every request and MUST
     ///   equal the body `method`.
     /// - `Mcp-Name` is REQUIRED for `tools/call` / `prompts/get`
     ///   (mirrors `params.name`) and `resources/read` (mirrors
@@ -132,7 +122,7 @@ impl ProtocolHandler for Handler {
     /// (`-32020`). Header rules apply only to JSON-RPC *requests*
     /// (id-bearing bodies); the revision leaves notification header
     /// rules undefined.
-    fn validate_transport_headers(
+    pub fn validate_transport_headers(
         &self,
         headers: &HeaderMap,
         body: &Value,
@@ -144,34 +134,18 @@ impl ProtocolHandler for Handler {
             .unwrap_or("");
         let body_id = body.as_object().and_then(|obj| obj.get("id")).cloned();
 
-        // SEP-2575 — the modern stateless wire removes a fixed set
-        // of methods that lived on the legacy session-bound wire.
-        // The spec says HTTP 404 + JSON-RPC `-32601` for these,
-        // not the default HTTP 200 + JSON-RPC error that
-        // `method_not_found` falls through to. Documented at
-        // `wire/routing.rs:20-24`.
-        if is_removed_modern_method(body_method) {
-            return Err(TransportRejection {
-                status: 404,
-                error_code: -32601,
-                message: format!(
-                    "Method `{body_method}` is removed on the modern wire \
-                     (2026-07-28) per SEP-2575. Legacy \
-                     callers should pin `Mcp-Protocol-Version: 2025-11-25` \
-                     to reach this method."
-                ),
-                data: None,
-                jsonrpc_id: body_id,
-            });
+        // SEP-2575: a method the revision does not define answers HTTP 404
+        // + JSON-RPC `-32601`, not the HTTP 200 + JSON-RPC error the
+        // parser's `method_not_found` gives.
+        if is_undefined_method(body_method) {
+            return Err(undefined_method_rejection(body_method, body_id));
         }
 
-        // SEP-2575 stateless `_meta` shape. `server/discover`
-        // requests MUST carry
+        // SEP-2575 `_meta` shape. `server/discover` requests MUST carry
         // `params._meta.io.modelcontextprotocol/{protocolVersion,
-        // clientInfo, clientCapabilities}` so the server can
-        // negotiate without a prior `initialize` handshake. Other
-        // methods don't carry this strict requirement (clients
-        // routinely call `tools/list` etc. with minimal params).
+        // clientInfo, clientCapabilities}`. Other methods don't carry
+        // this strict requirement (clients routinely call `tools/list`
+        // etc. with minimal params).
         if body_id.is_some()
             && body_method == "server/discover"
             && let Some(missing) = missing_request_meta_key(body)
@@ -182,11 +156,10 @@ impl ProtocolHandler for Handler {
         // SEP-2575 header / body protocol-version cross-check. When
         // both the `Mcp-Protocol-Version` HTTP header AND the body's
         // `params._meta.io.modelcontextprotocol/protocolVersion` are
-        // present, they MUST agree. Mismatch = HTTP 400 carrying the
-        // dedicated `-32020` "HeaderMismatch" JSON-RPC error (the
-        // MCP-reserved-band code adopted in `2026-07-28`).
-        // (Either one absent is acceptable — the registry has its
-        // own legacy fall-through logic for absent / unknown values.)
+        // present, they MUST agree; a body value that is not a string
+        // never does. Mismatch = HTTP 400 carrying the dedicated `-32020`
+        // "HeaderMismatch" JSON-RPC error (the MCP-reserved-band code).
+        // Either one alone is checked by `negotiate` before this runs.
         if let (Some(header_version), Some(body_version)) = (
             headers
                 .get(PROTOCOL_VERSION_HEADER)
@@ -194,10 +167,13 @@ impl ProtocolHandler for Handler {
             body.as_object()
                 .and_then(|obj| obj.get("params"))
                 .and_then(|p| p.get("_meta"))
-                .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion"))
-                .and_then(Value::as_str),
-        ) && header_version != body_version
+                .and_then(|m| m.get("io.modelcontextprotocol/protocolVersion")),
+        ) && body_version.as_str() != Some(header_version)
         {
+            let body_version = match body_version {
+                Value::String(version) => version.clone(),
+                other => other.to_string(),
+            };
             return Err(TransportRejection {
                 status: 400,
                 error_code: HEADER_MISMATCH_CODE,
@@ -211,7 +187,7 @@ impl ProtocolHandler for Handler {
             });
         }
 
-        // SEP-2243 `Mcp-Method` is REQUIRED on every modern request
+        // SEP-2243 `Mcp-Method` is REQUIRED on every request
         // and MUST equal the body `method`. A request carrying a body
         // `id` is a JSON-RPC *request* (notification header rules are
         // left undefined by the revision, so id-less bodies are not
@@ -221,7 +197,7 @@ impl ProtocolHandler for Handler {
         match header_method {
             None if is_request => {
                 return Err(header_mismatch(
-                    "SEP-2243 requires the `Mcp-Method` header on modern requests; \
+                    "SEP-2243 requires the `Mcp-Method` header on requests; \
                      it is absent",
                     body_id.clone(),
                 ));
@@ -269,62 +245,31 @@ impl ProtocolHandler for Handler {
         Ok(())
     }
 
-    /// Parse a JSON body into a [`ProtocolMessage`] carrying the
-    /// modern [`ProtocolOperation`].
-    fn parse(&self, body: Value) -> Result<ProtocolMessage, ProtocolError> {
-        let mcp_method = body
-            .as_object()
-            .and_then(|obj| obj.get("method"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-
+    /// Parse a JSON body into a [`ProtocolMessage`] carrying its typed
+    /// [`ProtocolOperation`].
+    pub fn parse(&self, body: Value) -> Result<ProtocolMessage, ProtocolError> {
         let message = parse_client_message(body)?;
         let operation = map_client_message_to_operation(message)?;
-        let label = operation.label();
-        let jsonrpc_id = operation.client_request_id();
-
-        Ok(ProtocolMessage {
-            label,
-            inner: Box::new(operation),
-            jsonrpc_id,
-            mcp_method,
-            negotiated_version: ProtocolVersion::V_2026_07_28,
-        })
+        Ok(ProtocolMessage::new(operation))
     }
 
-    /// Dispatch a parsed modern operation.
+    /// Dispatch a parsed operation against `runtime`, the runtime the
+    /// transport holds for the whole request.
     ///
-    /// `server/discover` is handled natively in this file (builds
-    /// the `DiscoverResult` from server identity + the static
-    /// capability advertisement). Capability operations (tools,
-    /// prompts, resources, completion) route through the modern
-    /// dispatch arms. Notifications return the standard
-    /// `NotificationAccepted` envelope.
-    async fn dispatch(
+    /// `server/discover` is built here (server identity + the capability
+    /// advertisement). Capability operations (tools, prompts, resources,
+    /// completion) and the extensions go to their dispatch arms.
+    /// Notifications return the `NotificationAccepted` envelope.
+    pub async fn dispatch(
         &self,
         ctx: &RequestContext,
+        runtime: &GatewayRuntime,
         op: ProtocolMessage,
         services: &SharedServices,
     ) -> ProtocolHttpResponse {
-        let jsonrpc_id = op.jsonrpc_id.clone();
-        let operation = match op.downcast::<ProtocolOperation>() {
-            Ok(operation) => *operation,
-            Err(_) => {
-                tracing::error!(
-                    "v_2026_07_28::Handler::dispatch received a ProtocolMessage \
-                     whose inner type is not v_2026_07_28::ProtocolOperation — \
-                     registry routing bug"
-                );
-                return handler_internal_error(
-                    jsonrpc_id,
-                    "internal handler routing error: wrong operation type for v_2026_07_28",
-                );
-            }
-        };
-
-        match operation {
+        match op.operation {
             ProtocolOperation::Lifecycle(LifecycleOperation::Discover { request_id, .. }) => {
-                let result = build_discover_result(services, &ctx.transport);
+                let result = build_discover_result(services, runtime, &ctx.transport);
                 let result_value = match serde_json::to_value(&result) {
                     Ok(v) => v,
                     Err(error) => {
@@ -337,7 +282,6 @@ impl ProtocolHandler for Handler {
                 };
                 ProtocolHttpResponse {
                     http_status: 200,
-                    session_id_header: None,
                     response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
                         jsonrpc: JSONRPC_VERSION,
                         id: request_id,
@@ -349,66 +293,58 @@ impl ProtocolHandler for Handler {
                 request_id: cancelled_request_id,
                 reason,
             }) => {
-                // Route the modern `notifications/cancelled` into the
-                // same principal-partitioned, cross-instance
-                // cancellation machinery the legacy wire uses
-                // (`GatewayRuntime::handle_request_cancellation`):
-                // bus broadcast → `cancel_suspended_pipeline` on every
-                // replica, plus the audit + metric records. Without a
-                // runtime handle (shutdown) the cancel is dropped but
-                // still acknowledged 202 — `notifications/cancelled`
+                // `notifications/cancelled` goes into the principal-
+                // partitioned, cross-instance cancellation machinery
+                // (`GatewayRuntime::handle_request_cancellation`): bus
+                // broadcast → `cancel_suspended_pipeline` on every replica,
+                // plus the audit + metric records. `notifications/cancelled`
                 // carries no response.
-                if let Some(runtime_handle) = services.runtime() {
-                    let runtime = runtime_handle.load();
-                    runtime
-                        .handle_request_cancellation(ctx, &cancelled_request_id, reason.as_deref())
-                        .await;
-                }
+                runtime
+                    .handle_request_cancellation(ctx, &cancelled_request_id, reason.as_deref())
+                    .await;
                 ProtocolHttpResponse {
                     http_status: 202,
-                    session_id_header: None,
                     response: ProtocolResponse::NotificationAccepted,
                 }
             }
             ProtocolOperation::Lifecycle(LifecycleOperation::NotificationAccepted) => {
                 ProtocolHttpResponse {
                     http_status: 202,
-                    session_id_header: None,
                     response: ProtocolResponse::NotificationAccepted,
                 }
             }
             ProtocolOperation::Capabilities(CapabilityOperation::ToolsList {
                 request_id,
                 params,
-            }) => dispatch_tools_list(ctx, services, request_id, params).await,
+            }) => dispatch_tools_list(ctx, runtime, request_id, params).await,
             ProtocolOperation::Capabilities(CapabilityOperation::ToolsCall {
                 request_id,
                 params,
-            }) => dispatch_tools_call(ctx, services, request_id, params).await,
+            }) => dispatch_tools_call(ctx, runtime, services, request_id, params).await,
             ProtocolOperation::Capabilities(CapabilityOperation::PromptsList {
                 request_id,
                 params,
-            }) => dispatch_prompts_list(ctx, services, request_id, params).await,
+            }) => dispatch_prompts_list(ctx, runtime, request_id, params).await,
             ProtocolOperation::Capabilities(CapabilityOperation::PromptsGet {
                 request_id,
                 params,
-            }) => dispatch_prompts_get(ctx, services, request_id, params).await,
+            }) => dispatch_prompts_get(ctx, runtime, services, request_id, params).await,
             ProtocolOperation::Capabilities(CapabilityOperation::ResourcesList {
                 request_id,
                 params,
-            }) => dispatch_resources_list(ctx, services, request_id, params).await,
+            }) => dispatch_resources_list(ctx, runtime, request_id, params).await,
             ProtocolOperation::Capabilities(CapabilityOperation::ResourcesRead {
                 request_id,
                 params,
-            }) => dispatch_resources_read(ctx, services, request_id, params).await,
+            }) => dispatch_resources_read(ctx, runtime, request_id, params).await,
             ProtocolOperation::Capabilities(CapabilityOperation::ResourcesTemplatesList {
                 request_id,
                 params,
-            }) => dispatch_resources_templates_list(ctx, services, request_id, params).await,
+            }) => dispatch_resources_templates_list(ctx, runtime, request_id, params).await,
             ProtocolOperation::Capabilities(CapabilityOperation::Complete {
                 request_id,
                 params,
-            }) => dispatch_completion_complete(ctx, services, request_id, params).await,
+            }) => dispatch_completion_complete(ctx, runtime, request_id, params).await,
             ProtocolOperation::Capabilities(CapabilityOperation::SubscriptionsListen {
                 request_id,
                 ..
@@ -419,7 +355,7 @@ impl ProtocolHandler for Handler {
                 // here, the transport's branch is missing.
                 tracing::error!(
                     request_id = ctx.request_id.as_str(),
-                    "v_2026_07_28::Handler::dispatch reached for subscriptions/listen — \
+                    "Handler::dispatch reached for subscriptions/listen — \
                      the transport's POST-SSE branch should have intercepted; \
                      this is a routing bug"
                 );
@@ -430,38 +366,27 @@ impl ProtocolHandler for Handler {
                 )
             }
             ProtocolOperation::TasksExtension(op) => {
-                dispatch_tasks_extension(ctx, services, op).await
+                dispatch_tasks_extension(ctx, runtime, services, op).await
             }
             ProtocolOperation::EventsExtension(op) => {
-                dispatch_events_extension(ctx, services, op).await
+                dispatch_events_extension(ctx, runtime, services, op).await
             }
             ProtocolOperation::SkillsExtension(op) => {
-                let Some(runtime_handle) = services.runtime() else {
-                    return handler_internal_error(
-                        Some(op.request_id().clone()),
-                        "gateway runtime is shutting down",
-                    );
-                };
-                runtime_handle
-                    .load()
-                    .handle_skills_operation(op, ctx, crate::runtime::skills::SkillsWire::Modern)
-                    .await
+                runtime.handle_skills_operation(op, ctx).await
             }
         }
     }
 }
 
-/// JSON-RPC method names the legacy `2025-11-25` wire accepts but the modern
-/// `2026-07-28` revision removes.
+/// JSON-RPC methods that MCP `2026-07-28` does not define and that SEP-2575
+/// answers with HTTP 404 + JSON-RPC `-32601`; the parser's
+/// `method_not_found` fallback returns HTTP 200, which the conformance
+/// suite flags.
 ///
-/// SEP-2575 mandates HTTP 404 + JSON-RPC `-32601` for these on the stateless
-/// wire; the parser's default `method_not_found` fallback returns HTTP 200,
-/// which the conformance suite flags.
-///
-/// The inverse of the modern router's method table in
+/// Disjoint from the router's method table in
 /// [`crate::protocol::v_2026_07_28::wire::routing`] — a method added there must
 /// not appear here.
-fn is_removed_modern_method(method: &str) -> bool {
+fn is_undefined_method(method: &str) -> bool {
     matches!(
         method,
         "initialize"
@@ -475,9 +400,18 @@ fn is_removed_modern_method(method: &str) -> bool {
     )
 }
 
-// ── Dispatch arms ─────────────────────────────────────────────────────
-
-// ── SEP-2663 tasks-extension dispatch ────────────────────────────────
+/// The 404 + `-32601` answer to a method [`is_undefined_method`] names.
+fn undefined_method_rejection(method: &str, jsonrpc_id: Option<Value>) -> TransportRejection {
+    TransportRejection {
+        status: 404,
+        error_code: -32601,
+        message: format!(
+            "Method `{method}` is not defined in MCP {SUPPORTED_PROTOCOL_VERSION} (SEP-2575)"
+        ),
+        data: None,
+        jsonrpc_id,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -487,10 +421,8 @@ mod tests {
     };
     use crate::protocol::shared::jsonrpc::{JsonRpcError, JsonRpcErrorBody};
     use crate::protocol::v_2026_07_28::dispatch::mrtr::resume_did_not_commit;
-    use crate::protocol::v_2026_07_28::dispatch::prompts::{
-        legacy_prompt_arg_to_modern, legacy_prompt_to_modern,
-    };
-    use crate::protocol::v_2026_07_28::dispatch::resources::legacy_resource_to_modern;
+    use crate::protocol::v_2026_07_28::dispatch::prompts::{prompt_argument, prompt_descriptor};
+    use crate::protocol::v_2026_07_28::dispatch::resources::resource_descriptor;
     use crate::protocol::v_2026_07_28::dispatch::support::map_request_state_decode_error;
     use crate::protocol::v_2026_07_28::dispatch::tasks::fold_resume_outcome_onto_task;
     use crate::protocol::v_2026_07_28::wire::NAME_HEADER;
@@ -500,7 +432,6 @@ mod tests {
     fn error_response(code: i32) -> ProtocolHttpResponse {
         ProtocolHttpResponse {
             http_status: 200,
-            session_id_header: None,
             response: ProtocolResponse::JsonRpcError(JsonRpcError {
                 jsonrpc: JSONRPC_VERSION,
                 id: None,
@@ -515,7 +446,7 @@ mod tests {
 
     #[test]
     fn resume_did_not_commit_for_retry_safe_errors() {
-        // SR-7: on these the resume advanced nothing, so the inline
+        // On these the resume advanced nothing, so the inline
         // requestState blob must stay un-spent for a legitimate retry.
         for code in [-32600, -32001, -32603] {
             assert!(
@@ -530,7 +461,6 @@ mod tests {
         // Success → the resume committed; the blob is spent.
         let success = ProtocolHttpResponse {
             http_status: 200,
-            session_id_header: None,
             response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
                 jsonrpc: JSONRPC_VERSION,
                 id: Value::Null,
@@ -543,7 +473,6 @@ mod tests {
         // the pipeline already advanced on some replica, so spend the blob.
         let accepted = ProtocolHttpResponse {
             http_status: 202,
-            session_id_header: None,
             response: ProtocolResponse::NotificationAccepted,
         };
         assert!(!resume_did_not_commit(&accepted));
@@ -602,7 +531,7 @@ mod tests {
         let store = KvBackedTaskStore::new_in_memory_default();
         let session = "sess-A";
         let record = store
-            .create_task(session, Value::from(1), "some_tool", None)
+            .create_task(session, Value::from(1), "some_tool")
             .expect("create task");
         let task_id = record.task.task_id.clone();
         store
@@ -634,100 +563,84 @@ mod tests {
         assert_eq!(failed.task.status, crate::protocol::TaskStatus::Failed);
     }
 
-    /// Compile-time guard pinning every modern well-known wire
-    /// string to its spec value; accidental drift fails this test
-    /// at the constant-equality assertion. Cross-references the
-    /// originating SEP for each block.
+    /// Pins every well-known wire string to its spec value, grouped by
+    /// the SEP that defines it.
     #[test]
-    fn modern_wire_well_known_strings_match_spec() {
+    fn well_known_strings_match_spec() {
         use crate::protocol::v_2026_07_28::extensions::tasks::wire as tasks_ext;
-        use crate::protocol::v_2026_07_28::wire as modern;
+        use crate::protocol::v_2026_07_28::wire;
 
-        // ── Negotiated version (default until the spec ships
-        //    final on 2026-07-28).
-        assert_eq!(modern::SUPPORTED_PROTOCOL_VERSION, "2026-07-28");
+        assert_eq!(wire::SUPPORTED_PROTOCOL_VERSION, "2026-07-28");
+        assert_eq!(crate::protocol::SUPPORTED_PROTOCOL_VERSION, "2026-07-28");
 
         // ── SEP-2243 transport-header routing.
-        assert_eq!(modern::PROTOCOL_VERSION_HEADER, "mcp-protocol-version");
-        assert_eq!(modern::METHOD_HEADER, "mcp-method");
-        assert_eq!(modern::NAME_HEADER, "mcp-name");
-        assert_eq!(modern::PARAM_HEADER_PREFIX, "mcp-param-");
+        assert_eq!(wire::PROTOCOL_VERSION_HEADER, "mcp-protocol-version");
+        assert_eq!(wire::METHOD_HEADER, "mcp-method");
+        assert_eq!(wire::NAME_HEADER, "mcp-name");
+        assert_eq!(wire::PARAM_HEADER_PREFIX, "mcp-param-");
 
         // ── Core method strings.
-        assert_eq!(modern::lifecycle::METHOD_SERVER_DISCOVER, "server/discover");
-        assert_eq!(modern::tools::METHOD_TOOLS_LIST, "tools/list");
-        assert_eq!(modern::tools::METHOD_TOOLS_CALL, "tools/call");
-        assert_eq!(modern::prompts::METHOD_PROMPTS_LIST, "prompts/list");
-        assert_eq!(modern::prompts::METHOD_PROMPTS_GET, "prompts/get");
-        assert_eq!(modern::resources::METHOD_RESOURCES_LIST, "resources/list");
-        assert_eq!(modern::resources::METHOD_RESOURCES_READ, "resources/read");
+        assert_eq!(wire::lifecycle::METHOD_SERVER_DISCOVER, "server/discover");
+        assert_eq!(wire::tools::METHOD_TOOLS_LIST, "tools/list");
+        assert_eq!(wire::tools::METHOD_TOOLS_CALL, "tools/call");
+        assert_eq!(wire::prompts::METHOD_PROMPTS_LIST, "prompts/list");
+        assert_eq!(wire::prompts::METHOD_PROMPTS_GET, "prompts/get");
+        assert_eq!(wire::resources::METHOD_RESOURCES_LIST, "resources/list");
+        assert_eq!(wire::resources::METHOD_RESOURCES_READ, "resources/read");
         assert_eq!(
-            modern::resources::METHOD_RESOURCES_TEMPLATES_LIST,
+            wire::resources::METHOD_RESOURCES_TEMPLATES_LIST,
             "resources/templates/list"
         );
         assert_eq!(
-            modern::completion::METHOD_COMPLETION_COMPLETE,
+            wire::completion::METHOD_COMPLETION_COMPLETE,
             "completion/complete"
         );
         assert_eq!(
-            modern::subscriptions::METHOD_SUBSCRIPTIONS_LISTEN,
+            wire::subscriptions::METHOD_SUBSCRIPTIONS_LISTEN,
             "subscriptions/listen"
         );
 
         // ── SEP-2322 MRTR.
-        assert_eq!(
-            modern::mrtr::META_KEY_REQUEST_STATE,
-            "io.modelcontextprotocol/requestState"
-        );
-        assert_eq!(
-            modern::mrtr::META_KEY_INPUT_RESPONSES,
-            "io.modelcontextprotocol/inputResponses"
-        );
-        assert_eq!(modern::mrtr::RESULT_TYPE_INPUT_REQUIRED, "input_required");
+        assert_eq!(wire::mrtr::RESULT_TYPE_INPUT_REQUIRED, "input_required");
 
-        // ── SEP-2549 cache discriminator strings live as serde
-        //    rename targets on `CacheScope`; verify the round-trip
-        //    matches each tagged string.
-        // SEP-2549 mandates the two-value enum `public` / `private`.
-        // MCPG's old richer taxonomy (`global` / `client` / `tenant` /
-        // `none`) was collapsed at the wire boundary.
+        // ── SEP-2549 two-value `CacheScope` (`public` / `private`).
         for (scope, expected) in [
-            (modern::tools::CacheScope::Public, "public"),
-            (modern::tools::CacheScope::Private, "private"),
+            (wire::tools::CacheScope::Public, "public"),
+            (wire::tools::CacheScope::Private, "private"),
         ] {
             assert_eq!(serde_json::to_value(scope).unwrap(), expected);
         }
 
         // ── SEP-2243 + 2575 per-request `_meta` namespace keys.
-        assert_eq!(modern::meta::META_NAMESPACE, "io.modelcontextprotocol");
+        assert_eq!(wire::meta::META_NAMESPACE, "io.modelcontextprotocol");
         assert_eq!(
-            modern::meta::META_KEY_TRACEPARENT,
+            wire::meta::META_KEY_TRACEPARENT,
             "io.modelcontextprotocol/traceparent"
         );
         assert_eq!(
-            modern::meta::META_KEY_PROGRESS_TOKEN,
+            wire::meta::META_KEY_PROGRESS_TOKEN,
             "io.modelcontextprotocol/progressToken"
         );
         assert_eq!(
-            modern::meta::META_KEY_LOG_LEVEL,
+            wire::meta::META_KEY_LOG_LEVEL,
             "io.modelcontextprotocol/logLevel"
         );
         assert_eq!(
-            modern::meta::META_KEY_CACHE_TOKEN,
+            wire::meta::META_KEY_CACHE_TOKEN,
             "io.modelcontextprotocol/cacheToken"
         );
         assert_eq!(
-            modern::meta::META_KEY_IDEMPOTENCY,
+            wire::meta::META_KEY_IDEMPOTENCY,
             "io.modelcontextprotocol/idempotencyKey"
         );
         assert_eq!(
-            modern::meta::META_KEY_PRESERVE_CONTEXT,
+            wire::meta::META_KEY_PRESERVE_CONTEXT,
             "io.modelcontextprotocol/preserveContext"
         );
 
         // ── SEP-2575 subscriptions.
         assert_eq!(
-            modern::subscriptions::META_KEY_SUBSCRIPTION_ID,
+            wire::subscriptions::META_KEY_SUBSCRIPTION_ID,
             "io.modelcontextprotocol/subscriptionId"
         );
 
@@ -743,16 +656,105 @@ mod tests {
         assert_eq!(tasks_ext::RESULT_TYPE_TASK, "task");
 
         // ── SEP-2663 resultType discriminator vocabulary.
-        assert_eq!(modern::tools::RESULT_TYPE_COMPLETE, "complete");
-        assert_eq!(modern::tools::RESULT_TYPE_INPUT_REQUIRED, "input_required");
-        assert_eq!(modern::tools::RESULT_TYPE_TASK, "task");
+        assert_eq!(wire::tools::RESULT_TYPE_COMPLETE, "complete");
+        assert_eq!(wire::tools::RESULT_TYPE_INPUT_REQUIRED, "input_required");
+        assert_eq!(wire::tools::RESULT_TYPE_TASK, "task");
+    }
+
+    /// A method the revision does not define is a 404 + `-32601` that names
+    /// the revision and offers no other one.
+    #[test]
+    fn undefined_methods_are_404_method_not_found() {
+        let h = Handler::new();
+        for method in [
+            "initialize",
+            "notifications/initialized",
+            "ping",
+            "logging/setLevel",
+            "resources/subscribe",
+            "resources/unsubscribe",
+            "tasks/result",
+            "tasks/list",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(METHOD_HEADER, method.parse().unwrap());
+            let body = serde_json::json!({ "jsonrpc": "2.0", "id": 5, "method": method });
+            let err = h.validate_transport_headers(&headers, &body).unwrap_err();
+            assert_eq!(err.status, 404, "{method}");
+            assert_eq!(err.error_code, -32601, "{method}");
+            assert_eq!(err.jsonrpc_id, Some(serde_json::json!(5)));
+            assert!(err.message.contains(method), "{}", err.message);
+            assert!(err.message.contains("2026-07-28"), "{}", err.message);
+            assert!(!err.message.contains("2025"), "{}", err.message);
+        }
+    }
+
+    /// With the version header present, a body `_meta` version must be the
+    /// same string: a different string, a number or `null` is a `-32020`.
+    #[test]
+    fn a_body_version_must_be_the_header_version() {
+        let h = Handler::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(METHOD_HEADER, "tools/list".parse().unwrap());
+        headers.insert(PROTOCOL_VERSION_HEADER, "2026-07-28".parse().unwrap());
+        let body = |version: Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/list",
+                "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": version } }
+            })
+        };
+        assert!(
+            h.validate_transport_headers(&headers, &body(serde_json::json!("2026-07-28")))
+                .is_ok()
+        );
+        for disagreeing in [
+            serde_json::json!("2026-01-01"),
+            serde_json::json!(20260728),
+            Value::Null,
+            serde_json::json!({ "v": "2026-07-28" }),
+        ] {
+            let err = h
+                .validate_transport_headers(&headers, &body(disagreeing.clone()))
+                .unwrap_err();
+            assert_eq!(err.status, 400, "{disagreeing}");
+            assert_eq!(err.error_code, HEADER_MISMATCH_CODE, "{disagreeing}");
+            assert_eq!(err.jsonrpc_id, Some(serde_json::json!(3)));
+        }
     }
 
     #[test]
-    fn handler_version_identity() {
+    fn long_lived_stream_plans() {
         let h = Handler::new();
-        assert_eq!(h.version_string(), "2026-07-28");
-        assert_eq!(h.version(), ProtocolVersion::V_2026_07_28);
+        assert_eq!(
+            h.long_lived_stream_plan(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "subscriptions/listen"
+            })),
+            Some(StreamPlan::SubscriptionsListen)
+        );
+        assert_eq!(
+            h.long_lived_stream_plan(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "events/stream"
+            })),
+            Some(StreamPlan::EventsStream)
+        );
+        // An `events/stream` notification has no stream to answer with.
+        assert_eq!(
+            h.long_lived_stream_plan(&serde_json::json!({
+                "jsonrpc": "2.0", "method": "events/stream"
+            })),
+            None
+        );
+        assert_eq!(
+            h.long_lived_stream_plan(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/list"
+            })),
+            None
+        );
+        assert_eq!(
+            StreamPlan::SubscriptionsListen.method(),
+            "subscriptions/listen"
+        );
+        assert_eq!(StreamPlan::EventsStream.method(), "events/stream");
     }
 
     /// Minimal SEP-2575 `_meta` block that satisfies the
@@ -782,10 +784,7 @@ mod tests {
             .validate_transport_headers(&HeaderMap::new(), &body)
             .unwrap_err();
         assert_eq!(err.status, 400);
-        assert_eq!(
-            err.error_code, -32020,
-            "SEP-2243 makes Mcp-Method REQUIRED on the modern wire"
-        );
+        assert_eq!(err.error_code, -32020, "SEP-2243 makes Mcp-Method REQUIRED");
         assert!(err.message.contains("Mcp-Method"));
     }
 
@@ -986,23 +985,21 @@ mod tests {
             .expect("parse ok");
         assert_eq!(msg.label, "events_ext.subscribe");
         assert_eq!(msg.jsonrpc_id, Some(serde_json::json!(12)));
-        assert_eq!(msg.mcp_method.as_deref(), Some("events/subscribe"));
     }
 
     /// With events off (the default) the methods do not exist: the
-    /// modern wire's `-32601` on HTTP 404.
+    /// `-32601` on HTTP 404.
     #[tokio::test]
     async fn events_methods_are_method_not_found_by_default() {
         let h = Handler::new();
         let ctx = make_test_request_context();
-        let services =
-            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
+        let services = SharedServices::for_tests(Arc::new(crate::config::AppConfig::default()));
         for body in [
             serde_json::json!({ "jsonrpc": "2.0", "id": 3, "method": "events/list" }),
             events_subscribe_body("orders.created"),
         ] {
             let msg = h.parse(body).expect("parse ok");
-            let response = h.dispatch(&ctx, msg, &services).await;
+            let response = dispatch(&h, &ctx, msg, &services).await;
             assert_eq!(response.http_status, 404);
             match response.response {
                 ProtocolResponse::JsonRpcError(err) => assert_eq!(err.error.code, -32601),
@@ -1050,22 +1047,16 @@ mod tests {
         let msg = h.parse(body).expect("parse ok");
         assert_eq!(msg.label, "lifecycle.discover");
         assert_eq!(msg.jsonrpc_id, Some(serde_json::json!(1)));
-        assert_eq!(msg.mcp_method.as_deref(), Some("server/discover"));
-        assert_eq!(msg.negotiated_version, ProtocolVersion::V_2026_07_28);
-        let Ok(op) = msg.downcast::<ProtocolOperation>() else {
-            panic!("inner should be v_2026_07_28::ProtocolOperation");
-        };
         assert!(matches!(
-            *op,
+            msg.operation,
             ProtocolOperation::Lifecycle(LifecycleOperation::Discover { .. })
         ));
     }
 
     #[test]
-    fn parse_rejects_legacy_initialize_method() {
+    fn parse_refuses_initialize() {
         let h = Handler::new();
-        // `initialize` is legacy-only; the modern routing function
-        // refuses it with -32601.
+        // The router does not define `initialize`; it answers -32601.
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -1073,7 +1064,7 @@ mod tests {
             "params": {}
         });
         let Err(err) = h.parse(body) else {
-            panic!("legacy `initialize` must not parse under the modern handler");
+            panic!("`initialize` must not parse");
         };
         assert_eq!(err.code(), -32601);
     }
@@ -1114,7 +1105,7 @@ mcp:
 "#,
         )
         .expect("test AppConfig YAML parses");
-        let services = SharedServices::with_no_runtime(Arc::new(cfg));
+        let services = SharedServices::for_tests(Arc::new(cfg));
 
         let msg = h
             .parse(serde_json::json!({
@@ -1128,18 +1119,21 @@ mcp:
             }))
             .expect("parse ok");
 
-        let response = h.dispatch(&ctx, msg, &services).await;
+        let response = dispatch(&h, &ctx, msg, &services).await;
         assert_eq!(response.http_status, 200);
         match response.response {
             ProtocolResponse::JsonRpcSuccess(success) => {
                 assert_eq!(success.id, serde_json::json!(1));
-                // CacheableResult envelope; the singular
-                // `protocolVersion` was dropped (VN-5).
+                // CacheableResult envelope with the plural
+                // `supportedVersions`, which lists the one served revision.
                 assert!(success.result.get("protocolVersion").is_none());
                 assert_eq!(success.result["resultType"], "complete");
                 assert!(success.result["ttlMs"].is_u64());
                 assert_eq!(success.result["cacheScope"], "public");
-                assert!(success.result["supportedVersions"].is_array());
+                assert_eq!(
+                    success.result["supportedVersions"],
+                    serde_json::json!(["2026-07-28"])
+                );
                 assert_eq!(success.result["serverInfo"]["name"], "mcpg");
                 // Capability advertisement reflects the
                 // configured bindings — tools/prompts/resources all
@@ -1162,8 +1156,8 @@ mcp:
                 let methods = ext["io.modelcontextprotocol/tasks"]["methods"]
                     .as_array()
                     .expect("methods array");
-                // SEP-2663 final: three bare methods (get/update/cancel);
-                // `createTask` was removed.
+                // SEP-2663: three bare methods (get/update/cancel); a task
+                // is created by `tools/call`.
                 assert_eq!(methods.len(), 3);
                 let method_strs: Vec<&str> = methods.iter().filter_map(Value::as_str).collect();
                 assert!(method_strs.contains(&"tasks/get"));
@@ -1195,7 +1189,7 @@ mcp:
 "#,
         )
         .expect("test AppConfig YAML parses");
-        let services = SharedServices::with_no_runtime(Arc::new(cfg));
+        let services = SharedServices::for_tests(Arc::new(cfg));
 
         let msg = h
             .parse(serde_json::json!({
@@ -1209,7 +1203,7 @@ mcp:
             }))
             .expect("parse ok");
 
-        let response = h.dispatch(&ctx, msg, &services).await;
+        let response = dispatch(&h, &ctx, msg, &services).await;
         match response.response {
             ProtocolResponse::JsonRpcSuccess(success) => {
                 let ext = success.result["capabilities"]["extensions"]
@@ -1244,14 +1238,14 @@ mcp:
 "#,
         )
         .expect("test AppConfig YAML parses");
-        let services = SharedServices::with_no_runtime(Arc::new(cfg));
+        let services = SharedServices::for_tests(Arc::new(cfg));
         let msg = h
             .parse(serde_json::json!({
                 "jsonrpc": "2.0", "id": 1, "method": "server/discover",
                 "params": { "protocolVersion": "2026-07-28", "clientInfo": { "name": "t", "version": "0" } }
             }))
             .expect("parse ok");
-        let response = h.dispatch(&ctx, msg, &services).await;
+        let response = dispatch(&h, &ctx, msg, &services).await;
         match response.response {
             ProtocolResponse::JsonRpcSuccess(success) => {
                 let extensions = &success.result["capabilities"]["extensions"];
@@ -1272,7 +1266,7 @@ mcp:
             let h = Handler::new();
             let cfg: crate::config::AppConfig =
                 serde_yaml::from_str(cfg).expect("test AppConfig YAML parses");
-            let services = SharedServices::with_no_runtime(Arc::new(cfg));
+            let services = SharedServices::for_tests(Arc::new(cfg));
             let mut ctx = make_test_request_context();
             ctx.transport = transport;
             let msg = h
@@ -1281,7 +1275,7 @@ mcp:
                     "params": { "protocolVersion": "2026-07-28", "clientInfo": { "name": "t", "version": "0" } }
                 }))
                 .expect("parse ok");
-            match h.dispatch(&ctx, msg, &services).await.response {
+            match dispatch(&h, &ctx, msg, &services).await.response {
                 ProtocolResponse::JsonRpcSuccess(success) => {
                     success.result["capabilities"]["extensions"]
                         .get("io.modelcontextprotocol/enterprise-managed-authorization")
@@ -1320,7 +1314,7 @@ governance:
 
     #[tokio::test]
     async fn dispatch_discover_advertises_completions_plural_key_when_configured() {
-        // PR-02: a prompt argument with static completions makes the
+        // A prompt argument with static completions makes the
         // gateway advertise the `completions` capability under the
         // PLURAL wire key.
         let h = Handler::new();
@@ -1339,14 +1333,14 @@ mcp:
 "#,
         )
         .expect("test AppConfig YAML parses");
-        let services = SharedServices::with_no_runtime(Arc::new(cfg));
+        let services = SharedServices::for_tests(Arc::new(cfg));
         let msg = h
             .parse(serde_json::json!({
                 "jsonrpc": "2.0", "id": 1, "method": "server/discover",
                 "params": { "protocolVersion": "2026-07-28", "clientInfo": { "name": "t", "version": "0" } }
             }))
             .expect("parse ok");
-        let response = h.dispatch(&ctx, msg, &services).await;
+        let response = dispatch(&h, &ctx, msg, &services).await;
         match response.response {
             ProtocolResponse::JsonRpcSuccess(success) => {
                 let caps = &success.result["capabilities"];
@@ -1375,14 +1369,14 @@ mcp:
 "#,
         )
         .expect("test AppConfig YAML parses");
-        let services = SharedServices::with_no_runtime(Arc::new(cfg));
+        let services = SharedServices::for_tests(Arc::new(cfg));
         let msg = h
             .parse(serde_json::json!({
                 "jsonrpc": "2.0", "id": 1, "method": "server/discover",
                 "params": { "protocolVersion": "2026-07-28", "clientInfo": { "name": "t", "version": "0" } }
             }))
             .expect("parse ok");
-        let response = h.dispatch(&ctx, msg, &services).await;
+        let response = dispatch(&h, &ctx, msg, &services).await;
         match response.response {
             ProtocolResponse::JsonRpcSuccess(success) => {
                 let caps = &success.result["capabilities"];
@@ -1393,83 +1387,8 @@ mcp:
         }
     }
 
-    #[tokio::test]
-    async fn dispatch_resources_list_returns_500_when_runtime_unavailable() {
-        let h = Handler::new();
-        let ctx = make_test_request_context();
-        let services =
-            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
-        let msg = h
-            .parse(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 31,
-                "method": "resources/list"
-            }))
-            .expect("parse ok");
-        let response = h.dispatch(&ctx, msg, &services).await;
-        assert_eq!(response.http_status, 500);
-    }
-
-    #[tokio::test]
-    async fn dispatch_resources_read_returns_500_when_runtime_unavailable() {
-        let h = Handler::new();
-        let ctx = make_test_request_context();
-        let services =
-            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
-        let msg = h
-            .parse(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 32,
-                "method": "resources/read",
-                "params": { "uri": "x://y" }
-            }))
-            .expect("parse ok");
-        let response = h.dispatch(&ctx, msg, &services).await;
-        assert_eq!(response.http_status, 500);
-    }
-
-    #[tokio::test]
-    async fn dispatch_resources_templates_list_returns_500_when_runtime_unavailable() {
-        let h = Handler::new();
-        let ctx = make_test_request_context();
-        let services =
-            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
-        let msg = h
-            .parse(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 33,
-                "method": "resources/templates/list"
-            }))
-            .expect("parse ok");
-        let response = h.dispatch(&ctx, msg, &services).await;
-        assert_eq!(response.http_status, 500);
-    }
-
-    #[tokio::test]
-    async fn dispatch_completion_complete_returns_500_when_runtime_unavailable() {
-        let h = Handler::new();
-        let ctx = make_test_request_context();
-        let services =
-            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
-        let msg = h
-            .parse(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 41,
-                "method": "completion/complete",
-                "params": {
-                    "ref": { "type": "ref/prompt", "name": "x" },
-                    "argument": { "name": "a", "value": "" }
-                }
-            }))
-            .expect("parse ok");
-        let response = h.dispatch(&ctx, msg, &services).await;
-        assert_eq!(response.http_status, 500);
-    }
-
     #[test]
-    fn legacy_resource_to_modern_carries_annotations() {
-        // RES-08: annotations are carried through to the modern wire,
-        // not dropped.
+    fn resource_descriptor_carries_annotations() {
         let backend = crate::backends::ResourceDescriptor {
             uri: "u".to_owned(),
             name: "n".to_owned(),
@@ -1485,53 +1404,21 @@ mcp:
             }),
             meta: None,
         };
-        let modern = legacy_resource_to_modern(&backend);
-        assert_eq!(modern.uri, "u");
-        assert_eq!(modern.mime_type.as_deref(), Some("text/plain"));
-        assert_eq!(modern.size, Some(100));
-        let ann = modern.annotations.as_ref().expect("annotations carried");
+        let descriptor = resource_descriptor(&backend);
+        assert_eq!(descriptor.uri, "u");
+        assert_eq!(descriptor.mime_type.as_deref(), Some("text/plain"));
+        assert_eq!(descriptor.size, Some(100));
+        let ann = descriptor
+            .annotations
+            .as_ref()
+            .expect("annotations carried");
         assert_eq!(ann.priority, Some(0.5));
         assert_eq!(ann.audience.as_deref(), Some(&["user".to_owned()][..]));
-        assert!(modern.cache_scope.is_none());
-    }
-
-    #[tokio::test]
-    async fn dispatch_prompts_list_returns_500_when_runtime_unavailable() {
-        let h = Handler::new();
-        let ctx = make_test_request_context();
-        let services =
-            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
-        let msg = h
-            .parse(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 21,
-                "method": "prompts/list"
-            }))
-            .expect("parse ok");
-        let response = h.dispatch(&ctx, msg, &services).await;
-        assert_eq!(response.http_status, 500);
-    }
-
-    #[tokio::test]
-    async fn dispatch_prompts_get_returns_500_when_runtime_unavailable() {
-        let h = Handler::new();
-        let ctx = make_test_request_context();
-        let services =
-            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
-        let msg = h
-            .parse(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 22,
-                "method": "prompts/get",
-                "params": { "name": "x" }
-            }))
-            .expect("parse ok");
-        let response = h.dispatch(&ctx, msg, &services).await;
-        assert_eq!(response.http_status, 500);
+        assert!(descriptor.cache_scope.is_none());
     }
 
     #[test]
-    fn legacy_prompt_to_modern_with_empty_arguments_omits_field() {
+    fn prompt_descriptor_with_empty_arguments_omits_field() {
         let backend = crate::backends::PromptDescriptor {
             name: "x".to_owned(),
             title: None,
@@ -1540,94 +1427,31 @@ mcp:
             icons: None,
             meta: None,
         };
-        let modern = legacy_prompt_to_modern(&backend);
-        assert_eq!(modern.name, "x");
-        assert_eq!(modern.description.as_deref(), Some("d"));
+        let descriptor = prompt_descriptor(&backend);
+        assert_eq!(descriptor.name, "x");
+        assert_eq!(descriptor.description.as_deref(), Some("d"));
         assert!(
-            modern.arguments.is_none(),
-            "empty backend arguments must become None on modern wire"
+            descriptor.arguments.is_none(),
+            "empty backend arguments must serialize as no `arguments`"
         );
     }
 
     #[test]
-    fn legacy_prompt_arg_to_modern_wraps_required_in_some() {
+    fn prompt_argument_wraps_required_in_some() {
         let backend = crate::backends::PromptArgument {
             name: "n".to_owned(),
             title: None,
             description: None,
             required: true,
         };
-        let modern = legacy_prompt_arg_to_modern(&backend);
-        assert_eq!(modern.required, Some(true));
-    }
-
-    #[tokio::test]
-    async fn dispatch_tools_call_returns_500_when_runtime_unavailable() {
-        // Regression guard for the no-runtime path on the new
-        // tools/call arm.
-        let h = Handler::new();
-        let ctx = make_test_request_context();
-        let services =
-            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
-
-        let msg = h
-            .parse(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 11,
-                "method": "tools/call",
-                "params": { "name": "x", "arguments": {} }
-            }))
-            .expect("parse ok");
-
-        let response = h.dispatch(&ctx, msg, &services).await;
-        assert_eq!(response.http_status, 500);
-        match response.response {
-            ProtocolResponse::JsonRpcError(err) => {
-                assert_eq!(err.error.code, INTERNAL_ERROR_CODE);
-                assert!(err.error.message.contains("shutting down"));
-                assert_eq!(err.id, Some(serde_json::json!(11)));
-            }
-            other => panic!("expected JsonRpcError, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn dispatch_tools_list_returns_500_when_runtime_unavailable() {
-        // The new `tools/list` arm reaches for the runtime via
-        // `SharedServices.runtime()`; with the test's no-runtime
-        // services it surfaces a -32603 with a clear shutdown
-        // diagnostic (regression guard — make sure the new arm
-        // handles the no-runtime case rather than panicking).
-        let h = Handler::new();
-        let ctx = make_test_request_context();
-        let services =
-            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
-
-        let msg = h
-            .parse(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 7,
-                "method": "tools/list"
-            }))
-            .expect("parse ok");
-
-        let response = h.dispatch(&ctx, msg, &services).await;
-        assert_eq!(response.http_status, 500);
-        match response.response {
-            ProtocolResponse::JsonRpcError(err) => {
-                assert_eq!(err.error.code, INTERNAL_ERROR_CODE);
-                assert!(err.error.message.contains("shutting down"));
-            }
-            other => panic!("expected JsonRpcError, got {other:?}"),
-        }
+        assert_eq!(prompt_argument(&backend).required, Some(true));
     }
 
     #[tokio::test]
     async fn dispatch_notification_returns_202() {
         let h = Handler::new();
         let ctx = make_test_request_context();
-        let services =
-            SharedServices::with_no_runtime(Arc::new(crate::config::AppConfig::default()));
+        let services = SharedServices::for_tests(Arc::new(crate::config::AppConfig::default()));
 
         let msg = h
             .parse(serde_json::json!({
@@ -1637,7 +1461,7 @@ mcp:
             }))
             .expect("parse ok");
 
-        let response = h.dispatch(&ctx, msg, &services).await;
+        let response = dispatch(&h, &ctx, msg, &services).await;
         assert_eq!(response.http_status, 202);
         assert!(matches!(
             response.response,
@@ -1645,12 +1469,21 @@ mcp:
         ));
     }
 
+    /// Dispatch `msg` over `services` and the runtime their config builds.
+    async fn dispatch(
+        h: &Handler,
+        ctx: &RequestContext,
+        msg: ProtocolMessage,
+        services: &SharedServices,
+    ) -> ProtocolHttpResponse {
+        let runtime = crate::runtime::shared_services::test_runtime(&services.config_snapshot);
+        h.dispatch(ctx, &runtime, msg, services).await
+    }
+
     fn make_test_request_context() -> RequestContext {
         use crate::runtime::{GatewayRequestId, RequestIdentity, TransportKind};
         RequestContext::new(
             GatewayRequestId::new(),
-            None,
-            None,
             None,
             RequestIdentity::Anonymous {
                 source: "test".to_owned(),

@@ -1,9 +1,9 @@
 //! MCPG — Model Context Protocol Gateway.
 //!
-//! A reverse proxy that sits between MCP clients and backend services,
-//! providing session management, capability negotiation, identity resolution,
-//! policy enforcement, plugin-based gating/transform, multi-step pipelines,
-//! and observability.
+//! A reverse proxy that sits between MCP clients and backend services. It
+//! serves MCP 2026-07-28 and provides capability discovery, identity
+//! resolution, policy enforcement, plugin-based gating/transform,
+//! multi-step pipelines, and observability.
 
 // Mirrors `[lints.clippy]` in Cargo.toml. Cargo reads the manifest table and
 // other build systems do not, and a command-line `-D warnings` outranks a

@@ -2,7 +2,7 @@
 //!
 //! Encodes / decodes the opaque `requestState` blob carried on
 //! [`InputRequiredResult`] and echoed back in the resumption
-//! request's `_meta.io.modelcontextprotocol/requestState`.
+//! request's top-level `requestState` param.
 //!
 //! ## Hybrid scheme
 //!
@@ -109,7 +109,7 @@ impl std::error::Error for RequestStateError {}
 ///
 /// In the gateway this is `KvBackedRequestStateStore`
 /// (`crate::runtime::request_state_store`) over the cluster coordinator
-/// KV, so a large-payload modern suspension resumes on any replica and
+/// KV, so a large-payload suspension resumes on any replica and
 /// across restarts. Tests / dev can use the
 /// [`InMemoryRequestStateStore`] below.
 #[async_trait]
@@ -190,7 +190,7 @@ impl RequestStateStore for InMemoryRequestStateStore {
 }
 
 /// `requestState` codec — encode / decode the opaque blob the
-/// modern handler ships on `InputRequiredResult` and reads back on
+/// handler ships on `InputRequiredResult` and reads back on
 /// resumption.
 pub struct RequestStateCodec {
     cipher: ChaCha20Poly1305,

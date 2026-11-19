@@ -72,7 +72,6 @@ async fn build_with(
         mcpg_plugin_host::span_sampling::set_plugin_call_sampling_rate(rate);
     }
     let store_config = SessionStoreConfig {
-        replay_window_limit: config.gateway.server.replay_window_limit,
         session_idle_timeout_ms: config.gateway.server.session_idle_timeout_ms,
         max_sessions: 10_000,
         max_sessions_per_tenant: config.gateway.server.max_sessions_per_tenant,
@@ -239,13 +238,11 @@ async fn build_with(
         ));
 
     // Thread the configured retention policy into whichever backend. Both
-    // sides are milliseconds — the config field is named `_ms`, defaults to
-    // 1_800_000 (30 minutes), and is documented as such, matching the
-    // `task.ttl` the client sends.
+    // sides are milliseconds — the config field is named `_ms` and
+    // defaults to 1_800_000 (30 minutes).
     let task_policy = crate::runtime::task_store::TaskRetentionPolicy {
         default_ttl_ms: config.mcp.capabilities.tasks.default_ttl_ms,
         max_tasks_per_session: config.mcp.capabilities.tasks.max_tasks_per_session,
-        result_wait_ms: config.mcp.capabilities.tasks.result_wait_ms,
     };
     info!(
         default_ttl_ms = task_policy.default_ttl_ms,
@@ -494,12 +491,8 @@ async fn build_with(
     // `federate_upstream` (inheriting `enabled`) advertises the
     // capability to federated upstreams so they emit UI tools.
     let apps_cfg = &config.mcp.configurations.apps;
-    let apps_capability = apps_cfg
-        .enabled
-        .then(|| crate::protocol::shared::apps::capability_value(&[]));
     let apps_policy = apps_cfg.enabled.then(|| apps_cfg.compiled_policy());
     runtime.set_apps_config(
-        apps_capability,
         apps_cfg.federate_upstream_enabled(),
         apps_policy,
         &apps_cfg.registry,
@@ -687,15 +680,11 @@ async fn build_with(
     runtime.watch_engine.attach_cluster(fleet_watch).await;
 
     // Tool-call rate limiting (cluster-aware via NATS / Redis or
-    // in-process token bucket) is now configured as a tool-gate
-    // plugin under `plugins[]` — see
-    // `libs/plugins/reliability/rate-limit/`. The previous top-level
-    // `rate_limit:` block + `mcpg-backend-api` adapter chain has been
-    // removed.
+    // in-process token bucket) is a tool-gate plugin under `plugins[]` —
+    // see `libs/plugins/reliability/rate-limit/`.
 
     runtime.set_completion_rate_limit(config.gateway.server.completion_rate_limit_per_sec);
     runtime.set_max_sessions_per_tenant(config.gateway.server.max_sessions_per_tenant);
-    runtime.set_relax_request_id_uniqueness(config.gateway.server.relax_request_id_uniqueness);
     runtime.set_access_log(config.gateway.server.access_log);
     // Wire MCP federation: build the engine, attach it
     // to the dispatcher, and kick off capability import + the satellite
@@ -703,7 +692,6 @@ async fn build_with(
     runtime.wire_federations(
         config.mcp.federations.clone(),
         format!("mcpg/{}", env!("CARGO_PKG_VERSION")),
-        tenant_seg.clone(),
     );
     crate::backends::set_extra_resource_uri_schemes(
         config.gateway.server.extra_resource_uri_schemes.clone(),
@@ -843,29 +831,14 @@ async fn build_with(
     observability.attach_telemetry_bridge(Arc::clone(&runtime_arc), traces_filters);
     observability.attach_metrics_bridge(Arc::clone(&runtime_arc), metrics_filters);
 
-    // Install the multi-version protocol registry and
-    // `SharedServices` bundle on the runtime. After this call
-    // `GatewayRuntime::handle_request` routes the Protocol arm through
-    // `ProtocolHandler::dispatch` for the negotiated version
-    // (compile-time default = `V_2025_11_25`).
-    //
-    // Two handlers are registered today:
-    // - `v_2025_11_25::Handler` — the production-grade legacy
-    //   wire (default).
-    // - `v_2026_07_28::Handler` — the modern wire (advertises
-    //   `DRAFT-2026-v1`). Reachable when a client pins the modern
-    //   version via the `Mcp-Protocol-Version` header or the
-    //   request body's `_meta.io.modelcontextprotocol/protocolVersion`.
-    //   `transports/http.rs::mcp_handler` runs `registry.select()` on the
-    //   request itself, so a modern request reaches the modern handler's
-    //   `parse()` + `dispatch()`.
-    //
-    // SharedServices holds a Weak handle to `runtime_arc` to break
-    // the runtime↔services ownership cycle.
+    // Install the `SharedServices` bundle (config snapshot, MRTR
+    // `requestState` codec) on the runtime; the protocol handler reads it
+    // on every request. SharedServices holds a Weak handle to
+    // `runtime_arc` to break the runtime↔services ownership cycle.
     let config_arc: Arc<AppConfig> = Arc::new(config);
 
-    // Mint the MRTR `requestState` codec used by the modern handler's
-    // suspending `tools/call` arm.
+    // Mint the MRTR `requestState` codec that seals the state of a
+    // suspended `tools/call`.
     // Sources the encryption key in the following order:
     //   1. operator config (`mcp.configurations.request_state.encryption_key`).
     //   2. clustered: a sub-key derived from `cluster.state_encryption_key_env`
@@ -926,8 +899,8 @@ async fn build_with(
         // on every replica.
         tracing::info!(
             "MRTR `requestState` codec: deriving the encryption key from \
-             cluster.state_encryption_key_env (domain-separated) — modern resumptions \
-             decode across replicas without a separate request_state.encryption_key"
+             cluster.state_encryption_key_env (domain-separated) — resumptions decode \
+             across replicas without a separate request_state.encryption_key"
         );
         derive_cluster_subkey(&base, b"mcpg:request-state-codec:v1")
     } else if clustered && strict_encryption {
@@ -937,13 +910,13 @@ async fn build_with(
              stable key: set mcp.configurations.request_state.encryption_key (base64 \
              32-byte secret, IDENTICAL on every replica) OR cluster.state_encryption_key_env. \
              Refusing to boot with an ephemeral per-process key, which is undecodable on a \
-             peer and would silently break modern cross-replica resume."
+             peer and would silently break cross-replica resume."
         );
     } else {
         if clustered {
             tracing::warn!(
                 "MRTR `requestState` codec is using an EPHEMERAL encryption key in a \
-                 CLUSTERED deployment — the inline (≤8 KiB) modern resume blob cannot be \
+                 CLUSTERED deployment — the inline (≤8 KiB) resume blob cannot be \
                  decoded on another replica (cross-instance resume silently fails). Set \
                  mcp.configurations.request_state.encryption_key OR \
                  cluster.state_encryption_key_env (identical on every replica), or set \
@@ -953,16 +926,16 @@ async fn build_with(
             tracing::warn!(
                 "MRTR `requestState` codec is using an EPHEMERAL encryption key — \
                  configure `mcp.configurations.request_state.encryption_key` (base64-encoded \
-                 32-byte secret) to keep modern resumptions decodable across gateway restarts."
+                 32-byte secret) to keep resumptions decodable across gateway restarts."
             );
         }
         RequestStateCodec::ephemeral_key()
     };
     // Back the >8 KiB handle path with the coordinator KV (reusing
     // the pipeline KV — requestState IS pipeline-resumption state, with a
-    // distinct `request_state/` key namespace) so a large-payload modern
-    // suspension resumes on any replica and survives a restart, instead of
-    // the per-process InMemory store that pinned it to one instance.
+    // distinct `request_state/` key namespace) so a large-payload
+    // suspension resumes on any replica and survives a restart, which a
+    // per-process InMemory store would pin to one instance.
     let request_state_codec = Arc::new(RequestStateCodec::new(
         request_state_key,
         Arc::new(
@@ -972,15 +945,14 @@ async fn build_with(
         ),
     ));
 
-    // Modern (DRAFT-2026-v1) stateless cross-replica continuity. The
-    // synthetic session id minted for an authenticated principal is
-    // deterministic across replicas when a shared
-    // `sessions.synthetic_session_key` is configured OR (by default) when it
-    // can be derived from `cluster.state_encryption_key_env`. Surface the
-    // remaining failure modes at boot (malformed explicit key, clustered with
-    // neither key) so a misconfigured multi-replica deployment doesn't
-    // silently break task/subscription continuity + modern resume under a
-    // round-robin LB.
+    // Cross-replica session continuity. The session id minted for an
+    // authenticated principal is deterministic across replicas when a
+    // shared `sessions.synthetic_session_key` is configured OR (by default)
+    // when it can be derived from `cluster.state_encryption_key_env`.
+    // Surface the remaining failure modes at boot (malformed explicit key,
+    // clustered with neither key) so a misconfigured multi-replica
+    // deployment doesn't silently break task/subscription continuity and
+    // resume under a round-robin LB.
     {
         let clustered = !config_arc.cluster.is_single_node();
         // Whether a cluster-stable derivation source exists (a malformed
@@ -998,42 +970,41 @@ async fn build_with(
         {
             Some(b64) => match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
                 Ok(bytes) if bytes.len() == 32 => tracing::info!(
-                    "modern stateless: deterministic per-principal synthetic session ids \
-                     enabled (sessions.synthetic_session_key)"
+                    "deterministic per-principal session ids enabled \
+                     (sessions.synthetic_session_key)"
                 ),
                 Ok(bytes) => tracing::warn!(
                     key_bytes = bytes.len(),
                     "mcp.configurations.sessions.synthetic_session_key decoded to {} bytes, \
-                     expected 32 — modern synthetic sessions stay per-instance (no \
-                     cross-replica continuity)",
+                     expected 32 — session ids stay per-instance (no cross-replica \
+                     continuity)",
                     bytes.len()
                 ),
                 Err(error) => tracing::warn!(
                     error = %error,
                     "mcp.configurations.sessions.synthetic_session_key is not valid base64 — \
-                     modern synthetic sessions stay per-instance"
+                     session ids stay per-instance"
                 ),
             },
             None if clustered && cluster_derivable => tracing::info!(
-                "modern stateless: deterministic per-principal synthetic session ids enabled \
-                 via a key derived from cluster.state_encryption_key_env (no separate \
+                "deterministic per-principal session ids enabled via a key derived from \
+                 cluster.state_encryption_key_env (no separate \
                  sessions.synthetic_session_key needed)"
             ),
             None if clustered => tracing::warn!(
                 "a distributed cluster coordinator is configured but neither \
                  `mcp.configurations.sessions.synthetic_session_key` nor \
-                 `cluster.state_encryption_key_env` is set — modern (DRAFT-2026-v1) stateless \
-                 requests mint a PER-INSTANCE synthetic session on each replica, so the same \
-                 principal gets a different session id per replica (task/subscription \
-                 continuity AND cross-replica resume break under a round-robin LB). Set an \
-                 identical base64 32-byte key on every replica (either field) for deterministic \
-                 cross-replica sessions."
+                 `cluster.state_encryption_key_env` is set — each replica mints a \
+                 PER-INSTANCE session for a caller, so the same principal gets a different \
+                 session id per replica (task/subscription continuity AND cross-replica \
+                 resume break under a round-robin LB). Set an identical base64 32-byte key on \
+                 every replica (either field) for deterministic cross-replica sessions."
             ),
             None => {}
         }
     }
 
-    install_protocol_handlers(
+    install_shared_services(
         &runtime_arc,
         Arc::clone(&config_arc),
         Arc::clone(&request_state_codec),
@@ -1051,7 +1022,7 @@ async fn build_with(
     }
 
     let base_config_arc = base_config.map_or_else(|| Arc::clone(&config_arc), Arc::new);
-    let state = AppState {
+    let state: AppState = AppStateInner {
         config: Arc::new(ArcSwap::new(config_arc)),
         base_config: Arc::new(ArcSwap::new(base_config_arc)),
         registry_overlay: Arc::new(ArcSwap::from_pointee(
@@ -1060,7 +1031,7 @@ async fn build_with(
         runtime: runtime_arc,
         session_store,
         observability: Arc::new(observability),
-        config_sources,
+        config_sources: config_sources.into(),
         sse_stream_counts: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         config_overlay: Arc::new(ArcSwap::from_pointee(config_overlay_outcome.merged)),
         policy_chain: Arc::new(ArcSwap::from_pointee(policy_chain)),
@@ -1068,7 +1039,8 @@ async fn build_with(
         secret_watcher: Arc::new(tokio::sync::Mutex::new(secret_watcher_set)),
         #[cfg(feature = "governance-quotas")]
         quota_gate: Arc::new(ArcSwap::from_pointee(quota_gate)),
-    };
+    }
+    .into();
 
     // Bind the live state to the CP-attach hook so a pushed ConfigUpdate can
     // hot-reload this gateway in place, and so log capture ships to the agent.
@@ -1113,33 +1085,27 @@ pub(crate) async fn resolved_resource_watches(
     Ok((resources, templates))
 }
 
-/// Register the handler of every MCP revision the gateway speaks on
-/// `runtime`, sharing `config` and the `requestState` codec `codec`.
-fn install_protocol_handlers(
+/// Install the `SharedServices` bundle on `runtime`, sharing `config` and
+/// the `requestState` codec `codec`.
+fn install_shared_services(
     runtime: &Arc<ArcSwap<GatewayRuntime>>,
     config: Arc<AppConfig>,
     codec: Arc<crate::protocol::v_2026_07_28::dispatch::request_state::RequestStateCodec>,
 ) {
     let shared_services = Arc::new(crate::runtime::shared_services::SharedServices::new(
-        config, runtime, codec,
+        config, codec,
     ));
-    let mut protocol_registry = crate::protocol::registry::ProtocolRegistry::new();
-    protocol_registry.register(Arc::new(crate::protocol::v_2025_11_25::Handler::new()));
-    protocol_registry.register(Arc::new(crate::protocol::v_2026_07_28::Handler::new()));
-    runtime
-        .load()
-        .set_protocol_registry(Arc::new(protocol_registry));
     runtime.load().set_shared_services(shared_services);
 }
 
-/// Serve every MCP revision from a hand-built `state` as boot does, with a
-/// `requestState` key of this process and an in-memory store behind it.
-/// Public for the integration-test harness.
-pub fn install_protocol_handlers_in_process(state: &AppState) {
+/// Install the `SharedServices` bundle on a hand-built `state` as boot
+/// does, with a `requestState` key of this process and an in-memory store
+/// behind it. Public for the integration-test harness.
+pub fn install_shared_services_in_process(state: &AppState) {
     use crate::protocol::v_2026_07_28::dispatch::request_state::{
         InMemoryRequestStateStore, RequestStateCodec,
     };
-    install_protocol_handlers(
+    install_shared_services(
         &state.runtime,
         state.config.load_full(),
         Arc::new(RequestStateCodec::new(

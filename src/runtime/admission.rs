@@ -51,7 +51,7 @@ pub enum AdmissionTarget {
 pub struct AdmissionLease {
     /// The same in `admit`, `renew` and `release`, on every replica.
     pub id: String,
-    /// `stream`, `poll`, `webhook`, `listen` or `subscribe`.
+    /// `stream`, `poll`, `webhook` or `listen`.
     pub delivery: &'static str,
     pub target: AdmissionTarget,
 }
@@ -240,8 +240,6 @@ impl GatewayRuntime {
         let mut ctx = RequestContext::new(
             GatewayRequestId::new(),
             None,
-            None,
-            None,
             identity.clone(),
             TransportKind::Http,
         );
@@ -251,10 +249,11 @@ impl GatewayRuntime {
             name: admission.tool().to_owned(),
             arguments: Some(lease.arguments(op, client)),
             meta: None,
-            task: None,
         };
         let key = format!("realtime-{}:{}", op.as_str(), lease.id);
-        let response = self.handle_tools_call(json!(key), params, &ctx).await;
+        let response = self
+            .handle_tools_call(json!(key), params, false, &ctx)
+            .await;
         let answer = match response.response {
             ProtocolResponse::JsonRpcSuccess(success)
                 if success.result.get("isError").and_then(Value::as_bool) != Some(true) =>
@@ -313,26 +312,6 @@ impl GatewayRuntime {
     }
 }
 
-/// What the admission holds for the subscription of `session_id` on `uri`:
-/// one lease per session and URI, the same on every replica. The id is a
-/// digest, so the tool never sees the session id.
-pub(crate) fn session_resource_lease(session_id: &str, uri: &str) -> AdmissionLease {
-    use sha2::{Digest as _, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(session_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(uri.as_bytes());
-    let digest = hasher.finalize();
-    let id: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
-    AdmissionLease {
-        id: format!("sub-{id}"),
-        delivery: "subscribe",
-        target: AdmissionTarget::Resource {
-            uri: uri.to_owned(),
-        },
-    }
-}
-
 /// What the admission holds for one `subscriptions/listen` target: a lease
 /// of its own, because streams of one principal share a session.
 pub(crate) fn listen_resource_lease(uri: &str) -> AdmissionLease {
@@ -342,66 +321,6 @@ pub(crate) fn listen_resource_lease(uri: &str) -> AdmissionLease {
         target: AdmissionTarget::Resource {
             uri: uri.to_owned(),
         },
-    }
-}
-
-impl GatewayRuntime {
-    /// Renew `lease` at the admission's pace for as long as `session_id`
-    /// stays subscribed to `uri` on this replica. A refused renewal ends
-    /// the subscription; a subscription that went away releases the lease.
-    pub(crate) fn keep_session_subscription_admitted(
-        &self,
-        session_id: &str,
-        uri: &str,
-        identity: &RequestIdentity,
-        client: Option<mcpg_plugin_protocol::ClientInfo>,
-        lease: AdmissionLease,
-        grant: AdmissionGrant,
-    ) {
-        let Some(handle) = self
-            .shared_services
-            .load_full()
-            .and_then(|services| services.runtime())
-        else {
-            return;
-        };
-        let handle = std::sync::Arc::downgrade(&handle);
-        let (session_id, uri, identity) = (session_id.to_owned(), uri.to_owned(), identity.clone());
-        tokio::spawn(async move {
-            let mut renew_after = grant.renew_after;
-            loop {
-                tokio::time::sleep(renew_after).await;
-                let Some(runtime) = handle.upgrade() else {
-                    return;
-                };
-                let runtime = runtime.load_full();
-                if !runtime.subscriptions().is_held(&session_id, &uri) {
-                    runtime
-                        .realtime_release(&identity, client.as_ref(), &lease)
-                        .await;
-                    return;
-                }
-                match runtime
-                    .realtime_admit(AdmissionOp::Renew, &identity, client.as_ref(), &lease)
-                    .await
-                {
-                    Ok(Some(grant)) => renew_after = grant.renew_after,
-                    Ok(None) => return,
-                    Err(denial) => {
-                        tracing::info!(
-                            uri = %uri,
-                            code = denial.code,
-                            "the realtime admission refused a renewal; the resource subscription ends"
-                        );
-                        runtime
-                            .subscriptions()
-                            .unsubscribe_once(&session_id, &uri)
-                            .await;
-                        return;
-                    }
-                }
-            }
-        });
     }
 }
 
@@ -513,7 +432,7 @@ mod tests {
         );
         let resource = AdmissionLease {
             id: "lease-2".into(),
-            delivery: "subscribe",
+            delivery: "listen",
             target: AdmissionTarget::Resource {
                 uri: "imd://i/1".into(),
             },
@@ -521,7 +440,7 @@ mod tests {
         assert_eq!(
             resource.arguments(AdmissionOp::Release, None),
             json!({
-                "op": "release", "lease_id": "lease-2", "delivery": "subscribe",
+                "op": "release", "lease_id": "lease-2", "delivery": "listen",
                 "kind": "resource", "resource": {"uri": "imd://i/1"}
             })
         );

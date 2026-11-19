@@ -178,6 +178,11 @@ impl SampleOutcome {
 /// running without a CP attached has zero cost.
 pub trait ToolCallRecorder: Send + Sync {
     fn record(&self, sample: ToolCallSample);
+    /// Whether `record` keeps samples. A dispatch site that sees
+    /// `false` skips building the sample.
+    fn records_tool_calls(&self) -> bool {
+        true
+    }
     /// Whether this recorder wants the dispatch site to capture
     /// `request_payload` + `response_payload` (Enterprise opt-in).
     /// Default `false`; only the
@@ -286,6 +291,10 @@ pub struct NoopRecorder;
 
 impl ToolCallRecorder for NoopRecorder {
     fn record(&self, _sample: ToolCallSample) {}
+
+    fn records_tool_calls(&self) -> bool {
+        false
+    }
 }
 
 /// BLAKE3 hex hash of an error message — operators correlate the
@@ -314,6 +323,9 @@ impl ToolCallRecorderHandle {
     }
     pub fn record(&self, sample: ToolCallSample) {
         self.0.record(sample);
+    }
+    pub fn records_tool_calls(&self) -> bool {
+        self.0.records_tool_calls()
     }
     pub fn payload_capture_enabled(&self) -> bool {
         self.0.payload_capture_enabled()
@@ -426,6 +438,16 @@ mod tests {
             response_payload: None,
             payload_truncated: false,
         });
+    }
+
+    /// Dispatch sites skip building a sample only for the no-op
+    /// recorder; any other recorder gets every sample.
+    #[test]
+    fn only_the_noop_recorder_declines_samples() {
+        assert!(!ToolCallRecorderHandle::noop().records_tool_calls());
+        assert!(!ToolCallRecorderHandle::default().records_tool_calls());
+        let recorder = ToolCallRecorderHandle::new(Arc::new(RecordingRecorder::default()));
+        assert!(recorder.records_tool_calls());
     }
 
     #[test]

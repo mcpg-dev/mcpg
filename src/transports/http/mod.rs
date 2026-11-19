@@ -1,8 +1,10 @@
-//! HTTP/SSE transport — Axum router, MCP Streamable HTTP endpoint,
-//! health/readiness probes, and OAuth protected-resource metadata.
+//! HTTP transport — Axum router, the MCP endpoint, health/readiness probes,
+//! and OAuth protected-resource metadata.
 //!
-//! Implements the MCP Streamable HTTP specification including session
-//! management, SSE streaming, and reconnection with `Last-Event-ID`.
+//! The MCP endpoint serves MCP 2026-07-28 over `POST`: every request is
+//! answered on its own response, as JSON or as an SSE stream.
+//! `subscriptions/listen` and `events/stream` are POSTs answered with a
+//! long-lived SSE stream. `GET`, `HEAD` and `DELETE` answer `405`.
 
 use anyhow::Result;
 use axum::{
@@ -19,29 +21,28 @@ use axum::{
 use serde::Serialize;
 use serde_json::Value;
 use std::convert::Infallible;
-use tokio_stream::{StreamExt, iter, wrappers::ReceiverStream};
-use tower_http::timeout::TimeoutLayer;
+use tokio_stream::{StreamExt, iter};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
-use crate::transports::wire_policy::{self, Negotiated, WireVersion};
+use crate::transports::dispatch::{DispatchOutcome, dispatch};
+use crate::transports::listen::{ListenRefusal, open_listen};
 use crate::{
     app::AppState,
     protocol::{
-        PROTOCOL_VERSION_HEADER, ProtocolError, ProtocolHttpResponse, ProtocolResponse,
-        SESSION_ID_HEADER, map_client_message_to_operation, parse_client_message,
+        METHOD_NOT_FOUND_CODE, PROTOCOL_VERSION_HEADER, ProtocolError, ProtocolHttpResponse,
+        ProtocolResponse, StreamPlan,
     },
     runtime::{
-        DiagnosticsOperation, GatewayOperation, GatewayRequest, GatewayRequestId, GatewayResponse,
-        GatewayResponsePayload, RequestContext, RequestIdentity, ResumeCursor, SseEventRecord,
-        StreamAccessError, TransportKind, pipeline_store::DeliveryMessage,
+        DiagnosticsOperation, GatewayRequestId, GatewayResponse, GatewayResponsePayload,
+        RequestContext, RequestIdentity, TransportKind,
     },
 };
 
 /// Per-handler extractor of what the connection vouches for: the
 /// `TlsInfoArc` [`crate::transports::tls::McpgTlsAcceptor`] stamps (absent on
-/// plain HTTP, and on TLS with no SNI and no client cert) and the peer an
-/// `http`-wire transport attests (absent on every other path).
+/// plain HTTP, and on TLS with no SNI and no client cert) and the peer a
+/// transport plugin attests (absent on every other path).
 pub(crate) struct ConnectionExt(crate::transports::attested::ConnectionFacts);
 
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for ConnectionExt {
@@ -63,6 +64,22 @@ impl ConnectionExt {
     }
 }
 
+/// The request headers, moved out of the request instead of copied. Every
+/// extractor after it sees an empty map, so a handler lists it after every
+/// other parts extractor.
+pub(crate) struct RequestHeaders(HeaderMap);
+
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestHeaders {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(std::mem::take(&mut parts.headers)))
+    }
+}
+
 mod cors;
 mod discovery;
 mod events_stream;
@@ -72,7 +89,6 @@ mod oauth_browser;
 mod personal_agent_operations;
 mod probes;
 mod response;
-mod sse;
 mod validate;
 mod webhooks;
 
@@ -92,35 +108,26 @@ pub(crate) use probes::{health_handler, metrics_handler, readiness_handler, runt
 pub(crate) use response::{
     INSUFFICIENT_SCOPE_DATA_KEY, RETRY_AFTER_DATA_KEY, SIGN_IN_REQUIRED_DATA_KEY, challenge_scope,
     map_gateway_response, map_protocol_error_response, map_protocol_error_with_status,
-    map_sse_events, map_transport_rejection, reject_method_on_modern_wire, request_host,
-    resource_metadata_url, retry_after_data, strip_internal_markers, with_request_id_header,
-    with_resource_metadata_pointer, with_session_id_header, with_www_authenticate_challenge,
-};
-pub(crate) use sse::{
-    ResourceSubscriptionGuard, SlottedEventStream, SseStreamSlot, acquire_sse_slot,
-    delivery_bus_sse, delivery_dedupe_key, delivery_to_sse_event, open_post_continuation_sse,
-    register_modern_resource_subscriptions, sse_event_from_record,
+    map_protocol_http_response, map_response_stream, map_transport_rejection, request_host,
+    resource_metadata_url, retry_after_data, strip_internal_markers, with_protocol_version_header,
+    with_request_id_header, with_resource_metadata_pointer, with_www_authenticate_challenge,
+    without_internal_headers,
 };
 pub use validate::origin_admitted;
-pub(crate) use validate::{
-    enforce_http_protocol_version_header, legacy_wire_refused, post_accepts_sse,
-    session_header_refused, validate_get_accept, validate_origin, validate_post_accept,
-    validate_post_content_type,
-};
+pub(crate) use validate::{validate_origin, validate_post_accept, validate_post_content_type};
 pub(crate) use webhooks::{webhook_approval_resolution_handler, webhook_resource_updated_handler};
 // Reached only from this transport's test module.
+#[cfg(test)]
+pub(crate) use crate::transports::listen::{SseStreamCounts, acquire_sse_slot};
 #[cfg(test)]
 pub(crate) use identity::{CredentialOrigin, build_request_context, plugin_identity_to_request};
 #[cfg(test)]
 pub(crate) use response::INSUFFICIENT_SCOPE_HEADER;
-#[cfg(test)]
-pub(crate) use sse::SseStreamCounts;
 
 const REQUEST_ID_RESPONSE_HEADER: &str = "x-mcpg-request-id";
 const UPSTREAM_REQUEST_ID_HEADER: &str = "x-request-id";
 const SUBJECT_ID_HEADER: &str = "x-mcpg-subject-id";
-const ORIGIN_HEADER: &str = "origin";
-const LAST_EVENT_ID_HEADER: &str = "last-event-id";
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const JSON_ACCEPT: &str = "application/json";
 const SSE_ACCEPT: &str = "text/event-stream";
 
@@ -200,16 +207,18 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
     let config = state.config.load();
     let request_timeout =
         std::time::Duration::from_millis(config.gateway.server.request_timeout_ms);
+    let mcp_path_owned = mcp_path.to_owned();
 
     let mut router = Router::new()
         .route(health_path, get(health_handler))
         .route(probes::READINESS_PATH, get(readiness_handler))
         .route(probes::RUNTIME_PATH, get(runtime_handler))
+        // `get` serves `HEAD` too.
         .route(
             mcp_path,
-            get(mcp_get_handler)
+            get(mcp_405_handler)
                 .post(mcp_handler)
-                .delete(mcp_delete_handler),
+                .delete(mcp_405_handler),
         );
 
     // Kept for the canonical-host exemption list below: the metrics endpoint is
@@ -473,17 +482,20 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         // gateway not to buffer it: such a proxy holds a response without a
         // Content-Length until the upstream closes, and an SSE body never
         // closes on its own — the client sees no status line at all. One
-        // layer covers the GET stream, the SSE-framed POST results and the
-        // long-lived `subscriptions/listen` response alike.
+        // layer covers the SSE-framed POST results and the long-lived
+        // `subscriptions/listen` and `events/stream` responses alike.
         .layer(axum::middleware::map_response(
             no_proxy_buffering_for_event_streams,
         ))
         .layer(axum::extract::DefaultBodyLimit::max(
             body_cap_mb * 1024 * 1024,
         ))
-        .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            request_timeout,
+        // The request deadline. A tool call's awaited plugin call holds it,
+        // and a request dropped once such a call began still finishes.
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                crate::transports::request_deadline::enforce(request_timeout, req, next)
+            },
         ))
         // Last-resort panic boundary: a panic in any handler becomes a
         // JSON-RPC 500 instead of resetting the connection / killing the
@@ -492,6 +504,22 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(
             handle_router_panic,
         ))
+        // Every answer of the MCP endpoint names the revision it serves,
+        // the timeout and the panic answers included, so the stamp sits
+        // outside both.
+        .layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let stamp = req.uri().path() == mcp_path_owned;
+                async move {
+                    let response = next.run(req).await;
+                    if stamp {
+                        with_protocol_version_header(response)
+                    } else {
+                        response
+                    }
+                }
+            },
+        ))
         .layer(TraceLayer::new_for_http().make_span_with(request_span))
         .with_state(state)
 }
@@ -499,102 +527,6 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
 /// The span every request runs in, with the method and the path only. A
 /// query string can carry an authorization code or `state` (RFC 6749
 /// §10.5), so the URI is never recorded whole.
-/// Longest client name or version kept; the client chooses both.
-const MAX_CLIENT_FIELD_CHARS: usize = 128;
-
-/// The client a stateless request names in
-/// `params._meta["io.modelcontextprotocol/clientInfo"]`, with control
-/// characters dropped and each field bounded. `None` without a name.
-fn modern_request_client(body: &serde_json::Value) -> Option<mcpg_plugin_protocol::ClientInfo> {
-    let info = body
-        .get("params")?
-        .get("_meta")?
-        .get("io.modelcontextprotocol/clientInfo")?;
-    let clean = |v: &serde_json::Value| -> Option<String> {
-        let s: String = v
-            .as_str()?
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(MAX_CLIENT_FIELD_CHARS)
-            .collect();
-        let s = s.trim().to_owned();
-        (!s.is_empty()).then_some(s)
-    };
-    Some(mcpg_plugin_protocol::ClientInfo {
-        name: clean(info.get("name")?)?,
-        version: info.get("version").and_then(clean),
-    })
-}
-
-/// Writes one `mcpg.resource.updated_delivered` receipt for each
-/// `notifications/resources/updated` a stream hands its client, through
-/// the runtime current at that moment.
-#[derive(Clone)]
-struct UpdateReceipts {
-    /// Weak: a stream must not keep the runtime (and its delivery bus)
-    /// alive past the gateway's own handle.
-    runtime: std::sync::Weak<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>>,
-    actor: mcpg_plugin_protocol::PluginIdentity,
-    request_id: String,
-    client: Option<serde_json::Value>,
-}
-
-impl UpdateReceipts {
-    fn new(
-        runtime: &std::sync::Arc<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>>,
-        request_context: &crate::runtime::RequestContext,
-    ) -> Self {
-        // A stream's context may not have read its session yet; the
-        // session's `initialize` client is what `client()` falls back to.
-        let _ = request_context.load_session_cached(&**runtime.load().session_store(), false);
-        Self {
-            runtime: std::sync::Arc::downgrade(runtime),
-            actor: crate::runtime::plugin_identity_from_request(request_context),
-            request_id: request_context.request_id.as_str().to_owned(),
-            client: request_context
-                .client()
-                .map(|c| serde_json::json!({ "name": c.name, "version": c.version })),
-        }
-    }
-
-    fn record(&self, message: &Value, subscription_id: Option<&str>) {
-        if message.get("method").and_then(Value::as_str) != Some("notifications/resources/updated")
-        {
-            return;
-        }
-        let uri = message
-            .pointer("/params/uri")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        metrics::counter!("mcpg_resource_updates_delivered_total").increment(1);
-        let event = mcpg_plugin_protocol::audit::AuditEvent {
-            event_id: mcpg_plugin_host::audit_events::new_event_id(),
-            occurred_at: mcpg_plugin_host::audit_events::now_rfc3339_utc(),
-            actor: self.actor.clone(),
-            action: "mcpg.resource.updated_delivered".to_owned(),
-            resource: Some(format!("resource://{uri}")),
-            outcome: mcpg_plugin_protocol::audit::AuditOutcome::Success,
-            request_id: Some(self.request_id.clone()),
-            upstream_request_id: None,
-            node_id: None,
-            details: serde_json::json!({
-                "uri": uri,
-                "subscription_id": subscription_id,
-                "client": self.client,
-            }),
-            prev_event_hash: None,
-        };
-        let Some(runtime) = self.runtime.upgrade() else {
-            return;
-        };
-        let runtime = runtime.load_full();
-        tokio::spawn(async move {
-            let _ = runtime.plugin_registry().emit_audit_event(&event).await;
-        });
-    }
-}
-
 fn request_span(req: &axum::http::Request<axum::body::Body>) -> tracing::Span {
     tracing::debug_span!("request", method = %req.method(), path = %req.uri().path())
 }
@@ -724,7 +656,6 @@ fn handle_router_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response
 fn mcp_post_preflight(
     headers: &HeaderMap,
     config: &crate::config::AppConfig,
-    peer: Option<axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     request_context: &RequestContext,
 ) -> Result<bool, Response> {
     // Per-IP rate limit for requests below cryptographically-verified trust —
@@ -739,11 +670,7 @@ fn mcp_post_preflight(
         // XFF, no ConnectInfo — in-process tests): skip rather than lump every
         // such caller into one shared bucket. Real serve paths always stamp it.
         if srv.anonymous_rate_limit_per_min > 0
-            && let Some(ip) = crate::transports::anon_limit::client_ip(
-                srv.trust_proxy_ip,
-                headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
-                peer.map(|ext| ext.0.0.ip()),
-            )
+            && let Some(ip) = request_context.client_ip
             && !crate::transports::anon_limit::check(
                 ip,
                 srv.anonymous_rate_limit_per_min,
@@ -775,26 +702,21 @@ fn mcp_post_preflight(
     ) {
         return Err(response);
     }
-    if let Some(response) = validate_post_accept(headers, &request_context.request_id) {
-        return Err(response);
-    }
-    // `validate_post_accept` admits a client that advertised only
-    // `application/json`; this is the other half of that policy — such a client
-    // gets the inline-JSON shape at every optional SSE upgrade.
-    let client_accepts_sse = post_accepts_sse(headers);
+    // A client that advertised only `application/json` gets the inline-JSON
+    // shape at every optional SSE upgrade.
+    let client_accepts_sse = validate_post_accept(headers, &request_context.request_id)?;
     if let Some(response) = validate_post_content_type(headers, &request_context.request_id) {
         return Err(response);
     }
     Ok(client_accepts_sse)
 }
 
-/// POST handler for the MCP endpoint. Flow: parse JSON body -> validate headers
-/// (origin, accept, content-type, protocol version) -> parse client message ->
-/// route to runtime -> either stream via SSE or return JSON-RPC directly.
-/// Batch arrays are rejected; only single JSON-RPC messages are accepted.
+/// POST handler for the MCP endpoint. Flow: identity -> the preflight gates
+/// (rate limit, origin, `Accept`, `Content-Type`) -> authentication -> parse
+/// the JSON body -> [`dispatch`] (protocol version, routing headers, session)
+/// -> frame the outcome as JSON or SSE.
 async fn mcp_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-    headers: HeaderMap,
     connection: ConnectionExt,
     // `ConnectInfo` rides the request extensions on BOTH serve paths (axum's
     // `into_make_service_with_connect_info` on plain HTTP; `McpgTlsAcceptor`'s
@@ -804,6 +726,7 @@ async fn mcp_handler(
     peer: Option<axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     method: axum::http::Method,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
+    RequestHeaders(headers): RequestHeaders,
     body: Bytes,
 ) -> Response {
     let runtime = state.runtime.load();
@@ -828,15 +751,19 @@ async fn mcp_handler(
         Ok(ctx) => ctx,
         Err(resp) => return refused_credential_response(resp, &config, &headers),
     };
+    let trust_proxy = config.gateway.server.trust_proxy_ip;
     request_context.client_ip = crate::transports::anon_limit::client_ip(
-        config.gateway.server.trust_proxy_ip,
-        headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()),
+        trust_proxy,
+        trust_proxy
+            .then(|| headers.get(X_FORWARDED_FOR))
+            .flatten()
+            .and_then(|v| v.to_str().ok()),
         peer_ip,
     );
 
     // The preflight first: a foreign `Origin` is a 403 (MCP Streamable
     // HTTP), whether or not the caller must authenticate.
-    let client_accepts_sse = match mcp_post_preflight(&headers, &config, peer, &request_context) {
+    let client_accepts_sse = match mcp_post_preflight(&headers, &config, &request_context) {
         Ok(accepts_sse) => accepts_sse,
         Err(rejection) => return rejection,
     };
@@ -852,21 +779,9 @@ async fn mcp_handler(
             let error = crate::protocol::ProtocolError::parse_error(format!(
                 "Failed to parse the request body as JSON: {parse_err}"
             ));
-            // The only exit with no body to negotiate against.
-            return WireVersion::from_headers(&runtime, &headers).apply_protocol_version_header(
-                map_protocol_error_response(error, &request_context.request_id),
-            );
+            return map_protocol_error_response(error, &request_context.request_id);
         }
     };
-
-    // Single wire-negotiation point. Everything below — the two dispatch
-    // paths, the response framing, and the version header on every exit —
-    // reads this. The idempotency lift only touches `params._meta`, so
-    // negotiating before it sees the same method the dispatch will.
-    let Negotiated {
-        wire,
-        modern_handler,
-    } = WireVersion::negotiate(&runtime, &headers, &body);
 
     // SEP-2133 `dev.mcpg/idempotency` HTTP-transport header lift.
     // When the caller supplies the conventional RFC
@@ -878,113 +793,41 @@ async fn mcp_handler(
     // (Stripe-style precedence, design doc §1.4).
     let body = match lift_idempotency_key_header(body, &headers, &request_context.request_id) {
         Ok(v) => v,
-        Err(resp) => return wire.apply_protocol_version_header(resp),
+        Err(resp) => return resp,
     };
 
-    // Per MCP 2025-11-25 transport: an explicit invalid or unsupported
-    // `Mcp-Protocol-Version` header MUST cause HTTP 400. Absent headers are allowed;
-    // the runtime will fall back to the negotiated session version or the single
-    // supported revision. The gate also accepts the modern wire strings
-    // (DRAFT-2026-v1 / 2026-07-28) — registry-driven dispatch picks the
-    // right handler below.
-    //
-    // Pass the body's `id` through so the resulting JSON-RPC error
-    // envelope echoes it back (SEP-2575 says all error responses
-    // carry the request id; otherwise the client can't correlate).
-    let body_id_for_errors = body.as_object().and_then(|obj| obj.get("id")).cloned();
-    let legacy_wire = config.gateway.server.legacy_wire;
-    if let Err(response) =
-        enforce_http_protocol_version_header(&headers, body_id_for_errors.as_ref(), legacy_wire)
-    {
-        return response;
-    }
-    // Without the legacy wire, a request that negotiated a `2025-xx`
-    // revision or names a session is refused before any session work.
-    if !legacy_wire {
-        if !wire.is_modern() {
-            return legacy_wire_refused(&headers, &body);
+    let request_id = request_context.request_id.clone();
+    let outcome = dispatch(&runtime, &config, body, request_context, Some(&headers)).await;
+    match outcome {
+        DispatchOutcome::Rejected(rejection) => map_transport_rejection(rejection, &request_id),
+        DispatchOutcome::Stream {
+            plan: StreamPlan::SubscriptionsListen,
+            ctx,
+            session_id,
+            body,
+        } => subscriptions_listen_handler(state.clone(), ctx, session_id, body).await,
+        DispatchOutcome::Stream {
+            plan: StreamPlan::EventsStream,
+            ctx,
+            body,
+            ..
+        } => {
+            events_stream::events_stream_handler(state.clone(), ctx, body, client_accepts_sse).await
         }
-        if headers.contains_key(SESSION_ID_HEADER) {
-            return session_header_refused(body_id_for_errors);
-        }
-    }
-
-    // MCP 2025-11-25: POST body MUST be a single JSON-RPC request, notification, or response.
-    // JSON-RPC batch arrays were removed from the spec in 2025-06-18 and are rejected.
-    if body.is_array() {
-        return wire.apply_protocol_version_header(map_protocol_error_response(
-            ProtocolError::invalid_request(
-                "JSON-RPC batch arrays are not supported; POST a single JSON-RPC message",
-            ),
-            &request_context.request_id,
-        ));
-    }
-
-    // (SEP-414 draft): if the request body carries
-    // `params._meta.traceparent` and the transport layer did not see a
-    // W3C header, promote the in-band value to the request's trace
-    // context so spans correlate.
-    if request_context.trace_context.is_none()
-        && let Some(body_meta_tc) = body
-            .get("params")
-            .and_then(|p| p.get("_meta"))
-            .and_then(crate::transports::TraceContext::from_meta_object)
-    {
-        request_context = request_context.with_trace_context(Some(body_meta_tc));
-    }
-
-    // Session-owner binding on the main dispatch path. The control was
-    // applied to GET / DELETE / subscribe / continuation but not here, so a
-    // caller presenting someone else's `Mcp-Session-Id` reached the session's
-    // tasks, cached idempotent results and subscriptions through an ordinary
-    // POST — the task store compares `record.session_id` only, and has no
-    // notion of who owns that session. Not-found-style on mismatch so the
-    // session's existence is not leaked, matching the GET path.
-    if let Some(ref sid) = request_context.session_id
-        && !runtime.caller_owns_session(sid, &request_context)
-    {
-        return with_request_id_header(
-            axum::http::StatusCode::NOT_FOUND.into_response(),
-            &request_context.request_id,
-        );
-    }
-
-    // A modern request routes through the registry-driven path
-    // (`handler.parse` → `handler.dispatch` via
-    // `runtime.handle_protocol_message`); a legacy one stays on
-    // `parse_client_message` + `map_client_message_to_operation`.
-    let dispatch = if let Some(handler) = modern_handler {
-        dispatch_modern(
-            &state,
+        DispatchOutcome::Response {
+            response,
+            notifications,
+            ctx,
+        } => finish_response(
             &runtime,
             &config,
-            handler,
             &headers,
-            body,
-            &request_context,
-            wire,
+            &ctx,
             client_accepts_sse,
-        )
-        .await
-    } else {
-        dispatch_legacy(&runtime, &config, body, &mut request_context).await
-    };
-    let dispatch = match dispatch {
-        Dispatch::Dispatched(outcome) => outcome,
-        Dispatch::Complete(response) => return response,
-    };
-
-    finish_response(
-        &state,
-        &runtime,
-        &config,
-        &headers,
-        &request_context,
-        wire,
-        client_accepts_sse,
-        dispatch,
-    )
-    .await
+            response,
+            notifications,
+        ),
+    }
 }
 
 /// The identity gate refused the credential: point the challenge at the
@@ -1054,321 +897,56 @@ fn authentication_required_response(
     ))
 }
 
-/// A request's dispatch either produced a runtime result the response tail has
-/// to shape, or produced the whole response itself (a rejection, or the
-/// long-lived `subscriptions/listen` stream, which does not fit the finite
-/// parse → dispatch shape).
-enum Dispatch {
-    Dispatched(DispatchOutcome),
-    Complete(Response),
-}
-
-/// What the response tail needs from whichever wire dispatched.
-struct DispatchOutcome {
-    response: Result<GatewayResponse, ProtocolError>,
-    /// Stream the result onto the session's SSE channel. Legacy only — the
-    /// modern wire never uses the long-lived channel for `tools/call`
-    /// responses.
-    should_stream_response: bool,
-    /// The synthetic session a modern `tools/call` ran under, so the tail can
-    /// drain that request's own `notifications/progress` +
-    /// `notifications/message` and, when any were produced, reframe the
-    /// buffered JSON result as a per-request SSE stream. `None` on every other
-    /// method and on the legacy wire.
-    modern_tools_call_session: Option<String>,
-}
-
-/// Modern (`2026-07-28`) dispatch: transport-header validation, the synthetic
-/// session, then `handler.parse` → `runtime.handle_protocol_message`.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch_modern(
-    state: &AppState,
-    runtime: &crate::runtime::GatewayRuntime,
-    config: &crate::config::AppConfig,
-    handler: std::sync::Arc<dyn crate::protocol::shared::traits::ProtocolHandler>,
-    headers: &HeaderMap,
-    body: Value,
-    request_context: &RequestContext,
-    wire: WireVersion,
-    client_accepts_sse: bool,
-) -> Dispatch {
-    let mut modern_tools_call_session: Option<String> = None;
-    // SEP-2243 transport-level header validation (handler decides).
-    if let Err(rejection) = handler.validate_transport_headers(headers, &body) {
-        return Dispatch::Complete(wire.apply_protocol_version_header(map_transport_rejection(
-            rejection,
-            &request_context.request_id,
-        )));
-    }
-    // TOOLS-09 (opt-in): when the operator enables
-    // `server.enforce_modern_request_meta`, require the SEP-2575
-    // per-request `_meta` identity triple on every id-bearing
-    // modern method, not just `server/discover`. Default off so
-    // existing modern clients are unaffected.
-    if config.gateway.server.enforce_modern_request_meta
-        && let Some(rejection) =
-            crate::protocol::v_2026_07_28::wire::enforce_request_meta_triple(&body)
-    {
-        return Dispatch::Complete(wire.apply_protocol_version_header(map_transport_rejection(
-            rejection,
-            &request_context.request_id,
-        )));
-    }
-    // Stamp the negotiated version onto the request context so
-    // version-aware code paths inside `handle_protocol_operation`
-    // (e.g., MRTR's `InputRequiredResult` vs the legacy SSE+202
-    // suspension envelope) can branch on it.
-    let mut stamped_context = request_context
-        .clone()
-        .with_negotiated_version(handler.version());
-
-    // SEP-2567/2575: the modern wire has no protocol-level
-    // sessions. A 2026-07-28 server MUST IGNORE any inbound
-    // `Mcp-Session-Id` (and the resume cursor it would key); the
-    // synthetic operational session is derived internally from the
-    // principal by `ensure_modern_session`, not adopted from a
-    // client-supplied header. Clearing it here also forces the
-    // synthetic mint instead of trusting a forged/foreign id.
-    stamped_context.session_id = None;
-    stamped_context.resume_cursor = None;
-
-    // SEP-2575 stateless: extract the per-request
-    // `_meta.io.modelcontextprotocol/clientCapabilities` from the
-    // request body and stash it on the context. The runtime's
-    // `client_capabilities_for_context` consults this BEFORE the
-    // session-bound caps, so suspending pipeline steps (elicitation /
-    // sampling / roots) gate correctly on modern stateless traffic
-    // where the synthetic session itself carries empty caps.
-    // The same `_meta` names the client of this one request.
-    stamped_context.client = modern_request_client(&body);
-    if let Some(caps_value) = body
-        .get("params")
-        .and_then(|p| p.get("_meta"))
-        .and_then(|m| m.get("io.modelcontextprotocol/clientCapabilities"))
-    {
-        match serde_json::from_value::<crate::protocol::ClientCapabilities>(caps_value.clone()) {
-            Ok(typed_caps) => {
-                stamped_context = stamped_context.with_modern_request_capabilities(typed_caps);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    request_id = stamped_context.request_id.as_str(),
-                    error = %error,
-                    "failed to deserialize modern _meta clientCapabilities"
-                );
-            }
-        }
-    }
-
-    // Modern stateless mode. When a modern request arrives
-    // without an `Mcp-Session-Id`, mint an ephemeral operational
-    // session so the legacy session-requiring dispatch paths
-    // still work. Pass-through when the client does supply a
-    // session header (e.g., across the migration). A store that
-    // refuses the row (`sessions.max_sessions`) is answered with
-    // explicit backpressure rather than a dispatch that would
-    // fail against a never-stored session.
-    let stamped_context = match runtime.ensure_modern_session(&stamped_context) {
-        crate::runtime::ModernSessionOutcome::Ready(ctx) => ctx,
-        crate::runtime::ModernSessionOutcome::CapacityExhausted => {
-            return Dispatch::Complete(wire.apply_protocol_version_header(
-                map_transport_rejection(
-                    crate::protocol::shared::messages::TransportRejection {
-                        status: 503,
-                        error_code: -32000,
-                        message: "session capacity exhausted; retry later".to_owned(),
-                        data: None,
-                        jsonrpc_id: body.get("id").cloned(),
-                    },
-                    &stamped_context.request_id,
-                ),
-            ));
-        }
-    };
-    // The ephemeral (row-less) session id this request runs under,
-    // if any — continuations materialize the real row post-dispatch.
-    let modern_ephemeral_session = if stamped_context.session_ephemeral {
-        stamped_context.session_id.clone()
-    } else {
-        None
-    };
-
-    // A long-lived POST-SSE response cannot fit in the finite
-    // `handler.parse` + `handler.dispatch` shape: the handler names the
-    // plan before parse and the dedicated streaming handler runs it.
-    if let Some(plan) = handler.long_lived_stream_plan(&body) {
-        use crate::protocol::shared::traits::StreamPlan;
-        runtime.record_request_received(&stamped_context, plan.method());
-        metrics::counter!("mcpg_requests_total", "operation" => plan.method(), "transport" => "http")
-            .increment(1);
-        let response = match plan {
-            StreamPlan::SubscriptionsListen => {
-                // The stream outlives the request, so an ephemeral session
-                // materializes its row first (session lifecycle then belongs
-                // to the TTL reaper, exactly as for a stored synthetic
-                // session).
-                if let Some(sid) = modern_ephemeral_session.as_deref() {
-                    runtime.materialize_ephemeral_session(sid);
-                }
-                modern_subscriptions_listen_handler(state.clone(), stamped_context, body).await
-            }
-            StreamPlan::EventsStream => {
-                events_stream::modern_events_stream_handler(
-                    state.clone(),
-                    stamped_context,
-                    body,
-                    client_accepts_sse,
-                )
-                .await
-            }
-        };
-        return Dispatch::Complete(response);
-    }
-
-    // RPN-4: remember the synthetic session id this `tools/call`
-    // runs under so the post-dispatch step can drain the request's
-    // own progress/log notifications from it. Captured BEFORE
-    // `handle_protocol_message` consumes `stamped_context`.
-    if body.get("method").and_then(serde_json::Value::as_str) == Some("tools/call") {
-        modern_tools_call_session = stamped_context.session_id.clone();
-    }
-
-    let resp = match handler.parse(body) {
-        Ok(message) => Ok(runtime
-            .handle_protocol_message(stamped_context, message)
-            .await),
-        Err(error) => Err(error),
-    };
-    // An ephemeral session has no store row. When the response hands
-    // the client a continuation (`resultType` `task` /
-    // `input_required` — a background task keeps delivering into the
-    // session; a suspended MRTR resumes against it), materialize the
-    // row now so the continuation behaves exactly like one under a
-    // stored synthetic session. A terminal response needs nothing:
-    // the id was never revealed on the wire (and inbound
-    // `Mcp-Session-Id` is ignored on this wire), so the request
-    // leaves zero session-store state behind. The RPN-4 drain below
-    // only needs the id string; pending deliveries live in the
-    // pipeline store, not the session row.
-    if let Some(sid) = modern_ephemeral_session.as_deref() {
-        let hands_continuation = matches!(
-            &resp,
-            Ok(response) if matches!(
-                &response.payload,
-                GatewayResponsePayload::Protocol(p)
-                    if p.http_status == 200
-                        && matches!(
-                            &p.response,
-                            ProtocolResponse::JsonRpcSuccess(s)
-                                if matches!(
-                                    s.result.get("resultType").and_then(serde_json::Value::as_str),
-                                    Some("task") | Some("input_required")
-                                )
-                        )
-            )
-        );
-        if hands_continuation {
-            runtime.materialize_ephemeral_session(sid);
-        }
-    }
-    // Modern wire never uses the long-lived SSE channel for
-    // tools/call responses — MRTR carries `InputRequiredResult`
-    // inline, server-initiated requests go through
-    // `subscriptions/listen`, and the per-request response stream
-    // (RPN-4) is handled by the dedicated post-dispatch branch
-    // below rather than this legacy `should_stream` flag.
-    Dispatch::Dispatched(DispatchOutcome {
-        response: resp,
-        should_stream_response: false,
-        modern_tools_call_session,
-    })
-}
-
-/// Legacy (`2025-11-25`) dispatch: parse the client message, apply the
-/// `sessions.optional` ephemeral lane, then `runtime.handle_request`.
-async fn dispatch_legacy(
-    runtime: &crate::runtime::GatewayRuntime,
-    config: &crate::config::AppConfig,
-    body: Value,
-    request_context: &mut RequestContext,
-) -> Dispatch {
-    let client_message = match parse_client_message(body) {
-        Ok(message) => message,
-        Err(error) => {
-            return Dispatch::Complete(map_protocol_error_response(
-                error,
-                &request_context.request_id,
-            ));
-        }
-    };
-
-    // `sessions.optional`: a legacy request that arrives without a
-    // session header for a session-requiring method rides the same
-    // ephemeral (row-less) lane the modern wire uses, instead of the
-    // `-32600` "missing session" rejection. `initialize` still mints
-    // a real session, and a request that supplied a session id keeps
-    // the stored path. The ephemeral snapshot pins the request's own
-    // (legacy) negotiated version.
-    let is_non_initialize_request = matches!(
-        client_message,
-        crate::protocol::ClientMessage::Request(ref request) if request.method != "initialize"
-    );
-    if config.mcp.configurations.sessions.optional
-        && request_context.session_id.is_none()
-        && is_non_initialize_request
-    {
-        let snapshot = crate::runtime::GatewayRuntime::ephemeral_session_snapshot_for(
-            request_context.negotiated_version.as_str(),
-        );
-        *request_context = request_context.clone().with_ephemeral_session(snapshot);
-    }
-
-    // Stream onto the session's SSE channel only for a request bound
-    // to a REAL (stored) session; an ephemeral session has no channel,
-    // so it answers with inline JSON (the `unary_json_fast_path`
-    // shape), interleaving any emitted notifications as one-shot SSE
-    // frames via the pending-delivery path below.
-    let should_stream = is_non_initialize_request
-        && request_context.session_id.is_some()
-        && !request_context.session_ephemeral;
-
-    let resp = match map_client_message_to_operation(client_message) {
-        Ok(operation) => {
-            let request = GatewayRequest::new(
-                request_context.clone(),
-                GatewayOperation::Protocol(operation),
-            );
-            Ok(runtime.handle_request(request).await)
-        }
-        Err(e) => Err(e),
-    };
-    Dispatch::Dispatched(DispatchOutcome {
-        response: resp,
-        should_stream_response: should_stream,
-        modern_tools_call_session: None,
-    })
-}
-
-/// Shape the dispatched result into the HTTP response: the modern per-request
-/// SSE stream, the ephemeral/unary inline-JSON fast paths, the legacy session
-/// SSE channel, or the POST-continuation upgrade — in that order, which is the
-/// order they were written in and the order their conditions assume.
-#[allow(clippy::too_many_arguments)]
-async fn finish_response(
-    state: &AppState,
+/// Shape the dispatched result into the HTTP response: an SSE stream of the
+/// request's notifications followed by its result, or the inline JSON
+/// result. A `-32601` is a `404`: the method does not exist on this endpoint.
+fn finish_response(
     runtime: &crate::runtime::GatewayRuntime,
     config: &crate::config::AppConfig,
     headers: &HeaderMap,
     request_context: &RequestContext,
-    wire: WireVersion,
     client_accepts_sse: bool,
-    dispatch: DispatchOutcome,
+    response: Result<ProtocolHttpResponse, ProtocolError>,
+    notifications: Vec<Value>,
 ) -> Response {
-    let DispatchOutcome {
-        response,
-        should_stream_response,
-        modern_tools_call_session,
-    } = dispatch;
+    let request_id = &request_context.request_id;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) if error.code() == METHOD_NOT_FOUND_CODE => {
+            return map_protocol_error_with_status(
+                error,
+                axum::http::StatusCode::NOT_FOUND,
+                &request_context.request_id,
+            );
+        }
+        Err(error) => return map_protocol_error_response(error, &request_context.request_id),
+    };
+    // A `tools/call` that emitted progress or log notifications
+    // answers a client that accepts `text/event-stream` with a per-request
+    // stream: the notifications in order, then the result, then the stream
+    // closes. A client that accepts only JSON gets the result inline.
+    if client_accepts_sse
+        && !notifications.is_empty()
+        && let ProtocolResponse::JsonRpcSuccess(success) = &response.response
+    {
+        let frames: Vec<String> = notifications
+            .iter()
+            .map(Value::to_string)
+            .chain(std::iter::once(
+                serde_json::to_string(success).unwrap_or_default(),
+            ))
+            .collect();
+        return with_request_id_header(map_response_stream(frames), request_id);
+    }
+    let response = with_request_id_header(map_protocol_http_response(response), request_id);
+    // Only a 401 or a 403 carries a challenge, so no other status pays for
+    // the challenge inputs below.
+    if !matches!(
+        response.status(),
+        axum::http::StatusCode::UNAUTHORIZED | axum::http::StatusCode::FORBIDDEN
+    ) {
+        return without_internal_headers(response);
+    }
     let auth_enabled = config.governance.access.is_enabled();
     // The challenge names the resource metadata bound to the hostname the
     // request arrived on, so a host reaching a custom domain discovers a
@@ -1385,494 +963,70 @@ async fn finish_response(
             resource,
             identity: caller,
         });
-    let dpop_challenge = runtime.dpop_challenge();
-    // SEP-2567/2575: a 2026-07-28 server MUST NOT surface `Mcp-Session-Id`
-    // on the wire. The synthetic operational session still exists
-    // internally (clustering / MRTR resume / delivery re-keying) but is
-    // never echoed on a modern response. Legacy (`2025-11-25`) keeps the
-    // session header byte-identical.
-    let session_id_for_header = if wire.is_modern() {
-        None
-    } else {
-        request_context.session_id.clone()
-    };
-
-    match response {
-        Ok(response) => {
-            // RPN-4: per-request SSE response stream for a modern
-            // (`2026-07-28`) `tools/call`. The spec's preferred shape is
-            // a POST that returns `text/event-stream` carrying this
-            // request's own `notifications/progress` +
-            // `notifications/message`, terminated by the JSON-RPC
-            // result. We take it ONLY when the tool/pipeline actually
-            // emitted such notifications for this request (drained from
-            // the request's synthetic session); a tool that emits
-            // nothing keeps the inline single-response fast path. The
-            // MRTR suspend (`resultType:"input_required"`) and task
-            // materialization (`resultType:"task"`) shapes are excluded
-            // — only a terminal `resultType:"complete"` is streamable —
-            // so suspend/resume + task surfaces are untouched.
-            if client_accepts_sse
-                && let Some(session_id) = modern_tools_call_session.as_deref()
-                && let GatewayResponsePayload::Protocol(protocol_http_response) = &response.payload
-                && protocol_http_response.http_status == 200
-                && let ProtocolResponse::JsonRpcSuccess(success) = &protocol_http_response.response
-                && wire_policy::modern_result_is_streamable_complete(&success.result)
-            {
-                let pending = runtime.take_pending_deliveries(session_id);
-                if !pending.is_empty() {
-                    let frames: Vec<String> = pending
-                        .into_iter()
-                        .map(|msg| msg.jsonrpc_message.to_string())
-                        .chain(std::iter::once(
-                            serde_json::to_value(success)
-                                .map(|v| v.to_string())
-                                .unwrap_or_default(),
-                        ))
-                        .collect();
-                    // No `Mcp-Session-Id` (TS-09) and no SSE event ids
-                    // (TS-11) on the modern wire. The terminal frame is
-                    // the JSON-RPC response; the stream then closes.
-                    return wire.apply_protocol_version_header(with_request_id_header(
-                        wire_policy::map_modern_response_stream(frames),
-                        &response.request_id,
-                    ));
-                }
-                // Pending empty ⇒ fall through to the inline JSON path.
-            }
-            // Ephemeral-session (`sessions.optional`) legacy request: it
-            // has no stored session, so no SSE replay channel exists —
-            // answer with inline JSON. If the tool/pipeline emitted
-            // per-request notifications, deliver them as one-shot SSE
-            // frames (store-free, non-resumable) terminated by the
-            // result, mirroring the modern ephemeral shape. Draining also
-            // keeps the pipeline store from retaining deliveries for a
-            // session id with no reaping row.
-            if client_accepts_sse
-                && request_context.session_ephemeral
-                && let Some(session_id) = request_context.session_id.as_deref()
-                && let GatewayResponsePayload::Protocol(p) = &response.payload
-                && p.http_status == 200
-                && let ProtocolResponse::JsonRpcSuccess(success) = &p.response
-            {
-                let pending = runtime.take_pending_deliveries(session_id);
-                if pending.is_empty() {
-                    let resp = with_www_authenticate_challenge(
-                        map_gateway_response(response),
-                        auth_enabled,
-                        &prm_url,
-                        scope.as_deref(),
-                        aauth_challenge,
-                        caller,
-                        dpop_challenge,
-                    );
-                    return resp;
-                }
-                let frames: Vec<String> = pending
-                    .into_iter()
-                    .map(|m| m.jsonrpc_message.to_string())
-                    .chain(std::iter::once(
-                        serde_json::to_value(success)
-                            .map(|v| v.to_string())
-                            .unwrap_or_default(),
-                    ))
-                    .collect();
-                return with_request_id_header(
-                    wire_policy::map_modern_response_stream(frames),
-                    &response.request_id,
-                );
-            }
-            // Legacy inline-JSON fast path (opt-in via
-            // `server.unary_json_fast_path`): a unary 200 result that emitted
-            // no server→client notifications answers with a single
-            // application/json body instead of a one-frame SSE stream. This
-            // skips the per-request SSE bookkeeping (replay-window append,
-            // priming/logging frames, session snapshot) that otherwise runs
-            // under the session lock. A request that DID emit notifications, or
-            // whose stream build fails, still streams / falls back cleanly.
-            if (should_stream_response || !client_accepts_sse)
-                && config.gateway.server.unary_json_fast_path
-                && request_context.session_id.is_some()
-                && matches!(
-                    &response.payload,
-                    GatewayResponsePayload::Protocol(p) if p.http_status == 200
-                )
-            {
-                let session_id = request_context.session_id.clone().unwrap();
-                let pending = runtime.take_pending_deliveries(&session_id);
-                if pending.is_empty() {
-                    let resp = with_www_authenticate_challenge(
-                        map_gateway_response(response),
-                        auth_enabled,
-                        &prm_url,
-                        scope.as_deref(),
-                        aauth_challenge,
-                        caller,
-                        dpop_challenge,
-                    );
-                    return with_session_id_header(resp, session_id_for_header.as_deref());
-                }
-                let pending_payloads: Vec<String> = pending
-                    .into_iter()
-                    .map(|m| m.jsonrpc_message.to_string())
-                    .collect();
-                let events = match &response.payload {
-                    GatewayResponsePayload::Protocol(p) => runtime
-                        .stream_protocol_response_with_pending(
-                            &session_id,
-                            &p.response,
-                            &pending_payloads,
-                        )
-                        .ok(),
-                    _ => None,
-                };
-                let resp = match events {
-                    Some(events) => {
-                        with_request_id_header(map_sse_events(events), &response.request_id)
-                    }
-                    None => with_www_authenticate_challenge(
-                        map_gateway_response(response),
-                        auth_enabled,
-                        &prm_url,
-                        scope.as_deref(),
-                        aauth_challenge,
-                        caller,
-                        dpop_challenge,
-                    ),
-                };
-                return with_session_id_header(resp, session_id_for_header.as_deref());
-            }
-            if should_stream_response
-                && let GatewayResponsePayload::Protocol(protocol_http_response) = &response.payload
-            {
-                // Case 1: runtime produced an immediate JSON-RPC result.
-                // Stream it so the POST response lands on the session's SSE
-                // channel — but only for a client that admitted
-                // `text/event-stream`. A JSON-only client falls through to the
-                // inline body below, which is the whole point of admitting it
-                // in `validate_post_accept`.
-                if client_accepts_sse
-                    && protocol_http_response.http_status == 200
-                    && let Some(session_id) = request_context.session_id.as_deref()
-                {
-                    // Drain any pipeline-emitted notifications (`log` /
-                    // `progress` steps) and interleave them between the
-                    // priming/logging events and the terminal response so the
-                    // client matches them to the in-flight request.
-                    let pending = runtime.take_pending_deliveries(session_id);
-                    let pending_payloads: Vec<String> = pending
-                        .into_iter()
-                        .map(|msg| msg.jsonrpc_message.to_string())
-                        .collect();
-                    if let Ok(events) = runtime.stream_protocol_response_with_pending(
-                        session_id,
-                        &protocol_http_response.response,
-                        &pending_payloads,
-                    ) {
-                        let sse_response =
-                            with_request_id_header(map_sse_events(events), &response.request_id);
-                        return with_session_id_header(
-                            sse_response,
-                            session_id_for_header.as_deref(),
-                        );
-                    }
-                }
-
-                // Case 2: runtime suspended the pipeline and queued a
-                // server-initiated request. MCP 2025-11-25 forbids returning
-                // `202` with an empty body for a POSTed JSON-RPC request — the
-                // canonical continuation is an SSE stream on the same POST.
-                //
-                // We open SSE here and subscribe the client to the session's
-                // delivery bus so it receives the pending server request and,
-                // once the pipeline resumes, the eventual terminal JSON-RPC
-                // response.
-                //
-                // This is the one upgrade that cannot honour a JSON-only
-                // `Accept`: there is no result to inline yet, and the spec
-                // forbids the empty-202 alternative. A client that reaches a
-                // suspending pipeline has to speak SSE.
-                if protocol_http_response.http_status == 202
-                    && matches!(
-                        protocol_http_response.response,
-                        ProtocolResponse::NotificationAccepted
-                    )
-                    && let Some(session_id) = request_context.session_id.clone()
-                {
-                    // Session-owner binding: only the creator may upgrade a
-                    // suspended POST to a continuation SSE on the session.
-                    if !state
-                        .runtime
-                        .load()
-                        .caller_owns_session(&session_id, request_context)
-                    {
-                        return with_request_id_header(
-                            axum::http::StatusCode::NOT_FOUND.into_response(),
-                            &request_context.request_id,
-                        );
-                    }
-                    let sse_response =
-                        open_post_continuation_sse(state, &session_id, &request_context.request_id)
-                            .await;
-                    return with_session_id_header(sse_response, session_id_for_header.as_deref());
-                }
-            }
-            let resp = with_www_authenticate_challenge(
-                map_gateway_response(response),
-                auth_enabled,
-                &prm_url,
-                scope.as_deref(),
-                aauth_challenge,
-                caller,
-                dpop_challenge,
-            );
-            let resp = with_session_id_header(resp, session_id_for_header.as_deref());
-            wire.apply_protocol_version_header(resp)
-        }
-        Err(error) => {
-            // SEP-2575 modern stateless: any method-not-found
-            // returns HTTP 404 + JSON-RPC `-32601`. Legacy keeps
-            // the historical HTTP 200 behaviour. `modern_handler`
-            // was set above when the registry picked the modern
-            // version — use that rather than the request_context,
-            // because the outer `request_context` here still
-            // carries its default `negotiated_version` (the
-            // stamped one is local to the modern arm above).
-            let resp = if wire.is_modern() && error.code() == crate::protocol::METHOD_NOT_FOUND_CODE
-            {
-                map_protocol_error_with_status(
-                    error,
-                    axum::http::StatusCode::NOT_FOUND,
-                    &request_context.request_id,
-                )
-            } else {
-                map_protocol_error_response(error, &request_context.request_id)
-            };
-            let resp = with_session_id_header(resp, session_id_for_header.as_deref());
-            wire.apply_protocol_version_header(resp)
-        }
-    }
+    with_www_authenticate_challenge(
+        response,
+        auth_enabled,
+        &prm_url,
+        scope.as_deref(),
+        aauth_challenge,
+        caller,
+        runtime.dpop_challenge(),
+    )
 }
 
-async fn modern_subscriptions_listen_handler(
+/// `subscriptions/listen`: a POST answered with an SSE stream of the
+/// notifications the request names, until the client closes it or the
+/// session ends ([`open_listen`]). The client-facing subscription id is the
+/// request's JSON-RPC id; the session that keys the delivery bus stays
+/// internal.
+async fn subscriptions_listen_handler(
     state: AppState,
-    request_context: crate::runtime::RequestContext,
+    request_context: RequestContext,
+    session_id: String,
     body: Value,
 ) -> Response {
-    use crate::protocol::v_2026_07_28::wire::subscriptions::{self, SubscriptionsListenParams};
-    use axum::http::StatusCode;
-    // `iter` and `ReceiverStream` are already imported at the
-    // top of this module (re-used by mcp_get_handler).
-
-    let request_id_value = body.get("id").cloned().unwrap_or(Value::Null);
-
-    // Parse params.
-    let Some(params_value) = body.get("params").cloned() else {
-        return map_protocol_error_response(
-            ProtocolError::invalid_params(
-                Some(request_id_value),
-                "missing subscriptions/listen params",
-                None,
-            ),
-            &request_context.request_id,
-        );
-    };
-    let params: SubscriptionsListenParams = match serde_json::from_value(params_value) {
-        Ok(p) => p,
-        Err(error) => {
-            return map_protocol_error_response(
-                ProtocolError::invalid_params(
-                    Some(request_id_value),
-                    format!("invalid subscriptions/listen params: {error}"),
-                    None,
-                ),
-                &request_context.request_id,
-            );
+    let request_id = request_context.request_id.clone();
+    let listen = match open_listen(&state, &request_context, &session_id, &body).await {
+        Ok(listen) => listen,
+        Err(ListenRefusal::Error(error)) => {
+            return map_protocol_error_response(error, &request_id);
         }
-    };
-
-    // SEP-2567/2575: the modern wire has no protocol-level sessions
-    // and no `Mcp-Session-Id` requirement. Subscriptions are keyed
-    // client-facing by the listen request's JSON-RPC id (the
-    // `subscriptionId` below); the server-internal synthetic session
-    // (principal-derived, minted by `ensure_modern_session`) is what
-    // the cross-instance delivery bus keys on — it always resolves on
-    // the modern path, so no hard session requirement is imposed on
-    // the client. If the synthetic minter ever failed, the delivery
-    // bus simply has nothing to subscribe to and the stream carries
-    // only the ack + the eventual graceful close.
-    let session_id = request_context.session_id.clone();
-
-    // Concurrent-SSE-slot reservation; released when the stream below is
-    // dropped (client disconnect / completion). Held here through the
-    // stream build so an early return still releases it via Drop.
-    let mut sse_slot: Option<SseStreamSlot> = None;
-
-    // Session-owner binding + per-session SSE cap only apply when an
-    // internal synthetic session backs the delivery bus (the normal
-    // modern path). These guards protect the server-internal bus; they
-    // are never surfaced on the wire.
-    if let Some(ref sid) = session_id {
-        // Only the creator may subscribe to the session's server-push
-        // delivery bus. Checked before the SSE counter so a foreign
-        // caller cannot inflate the victim's count.
-        if !state
-            .runtime
-            .load()
-            .caller_owns_session(sid, &request_context)
-        {
+        Err(ListenRefusal::NotOwner) => {
             return with_request_id_header(
-                StatusCode::NOT_FOUND.into_response(),
-                &request_context.request_id,
+                axum::http::StatusCode::NOT_FOUND.into_response(),
+                &request_id,
             );
         }
-
-        // Reserve a concurrent SSE slot — same backstop the legacy GET /mcp
-        // handler uses. The guard releases the slot when the stream is dropped.
-        match acquire_sse_slot(&state.sse_stream_counts, sid) {
-            Some(slot) => sse_slot = Some(slot),
-            None => {
-                metrics::counter!(
-                    "mcpg_sse_stream_limit_rejected_total",
-                    "session_id" => sid.clone(),
-                )
-                .increment(1);
-                return with_request_id_header(
-                    StatusCode::TOO_MANY_REQUESTS.into_response(),
-                    &request_context.request_id,
-                );
-            }
+        Err(ListenRefusal::TooManyStreams) => {
+            return with_request_id_header(
+                axum::http::StatusCode::TOO_MANY_REQUESTS.into_response(),
+                &request_id,
+            );
         }
-    }
-
-    // The subscription id is the listen request's JSON-RPC id as sent:
-    // a number stays a number.
-    let subscription_id = request_id_value.clone();
-    metrics::counter!("mcpg_subscriptions_listen_opened_total").increment(1);
-
-    let runtime = state.runtime.load();
-
-    // `resources/updated` targets are a real subscription, not just a
-    // filter: something has to tell the watch engine this URI is being
-    // watched or no update event is ever produced to filter. Register them
-    // the way the legacy `resources/subscribe` arm does — the guard
-    // unsubscribes when the stream ends, which is the modern wire's
-    // equivalent of `resources/unsubscribe`.
-    //
-    // Registration runs BEFORE the ack is built, because the ack reports what
-    // was established: a URI no resource route resolves, or one the store
-    // rejected, is not a subscription and must not be acked as one.
-    let watched_resources: Vec<String> = params
-        .subscriptions
-        .iter()
-        .filter_map(|target| match target {
-            subscriptions::SubscriptionTarget::ResourcesUpdated { uri } => Some(uri.clone()),
-            _ => None,
-        })
-        .collect();
-    let mut resource_subscriptions: Option<ResourceSubscriptionGuard> = None;
-    if let Some(ref sid) = session_id
-        && !watched_resources.is_empty()
-    {
-        match register_modern_resource_subscriptions(
-            &runtime,
-            &state.runtime,
-            sid,
-            &request_context,
-            &watched_resources,
-        )
-        .await
-        {
-            Ok(guard) => resource_subscriptions = Some(guard),
-            Err(denial) => {
-                return map_protocol_error_response(
-                    ProtocolError::application(
-                        Some(request_id_value),
-                        denial.code,
-                        denial.message,
-                        denial.data,
-                    ),
-                    &request_context.request_id,
-                );
-            }
+        Err(ListenRefusal::CapacityExhausted) => {
+            return map_transport_rejection(
+                crate::transports::dispatch::capacity_exhausted(body.get("id").cloned()),
+                &request_id,
+            );
         }
-    }
-
-    // The first frame is `notifications/subscriptions/acknowledged` with
-    // the honored filter; then the live notifications, each with the
-    // subscription id in `_meta`. The request's result comes only when the
-    // server ends the stream itself. No SSE event ids are assigned: a
-    // dropped stream is not resumed, the client listens again.
-    let established = resource_subscriptions
-        .as_ref()
-        .map(ResourceSubscriptionGuard::established)
-        .unwrap_or_default();
-    let honored = params.honored_notifications(&established);
-    let ack_payload = subscriptions::acknowledged_notification(&subscription_id, &honored);
-    let ack_event: Result<Event, Infallible> = Ok(Event::default()
-        .event("message")
-        .data(ack_payload.to_string()));
-
-    // Live event stream: subscribe to the server-internal (synthetic)
-    // session delivery bus, filter by subscription targets, stamp the
-    // client-facing subscriptionId on each. The bus is keyed on the
-    // synthetic session (cross-instance), which is decoupled from the
-    // wire-facing subscriptionId above.
-    let subscription_targets = std::sync::Arc::new(params.subscriptions);
-    let sub_id_for_filter = subscription_id.clone();
-    let receipts = UpdateReceipts::new(&state.runtime, &request_context);
-    let live: std::pin::Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send>,
-    > = if let Some(ref sid) = session_id {
-        Box::pin(
-            delivery_bus_sse(&runtime, sid, move |msg| {
-                // Each `DeliveryMessage.jsonrpc_message` is a JSON-RPC
-                // notification. Match it against the subscriber's target
-                // list; mutate to inject `_meta.subscriptionId`.
-                let mut payload = msg.jsonrpc_message;
-                let method = payload
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_owned();
-                if !subscriptions::subscription_matches(&subscription_targets, &method, &payload) {
-                    return None;
-                }
-                receipts.record(&payload, Some(&sub_id_for_filter.to_string()));
-                subscriptions::inject_subscription_id_meta(&mut payload, &sub_id_for_filter);
-                Some(Ok(Event::default()
-                    .event("message")
-                    .data(payload.to_string())))
-            })
-            .await,
-        )
-    } else {
-        Box::pin(tokio_stream::empty())
     };
-
-    // When the delivery bus closes (shutdown, session teardown) the
-    // server ends the subscription: the listen request's result tells the
-    // client the close is orderly, not a dropped connection.
-    let close_payload = subscriptions::closed_stream_result(&request_id_value);
-    let close_event: Result<Event, Infallible> = Ok(Event::default()
-        .event("message")
-        .data(close_payload.to_string()));
-
-    let priming = iter(vec![ack_event]);
-    let merged = priming.chain(live).chain(iter(vec![close_event]));
-    let guarded = SlottedEventStream {
-        inner: Box::pin(merged),
-        _slot: sse_slot,
-        _resource_subscriptions: resource_subscriptions,
-    };
-    let response = Sse::new(guarded)
-        .keep_alive(KeepAlive::default())
-        .into_response();
-    // SEP-2567/2575: never echo `Mcp-Session-Id` on the modern wire.
-    with_request_id_header(response, &request_context.request_id)
+    let events = listen.map(|frame| {
+        Ok::<_, Infallible>(Event::default().event("message").data(frame.to_string()))
+    });
+    with_request_id_header(
+        Sse::new(events)
+            .keep_alive(KeepAlive::default())
+            .into_response(),
+        &request_id,
+    )
 }
 
-async fn mcp_get_handler(
+/// `GET`, `HEAD` and `DELETE` on the MCP endpoint, whose only method is
+/// `POST`. The gates run in the order `POST` runs them, so these methods
+/// disclose nothing a `POST` would not: the browser hand-off (`GET`/`HEAD`
+/// only), then identity, the origin check (`403`) and authentication
+/// (`401`), and only then `405 Allow: POST`.
+async fn mcp_405_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
     connection: ConnectionExt,
@@ -1886,10 +1040,12 @@ async fn mcp_get_handler(
     // navigation (GET/HEAD, Accept has text/html and not text/event-stream)
     // 303s to the configured literal URL. Anonymous browsers are the point,
     // the Location carries no request data, and the request class it claims
-    // is otherwise a guaranteed 405/406 — so the pre-auth surface gets
-    // simpler here, not wider. `Vary: Accept` keeps a shared cache from
-    // serving the redirect to an SSE client.
-    if let Some(ref url) = config.gateway.server.browser_redirect_url {
+    // is otherwise a guaranteed 405 — so the pre-auth surface gets simpler
+    // here, not wider. `Vary: Accept` keeps a shared cache from serving the
+    // redirect to an SSE client.
+    if matches!(method, axum::http::Method::GET | axum::http::Method::HEAD)
+        && let Some(ref url) = config.gateway.server.browser_redirect_url
+    {
         let accept = headers
             .get(axum::http::header::ACCEPT)
             .and_then(|v| v.to_str().ok())
@@ -1935,339 +1091,14 @@ async fn mcp_get_handler(
     {
         return response;
     }
-    // SEP-2575: a 2026-07-28 server has no server-push GET stream
-    // (`subscriptions/listen` over POST replaces it) — answer 405.
-    // Legacy GET (SSE delivery) is unchanged.
-    let legacy_wire = config.gateway.server.legacy_wire;
-    if let Some(response) =
-        reject_method_on_modern_wire(&runtime, &headers, &request_context.request_id, legacy_wire)
-    {
-        return response;
-    }
-    if let Some(response) = validate_get_accept(&headers, &request_context.request_id) {
-        return response;
-    }
-    if let Err(response) = enforce_http_protocol_version_header(&headers, None, legacy_wire) {
-        return response;
-    }
-    // Session-owner binding: only the session's creator may drain its
-    // server-push stream. Checked before the per-session stream counter so
-    // a foreign caller cannot inflate the victim's count. Not-found-style
-    // on mismatch so existence isn't leaked.
-    if let Some(ref sid) = request_context.session_id
-        && !runtime.caller_owns_session(sid, &request_context)
-    {
-        return with_request_id_header(
-            axum::http::StatusCode::NOT_FOUND.into_response(),
-            &request_context.request_id,
-        );
-    }
-    // Reserve one of the session's concurrent SSE slots; the guard releases
-    // it when the stream below is dropped (client disconnect / completion).
-    let mut sse_slot: Option<SseStreamSlot> = None;
-    if let Some(ref sid) = request_context.session_id {
-        match acquire_sse_slot(&state.sse_stream_counts, sid) {
-            Some(slot) => sse_slot = Some(slot),
-            None => {
-                metrics::counter!(
-                    "mcpg_sse_stream_limit_rejected_total",
-                    "session_id" => sid.clone(),
-                )
-                .increment(1);
-                return with_request_id_header(
-                    axum::http::StatusCode::TOO_MANY_REQUESTS.into_response(),
-                    &request_context.request_id,
-                );
-            }
-        }
-    }
-
-    let opened = match runtime.open_sse_stream(&request_context) {
-        Err(StreamAccessError::InvalidCursor | StreamAccessError::ExpiredCursor)
-            if request_context
-                .resume_cursor
-                .as_ref()
-                .is_some_and(|cursor| {
-                    crate::runtime::session_store::delivery_id_from_event_id(&cursor.last_event_id)
-                        .is_some()
-                }) =>
-        {
-            // Delivery-tagged cursor whose stream window is not replayable
-            // here — another replica minted the stream, or the event fell out
-            // of the window. The tag still orders the coordinator backlog, so
-            // any replica can serve the resume: open a fresh stream and let
-            // the ack-prune + ordered drain below deliver exactly the missed
-            // suffix from KV. Only an untagged cursor keeps the 400/409
-            // answer — with no delivery tag there is nothing to replay from.
-            metrics::counter!("mcpg_sse_resume_backlog_fallback_total").increment(1);
-            let mut fresh_context = request_context.clone();
-            fresh_context.resume_cursor = None;
-            runtime.open_sse_stream(&fresh_context)
-        }
-        other => other,
-    };
-    match opened {
-        Ok(events) => {
-            let session_id = request_context.session_id.clone();
-
-            // Order matters for cross-replica delivery (continuation SSE).
-            // A terminal result published by a peer between the backlog drain
-            // and the live subscribe would be lost on BOTH paths: too late for
-            // the drain (its KV row is written after the drain reads), dropped
-            // on the bus (no subscriber yet). So SUBSCRIBE FIRST, then drain.
-            //
-            // Subscribing first reopens a different hazard: a delivery that is
-            // both still in the backlog AND replayed on the live bus would be
-            // delivered twice. We dedupe by content key: every drained message
-            // is recorded, and the first matching live event is suppressed
-            // (the duplicate is the same logical delivery). The dedupe set
-            // covers only the brief startup overlap, after which live events
-            // are never in the (already-drained) backlog.
-            if let Some(ref sid) = session_id {
-                // 0. Reconnect ack-prune: if the client reconnects
-                //    echoing a delivery-tagged Last-Event-Id, it has PROVEN it
-                //    received that backlog row (live or replayed) and — since
-                //    deliveries stream in sequence order — every row before
-                //    it. Delete that whole prefix from the coordinator-KV
-                //    backlog BEFORE draining, so the drain replays exactly the
-                //    suffix the client missed. The prune is epoch-guarded in
-                //    the store, so it cannot drop an unseen result.
-                if let Some(ref cursor) = request_context.resume_cursor {
-                    runtime.ack_deliveries_from_cursor(sid, &cursor.last_event_id);
-                }
-
-                // 1. Subscribe to the live delivery bus FIRST so nothing
-                //    published from this point on can fall through the gap.
-                //    The live filter suppresses the first occurrence of any
-                //    delivery whose content matches a just-drained backlog
-                //    entry (the race-window duplicate). The dedupe set is
-                //    shared with the filter because the helper subscribes
-                //    before the step-2 drain populates it; the drain
-                //    completes before any live event is polled, so the filter
-                //    always sees the full set.
-                let drained_keys: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<u64>>> =
-                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-                // Session store rather than the runtime — see
-                // `open_post_continuation_sse`. A GET stream is the longest-lived
-                // body the gateway serves, so pinning the runtime here is what
-                // kept a reload from ever retiring the old one.
-                let store = state.session_store.clone();
-                let sid_owned = sid.clone();
-                let filter_keys = std::sync::Arc::clone(&drained_keys);
-                let receipts = UpdateReceipts::new(&state.runtime, &request_context);
-                let live = delivery_bus_sse(&runtime, sid, move |msg| {
-                    let key = delivery_dedupe_key(&msg);
-                    if filter_keys.lock().expect("drained-keys lock").remove(&key) {
-                        // Same delivery already emitted from the backlog drain.
-                        None
-                    } else {
-                        receipts.record(&msg.jsonrpc_message, None);
-                        delivery_to_sse_event(&store, &sid_owned, msg)
-                    }
-                })
-                .await;
-
-                // 2. Drain the persisted backlog and assign replay event ids.
-                //    The scan drain consults the coordinator KV even when this
-                //    replica's pending index never saw the rows (they may have
-                //    been stored by a peer), and returns them in delivery
-                //    order — after the step-0 prefix prune that is exactly the
-                //    suffix the client missed.
-                //
-                //    A delivery can be both retained in the stream's replay
-                //    window (already in `events` above) and still in the
-                //    backlog; emit it once, from the window. Its row is
-                //    consumed by the drain either way.
-                let window_replayed: std::collections::HashSet<&str> = events
-                    .iter()
-                    .filter_map(|event| {
-                        crate::runtime::session_store::delivery_id_from_event_id(&event.event_id)
-                    })
-                    .collect();
-                let pending = runtime.drain_deliveries_for_reconnect(sid);
-                let mut sse_records = Vec::new();
-                {
-                    let mut keys = drained_keys.lock().expect("drained-keys lock");
-                    for msg in pending {
-                        if window_replayed.contains(msg.delivery_id.as_str()) {
-                            continue;
-                        }
-                        keys.insert(delivery_dedupe_key(&msg));
-                        if let Ok(records) = runtime.stream_delivery_message(
-                            sid,
-                            &msg.jsonrpc_message.to_string(),
-                            &msg.delivery_id,
-                        ) {
-                            sse_records.extend(records);
-                        }
-                    }
-                }
-
-                // 3. Build the initial stream (replay/priming + drained backlog).
-                let initial = iter(
-                    events
-                        .into_iter()
-                        .chain(sse_records)
-                        .map(sse_event_from_record),
-                );
-
-                let merged = initial.chain(live);
-                let guarded = SlottedEventStream {
-                    inner: Box::pin(merged),
-                    _slot: sse_slot,
-                    // The legacy GET stream carries no subscriptions of its
-                    // own: `resources/subscribe` owns them and
-                    // `resources/unsubscribe` releases them.
-                    _resource_subscriptions: None,
-                };
-                with_session_id_header(
-                    with_request_id_header(
-                        Sse::new(guarded)
-                            .keep_alive(KeepAlive::default())
-                            .into_response(),
-                        &request_context.request_id,
-                    ),
-                    session_id.as_deref(),
-                )
-            } else {
-                let initial = iter(events.into_iter().map(sse_event_from_record));
-                with_request_id_header(
-                    Sse::new(initial)
-                        .keep_alive(KeepAlive::default())
-                        .into_response(),
-                    &request_context.request_id,
-                )
-            }
-        }
-        Err(
-            StreamAccessError::MissingSessionId
-            | StreamAccessError::InvalidCursor
-            | StreamAccessError::NotInitialized,
-        ) => with_request_id_header(
-            axum::http::StatusCode::BAD_REQUEST.into_response(),
-            &request_context.request_id,
-        ),
-        Err(StreamAccessError::ExpiredCursor) => with_request_id_header(
-            axum::http::StatusCode::CONFLICT.into_response(),
-            &request_context.request_id,
-        ),
-        Err(StreamAccessError::UnknownSession) => with_request_id_header(
-            axum::http::StatusCode::NOT_FOUND.into_response(),
-            &request_context.request_id,
-        ),
-    }
-}
-
-/// DELETE handler for the MCP endpoint: terminates the session and cascades
-/// cleanup (session store removal, SSE stream counter pruning, tenant quota
-/// release, request-id tracker eviction, progress state purge).
-async fn mcp_delete_handler(
-    axum::extract::State(state): axum::extract::State<AppState>,
-    headers: HeaderMap,
-    connection: ConnectionExt,
-    peer: Option<axum::extract::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
-    method: axum::http::Method,
-    axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
-) -> Response {
-    let runtime = state.runtime.load();
-    let config = state.config.load();
-    // Browser hand-off, BEFORE identity and every other gate: a plain
-    // navigation (GET/HEAD, Accept has text/html and not text/event-stream)
-    // 303s to the configured literal URL. Anonymous browsers are the point,
-    // the Location carries no request data, and the request class it claims
-    // is otherwise a guaranteed 405/406 — so the pre-auth surface gets
-    // simpler here, not wider. `Vary: Accept` keeps a shared cache from
-    // serving the redirect to an SSE client.
-    if let Some(ref url) = config.gateway.server.browser_redirect_url {
-        let accept = headers
-            .get(axum::http::header::ACCEPT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if accept.contains("text/html") && !accept.contains(SSE_ACCEPT) {
-            metrics::counter!("mcpg_browser_redirects_total").increment(1);
-            return Response::builder()
-                .status(axum::http::StatusCode::SEE_OTHER)
-                .header(axum::http::header::LOCATION, url.clone())
-                .header(axum::http::header::VARY, "Accept")
-                .body(axum::body::Body::empty())
-                .unwrap();
-        }
-    }
-    let request_context = match build_full_request_context(
-        &headers,
-        &runtime,
-        connection.into_inner(),
-        config.gateway.server.trust_subject_header,
-        &method,
-        Some(
-            original_uri
-                .path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or("/"),
-        ),
-        peer.as_ref().map(|ext| ext.0.0.ip()),
-    )
-    .await
-    {
-        Ok(ctx) => ctx,
-        Err(resp) => return refused_credential_response(resp, &config, &headers),
-    };
-    if let Some(response) = validate_origin(
-        &headers,
-        &config.gateway.server.allowed_origins,
+    with_request_id_header(
+        (
+            axum::http::StatusCode::METHOD_NOT_ALLOWED,
+            [(axum::http::header::ALLOW, "POST")],
+        )
+            .into_response(),
         &request_context.request_id,
-    ) {
-        return response;
-    }
-    if let Some(response) =
-        authentication_required_response(&runtime, &config, &headers, &request_context)
-    {
-        return response;
-    }
-    // SEP-2567/2575: the modern wire has no protocol-level sessions to
-    // terminate — answer 405 on DELETE. Legacy DELETE (session
-    // termination) is unchanged.
-    let legacy_wire = config.gateway.server.legacy_wire;
-    if let Some(response) =
-        reject_method_on_modern_wire(&runtime, &headers, &request_context.request_id, legacy_wire)
-    {
-        return response;
-    }
-    if let Err(response) = enforce_http_protocol_version_header(&headers, None, legacy_wire) {
-        return response;
-    }
-    let Some(session_id) = request_context.session_id.as_deref() else {
-        return with_request_id_header(
-            axum::http::StatusCode::BAD_REQUEST.into_response(),
-            &request_context.request_id,
-        );
-    };
-
-    // Session-owner binding: only the creator may terminate the session.
-    // Not-found-style on mismatch so existence isn't leaked. The owner
-    // check lives at the HTTP layer (not the runtime wrapper) so admin /
-    // self-cleanup terminate paths stay unconditional.
-    if !runtime.caller_owns_session(session_id, &request_context) {
-        return with_request_id_header(
-            axum::http::StatusCode::NOT_FOUND.into_response(),
-            &request_context.request_id,
-        );
-    }
-
-    let response = if runtime.terminate_session(session_id) {
-        // prune SSE stream counter for terminated sessions.
-        if let Ok(mut counts) = state.sse_stream_counts.lock() {
-            counts.remove(session_id);
-        }
-        axum::http::StatusCode::NO_CONTENT.into_response()
-    } else {
-        axum::http::StatusCode::NOT_FOUND.into_response()
-    };
-
-    // The session identifier MUST be echoed on every session-scoped HTTP
-    // response, DELETE included (MCP 2025-11-25 Streamable HTTP).
-    let response = with_request_id_header(response, &request_context.request_id);
-    with_session_id_header(response, Some(session_id))
+    )
 }
 
 #[cfg(test)]

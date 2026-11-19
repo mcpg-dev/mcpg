@@ -85,7 +85,7 @@ pub(crate) trait IdpSessionSource: Send + Sync {
 /// neither the id nor the URL.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct UrlElicitation {
-    /// The link id: the `elicitationId` of `2025-11-25`.
+    /// The link id.
     pub(crate) id: String,
     pub(crate) url: String,
     pub(crate) message: String,
@@ -117,12 +117,8 @@ enum LinkSlot {
     /// The retry of a request that offered `link`, which may answer with
     /// it again.
     Resuming { link: String },
-    /// The request may answer with a link: the one it resumes, if any, and
-    /// the session told when it completes.
-    Open {
-        resume: Option<String>,
-        notify_session: Option<String>,
-    },
+    /// The request may answer with a link: the one it resumes, if any.
+    Open { resume: Option<String> },
     /// The link the request answers with.
     Offered(UrlElicitation),
 }
@@ -144,8 +140,6 @@ impl std::fmt::Debug for LinkSlot {
 pub(crate) struct LinkRequest {
     /// The link an earlier attempt of the request offered.
     pub(crate) resume: Option<String>,
-    /// The session told when the link completes.
-    pub(crate) notify_session: Option<String>,
 }
 
 impl ConnectLinkSlot {
@@ -163,9 +157,9 @@ impl ConnectLinkSlot {
         *self.lock() = LinkSlot::Declined;
     }
 
-    /// Let the request answer with a link, telling `notify_session` when
-    /// it completes; `false` when the user declined one.
-    pub(crate) fn open(&self, notify_session: Option<String>) -> bool {
+    /// Let the request answer with a link; `false` when the user declined
+    /// one.
+    pub(crate) fn open(&self) -> bool {
         let mut slot = self.lock();
         let resume = match std::mem::take(&mut *slot) {
             LinkSlot::Declined => {
@@ -175,22 +169,15 @@ impl ConnectLinkSlot {
             LinkSlot::Resuming { link } => Some(link),
             LinkSlot::Closed | LinkSlot::Open { .. } | LinkSlot::Offered(_) => None,
         };
-        *slot = LinkSlot::Open {
-            resume,
-            notify_session,
-        };
+        *slot = LinkSlot::Open { resume };
         true
     }
 
     /// What the request asks of a link, while it may answer with one.
     pub(crate) fn request(&self) -> Option<LinkRequest> {
         match &*self.lock() {
-            LinkSlot::Open {
-                resume,
-                notify_session,
-            } => Some(LinkRequest {
+            LinkSlot::Open { resume } => Some(LinkRequest {
                 resume: resume.clone(),
-                notify_session: notify_session.clone(),
             }),
             _ => None,
         }
@@ -291,8 +278,7 @@ pub(crate) async fn offer_link(
     let offer = LinkOffer {
         principal,
         client_id,
-        session_id: request.notify_session.as_deref().or(session_id),
-        notify: request.notify_session.is_some(),
+        session_id,
         resume: request.resume.as_deref(),
     };
     let link = match source.offer_link(offer).await {

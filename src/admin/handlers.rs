@@ -31,7 +31,8 @@ pub async fn runtime_info(State(svc): State<SharedAdmin>) -> impl IntoResponse {
     Json(svc.runtime_info())
 }
 
-/// Lists all active MCP sessions.
+/// Lists the internal session rows (the state the gateway holds for
+/// listen streams, tasks and requests that wait for input).
 pub async fn list_sessions(State(svc): State<SharedAdmin>) -> impl IntoResponse {
     Json(svc.list_sessions())
 }
@@ -50,7 +51,8 @@ pub async fn get_session(
     }
 }
 
-/// Forcefully terminates a session by ID.
+/// Forcefully terminates a session by ID: its listen streams end and its
+/// unfinished tasks are cancelled.
 pub async fn terminate_session(
     State(svc): State<SharedAdmin>,
     Path(id): Path<String>,

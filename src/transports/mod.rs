@@ -1,18 +1,22 @@
-//! Transport layer — pluggable wire transports for the MCP gateway.
-//!
-//! Currently supports HTTP/SSE (`http`), stdio (`stdio`), and the
+//! Transport layer of the MCP gateway: HTTP (`http`), stdio (`stdio`), the
+//! server transport plugins hand their requests to (`ingress`), and the
 //! outbound relay tunnel (`tunnel`).
-//! Also defines the shared `TraceContext` for W3C trace propagation.
+//!
+//! HTTP and stdio share one MCP dispatch ([`dispatch`]) and one
+//! `subscriptions/listen` stream ([`listen`]). Also defines the shared
+//! `TraceContext` for W3C trace propagation.
 
 pub mod anon_limit;
 pub mod attested;
+pub(crate) mod dispatch;
 pub mod http;
 pub mod http_route;
 pub mod ingress;
+pub(crate) mod listen;
+pub(crate) mod request_deadline;
 pub mod stdio;
 pub mod tls;
 pub mod tunnel;
-pub mod wire_policy;
 
 /// Pub(crate) bridge used by [`http_route`] to build a
 /// [`crate::runtime::RequestContext`] from the inbound HTTP headers.

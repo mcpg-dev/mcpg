@@ -1156,17 +1156,13 @@ fn authorization_details_value(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{GatewayRequestId, RequestIdentity, ResumeCursor, TransportKind};
+    use crate::runtime::{GatewayRequestId, RequestIdentity, TransportKind};
 
     fn sample_context(identity: RequestIdentity) -> RequestContext {
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some("session-1".to_owned()),
-            None::<ResumeCursor>,
-            identity,
-            TransportKind::Http,
-        )
+        let mut context =
+            RequestContext::new(GatewayRequestId::new(), None, identity, TransportKind::Http);
+        context.session_id = Some("session-1".to_owned());
+        context
     }
 
     #[test]

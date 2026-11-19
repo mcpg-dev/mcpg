@@ -418,26 +418,15 @@ impl GatewayRuntime {
         }
     }
 
-    /// Resolve the client's negotiated capabilities for the given request
-    /// context. Used by non-tool surfaces (prompts, resources) that share the
-    /// tool execution plumbing so pipeline steps can enforce capability gating.
+    /// The client capabilities of the given request: the ones its
+    /// `_meta["io.modelcontextprotocol/clientCapabilities"]` declares, else
+    /// the default (none). Pipeline steps that send the client a request
+    /// (elicitation, sampling, roots) are gated on them.
     pub(crate) fn client_capabilities_for_context(
         &self,
         context: &RequestContext,
     ) -> crate::protocol::ClientCapabilities {
-        // SEP-2575 stateless: a per-request `_meta.io.modelcontextprotocol/clientCapabilities`
-        // wins over the session-bound capabilities. Stateless clients
-        // never call `initialize`, so the synthetic session has empty
-        // caps; reading from the per-request envelope is what makes
-        // suspending steps (elicitation / sampling / roots) reachable.
-        if let Some(caps) = context.modern_request_capabilities.as_ref() {
-            return caps.clone();
-        }
-        context
-            .load_session_cached(&*self.session_store, false)
-            .ok()
-            .map(|snap| snap.client_capabilities.clone())
-            .unwrap_or_default()
+        context.request_capabilities.clone().unwrap_or_default()
     }
 
     pub(crate) fn record_policy_denial(
@@ -519,70 +508,30 @@ impl GatewayRuntime {
         }))
     }
 
-    pub(crate) fn map_session_error_to_protocol_response(
-        &self,
-        error: SessionAccessError,
-        id: Option<serde_json::Value>,
-    ) -> ProtocolHttpResponse {
-        match error {
-            SessionAccessError::MissingSessionId => {
-                metrics::counter!("mcpg_errors_total", "error_kind" => "session_missing_id")
-                    .increment(1);
-                protocol_http_error(
-                    400,
-                    id,
-                    -32600,
-                    format!("missing {} header", SESSION_ID_HEADER),
-                    None,
-                )
-            }
-            SessionAccessError::UnknownSession => {
-                metrics::counter!("mcpg_errors_total", "error_kind" => "session_not_found")
-                    .increment(1);
-                protocol_http_error(404, id, -32001, "unknown or expired MCP session", None)
-            }
-            SessionAccessError::NotInitialized => {
-                metrics::counter!("mcpg_errors_total", "error_kind" => "session_not_initialized")
-                    .increment(1);
-                protocol_http_error(
-                    400,
-                    id,
-                    -32600,
-                    "session has not completed notifications/initialized",
-                    None,
-                )
-            }
-        }
-    }
-
-    /// Resume a suspended pipeline after receiving a client response to a
-    /// server-initiated request (elicitation, sampling, or roots/list).
-    /// Looks up the pending request in the pipeline store, records the step
-    /// result, resumes execution from the next step, and delivers the final
-    /// result via the delivery bus to the client's SSE stream.
     /// Reject a pipeline-resume whose caller doesn't own the suspended
     /// pipeline. The owning session/principal is captured at suspension in
     /// `pipeline_state`; a resumer that learned/observed a pending
     /// `server_request_id` or replayed a `requestState` blob from another
     /// session must not drive the victim's pipeline forward (its later steps
     /// run under the OWNER's stored identity — privilege escalation +
-    /// answer injection). Mirrors the federation server-request bridge's
-    /// responder-session check.
+    /// answer injection). A handle-encoded `requestState` carries no owner
+    /// binding of its own, so this is its only owner check.
     ///
     /// Returns `Some(error_response)` to deny (a 200 not-found-style envelope
-    /// that doesn't leak the pipeline's existence), `None` to proceed.
+    /// under `reply_id` that doesn't leak the pipeline's existence), `None`
+    /// to proceed.
     ///
     /// Binds on PRINCIPAL first — the escalation-critical axis, stable across
-    /// requests on both wires; a cross-principal (incl. anonymous→identified)
-    /// resumer is rejected. Session binding is additionally enforced when the
-    /// owner is an identified caller (legacy stateful / principal-derived
-    /// modern session), and skipped for anonymous owners whose modern
-    /// synthetic session is per-request ephemeral — replay of those is
-    /// covered by the requestState single-use guard instead.
+    /// requests; a cross-principal (incl. anonymous→identified) resumer is
+    /// rejected. Session binding is additionally enforced when the owner is
+    /// an identified caller (its session is principal-derived), and skipped
+    /// for anonymous owners whose session is per-request ephemeral — replay
+    /// of those is covered by the requestState single-use guard instead.
     pub(crate) fn reject_foreign_pipeline_resumer(
         &self,
         request_context: &RequestContext,
         pipeline_state: &pipeline_store::PipelineExecutionState,
+        reply_id: &Value,
     ) -> Option<ProtocolHttpResponse> {
         if resumer_owns_pipeline(
             pipeline_state.request_context.identity.principal_id(),
@@ -597,15 +546,6 @@ impl GatewayRuntime {
             pipeline_id = %pipeline_state.pipeline_id,
             "pipeline resume denied: resumer session/principal does not own the suspended pipeline"
         );
-        Some(protocol_http_error(
-            200,
-            None,
-            -32600,
-            "no pending server request found for this response id",
-            self.debug_error_data(
-                request_context,
-                "the server request may have expired or already been handled",
-            ),
-        ))
+        Some(self.no_pending_request(request_context, reply_id.clone()))
     }
 }

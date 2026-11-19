@@ -18,7 +18,7 @@ The delivery bus is selected automatically at startup:
 3. Otherwise → in-process broadcast (single-instance only)
 
 **Why multi-instance requires a distributed backend:**
-Server-initiated messages (elicitation requests, sampling requests, deferred pipeline results) are emitted by the instance executing the pipeline. The SSE stream to the client may be held by a different instance behind a load balancer. The delivery bus routes these messages across instances. Without NATS or Redis, the message stays local and the pipeline hangs.
+A call paused on one instance (an `InputRequiredResult`) is retried on whichever instance the load balancer picks, which must load the paused pipeline; a task created on one instance is polled on another; and a notification raised on one instance must reach the `subscriptions/listen` stream another instance holds. Without NATS or Redis, that state and those notifications stay local.
 
 ---
 

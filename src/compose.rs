@@ -719,13 +719,6 @@ fn prewired_targets(config: &AppConfig, gateway_url: &str) -> Vec<serde_json::Va
         targets.push(serde_json::json!({
             "name": format!("upstream:{}", federation.name),
             "url": upstream.url,
-            // Pin what the gateway pinned; `auto` means it probes, so the
-            // inspector should probe too rather than guess differently.
-            "protocol_version": match upstream.protocol_version {
-                crate::config::UpstreamProtocolVersion::V2026_07_28 => "2026-07-28",
-                crate::config::UpstreamProtocolVersion::V2025_11_25 => "2025-11-25",
-                _ => "auto",
-            },
             "allow_private": upstream.upstream_safety.allow_private_backends,
         }));
     }
@@ -1282,10 +1275,7 @@ mod prewired_target_tests {
         let config = config_with(serde_json::json!([
             {
                 "name": "notes",
-                "upstream": {
-                    "url": "https://notes.example/mcp",
-                    "protocol_version": "2026-07-28"
-                }
+                "upstream": { "url": "https://notes.example/mcp" }
             },
             {
                 "name": "docs",
@@ -1296,10 +1286,8 @@ mod prewired_target_tests {
         assert_eq!(targets.len(), 3);
         assert_eq!(targets[1]["name"], "upstream:notes");
         assert_eq!(targets[1]["url"], "https://notes.example/mcp");
-        assert_eq!(targets[1]["protocol_version"], "2026-07-28");
-        // Unpinned upstream: the gateway probes, so the inspector probes.
         assert_eq!(targets[2]["name"], "upstream:docs");
-        assert_eq!(targets[2]["protocol_version"], "auto");
+        assert_eq!(targets[2]["url"], "https://docs.example/mcp");
     }
 
     /// Not one credential may travel on argv, which every process on the

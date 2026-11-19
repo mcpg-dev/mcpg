@@ -1,56 +1,27 @@
-//! [`SharedServices`] — the bundle of runtime services every
-//! [`ProtocolHandler`](crate::protocol::shared::traits::ProtocolHandler)
-//! impl receives at dispatch time.
+//! [`SharedServices`] — the bundle of services
+//! [`crate::protocol::Handler`] receives at dispatch time beside the
+//! runtime itself.
 //!
 //! Built once at boot in `app::build_from_config` and cloned (cheaply)
-//! into each handler. Every field is itself an `Arc<...>` so cloning
-//! the bundle is reference-counting.
-//!
-//! Handlers reach the gateway's runtime services (capability/plugin
-//! registries, gates, stores, buses, the execution dispatcher,
-//! pipeline engine, observability) through the [`GatewayRuntime`]
-//! handle held here, plus the MRTR `request_state_codec` carried
-//! directly on the bundle.
+//! where needed. Every field is itself an `Arc<...>` so cloning the
+//! bundle is reference-counting. The bundle holds what outlives a config
+//! reload: the MRTR `request_state_codec`, the MCP Events core and the
+//! tunnel's public URL.
 
 #![allow(dead_code)]
 
-use std::sync::{Arc, Weak};
-
-use arc_swap::ArcSwap;
+use std::sync::Arc;
 
 use crate::config::AppConfig;
 use crate::protocol::v_2026_07_28::dispatch::events::EventsHandlerSlot;
 #[cfg(test)]
 use crate::protocol::v_2026_07_28::dispatch::request_state::InMemoryRequestStateStore;
 use crate::protocol::v_2026_07_28::dispatch::request_state::RequestStateCodec;
-use crate::runtime::GatewayRuntime;
 
-/// All version-blind runtime services that
-/// [`ProtocolHandler`](crate::protocol::shared::traits::ProtocolHandler)
-/// implementations call into during dispatch.
+/// The services [`crate::protocol::Handler`] calls into during dispatch
+/// beside the runtime.
 ///
 /// Cloning a `SharedServices` is `Arc::clone` per field — cheap.
-///
-/// The bundle holds two handles:
-/// - `config_snapshot` — the operator config at boot time.
-/// - `runtime` — a **`Weak`** handle to the live
-///   `Arc<ArcSwap<GatewayRuntime>>`. The `Weak` is the key to avoid
-///   a memory leak: `GatewayRuntime` holds an
-///   `Arc<SharedServices>`; if `SharedServices` held a *strong*
-///   `Arc<ArcSwap<GatewayRuntime>>` we would form a reference cycle
-///   between the runtime, its bundle, and the swap cell. Handlers
-///   upgrade the `Weak` to a strong `Arc` transiently per dispatch
-///   call — the upgrade always succeeds during a real in-flight
-///   request because the transport keeps the runtime alive for the
-///   call's lifetime.
-///
-/// Holding the whole runtime as one handle (rather than per-service
-/// Arcs) is a pragmatic shortcut: it gives handlers everything they
-/// need (capability registry, plugin registry, gates, stores, buses,
-/// execution dispatcher, pipeline engine, observability) without
-/// re-plumbing each field through the bundle. Future passes can
-/// slim the bundle down to per-service Arcs as fields are factored
-/// out of `GatewayRuntime`.
 #[derive(Clone)]
 pub struct SharedServices {
     /// Operator-provided gateway configuration snapshot, captured at
@@ -59,17 +30,11 @@ pub struct SharedServices {
     /// rebuilding `SharedServices`.
     pub config_snapshot: Arc<AppConfig>,
 
-    /// Live [`GatewayRuntime`] handle (held weakly to avoid the
-    /// runtime→services→runtime cycle described above). Use
-    /// [`Self::runtime`] to obtain a strong `Arc<ArcSwap<...>>` for
-    /// dispatch.
-    runtime: Weak<ArcSwap<GatewayRuntime>>,
-
     /// MRTR `requestState` codec — encodes / decodes the opaque
     /// pipeline-resumption blob carried on
     /// [`InputRequiredResult`](crate::protocol::v_2026_07_28::wire::mrtr::InputRequiredResult).
-    /// Encoded when the modern `tools/call` path suspends awaiting
-    /// input, and decoded again when the pipeline resumes.
+    /// Encoded when a `tools/call` or `prompts/get` pipeline suspends
+    /// awaiting input, and decoded again when the pipeline resumes.
     pub request_state_codec: Arc<RequestStateCodec>,
 
     /// The MCP Events core, once installed. The bundle outlives config
@@ -83,58 +48,74 @@ pub struct SharedServices {
     /// The URL the relay of a public tunnel assigned this gateway, while
     /// the tunnel is up.
     pub tunnel_public_url: Arc<arc_swap::ArcSwapOption<String>>,
+
+    /// The synthetic-session HMAC state keyed from `config_snapshot`, or
+    /// `None` when it configures no key.
+    pub synthetic_session_mac: Option<Arc<hmac_sha256::HMAC>>,
 }
 
 impl SharedServices {
-    /// Construct a bundle from the boot-time configuration snapshot
-    /// and the gateway runtime swap handle. The runtime handle is
-    /// stored weakly internally. The MRTR `requestState` codec is
-    /// supplied separately so boot wiring can source the encryption
-    /// key from operator config.
+    /// Construct a bundle from the boot-time configuration snapshot. The
+    /// MRTR `requestState` codec is supplied separately so boot wiring can
+    /// source the encryption key from operator config.
     pub fn new(
         config_snapshot: Arc<AppConfig>,
-        runtime: &Arc<ArcSwap<GatewayRuntime>>,
         request_state_codec: Arc<RequestStateCodec>,
     ) -> Self {
+        use crate::runtime::GatewayRuntime;
+        let synthetic_session_mac = GatewayRuntime::synthetic_session_key(&config_snapshot)
+            .map(|key| Arc::new(GatewayRuntime::synthetic_session_mac(&key)));
         Self {
             config_snapshot,
-            runtime: Arc::downgrade(runtime),
             request_state_codec,
             events: Arc::default(),
             events_core: Arc::default(),
             tunnel_public_url: Arc::default(),
+            synthetic_session_mac,
         }
     }
 
-    /// Upgrade the runtime handle and return the strong
-    /// `Arc<ArcSwap<GatewayRuntime>>`. Returns `None` only if the
-    /// gateway is in the process of shutting down and the outer
-    /// [`AppState`](crate::app::AppState) has already dropped its
-    /// runtime — in normal in-flight dispatch this always succeeds.
-    pub fn runtime(&self) -> Option<Arc<ArcSwap<GatewayRuntime>>> {
-        self.runtime.upgrade()
-    }
-
-    /// Test-only constructor that produces a [`SharedServices`] whose
-    /// `runtime` `Weak` is unupgradeable. Useful for unit tests that
-    /// exercise the shutdown-mid-dispatch path on a
-    /// [`ProtocolHandler`](crate::protocol::shared::traits::ProtocolHandler)
-    /// without standing up a full `GatewayRuntime` fixture. The
-    /// MRTR codec is minted with a deterministic test key + the
-    /// in-memory store so tests can drive the encryption path
-    /// without standing up real persistence.
+    /// A bundle over `config_snapshot` whose MRTR codec has a fixed test
+    /// key and the in-memory store, so tests drive the encryption path
+    /// without real persistence.
     #[cfg(test)]
-    pub fn with_no_runtime(config_snapshot: Arc<AppConfig>) -> Self {
-        Self {
+    pub fn for_tests(config_snapshot: Arc<AppConfig>) -> Self {
+        Self::new(
             config_snapshot,
-            runtime: Weak::new(),
-            request_state_codec: Arc::new(RequestStateCodec::new(
+            Arc::new(RequestStateCodec::new(
                 *b"0123456789abcdef0123456789abcdef",
                 Arc::new(InMemoryRequestStateStore::new()),
             )),
-            events: Arc::default(),
-            events_core: Arc::default(),
-            tunnel_public_url: Arc::default(),
-        }
+        )
     }
+}
+
+/// A runtime for a protocol-layer test, carrying what dispatch reads of
+/// `config` from the runtime: the events config and the embedded
+/// authorization server.
+#[cfg(test)]
+pub(crate) fn test_runtime(config: &AppConfig) -> crate::runtime::GatewayRuntime {
+    let mut runtime = crate::runtime::GatewayRuntime::new(
+        "mcpg",
+        "0.1.0",
+        "127.0.0.1:8787",
+        "/health",
+        "/mcp",
+        "info",
+        vec![crate::config::SinkConfig {
+            kind: "stdout".to_owned(),
+            config: serde_json::json!({"format": "json"}),
+            level: None,
+        }],
+        true,
+    );
+    runtime.set_events_config(config.mcp.configurations.events.clone());
+    runtime.set_ema_authorization_server(
+        crate::app::build_ema_authorization_server(
+            config,
+            crate::runtime::authorization_server::ReplayLedger::in_process(),
+        )
+        .expect("a valid authorization server config"),
+    );
+    runtime
 }

@@ -7,16 +7,13 @@
 //!    to decide who receives an update;
 //! 2. a per-URI entry in the [`WatchEngine`], which is what actually *produces*
 //!    updates and refcounts how many subscribers still want them;
-//! 3. a holder — a legacy `resources/subscribe` call, or a modern
-//!    `subscriptions/listen` stream — whose lifetime says how long the other
-//!    two should exist.
+//! 3. a holder — a `subscriptions/listen` stream — whose lifetime says how
+//!    long the other two should exist.
 //!
-//! Spreading that across the two transports made the three disagree in both
-//! directions: two `subscriptions/listen` streams over the same principal's
-//! synthetic session shared one store row, so whichever ended first deleted the
-//! row the other was still being served by; and session teardown dropped the
-//! rows without telling the watch engine, leaving a watcher polling a resource
-//! nobody was subscribed to for the life of the process.
+//! Two `subscriptions/listen` streams over the same principal's session share
+//! one `(session, uri)` row, so the row stays until the last of them ends; and
+//! session teardown releases the watch engine's count as well as the rows, so
+//! no watcher polls a resource nobody is subscribed to.
 //!
 //! This module owns all three together. Callers hold a [`SubscriptionLease`]
 //! and nothing else: acquiring one creates the row and the watcher on the first
@@ -41,10 +38,6 @@ type Key = (String, String);
 struct Holders {
     count: usize,
     identity: Option<SubscriberIdentity>,
-    /// Streams hold the row under this replica's watch member, so it goes
-    /// when the member leaves the fleet; otherwise it lives as long as the
-    /// session.
-    held: bool,
 }
 
 /// Owns the store rows, the watch-engine refcounts, and the holder counts that
@@ -113,11 +106,11 @@ impl SubscriptionService {
     /// Write every row this replica holds again: the watch member was gone
     /// from the store, so another replica may have removed them.
     fn rewrite_rows(self: &Arc<Self>) {
-        let rows: Vec<(Key, Option<SubscriberIdentity>, bool)> = self
+        let rows: Vec<(Key, Option<SubscriberIdentity>)> = self
             .lock_holders()
             .iter()
             .filter(|(_, holders)| holders.count > 0)
-            .map(|(key, holders)| (key.clone(), holders.identity.clone(), holders.held))
+            .map(|(key, holders)| (key.clone(), holders.identity.clone()))
             .collect();
         if rows.is_empty() {
             return;
@@ -125,8 +118,8 @@ impl SubscriptionService {
         let service = Arc::clone(self);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                for ((session_id, uri), identity, held) in rows {
-                    if let Err(error) = service.write_row(&session_id, &uri, identity, held) {
+                for ((session_id, uri), identity) in rows {
+                    if let Err(error) = service.write_row(&session_id, &uri, identity) {
                         tracing::debug!(
                             session_id = %session_id,
                             uri = %uri,
@@ -139,14 +132,16 @@ impl SubscriptionService {
         }
     }
 
+    /// Write the row of `(session_id, uri)`. In a fleet the row names this
+    /// replica's watch member as its holder, so it goes when the member
+    /// leaves the fleet; otherwise it lives as long as the session.
     fn write_row(
         &self,
         session_id: &str,
         uri: &str,
         identity: Option<SubscriberIdentity>,
-        held: bool,
     ) -> Result<(), SubscriptionError> {
-        match self.watch.member_id().filter(|_| held) {
+        match self.watch.member_id() {
             Some(member) => self.store.subscribe_held(session_id, uri, identity, member),
             None => self.store.subscribe(session_id, uri, identity),
         }
@@ -204,7 +199,6 @@ impl SubscriptionService {
                         Holders {
                             count: 1,
                             identity: identity.clone(),
-                            held: true,
                         },
                     );
                     true
@@ -213,7 +207,7 @@ impl SubscriptionService {
         };
 
         if fresh {
-            if let Err(error) = self.write_row(session_id, uri, identity, true) {
+            if let Err(error) = self.write_row(session_id, uri, identity) {
                 self.lock_holders().remove(&key);
                 return Err(error);
             }
@@ -289,66 +283,6 @@ impl SubscriptionService {
                 }
             });
         }
-    }
-
-    /// Legacy `resources/subscribe`: one idempotent holder per
-    /// `(session, uri)`.
-    ///
-    /// The legacy wire has no per-stream identity — `resources/unsubscribe`
-    /// means "this session is done with this URI", so a repeat subscribe must
-    /// not add a holder that a single unsubscribe then fails to remove.
-    /// Returns whether this call established the subscription.
-    pub async fn subscribe_once(
-        self: &Arc<Self>,
-        session_id: &str,
-        uri: &str,
-        identity: Option<SubscriberIdentity>,
-    ) -> Result<bool, SubscriptionError> {
-        let key = (session_id.to_owned(), uri.to_owned());
-        {
-            let mut holders = self.lock_holders();
-            if let Some(existing) = holders.get_mut(&key) {
-                // Also revives a zero count whose release is still queued.
-                existing.count = 1;
-                return Ok(false);
-            }
-            holders.insert(
-                key.clone(),
-                Holders {
-                    count: 1,
-                    identity: identity.clone(),
-                    held: false,
-                },
-            );
-        }
-        if let Err(error) = self.write_row(session_id, uri, identity, false) {
-            self.lock_holders().remove(&key);
-            return Err(error);
-        }
-        self.watch.notify_subscribe(uri).await;
-        Ok(true)
-    }
-
-    /// Whether this replica holds a subscription of `session_id` on `uri`.
-    pub fn is_held(&self, session_id: &str, uri: &str) -> bool {
-        self.lock_holders()
-            .get(&(session_id.to_owned(), uri.to_owned()))
-            .is_some_and(|holders| holders.count > 0)
-    }
-
-    /// Legacy `resources/unsubscribe`: drop the session's holder on this URI
-    /// regardless of count. Returns whether there was one.
-    pub async fn unsubscribe_once(self: &Arc<Self>, session_id: &str, uri: &str) -> bool {
-        let key = (session_id.to_owned(), uri.to_owned());
-        let had_holder = self.lock_holders().remove(&key).is_some();
-        // The row can outlive this replica's holder table (restart, cross-
-        // replica subscribe), so delete unconditionally; only the watch-engine
-        // decrement is conditional, since that count is this replica's.
-        let removed_row = self.store.unsubscribe(session_id, uri).unwrap_or(false);
-        if had_holder {
-            self.watch.notify_unsubscribe(uri).await;
-        }
-        had_holder || removed_row
     }
 
     /// Stop the watch engine and every watcher it started.
@@ -490,8 +424,8 @@ mod tests {
             .expect("second lease");
 
         drop(first);
-        // Give the reaper every chance to get this wrong before asserting it
-        // did not: a bare `drop` used to delete the shared row outright.
+        // Give the reaper every chance to delete the shared row before
+        // asserting it did not.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
             service.store.subscribers_for("file:///a").len(),
@@ -729,34 +663,6 @@ mod tests {
         for neighbour in ["ses", "sess-2", "sesst"] {
             assert_eq!(service.store.subscriptions_for_session(neighbour).len(), 2);
         }
-    }
-
-    /// The legacy wire's contract: subscribing twice then unsubscribing once
-    /// leaves the session unsubscribed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn legacy_subscribe_is_idempotent() {
-        let service = service();
-        assert!(
-            service
-                .subscribe_once("sess", "file:///a", None)
-                .await
-                .expect("first subscribe"),
-            "the first subscribe establishes the subscription"
-        );
-        assert!(
-            !service
-                .subscribe_once("sess", "file:///a", None)
-                .await
-                .expect("second subscribe"),
-            "a repeat subscribe must not establish a second holder"
-        );
-
-        assert!(service.unsubscribe_once("sess", "file:///a").await);
-        assert!(
-            service.store.subscribers_for("file:///a").is_empty(),
-            "one unsubscribe must fully unsubscribe"
-        );
-        assert!(!service.unsubscribe_once("sess", "file:///a").await);
     }
 
     /// A store that refuses the subscription must not leave a holder behind —

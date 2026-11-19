@@ -526,7 +526,7 @@ A `watch.strategy` block makes a resource entry reactive: the
 strategy plugin runs a tracking query at `interval_ms` and
 emits a `WatchEvent` whenever the scalar advances. The gateway
 fans the event out as `notifications/resources/updated` to
-every subscribed MCP session.
+every subscribed `subscriptions/listen` stream.
 
 ```yaml
 - name: orders_feed

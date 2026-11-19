@@ -31,7 +31,7 @@ use crate::protocol::v_2026_07_28::extensions::events::wire::{
 };
 use crate::protocol::v_2026_07_28::wire::operations::EventsExtensionOperation;
 use crate::runtime::shared_services::SharedServices;
-use crate::runtime::{RequestContext, TransportKind};
+use crate::runtime::{GatewayRuntime, RequestContext, TransportKind};
 
 /// The events core, as the protocol layer sees it.
 ///
@@ -101,15 +101,6 @@ impl std::fmt::Debug for EventsHandlerSlot {
     }
 }
 
-/// The events config in force: the live runtime's, which a reload
-/// replaces, else the boot snapshot while the runtime is shutting down.
-pub(crate) fn live_events_config(services: &SharedServices) -> EventsConfig {
-    match services.runtime() {
-        Some(runtime) => runtime.load().events_config().clone(),
-        None => services.config_snapshot.mcp.configurations.events.clone(),
-    }
-}
-
 /// Whether `events/*` exist for this request: enabled by config, a core
 /// installed, and the HTTP transport (the only one that carries the
 /// `2026-07-28` wire).
@@ -121,22 +112,22 @@ pub(crate) fn events_served(
     config.enabled && *transport == TransportKind::Http && services.events.is_installed()
 }
 
-/// Dispatch one `events/*` operation.
+/// Dispatch one `events/*` operation under the events config of `runtime`,
+/// which a reload replaces.
 pub(crate) async fn dispatch_events_extension(
     ctx: &RequestContext,
+    runtime: &GatewayRuntime,
     services: &SharedServices,
     op: EventsExtensionOperation,
 ) -> ProtocolHttpResponse {
-    let config = live_events_config(services);
+    let config = runtime.events_config();
     let handler = match services.events.get() {
-        Some(handler) if events_served(&config, services, &ctx.transport) => Arc::clone(handler),
+        Some(handler) if events_served(config, services, &ctx.transport) => Arc::clone(handler),
         _ => return method_not_found(op.request_id().clone(), op.method()),
     };
     let method = op.method();
     let numbering = config.error_codes.numbering();
-    if let Some(runtime) = services.runtime()
-        && let Err(limit) = runtime.load().admit_plan_rps("events")
-    {
+    if let Err(limit) = runtime.admit_plan_rps("events") {
         return plan_rps_refusal(Some(op.request_id().clone()), limit, numbering);
     }
     match op {
@@ -235,7 +226,6 @@ pub(crate) fn events_error_response(
 ) -> ProtocolHttpResponse {
     ProtocolHttpResponse {
         http_status: events_error_http_status(error.code()),
-        session_id_header: None,
         response: ProtocolResponse::JsonRpcError(error.numbered(numbering).into_jsonrpc_error(id)),
     }
 }
@@ -352,8 +342,6 @@ mod tests {
         RequestContext::new(
             GatewayRequestId::new(),
             None,
-            None,
-            None,
             RequestIdentity::Anonymous {
                 source: "test".to_owned(),
             },
@@ -364,7 +352,18 @@ mod tests {
     fn services(enabled: bool) -> SharedServices {
         let mut config = AppConfig::default();
         config.mcp.configurations.events.enabled = enabled;
-        SharedServices::with_no_runtime(Arc::new(config))
+        SharedServices::for_tests(Arc::new(config))
+    }
+
+    /// Dispatch `op` as the handler does, over the runtime the services'
+    /// config builds.
+    async fn dispatch(
+        ctx: &RequestContext,
+        services: &SharedServices,
+        op: EventsExtensionOperation,
+    ) -> ProtocolHttpResponse {
+        let runtime = crate::runtime::shared_services::test_runtime(&services.config_snapshot);
+        dispatch_events_extension(ctx, &runtime, services, op).await
     }
 
     fn list_op() -> EventsExtensionOperation {
@@ -409,8 +408,7 @@ mod tests {
     #[tokio::test]
     async fn not_served_without_a_core_even_when_enabled() {
         let services = services(true);
-        let response =
-            dispatch_events_extension(&context(TransportKind::Http), &services, list_op()).await;
+        let response = dispatch(&context(TransportKind::Http), &services, list_op()).await;
         assert_eq!(response.http_status, 404);
         let (code, _, id) = error_body(&response);
         assert_eq!(code, -32601);
@@ -422,8 +420,7 @@ mod tests {
         let services = services(false);
         let core = install(&services, ScriptedCore::default());
         for op in [list_op(), subscribe_op()] {
-            let response =
-                dispatch_events_extension(&context(TransportKind::Http), &services, op).await;
+            let response = dispatch(&context(TransportKind::Http), &services, op).await;
             assert_eq!(response.http_status, 404);
             assert_eq!(error_body(&response).0, -32601);
         }
@@ -443,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_params_are_method_not_found_while_not_served() {
         for services in [services(false), services(true)] {
-            let response = dispatch_events_extension(
+            let response = dispatch(
                 &context(TransportKind::Http),
                 &services,
                 invalid_params_op(),
@@ -462,7 +459,7 @@ mod tests {
     async fn invalid_params_are_400_while_served() {
         let services = services(true);
         let core = install(&services, ScriptedCore::default());
-        let response = dispatch_events_extension(
+        let response = dispatch(
             &context(TransportKind::Http),
             &services,
             invalid_params_op(),
@@ -489,8 +486,7 @@ mod tests {
     async fn not_served_over_stdio() {
         let services = services(true);
         let core = install(&services, ScriptedCore::default());
-        let response =
-            dispatch_events_extension(&context(TransportKind::Stdio), &services, list_op()).await;
+        let response = dispatch(&context(TransportKind::Stdio), &services, list_op()).await;
         assert_eq!(error_body(&response).0, -32601);
         assert!(core.seen.lock().unwrap().is_empty());
     }
@@ -501,7 +497,7 @@ mod tests {
         let core = install(&services, ScriptedCore::default());
         let ctx = context(TransportKind::Http);
 
-        let listed = dispatch_events_extension(&ctx, &services, list_op()).await;
+        let listed = dispatch(&ctx, &services, list_op()).await;
         assert_eq!(listed.http_status, 200);
         match listed.response {
             ProtocolResponse::JsonRpcSuccess(success) => {
@@ -513,7 +509,7 @@ mod tests {
             other => panic!("expected success, got {other:?}"),
         }
 
-        let subscribed = dispatch_events_extension(&ctx, &services, subscribe_op()).await;
+        let subscribed = dispatch(&ctx, &services, subscribe_op()).await;
         match subscribed.response {
             ProtocolResponse::JsonRpcSuccess(success) => {
                 assert_eq!(success.id, json!("s-1"));
@@ -530,7 +526,7 @@ mod tests {
             )
             .unwrap(),
         };
-        let unsubscribed = dispatch_events_extension(&ctx, &services, unsubscribe).await;
+        let unsubscribed = dispatch(&ctx, &services, unsubscribe).await;
         match unsubscribed.response {
             ProtocolResponse::JsonRpcSuccess(success) => {
                 assert_eq!(success.result, json!({ "resultType": "complete" }));
@@ -556,8 +552,7 @@ mod tests {
             request_id: json!(6),
             params: serde_json::from_value(json!({ "name": "orders.created" })).unwrap(),
         };
-        let response =
-            dispatch_events_extension(&context(TransportKind::Http), &services, poll).await;
+        let response = dispatch(&context(TransportKind::Http), &services, poll).await;
         assert_eq!(response.http_status, 200);
         let (code, data, _) = error_body(&response);
         assert_eq!(code, -32014);
@@ -603,9 +598,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let response =
-                dispatch_events_extension(&context(TransportKind::Http), &services, subscribe_op())
-                    .await;
+            let response = dispatch(&context(TransportKind::Http), &services, subscribe_op()).await;
             assert_eq!(response.http_status, status, "{error}");
             let (got_code, data, id) = error_body(&response);
             assert_eq!(got_code, code);
@@ -642,7 +635,7 @@ mod tests {
             config.mcp.configurations.events.enabled = true;
             config.mcp.configurations.events.error_codes =
                 crate::config::events::EventErrorCodes::Sep3415;
-            let services = SharedServices::with_no_runtime(Arc::new(config));
+            let services = SharedServices::for_tests(Arc::new(config));
             install(
                 &services,
                 ScriptedCore {
@@ -650,9 +643,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let response =
-                dispatch_events_extension(&context(TransportKind::Http), &services, subscribe_op())
-                    .await;
+            let response = dispatch(&context(TransportKind::Http), &services, subscribe_op()).await;
             assert_eq!(response.http_status, status, "{error}");
             let (got_code, data, _) = error_body(&response);
             assert_eq!(got_code, code);

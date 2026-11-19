@@ -82,7 +82,7 @@ ten domains:
 - LLM sampling (requested with prompt hash + FinOps fields)
 - Payment processing (charged / failed with PCI-DSS-shaped receipt fields)
 - Pipeline transactions (started / completed / failed)
-- Session lifecycle (opened / terminated / initialized acked / handshake bookends)
+- Session lifecycle (session row terminated)
 - Cluster events (member join / leave / health change / leader changed)
 - Approval workflow (requested / granted / denied / expired)
 - Plugin chain (transform applied / catalog filtered / chain summary in tool.call.*)
@@ -173,7 +173,7 @@ URI of the resource the event acted on. Conventions:
 | `request://<id>` | cancellation, progress |
 | `http_route://<plugin_id>/<entity>` | HTTP-route plugin dispatch |
 | `config://gateway` | config reload |
-| `system://*` | gateway-internal (ping, etc.) |
+| `system://*` | gateway-internal |
 
 `None` is reserved for events with no resource concept (gateway
 boot / shutdown).
@@ -239,9 +239,9 @@ chain per call.
 | `mcpg.resource.read.success` | `resources/read` returned bytes | `resource://<uri>` | Success |
 | `mcpg.resource.read.denied` | `resources/read` was policy-rejected | `resource://<uri>` | Denied |
 | `mcpg.resource.read.not_found` | `resources/read` URI is unknown | `resource://<uri>` | Failure |
-| `mcpg.resource.subscribe` | `resources/subscribe` accepted, or a `subscriptions/listen` target established; `details.client` names the MCP client. Under `on_failure: fail_closed` a subscription whose record is lost is refused. | `resource://<uri>` | Success |
-| `mcpg.resource.unsubscribe` | `resources/unsubscribe` accepted, or a `subscriptions/listen` stream closed (`details.reason: stream_closed`) | `resource://<uri>` | Success |
-| `mcpg.resource.updated_delivered` | a stream handed a subscriber `notifications/resources/updated` (a delivery receipt; `details.client`, and `details.subscription_id` on the stateless wire) | `resource://<uri>` | Success |
+| `mcpg.resource.subscribe` | a `subscriptions/listen` target established; `details.client` names the MCP client. Under `on_failure: fail_closed` a subscription whose record is lost is refused. | `resource://<uri>` | Success |
+| `mcpg.resource.unsubscribe` | a `subscriptions/listen` stream closed (`details.reason: stream_closed`) | `resource://<uri>` | Success |
+| `mcpg.resource.updated_delivered` | a stream handed a subscriber `notifications/resources/updated` (a delivery receipt; `details.client` and `details.subscription_id`) | `resource://<uri>` | Success |
 | `mcpg.events.poll` | an `events/poll` returned events (`details.delivered`, `first_event_id`, `last_event_id`, the resume `cursor`), or started from no cursor (`details.started`); `details.client` names the MCP client. With the type's `audit.poll_heartbeat_secs` set, an empty poll from a cursor also writes one record per interval per poller (`details.heartbeat: true`); without it, it writes nothing. The subscription arguments follow the type's `audit.arguments` (below) | `event://<name>` | Success |
 | `mcpg.events.stream_opened` / `mcpg.events.stream_closed` | an `events/stream` began or ended (`details.stream_id`; on close `reason` and `events`); `details.client` names the MCP client; on open the arguments follow `audit.arguments` | `event://<name>` | Success |
 | `mcpg.prompt.get.success` | `prompts/get` returned a prompt | `prompt://<name>` | Success |
@@ -273,9 +273,7 @@ event.
 
 | Action | Trigger | Resource | Outcomes |
 |--------|---------|----------|----------|
-| `mcpg.session.opened` | `initialize` succeeded | `session://<id>` | Success |
-| `mcpg.session.terminated` | session evicted (idle / explicit close / quota) | `session://<id>` | Success |
-| `mcpg.session.initialized_acked` | client sent `notifications/initialized` | `session://<id>` | Success |
+| `mcpg.session.terminated` | session row ended (idle expiry / admin terminate) | `session://<id>` | Success |
 | `mcpg.auth.failed` | identity-resolution failure (invalid JWT / mTLS / OIDC mismatch) | `auth://<provider>` | Failure / Denied |
 
 `session.terminated` carries `details.duration_ms` and
@@ -299,13 +297,9 @@ or did step 3 fail and step 1+2 not roll back?".
 | Action | Trigger | Resource | Outcomes |
 |--------|---------|----------|----------|
 | `mcpg.elicitation.requested` | pipeline suspended on `elicitation/create` | `elicitation://<server_request_id>` | Success |
-| `mcpg.elicitation.completed` | client posted `notifications/elicitation/complete` | `elicitation://<server_request_id>` | Success / Denied / Failure |
 | `mcpg.roots.requested` | pipeline suspended on `roots/list` | `roots://<server_request_id>` | Success |
 | `mcpg.completion.requested` | client called `completion/complete` | `completion://<ref_name>` | Success |
 | `mcpg.operation.cancelled` | `notifications/cancelled` received | `request://<cancelled_request_id>` | Success |
-
-`elicitation.completed` outcome maps from `user_action`:
-`accept → Success`, `decline / cancel → Denied`, `other → Failure`.
 
 ### Payments
 
@@ -407,9 +401,7 @@ not its value. Plaintext never hits the audit lane.
 
 | Action | Trigger | Resource | Outcomes |
 |--------|---------|----------|----------|
-| `mcpg.ping.received` | client `ping` keepalive | `system://ping` | Success |
 | `mcpg.progress.notified` | gateway emitted `notifications/progress` | `request://<progress_token>` | Success |
-| `mcpg.logging.level_set` | client adjusted log verbosity via `logging/setLevel` | `session://<id>` | Success |
 
 These are emitted at typical rates that won't drown a SIEM; high-
 volume installations should route them to a dedicated sink with
@@ -891,11 +883,11 @@ output.
 
 ### Volume estimation
 
-Approximate emission rate at typical workloads (per session-second):
+Approximate emission rate at typical workloads (per client-second):
 
 | Workload | Events/s |
 |----------|----------|
-| Idle session | ~0.01 (ping every ~30s) |
+| Idle client | 0 |
 | Active tool calls (1 RPS) | ~3 (allowed + chain entries + completed + backend executed) |
 | Pipeline-heavy (1 RPS) | ~6–8 (started, per-step, completed) |
 | LLM streaming (1 RPS, 50 chunks) | ~50 (one progress event per chunk if `progress` is on) |

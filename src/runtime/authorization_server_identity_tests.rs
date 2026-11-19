@@ -90,14 +90,7 @@ fn admitted_by(cel_allow_if: &str, identity: RequestIdentity) -> bool {
         rules: Vec::new(),
     })
     .expect("policy compiles");
-    let context = RequestContext::new(
-        GatewayRequestId::new(),
-        None,
-        None,
-        None,
-        identity,
-        TransportKind::Http,
-    );
+    let context = RequestContext::new(GatewayRequestId::new(), None, identity, TransportKind::Http);
     matches!(
         gate.evaluate(
             &ToolPolicyContext::from_request_context(&context, "deploy"),

@@ -53,19 +53,13 @@ async fn a_task_status_change_reaches_only_the_principal_that_owns_the_task() {
     let bob = subscribe(&h, "bob", "tasks.updated").await;
 
     let runtime = h.state.runtime.load_full();
-    let session = runtime.session_store().create_session(
-        "2026-07-28",
-        &crate::runtime::GatewayRuntime::modern_synthetic_init_params(),
-    );
+    // A task is owned by its caller's principal key.
     let alice_key = verified_identity("alice")
         .synthetic_principal_key()
         .unwrap();
-    runtime
-        .session_store()
-        .bind_session_owner(&session.session_id, Some(&alice_key));
     let task = runtime
         .task_store()
-        .create_task(&session.session_id, json!(1), "slow.tool", None)
+        .create_task(&alice_key, json!(1), "slow.tool")
         .unwrap();
     settle(&h).await;
 
@@ -87,13 +81,11 @@ async fn a_task_of_an_anonymous_session_raises_nothing() {
     let h = WebhookHarness::start("", BUILTIN_TYPES).await;
     let alice = subscribe(&h, "alice", "tasks.updated").await;
     let runtime = h.state.runtime.load_full();
-    let session = runtime.session_store().create_session(
-        "2026-07-28",
-        &crate::runtime::GatewayRuntime::modern_synthetic_init_params(),
-    );
+    // An anonymous caller's task is owned by its session id.
+    let session = runtime.session_store().create_session();
     runtime
         .task_store()
-        .create_task(&session.session_id, json!(1), "slow.tool", None)
+        .create_task(&session.session_id, json!(1), "slow.tool")
         .unwrap();
     settle(&h).await;
     assert!(delivered_to(&h, &alice).is_empty());
@@ -329,34 +321,24 @@ async fn a_held_ingest_still_raises_builtin_events() {
 }
 
 #[tokio::test]
-async fn the_list_change_reaches_modern_sessions_only() {
+async fn the_list_change_reaches_every_session() {
     let h = WebhookHarness::start("", BUILTIN_TYPES).await;
     let runtime = h.state.runtime.load_full();
     let sessions = runtime.session_store();
-    let modern = sessions.create_session(
-        "2026-07-28",
-        &crate::runtime::GatewayRuntime::modern_synthetic_init_params(),
-    );
-    let legacy = sessions.create_session(
-        "2025-11-25",
-        &crate::runtime::GatewayRuntime::modern_synthetic_init_params(),
-    );
+    let first = sessions.create_session();
+    let second = sessions.create_session();
     let bus = runtime.delivery_bus();
-    let mut modern_rx = bus.subscribe(&modern.session_id).await;
-    let mut legacy_rx = bus.subscribe(&legacy.session_id).await;
+    let mut first_rx = bus.subscribe(&first.session_id).await;
+    let mut second_rx = bus.subscribe(&second.session_id).await;
     announce_list_changed(sessions, bus);
-    let message = tokio::time::timeout(Duration::from_secs(2), modern_rx.recv())
-        .await
-        .expect("the modern session hears it")
-        .expect("a message");
-    assert_eq!(
-        message.jsonrpc_message["method"],
-        crate::protocol::v_2026_07_28::extensions::events::wire::METHOD_NOTIFICATIONS_LIST_CHANGED
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), legacy_rx.recv())
+    for rx in [&mut first_rx, &mut second_rx] {
+        let message = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
-            .is_err(),
-        "the 2025-11-25 session hears nothing"
-    );
+            .expect("the session hears it")
+            .expect("a message");
+        assert_eq!(
+            message.jsonrpc_message["method"],
+            crate::protocol::v_2026_07_28::extensions::events::wire::METHOD_NOTIFICATIONS_LIST_CHANGED
+        );
+    }
 }

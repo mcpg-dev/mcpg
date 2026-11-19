@@ -12,7 +12,7 @@
 # conformance/README.md.
 #
 # Run via:
-#   MCPG_CONFIG=config-everything.yaml ./run.sh both
+#   MCPG_CONFIG=config-everything.yaml ./run.sh 2026-07-28
 
 gateway:
   # The injected mock cdylib is built locally and unsigned; the
@@ -347,8 +347,8 @@ mcp:
               expression: |
                 "Elicitation completed: action=" + string(steps.enum_form.action) + ", content=" + string(steps.enum_form.content)
 
-      # ── DRAFT-2026 MRTR fixtures ────────────────────────────────
-      # These tool names are hardcoded by conformance@0.2.0-alpha.0's
+      # ── MRTR fixtures ───────────────────────────────────────────
+      # These tool names are hardcoded by the conformance suite's
       # `input-required-result-*.ts` scenarios; the upstream
       # everythingServer.ts doesn't ship them, so we add them here.
       # Each uses a Pipeline with a single suspending step pinned to
@@ -778,9 +778,8 @@ mcp:
                   text: "Please analyze the image above."
 
       # MRTR — prompts/get with suspending step. Tests that the
-      # non-tool-request MRTR path works on `prompts/get`. Whether the
-      # modern handler's prompts/get arm honours pipeline suspension
-      # is what this exercises.
+      # non-tool-request MRTR path works on `prompts/get`: the
+      # prompts/get dispatch arm honours pipeline suspension.
       - name: test_input_required_result_prompt
         title: MRTR Prompt — input required
         description: Prompt that suspends for elicitation/create

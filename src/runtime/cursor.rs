@@ -127,7 +127,7 @@ impl CompositeCursor {
 pub(super) fn encode_composite_cursor(cursor: &CompositeCursor, bind_key: Option<&[u8]>) -> String {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     // Tag with a `c.` prefix so callers can distinguish a
-    // composite cursor from a legacy bare-offset one without a
+    // composite cursor from a bare-offset one without a
     // round-trip through serde — the bare-offset form is just a
     // base64-encoded number, never starts with `c.`.
     let payload = serde_json::to_vec(cursor).expect("composite cursor serializes");

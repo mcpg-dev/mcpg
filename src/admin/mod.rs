@@ -18,8 +18,8 @@ pub fn admin_router(service: AdminService) -> Router {
     let state = std::sync::Arc::new(service);
 
     // axum 0.8 capture syntax is `{id}`, not `:id`. axum 0.8 also
-    // disallows capture + literal in the same segment, so the
-    // legacy `:id:action` form is replaced with `{id}/action`.
+    // disallows capture + literal in the same segment, so an action on a
+    // captured id takes its own segment (`{id}/action`).
     // Static-segment colon-actions (`/config:reload`,
     // `/policy:preview`) keep the `:` because the segment text
     // doesn't open with `:` and there's no capture to compose with.

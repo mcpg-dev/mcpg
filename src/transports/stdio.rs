@@ -1,52 +1,81 @@
 //! Stdio transport for MCPG.
 //!
-//! Reads newline-delimited JSON-RPC messages from stdin, writes responses to stdout.
-//! Single-session: no session ID needed. Designed for local MCP clients (IDEs, CLI tools).
+//! Reads newline-delimited JSON-RPC messages from stdin and writes each
+//! answer to stdout as one JSON line. It speaks MCP 2026-07-28: a message
+//! names that revision in its `_meta`, or names none.
 //!
-//! Supports bidirectional push: after session initialization, server-to-client
-//! notifications and requests arrive via the DeliveryBus and are written to stdout.
+//! The process is one client, so the transport opens one session when it
+//! starts and runs every request under it. Each message goes through the same
+//! dispatch as an HTTP request ([`crate::transports::dispatch`]). A
+//! `subscriptions/listen` stream writes its frames to stdout between answers
+//! until the session ends or the client cancels the listen request with
+//! `notifications/cancelled`; `events/stream` is served on HTTP only.
 
 use anyhow::Result;
+use futures::StreamExt as _;
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::app::AppState;
-use crate::protocol::{ProtocolResponse, map_client_message_to_operation, parse_client_message};
-use crate::runtime::{
-    GatewayOperation, GatewayRequest, GatewayRequestId, GatewayResponsePayload, RequestContext,
-    RequestIdentity, ResumeCursor, TransportKind, pipeline_store::DeliveryMessage,
-};
+use crate::protocol::{ProtocolError, ProtocolHttpResponse, ProtocolResponse, StreamPlan};
+use crate::runtime::{GatewayRequestId, RequestContext, RequestIdentity, TransportKind};
+use crate::transports::dispatch::{DispatchOutcome, dispatch, transport_rejection_body};
+use crate::transports::listen::{ListenStream, open_listen};
+
+/// Frames of open `subscriptions/listen` streams that wait for stdout.
+const LISTEN_FRAME_BUFFER: usize = 64;
+
+/// The open `subscriptions/listen` streams of the process, keyed by the
+/// listen request's JSON-RPC id as serialized, so `1` and `"1"` stay apart.
+/// A client has no connection to close on stdio, so it ends a stream by
+/// cancelling the listen request.
+#[derive(Default)]
+pub(crate) struct OpenListens(std::collections::HashMap<String, tokio::task::AbortHandle>);
+
+impl OpenListens {
+    /// End the stream the listen request `id` opened. Aborting its task
+    /// drops the stream, which releases what it holds.
+    fn end(&mut self, id: &Value) {
+        if let Some(stream) = self.0.remove(&id.to_string()) {
+            stream.abort();
+        }
+    }
+
+    /// Whether a stream the listen request `id` opened is still open.
+    fn is_open(&mut self, id: &Value) -> bool {
+        self.0.retain(|_, stream| !stream.is_finished());
+        self.0.contains_key(&id.to_string())
+    }
+
+    fn insert(&mut self, id: &Value, stream: tokio::task::AbortHandle) {
+        self.0.insert(id.to_string(), stream);
+    }
+}
 
 /// Run the stdio transport. Reads from stdin, writes to stdout. Returns when
 /// stdin closes or the gateway shuts down.
 pub async fn serve(state: AppState, mut shutdown: tokio::sync::watch::Receiver<()>) -> Result<()> {
     let mut lines = spawn_stdin_reader();
     let mut writer = tokio::io::stdout();
-    let mut session_id: Option<String> = None;
-    // Delivery bus receiver for server-to-client push (set after session init).
-    let mut delivery_rx: Option<mpsc::Receiver<DeliveryMessage>> = None;
+    let (frames_tx, mut frames_rx) = mpsc::channel::<Value>(LISTEN_FRAME_BUFFER);
+    let mut listens = OpenListens::default();
+    let session_id = open_process_session(&state);
 
     info!("stdio transport ready, reading from stdin");
 
     loop {
-        // Read one line, or exit on shutdown / EOF / delivery bus message
         enum StdioEvent {
             StdinLine(Option<std::io::Result<String>>),
             Shutdown,
-            Delivery(DeliveryMessage),
+            Frame(Value),
         }
 
         let event = tokio::select! {
             next = lines.recv() => StdioEvent::StdinLine(next),
             _ = shutdown.changed() => StdioEvent::Shutdown,
-            Some(msg) = async {
-                match delivery_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending::<Option<DeliveryMessage>>().await,
-                }
-            } => StdioEvent::Delivery(msg),
+            Some(frame) = frames_rx.recv() => StdioEvent::Frame(frame),
         };
 
         let line = match event {
@@ -54,10 +83,8 @@ pub async fn serve(state: AppState, mut shutdown: tokio::sync::watch::Receiver<(
                 info!("stdio transport received shutdown signal");
                 break;
             }
-            StdioEvent::Delivery(msg) => {
-                // Server-to-client push: write the delivery message to stdout.
-                debug!(kind = ?msg.kind, "delivering server-initiated message to stdio client");
-                write_json_line(&mut writer, &msg.jsonrpc_message).await?;
+            StdioEvent::Frame(frame) => {
+                write_json_line(&mut writer, &frame).await?;
                 continue;
             }
             StdioEvent::StdinLine(Some(Ok(line))) => line,
@@ -78,119 +105,176 @@ pub async fn serve(state: AppState, mut shutdown: tokio::sync::watch::Receiver<(
 
         debug!(line = %trimmed, "received message from stdin");
 
-        // Parse JSON
         let body: Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
             Err(e) => {
-                let error_response = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": {
-                        "code": -32700,
-                        "message": format!("parse error: {e}")
-                    }
-                });
-                write_json_line(&mut writer, &error_response).await?;
+                let error = ProtocolError::parse_error(format!("parse error: {e}"));
+                write_json_line(&mut writer, &error_line(error)).await?;
                 continue;
             }
         };
 
-        // Parse JSON-RPC client message
-        let client_message = match parse_client_message(body) {
-            Ok(msg) => msg,
-            Err(protocol_error) => {
-                let error_json = serde_json::to_value(protocol_error.into_jsonrpc_error())
-                    .expect("serialize error");
-                write_json_line(&mut writer, &error_json).await?;
-                continue;
-            }
-        };
+        handle_message(
+            &state,
+            &session_id,
+            body,
+            &frames_tx,
+            &mut writer,
+            &mut listens,
+        )
+        .await?;
+    }
 
-        // Map to a protocol operation. Stdio does not carry MCP-Protocol-Version
-        // headers; the transport is a single trusted process and always speaks the
-        // one supported spec revision.
-        let operation = match map_client_message_to_operation(client_message) {
-            Ok(op) => op,
-            Err(protocol_error) => {
-                let error_json = serde_json::to_value(protocol_error.into_jsonrpc_error())
-                    .expect("serialize error");
-                write_json_line(&mut writer, &error_json).await?;
-                continue;
-            }
-        };
+    state.runtime.load().terminate_session(&session_id);
+    info!("stdio transport stopped");
+    Ok(())
+}
 
-        // Build request context.
-        //
-        // stdio is intentionally identity-plugin-less. Identity plugins
-        // (OIDC, JWT, header-asserted, ...) resolve a remote principal from
-        // HTTP request headers / bearer tokens. Over stdio there is no wire
-        // credential: the caller is the OS process that owns the fd pair, and
-        // authorization is expressed by which binary was allowed to spawn
-        // MCPG in the first place. Introducing the HTTP identity-plugin
-        // chain here would either be a no-op (no headers to evaluate) or
-        // actively misleading (every request would appear to be the same
-        // header-asserted subject). Stdio therefore stays anonymous-by-default
-        // and expects the surrounding process boundary to supply trust.
-        let identity = RequestIdentity::Anonymous {
-            source: "stdio".to_owned(),
-        };
-        let request_context = RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            session_id.clone(),
-            None::<ResumeCursor>,
-            identity,
-            TransportKind::Stdio,
-        );
+/// Open the session every request of this process runs under. The process is
+/// the only client, so the session is its own and no request names another.
+pub(crate) fn open_process_session(state: &AppState) -> String {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    state
+        .runtime
+        .load()
+        .materialize_ephemeral_session(&session_id);
+    session_id
+}
 
-        let request = GatewayRequest::new(request_context, GatewayOperation::Protocol(operation));
+/// Dispatch one message and write its answer.
+pub(crate) async fn handle_message<W: AsyncWrite + Unpin>(
+    state: &AppState,
+    session_id: &str,
+    body: Value,
+    frames: &mpsc::Sender<Value>,
+    writer: &mut W,
+    listens: &mut OpenListens,
+) -> Result<()> {
+    // A cancel that names a listen request ends its stream; it still goes
+    // to the dispatch, which answers nothing.
+    if body.get("method").and_then(Value::as_str) == Some("notifications/cancelled")
+        && let Some(listen_id) = body.pointer("/params/requestId")
+    {
+        listens.end(listen_id);
+    }
 
-        let runtime = state.runtime.load();
-        let response = runtime.handle_request(request).await;
+    // stdio resolves no identity. Identity plugins (OIDC, JWT,
+    // header-asserted, ...) resolve a remote principal from HTTP headers and
+    // bearer tokens; over stdio there is no wire credential. The caller is
+    // the OS process that owns the fd pair, and authorization is which binary
+    // was allowed to spawn MCPG. The process boundary supplies the trust.
+    let identity = RequestIdentity::Anonymous {
+        source: "stdio".to_owned(),
+    };
+    let mut ctx = RequestContext::new(
+        GatewayRequestId::new(),
+        None,
+        identity,
+        TransportKind::Stdio,
+    );
+    ctx.session_id = Some(session_id.to_owned());
 
-        // Extract session ID from initialize response and subscribe to delivery bus.
-        if let GatewayResponsePayload::Protocol(ref protocol_response) = response.payload
-            && let Some(ref sid) = protocol_response.session_id_header
-            && (session_id.is_none() || session_id.as_deref() != Some(sid.as_str()))
-        {
-            session_id = Some(sid.clone());
-            // Subscribe to delivery bus for server-to-client push.
-            delivery_rx = Some(runtime.subscribe_session_delivery(sid).await);
-            info!(session_id = %sid, "session established, delivery bus subscribed");
+    let runtime = state.runtime.load_full();
+    let config = state.config.load();
+    match dispatch(&runtime, &config, body, ctx, None).await {
+        DispatchOutcome::Rejected(rejection) => {
+            write_json_line(writer, &transport_rejection_body(&rejection)).await
         }
-
-        // Write response to stdout
-        match response.payload {
-            GatewayResponsePayload::Protocol(protocol_response) => {
-                match protocol_response.response {
-                    ProtocolResponse::JsonRpcSuccess(success) => {
-                        let json = serde_json::to_value(&success).expect("serialize success");
-                        write_json_line(&mut writer, &json).await?;
-                    }
-                    ProtocolResponse::JsonRpcError(mut error) => {
-                        crate::transports::http::strip_internal_markers(&mut error);
-                        let json = serde_json::to_value(&error).expect("serialize error");
-                        write_json_line(&mut writer, &json).await?;
-                    }
-                    ProtocolResponse::NotificationAccepted => {
-                        // Notifications don't get a response in stdio mode
-                        debug!("notification accepted (no response)");
-                    }
+        DispatchOutcome::Stream {
+            plan: StreamPlan::SubscriptionsListen,
+            ctx,
+            session_id,
+            body,
+        } => {
+            let listen_id = body.get("id").cloned().unwrap_or(Value::Null);
+            // The id is how the client ends the stream, so two open streams
+            // never share one.
+            if listens.is_open(&listen_id) {
+                let error = ProtocolError::application(
+                    Some(listen_id),
+                    crate::protocol::INVALID_REQUEST_CODE,
+                    "a subscriptions/listen stream with this id is already open",
+                    None,
+                );
+                return write_json_line(writer, &error_line(error)).await;
+            }
+            match open_listen(state, &ctx, &session_id, &body).await {
+                Ok(listen) => {
+                    let stream = tokio::spawn(forward_listen(listen, frames.clone()));
+                    listens.insert(&listen_id, stream.abort_handle());
+                    Ok(())
+                }
+                Err(refusal) => {
+                    let error = refusal.into_protocol_error(body.get("id").cloned());
+                    write_json_line(writer, &error_line(error)).await
                 }
             }
-            GatewayResponsePayload::Readiness(snapshot) => {
-                let json = serde_json::to_value(&snapshot).expect("serialize readiness");
-                write_json_line(&mut writer, &json).await?;
+        }
+        DispatchOutcome::Stream {
+            plan: StreamPlan::EventsStream,
+            body,
+            ..
+        } => {
+            let error = ProtocolError::method_not_found(
+                body.get("id").cloned(),
+                StreamPlan::EventsStream.method(),
+            );
+            write_json_line(writer, &error_line(error)).await
+        }
+        DispatchOutcome::Response {
+            response,
+            notifications,
+            ..
+        } => {
+            for notification in &notifications {
+                write_json_line(writer, notification).await?;
             }
-            GatewayResponsePayload::Runtime(snapshot) => {
-                let json = serde_json::to_value(&snapshot).expect("serialize runtime");
-                write_json_line(&mut writer, &json).await?;
+            match response {
+                Ok(response) => write_response(writer, response).await,
+                Err(error) => write_json_line(writer, &error_line(error)).await,
             }
         }
     }
+}
 
-    info!("stdio transport stopped");
-    Ok(())
+/// Copy a listen stream's frames to stdout until the stream ends or the
+/// transport stops; dropping the stream releases what it holds.
+async fn forward_listen(mut listen: ListenStream, frames: mpsc::Sender<Value>) {
+    loop {
+        let frame = tokio::select! {
+            () = frames.closed() => return,
+            frame = listen.next() => frame,
+        };
+        let Some(frame) = frame else {
+            return;
+        };
+        if frames.send(frame).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Write the runtime's answer. A notification has none.
+async fn write_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: ProtocolHttpResponse,
+) -> Result<()> {
+    match response.response {
+        ProtocolResponse::JsonRpcSuccess(success) => write_json_line(writer, &success).await,
+        ProtocolResponse::JsonRpcError(mut error) => {
+            crate::transports::http::strip_internal_markers(&mut error);
+            write_json_line(writer, &error).await
+        }
+        ProtocolResponse::NotificationAccepted => {
+            debug!("notification accepted (no response)");
+            Ok(())
+        }
+    }
+}
+
+/// The JSON-RPC error line of `error`.
+fn error_line(error: ProtocolError) -> Value {
+    serde_json::to_value(error.into_jsonrpc_error()).unwrap_or_default()
 }
 
 /// Read stdin line by line on a dedicated OS thread. A read on tokio's
@@ -223,7 +307,10 @@ fn spawn_stdin_reader() -> mpsc::Receiver<std::io::Result<String>> {
     rx
 }
 
-async fn write_json_line(writer: &mut tokio::io::Stdout, value: &Value) -> Result<()> {
+async fn write_json_line<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    value: &impl serde::Serialize,
+) -> Result<()> {
     let mut output = serde_json::to_string(value)?;
     output.push('\n');
     writer.write_all(output.as_bytes()).await?;
@@ -242,5 +329,26 @@ mod tests {
         output.push('\n');
         assert!(output.ends_with('\n'));
         assert!(serde_json::from_str::<Value>(output.trim()).is_ok());
+    }
+
+    #[test]
+    fn an_error_line_is_a_jsonrpc_error_with_the_request_id() {
+        let line = error_line(ProtocolError::method_not_found(
+            Some(serde_json::json!(4)),
+            "events/stream",
+        ));
+        assert_eq!(line["jsonrpc"], "2.0");
+        assert_eq!(line["id"], 4);
+        assert_eq!(
+            line["error"]["code"],
+            crate::protocol::METHOD_NOT_FOUND_CODE
+        );
+    }
+
+    #[test]
+    fn a_parse_error_line_has_a_null_id() {
+        let line = error_line(ProtocolError::parse_error("parse error: eof"));
+        assert!(line["id"].is_null());
+        assert_eq!(line["error"]["code"], crate::protocol::PARSE_ERROR_CODE);
     }
 }

@@ -45,9 +45,9 @@ pub const MAX_INBOUND_BODY_BYTES: usize = 262_144;
 /// `events:` config — the experimental MCP Events extension.
 ///
 /// Off by default. With `enabled: false` the `events/*` methods answer
-/// `-32601` and `server/discover` does not mention events. The extension
-/// is served on the `2026-07-28` wire over HTTP only; the `2025-11-25`
-/// wire and stdio never carry it. Event types are declared under
+/// `-32601` and `server/discover` does not mention events. The
+/// `events/stream` delivery mode is served over HTTP; the stdio transport
+/// answers it with `-32601`. Event types are declared under
 /// `mcp.capabilities.events`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]

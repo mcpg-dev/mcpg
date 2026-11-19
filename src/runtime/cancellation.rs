@@ -2,16 +2,10 @@ use super::*;
 
 impl GatewayRuntime {
     /// Route an incoming `notifications/cancelled` into the
-    /// principal-partitioned, cross-instance cancellation bus, emit the
-    /// audit + metric records, and short-circuit a cancel targeting the
-    /// `initialize` request (spec MUST-NOT).
-    ///
-    /// Shared by both wire eras: the legacy `2025-11-25`
-    /// `process_protocol_operation` arm and the modern `2026-07-28`
-    /// handler's `NotificationCancelled` dispatch call this so a modern
-    /// cancel reaches the same machinery that already cancels suspended
-    /// pipelines (`cancel_suspended_pipeline`) on every replica. The
-    /// caller is responsible for returning the HTTP 202
+    /// principal-partitioned, cross-instance cancellation bus and emit the
+    /// audit + metric records. The bus reaches the replica running the
+    /// request, or, when none runs it, the suspended pipeline
+    /// (`cancel_suspended_pipeline`). The caller returns the HTTP 202
     /// `NotificationAccepted` envelope; this method performs the
     /// side-effects only.
     pub(crate) async fn handle_request_cancellation(
@@ -20,22 +14,6 @@ impl GatewayRuntime {
         cancelled_request_id: &Value,
         reason: Option<&str>,
     ) {
-        // per MCP §Cancellation, the initialize request MUST NOT be
-        // cancelled via `notifications/cancelled`. Silently drop such
-        // notifications — acting on them would race the lifecycle
-        // handshake and could leave the session in an indeterminate
-        // state. (Inert on the modern wire, which has no `initialize`,
-        // but kept here so the shared path is uniformly safe.)
-        if let Value::String(s) = cancelled_request_id
-            && (s == "init" || s.eq_ignore_ascii_case("initialize"))
-        {
-            tracing::warn!(
-                request_id = %s,
-                "ignoring notifications/cancelled targeting initialize"
-            );
-            return;
-        }
-
         info!(
             cancelled_request_id = %cancelled_request_id,
             reason = ?reason,
@@ -263,8 +241,7 @@ impl GatewayRuntime {
                     // a SUSPENDED pipeline (awaiting an elicitation/sampling
                     // answer) which registered no token on any replica. Locate
                     // its persisted state by the original JSON-RPC id, claim it
-                    // exactly-once across replicas, and deliver a terminal
-                    // cancelled error to the caller before deleting it.
+                    // exactly-once across replicas, and delete it.
                     runtime.cancel_suspended_pipeline(&event).await;
                 }
             }
@@ -275,9 +252,10 @@ impl GatewayRuntime {
     /// whose request id matches no live token. Finds the persisted state by
     /// `(session, original_jsonrpc_id)`, authorizes the requester against the
     /// persisted owner, then CAS-claims it (exactly-once across replicas) and
-    /// delivers a terminal cancelled error to the caller before deletion.
+    /// deletes it. The caller already holds the `InputRequiredResult` of the
+    /// suspension, so nothing is sent to it; a later resume finds no state.
     pub(crate) async fn cancel_suspended_pipeline(
-        self: &Arc<Self>,
+        &self,
         event: &cancellation_bus::CancellationEvent,
     ) {
         if event.session_id.is_empty() {
@@ -317,7 +295,7 @@ impl GatewayRuntime {
             return;
         }
         // Exactly-once claim across replicas at the current version. The loser
-        // does nothing (the winner delivers the terminal error + deletes).
+        // does nothing (the winner deletes).
         match self
             .pipeline_store
             .try_claim_pipeline(&state.pipeline_id, state.state_version)
@@ -329,17 +307,8 @@ impl GatewayRuntime {
                 return;
             }
         }
-        self.deliver_pipeline_terminal_error(
-            &state.session_id,
-            &state.original_jsonrpc_id,
-            -32800,
-            "request cancelled by client",
-        )
-        .await;
         if let Some(srv_req_id) = &state.pending_server_request_id {
-            let _ = self
-                .pipeline_store
-                .delete_pending_server_request(srv_req_id);
+            self.delete_pending_request_of(srv_req_id, &state.pipeline_id);
         }
         let _ = self.pipeline_store.delete_pipeline(&state.pipeline_id);
         metrics::counter!(
@@ -351,9 +320,8 @@ impl GatewayRuntime {
 
     /// Bump the cancelled-task metric and broadcast the cancellation onto the
     /// cluster bus so a peer running the task's background work interrupts it too.
-    /// Shared by the legacy `tasks/cancel` arm and the modern tasks-extension
-    /// CancelTask arm — without it, a modern cancel never reaches the replica
-    /// executing the task.
+    /// Called by the tasks-extension `tasks/cancel` arm — without it, a cancel
+    /// never reaches the replica executing the task.
     pub(crate) fn broadcast_task_cancellation(
         &self,
         task_id: &str,
@@ -410,6 +378,51 @@ mod tests {
         let a = GatewayRuntime::request_cancellation_key(Some("sess-a"), "1");
         let b = GatewayRuntime::request_cancellation_key(Some("sess-b"), "1");
         assert_ne!(a, b);
+    }
+
+    /// A task's token is owned by the task's owner key, which `tasks/cancel`
+    /// broadcasts as the event's session: the owner's cancel fires it, and
+    /// another principal's does not.
+    #[test]
+    fn the_owner_of_a_task_can_cancel_it() {
+        let identity = |subject: &str| RequestIdentity::Verified {
+            subject_id: subject.to_owned(),
+            issuer: "https://idp.example".to_owned(),
+            auth_provider: "oidc".to_owned(),
+            source: "test".to_owned(),
+            roles: Vec::new(),
+            groups: Vec::new(),
+            scopes: Vec::new(),
+            attributes: std::collections::BTreeMap::new(),
+        };
+        let mut alice = RequestContext::new(
+            GatewayRequestId::new(),
+            None,
+            identity("alice"),
+            TransportKind::Http,
+        );
+        alice.session_id = Some("mcpg-m-alice-session".to_owned());
+        let owner_key = alice.task_owner_key().expect("an owner key");
+        let registered = RegisteredCancellation {
+            token: tokio_util::sync::CancellationToken::new(),
+            owner_session: Some(owner_key.clone()),
+            owner_principal: alice.identity.principal_id().map(str::to_owned),
+        };
+        let cancel = |principal: &RequestIdentity| cancellation_bus::CancellationEvent {
+            target_id: "task-1".to_owned(),
+            kind: cancellation_bus::CancellationKind::Task,
+            session_id: owner_key.clone(),
+            principal_id: principal.principal_id().map(str::to_owned),
+            reason: None,
+        };
+        assert!(cancellation_requester_is_owner(
+            &registered,
+            &cancel(&alice.identity)
+        ));
+        assert!(!cancellation_requester_is_owner(
+            &registered,
+            &cancel(&identity("mallory"))
+        ));
     }
 
     /// A numeric id and the string of the same digits are distinct JSON-RPC

@@ -1280,7 +1280,6 @@ fn notify_subscribers_filtered(
                 let msg = DeliveryMessage {
                     kind: DeliveryKind::ResourceUpdated,
                     jsonrpc_message: jsonrpc_message.clone(),
-                    delivery_id: String::new(),
                 };
                 delivery_publish(session_id, msg);
             }
@@ -1299,7 +1298,6 @@ fn notify_subscribers_filtered(
                 let msg = DeliveryMessage {
                     kind: DeliveryKind::ResourceUpdated,
                     jsonrpc_message: jsonrpc_message.clone(),
-                    delivery_id: String::new(),
                 };
                 delivery_publish(session_id, msg);
             }
@@ -1316,7 +1314,6 @@ fn notify_subscribers_filtered(
                         let msg = DeliveryMessage {
                             kind: DeliveryKind::ResourceUpdated,
                             jsonrpc_message: jsonrpc_message.clone(),
-                            delivery_id: String::new(),
                         };
                         delivery_publish(session_id, msg);
                     }
@@ -1340,7 +1337,6 @@ fn notify_subscribers_filtered(
                     let msg = DeliveryMessage {
                         kind: DeliveryKind::ResourceUpdated,
                         jsonrpc_message: jsonrpc_message.clone(),
-                        delivery_id: String::new(),
                     };
                     delivery_publish(session_id, msg);
                     count += 1;
@@ -1359,7 +1355,6 @@ fn notify_subscribers_filtered(
                         let msg = DeliveryMessage {
                             kind: DeliveryKind::ResourceUpdated,
                             jsonrpc_message: jsonrpc_message.clone(),
-                            delivery_id: String::new(),
                         };
                         delivery_publish(session_id, msg);
                     }
@@ -1374,7 +1369,6 @@ fn notify_subscribers_filtered(
                 let msg = DeliveryMessage {
                     kind: DeliveryKind::ResourceUpdated,
                     jsonrpc_message,
-                    delivery_id: String::new(),
                 };
                 delivery_publish(&originating_session, msg);
                 1
@@ -1398,7 +1392,6 @@ fn notify_subscribers_filtered(
                         let msg = DeliveryMessage {
                             kind: DeliveryKind::ResourceUpdated,
                             jsonrpc_message: jsonrpc_message.clone(),
-                            delivery_id: String::new(),
                         };
                         delivery_publish(session_id, msg);
                     }
@@ -1418,7 +1411,6 @@ fn notify_subscribers_filtered(
                     let msg = DeliveryMessage {
                         kind: DeliveryKind::ResourceUpdated,
                         jsonrpc_message: jsonrpc_message.clone(),
-                        delivery_id: String::new(),
                     };
                     delivery_publish(session_id, msg);
                     count += 1;

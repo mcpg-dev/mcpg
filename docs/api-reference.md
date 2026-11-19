@@ -2,7 +2,7 @@
 
 > HTTP transport endpoints, MCP protocol operations, and SSE streaming.
 > Source: `transports/http/` (router, request path, SSE, identity, validation,
-> response mapping), `protocol/mod.rs`
+> response mapping), `transports/dispatch.rs`, `protocol/`
 
 ## HTTP Endpoints
 
@@ -12,222 +12,149 @@
 | `GET` | `/ready` | Readiness probe |
 | `GET` | `/runtime` | Runtime metadata |
 | `POST` | `/mcp` | MCP JSON-RPC requests |
-| `GET` | `/mcp` | SSE stream (session events) |
-| `DELETE` | `/mcp` | Session termination |
+| `GET` / `HEAD` / `DELETE` | `/mcp` | `405 Method Not Allowed` with `Allow: POST` (after the browser redirect, the origin check and authentication) |
 | `GET` | `/metrics` | Prometheus metrics (if enabled) |
 
 ---
 
 ## MCP Protocol
 
-MCPG implements the Model Context Protocol over Streamable HTTP (JSON-RPC 2.0).
+MCPG supports MCP **`2026-07-28`** over Streamable HTTP (JSON-RPC 2.0). There is
+no handshake and no protocol session: every request is self-contained.
 
 ### Protocol Version
 
 ```
-Default:  2025-11-25   (production-grade; the negotiated default)
-Legacy:   2025-03-26, 2025-06-18   (accepted when explicitly requested)
-Modern:   2026-07-28   (stateless, MRTR-based; DRAFT-2026-v1 accepted inbound as a transitional alias)
+Supported:  2026-07-28
 ```
 
-The modern `2026-07-28` wire is stateless: it never emits an
-`Mcp-Session-Id`, and modern `GET`/`DELETE /mcp` return `405`.
-The `GET`/`DELETE`/`Mcp-Session-Id` rows below describe the stateful
-`2025-11-25` wire.
-
 Transport rules:
-- `POST /mcp` accepts exactly one JSON-RPC request, notification, or response body
+- `POST /mcp` accepts exactly one JSON-RPC request or notification body
 - JSON-RPC batch arrays are rejected on the primary endpoint
-- clients should send `Mcp-Protocol-Version` on all post-initialize HTTP requests
-- if the server receives an invalid or unsupported explicit `Mcp-Protocol-Version`, it returns HTTP `400 Bad Request`
-- if the header is omitted after initialization, MCPG uses the negotiated session version
+- every request names the version, with the `Mcp-Protocol-Version: 2026-07-28`
+  header or the `_meta` key `io.modelcontextprotocol/protocolVersion`
+- a request that names another version, or none, gets HTTP `400` and JSON-RPC
+  `-32022` with `data.supported: ["2026-07-28"]`
+- authentication runs before the version check, so a caller without
+  credentials gets the `401` challenge first
+- every response carries `Mcp-Protocol-Version: 2026-07-28`
 
 ### Request/Response Headers
 
 **Request headers**:
 - `Content-Type: application/json` — Required for POST
-- `Accept: application/json` — Required for POST; the minimum, and every response is then inline JSON. Add `text/event-stream` (`Accept: application/json, text/event-stream`) to consent to an SSE response for a non-initialize request on a session — then read frames until the one whose `id` matches (see [A minimal client](#a-minimal-client))
-- `Mcp-Session-Id: {session_id}` — Required after initialization
-- `Mcp-Protocol-Version: 2025-11-25` — Required on post-initialize HTTP requests; invalid/unsupported values return `400`
-- `Last-Event-Id: {event_id}` — For SSE resumption (GET only)
+- `Accept: application/json` — Required for POST; the minimum, and the response
+  is then inline JSON. Add `text/event-stream`
+  (`Accept: application/json, text/event-stream`) to consent to an SSE
+  response — a `tools/call` that emits progress or log notifications, and
+  `subscriptions/listen`
+- `Mcp-Protocol-Version: 2026-07-28` — Required
+- `Mcp-Method: {method}` — Required; must equal the body's `method`
+  (`-32020` on mismatch)
+- `Mcp-Name: {name}` — Required for `tools/call` and `prompts/get` (the
+  `params.name`) and `resources/read` (the `params.uri`); a non-ASCII value is
+  sent as `=?base64?…?=`
+- `Mcp-Param-{Name}: {value}` — Optional promotions of tool arguments the
+  tool's `inputSchema` marks with `x-mcp-header`; each must equal the argument
+
+No session or resume-cursor request header is read.
 
 **Response headers**:
 - `X-Mcpg-Request-Id: {uuid}` — Gateway request ID (all responses)
-- `X-Accel-Buffering: no` — On every `text/event-stream` response (the GET stream, an SSE-framed POST result, `subscriptions/listen`). An nginx-family proxy in front of the gateway (nginx, APISIX, OpenResty) honours it per response and streams the body instead of holding it until the upstream closes — which an event stream never does on its own, so a buffering proxy shows the client no status line at all. A proxy that does not honour it needs its response buffering turned off for the MCP route.
-- `Mcp-Session-Id: {session_id}` — Set on initialize response
-- `Mcp-Protocol-Version: 2025-11-25` — Negotiated version
+- `Mcp-Protocol-Version: 2026-07-28` — All responses
+- `X-Accel-Buffering: no` — On every `text/event-stream` response (an
+  SSE-framed `tools/call` result, `subscriptions/listen`, `events/stream`). An
+  nginx-family proxy in front of the gateway (nginx, APISIX, OpenResty) honours
+  it per response and streams the body instead of holding it until the
+  upstream closes — which an event stream never does on its own, so a
+  buffering proxy shows the client no status line at all. A proxy that does
+  not honour it needs its response buffering turned off for the MCP route.
+
+### Request `_meta`
+
+Every request carries its client context in `params._meta`:
+
+| Key | Value |
+|---|---|
+| `io.modelcontextprotocol/protocolVersion` | `"2026-07-28"` |
+| `io.modelcontextprotocol/clientInfo` | `{ "name": …, "version": … }` |
+| `io.modelcontextprotocol/clientCapabilities` | The client's capabilities (`elicitation`, `sampling`, `roots`, `extensions`) |
+| `io.modelcontextprotocol/logLevel` | Optional. The request's log floor; absent ⇒ no `notifications/message` for the request |
+| `io.modelcontextprotocol/progressToken` | Optional. Progress token for the request |
+
+`server/discover` requires the first three keys. Other methods require them
+when `gateway.server.enforce_request_meta` is `true`.
 
 ---
 
 ## A minimal client
 
-The whole round trip on the default `2025-11-25` wire, in the order it
-happens. Three rules carry most of the weight — two independently written
-clients got two of them wrong on their first attempt, so they are stated
-before the code:
-
-1. **`Accept: application/json` alone means inline JSON for every response.**
-   There is nothing to parse but the body. Add `text/event-stream` only when
-   the client wants streaming, and then the response to a POST is an SSE
-   stream whose first frames are *notifications* — a priming frame with no
-   data, a `notifications/message` log line (`logger: "mcpg.transport"`,
-   `"Streaming protocol response"`), any pipeline `log`/`progress`
-   notifications — and the result is the frame whose `id` matches the
-   request. A parser that takes the first `data:` frame as the answer reads a
-   log entry as its result and reports success with a nonsense payload.
-2. **A request id is used once per session — including by a request the
-   server answered with an error.** The check runs before dispatch, so a
-   failed attempt consumes its id; a reused id (number or string) is
-   refused with `-32600 duplicate request id on this session` before
-   anything else happens. Count up, or use UUIDs. This rule is the
-   `2025-11-25` wire's; on `2026-07-28` an id need only differ from the
-   client's other requests still in flight, and the gateway keeps no id
-   history there.
-3. **A notification carries no `id`.** `notifications/initialized` sent with
-   an `id` is a *request* for a method that does not exist, and is answered
-   with `-32601 Method not found: notifications/initialized` — the session
-   never becomes operational.
-
 ```bash
 U=https://gateway.example/mcp
-J='Content-Type: application/json'
+META='"_meta": {
+  "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+  "io.modelcontextprotocol/clientInfo": { "name": "my-client", "version": "1.0.0" },
+  "io.modelcontextprotocol/clientCapabilities": {} }'
+H=(-H 'Content-Type: application/json' -H 'Accept: application/json'
+   -H 'Mcp-Protocol-Version: 2026-07-28')
 
-# 1. initialize — the response is inline JSON; the session id is a header.
-H=$(mktemp)
-curl -sS -D "$H" -X POST "$U" -H "$J" -H 'Accept: application/json' -d '{
-  "jsonrpc": "2.0", "id": 1, "method": "initialize",
-  "params": { "protocolVersion": "2025-11-25", "capabilities": {},
-              "clientInfo": { "name": "my-client", "version": "1.0.0" } }
-}' | jq .result.serverInfo
-SID=$(tr -d '\r' < "$H" | awk 'tolower($1) == "mcp-session-id:" { print $2 }')
+# 1. server/discover — capabilities, extensions, supported versions.
+curl -sS -X POST "$U" "${H[@]}" -H 'Mcp-Method: server/discover' -d "{
+  \"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"server/discover\",
+  \"params\": { $META } }" | jq .result
 
-# Every later request carries the session and the negotiated version.
-S=(-H "$J" -H 'Accept: application/json' -H "Mcp-Session-Id: $SID" -H 'Mcp-Protocol-Version: 2025-11-25')
+# 2. tools/list
+curl -sS -X POST "$U" "${H[@]}" -H 'Mcp-Method: tools/list' -d "{
+  \"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/list\",
+  \"params\": { $META } }" | jq '.result.tools[].name'
 
-# 2. initialized — a notification: no id. 202 Accepted, empty body.
-curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$U" "${S[@]}" \
-  -d '{ "jsonrpc": "2.0", "method": "notifications/initialized" }'
-
-# 3. tools/list — a fresh id.
-curl -sS -X POST "$U" "${S[@]}" \
-  -d '{ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }' | jq '.result.tools[].name'
-
-# 4. tools/call — another fresh id, even if the previous call failed.
-curl -sS -X POST "$U" "${S[@]}" -d '{
-  "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-  "params": { "name": "ping", "arguments": {} }
-}' | jq .result
+# 3. tools/call — Mcp-Name carries the tool name.
+curl -sS -X POST "$U" "${H[@]}" -H 'Mcp-Method: tools/call' -H 'Mcp-Name: ping' -d "{
+  \"jsonrpc\": \"2.0\", \"id\": 3, \"method\": \"tools/call\",
+  \"params\": { \"name\": \"ping\", \"arguments\": {}, $META } }" | jq .result
 ```
 
-The same call with streaming consented to. The result is the frame whose
-`id` matches; everything before it is a notification:
+Two rules carry most of the weight:
 
-```bash
-# 5. tools/list again, over SSE — read frames until the id matches.
-curl -sS -N -X POST "$U" -H "$J" -H 'Accept: application/json, text/event-stream' \
-  -H "Mcp-Session-Id: $SID" -H 'Mcp-Protocol-Version: 2025-11-25' \
-  -d '{ "jsonrpc": "2.0", "id": 4, "method": "tools/list" }' \
-  | sed -n 's/^data: //p' | jq -c 'select(.id == 4) | .result'
+1. **`Accept: application/json` alone means inline JSON for every response.**
+   With `text/event-stream` added, a `tools/call` that emits notifications
+   answers with an SSE stream: the notifications first, then the frame whose
+   `id` matches the request. A parser that takes the first `data:` frame as
+   the answer reads a notification as its result.
+2. **A notification carries no `id`.** `notifications/cancelled` sent with an
+   `id` is a *request* for a method that does not exist.
 
-# 6. done — the session is released; its id is invalid from here on.
-curl -sS -o /dev/null -w '%{http_code}\n' -X DELETE "$U" \
-  -H "Mcp-Session-Id: $SID" -H 'Mcp-Protocol-Version: 2025-11-25'
-```
-
-What the stream carries, verbatim, for step 5:
-
-```
-event: message
-id: stream-0:0
-retry: 1500
-
-event: message
-id: stream-0:1
-retry: 3000
-data: {"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","logger":"mcpg.transport","data":{"message":"Streaming protocol response","sessionId":"…"}}}
-
-event: message
-id: stream-0:2
-retry: 3000
-data: {"jsonrpc":"2.0","id":4,"result":{"tools":[…],"ttlMs":60000,"cacheScope":"private"}}
-```
-
-With `server.unary_json_fast_path` enabled, a unary 200 result that emitted no
-notifications comes back as a single `application/json` body even when the
-client consented to SSE — a client that branches on the response's
-`Content-Type`, not on what it asked for, needs no change either way.
+---
 
 ## MCP Operations
 
-### Initialize
+### Discover
 
-Start a new session. Must be the first request.
-
-**Request** (POST /mcp):
 ```json
 {
   "jsonrpc": "2.0",
   "id": 1,
-  "method": "initialize",
+  "method": "server/discover",
   "params": {
-    "protocolVersion": "2025-11-25",
-    "capabilities": {
-      "elicitation": {},
-      "sampling": {}
-    },
-    "clientInfo": {
-      "name": "my-client",
-      "version": "1.0.0"
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "my-client", "version": "1.0.0" },
+      "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} }
     }
   }
 }
 ```
 
-**Response** (200 OK):
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "protocolVersion": "2025-11-25",
-    "capabilities": {
-      "tools": { "listChanged": false },
-      "prompts": { "listChanged": false },
-      "resources": { "listChanged": false },
-      "logging": {}
-    },
-    "serverInfo": {
-      "name": "mcpg",
-      "version": "0.1.0"
-    }
-  }
-}
-```
-
-The `Mcp-Session-Id` response header contains the session ID for subsequent requests.
-
-### Initialized (Notification)
-
-After receiving the initialize response, the client must send an `initialized` notification:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "notifications/initialized"
-}
-```
-
-This transitions the session from `AwaitingInitialized` to `Operational`.
+The result carries `supportedVersions: ["2026-07-28"]`, the server's
+`capabilities` (with the `extensions` map: `io.modelcontextprotocol/tasks`,
+`io.modelcontextprotocol/skills`, `io.modelcontextprotocol/ui`,
+`dev.mcpg/idempotency` when configured), `serverInfo`, `resultType`, `ttlMs`
+and `cacheScope`.
 
 ### List Tools
 
-**Request**:
 ```json
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "method": "tools/list"
-}
+{ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": { "_meta": { … } } }
 ```
 
 **Response**:
@@ -236,6 +163,7 @@ This transitions the session from `AwaitingInitialized` to `Operational`.
   "jsonrpc": "2.0",
   "id": 2,
   "result": {
+    "resultType": "complete",
     "tools": [
       {
         "name": "my_tool",
@@ -245,7 +173,9 @@ This transitions the session from `AwaitingInitialized` to `Operational`.
           "properties": { "input": { "type": "string" } }
         }
       }
-    ]
+    ],
+    "ttlMs": 60000,
+    "cacheScope": "private"
   }
 }
 ```
@@ -254,7 +184,7 @@ Tools filtered by policy (denied tools hidden from list).
 
 ### Call Tool
 
-**Request**:
+**Request** (with `Mcp-Name: my_tool`):
 ```json
 {
   "jsonrpc": "2.0",
@@ -262,7 +192,8 @@ Tools filtered by policy (denied tools hidden from list).
   "method": "tools/call",
   "params": {
     "name": "my_tool",
-    "arguments": { "input": "hello" }
+    "arguments": { "input": "hello" },
+    "_meta": { … }
   }
 }
 ```
@@ -273,6 +204,7 @@ Tools filtered by policy (denied tools hidden from list).
   "jsonrpc": "2.0",
   "id": 3,
   "result": {
+    "resultType": "complete",
     "content": [
       { "type": "text", "text": "result data" }
     ],
@@ -281,132 +213,147 @@ Tools filtered by policy (denied tools hidden from list).
 }
 ```
 
-**Response** (pipeline suspended — HTTP 200 + SSE):
-When a pipeline hits an elicitation or sampling step, the POST response upgrades to `text/event-stream`. The stream carries the server-initiated request first, then the eventual terminal JSON-RPC response for the original request.
-
-### List Prompts
-
+**Response** (the call needs client input — HTTP 200, `InputRequiredResult`):
 ```json
-{ "jsonrpc": "2.0", "id": 4, "method": "prompts/list" }
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "resultType": "input_required",
+    "inputRequests": {
+      "ask_user": {
+        "method": "elicitation/create",
+        "params": {
+          "message": "Please confirm the operation:",
+          "requestedSchema": { "type": "object", "properties": { "confirmed": { "type": "boolean" } } }
+        }
+      }
+    },
+    "requestState": "c.…"
+  }
+}
 ```
 
-### Get Prompt
+The client gets the input and calls the tool again with the same `name` and
+`arguments`, plus `requestState` and `inputResponses` as **top-level params**
+(under `_meta` they are refused with `-32600`):
 
 ```json
 {
   "jsonrpc": "2.0",
-  "id": 5,
+  "id": 4,
+  "method": "tools/call",
+  "params": {
+    "name": "my_tool",
+    "arguments": { "input": "hello" },
+    "requestState": "c.…",
+    "inputResponses": {
+      "ask_user": { "action": "accept", "content": { "confirmed": true } }
+    },
+    "_meta": { … }
+  }
+}
+```
+
+The call resumes where it stopped. A `requestState` is bound to the caller who
+paused the call and is accepted once. `inputRequests` may carry several entries
+(the `gather` pipeline step); each `inputRequests` entry is an
+`elicitation/create`, `sampling/createMessage` or `roots/list` request, emitted
+only when the request's `clientCapabilities` support it.
+
+**Response** (task): a tool whose `execution.taskSupport` allows it, called by a
+client that declared the `io.modelcontextprotocol/tasks` extension, answers
+`resultType: "task"` with a `taskId`, `ttlMs` and `pollIntervalMs`. The client
+polls `tasks/get`, answers input with `tasks/update`, and cancels with
+`tasks/cancel`.
+
+### List Prompts / Get Prompt
+
+```json
+{ "jsonrpc": "2.0", "id": 5, "method": "prompts/list", "params": { "_meta": { … } } }
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 6,
   "method": "prompts/get",
-  "params": { "name": "mcpg_operational_overview" }
+  "params": { "name": "mcpg_operational_overview", "_meta": { … } }
 }
 ```
 
-### List Resources
+### List Resources / Read Resource
 
 ```json
-{ "jsonrpc": "2.0", "id": 6, "method": "resources/list" }
+{ "jsonrpc": "2.0", "id": 7, "method": "resources/list", "params": { "_meta": { … } } }
 ```
-
-### Read Resource
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 7,
-  "method": "resources/read",
-  "params": { "uri": "mcpg://runtime/overview" }
-}
-```
-
-### Set Log Level
 
 ```json
 {
   "jsonrpc": "2.0",
   "id": 8,
-  "method": "logging/setLevel",
-  "params": { "level": "debug" }
+  "method": "resources/read",
+  "params": { "uri": "mcpg://runtime/overview", "_meta": { … } }
 }
 ```
+
+### Cancel
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "notifications/cancelled",
+  "params": { "requestId": 3, "reason": "user aborted" }
+}
+```
+
+Answered `202 Accepted`. Only the caller that started the request can cancel
+it.
 
 ---
 
 ## SSE Streaming
 
-### Opening a Stream
+### Per-request stream (`tools/call`)
 
-`GET /mcp` with `Accept: text/event-stream` and `Mcp-Session-Id: {session_id}`.
+A `tools/call` that emits `notifications/progress` or `notifications/message`
+for the request answers with `Content-Type: text/event-stream` when the client
+accepts it: each notification as an SSE `message` event, in order, then the
+JSON-RPC response frame, then the stream closes. A call that emits nothing
+answers inline. SSE events carry no `id:`; a broken stream is not resumed, and
+the client issues the request again.
 
-The SSE stream delivers:
-1. **Priming event** — empty data (connection confirmation)
-2. **Protocol responses** — JSON-RPC responses for tool calls, list operations
-3. **Server-initiated requests** — Elicitation, sampling (for suspended pipelines)
-4. **Pending deliveries** — Replayed on reconnect
+### `subscriptions/listen`
 
-The GET stream is also the canonical resumption path for any previously opened POST-originated SSE stream.
+A long-lived POST that returns `text/event-stream`. Its params select what the
+stream carries:
 
-### Event Format
-
-```
-id: stream-1:0
-data: {"jsonrpc":"2.0","id":3,"result":{...}}
-
-id: stream-1:1
-data: {"jsonrpc":"2.0","id":"srv-1","method":"elicitation/create","params":{...}}
-```
-
-### Resumption
-
-Send `Last-Event-Id: stream-1:5` header on reconnect. Events after the cursor are replayed from the replay window. If the cursor has expired, the server returns HTTP 409 Conflict. A session keeps the replay of its 16 most recent streams, within 256 KiB of events; a cursor on an older stream has expired too.
-
----
-
-## Server-Initiated Requests
-
-When a pipeline suspends for elicitation or sampling, the server sends a JSON-RPC request to the client:
-
-### Elicitation Request
 ```json
 {
   "jsonrpc": "2.0",
-  "id": "srv-abc123",
-  "method": "elicitation/create",
+  "id": 9,
+  "method": "subscriptions/listen",
   "params": {
-    "message": "Please confirm the operation:",
-    "requestedSchema": { "type": "object", "properties": { "confirmed": { "type": "boolean" } } }
+    "notifications": {
+      "toolsListChanged": true,
+      "promptsListChanged": true,
+      "resourcesListChanged": true,
+      "resourceSubscriptions": ["mcpg://runtime/overview"]
+    },
+    "_meta": { … }
   }
 }
 ```
 
-### Sampling Request
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "srv-def456",
-  "method": "sampling/createMessage",
-  "params": {
-    "messages": [{ "role": "user", "content": { "type": "text", "text": "Analyze this" } }],
-    "maxTokens": 500
-  }
-}
-```
+The first event acknowledges the subscription. Then the stream carries
+`notifications/*/list_changed`, `notifications/resources/updated` for the
+subscribed URIs, and `notifications/tasks` for the task ids named in
+`taskIds` (or `eventsListChanged` for MCP Events). A caller holds at most 3
+concurrent listen streams per session row.
 
-### Client Response
+### `events/stream`
 
-The client responds by POST-ing a JSON-RPC response to `/mcp`:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": "srv-abc123",
-  "result": {
-    "action": "accept",
-    "content": { "confirmed": true }
-  }
-}
-```
-
-This resumes the suspended pipeline.
+MCP Events push streams; see the MCP Events guide.
 
 ---
 
@@ -420,28 +367,32 @@ This resumes the suspended pipeline.
 | `-32600` | Invalid request (missing fields) |
 | `-32601` | Method not found |
 | `-32602` | Invalid params |
+| `-32020` | Header mismatch (`Mcp-Method` / `Mcp-Name` / `Mcp-Param-*` against the body) |
+| `-32021` | Missing required client capability |
+| `-32022` | Unsupported protocol version |
 
 ### Gateway Errors
 
 | Code | Meaning |
 |---|---|
-| `-32001` | Session not found |
-| `-32002` | Session not initialized |
 | `-32003` | Trust requirement not met (policy) |
-| `-32022` | Global CEL policy denied |
 | `-32005` | Per-tool CEL policy denied |
+| `-32000` | Session capacity exhausted (per-principal session-row cap) |
+| `-32099` | Rate limit exceeded |
 
 ### HTTP Status Codes
 
 | Status | When |
 |---|---|
-| 200 | Successful JSON-RPC response |
-| 202 | Pipeline suspended (elicitation/sampling) |
-| 400 | Bad request (missing headers, invalid JSON) |
-| 403 | CORS origin rejected, policy denial |
-| 404 | Unknown endpoint or session |
-| 409 | Expired SSE cursor |
+| 200 | Successful JSON-RPC response, `InputRequiredResult`, task created |
+| 202 | Notification accepted |
+| 400 | Bad request (missing headers, invalid JSON, unsupported or missing protocol version, header mismatch) |
+| 401 | Authentication required or credential invalid |
+| 403 | Origin rejected, policy denial |
+| 404 | Unknown endpoint, or a method the revision does not define |
+| 405 | `GET` / `HEAD` / `DELETE` on the MCP path |
 | 500 | Internal server error |
+| 503 | Session capacity exhausted |
 
 ---
 
@@ -451,10 +402,8 @@ This resumes the suspended pipeline.
 |---|---|---|
 | `Authorization: Bearer {token}` | Request | JWT/OIDC bearer token |
 | `x-mcpg-subject-id: {subject}` | Request | Header-asserted identity |
-| `Mcp-Session-Id: {sid}` | Both | Session identifier |
-| `Mcp-Protocol-Version: {ver}` | Both | Protocol version |
+| `Mcp-Protocol-Version: {ver}` | Both | Protocol version (`2026-07-28`) |
 | `X-Mcpg-Request-Id: {rid}` | Response | Gateway request ID |
-| `Last-Event-Id: {eid}` | Request | SSE resumption cursor |
 
 ---
 
@@ -469,30 +418,33 @@ outcome. The table below pins the cases where both are relevant.
 | HTTP | JSON-RPC code | When | Notes |
 |---|---|---|---|
 | 200  | n/a        | Successful JSON-RPC result | `result` populated; no `error`. |
+| 200  | n/a        | `InputRequiredResult` | `resultType: "input_required"`; the client retries with `requestState` + `inputResponses`. |
 | 200  | `-32602`   | `tools/call` with bad arguments | `isError: true` `ToolCallResult` is still 200 + success envelope. Distinct from protocol `-32602`. |
-| 202  | n/a        | Notification accepted; pipeline suspended waiting for elicitation/sampling | Client follows up via SSE GET or `tasks/result`. |
-| 400  | `-32600`   | `id` violates JSON-RPC 2.0 (null, bool, object, array, empty string, or reused on session) | T15-01/02/03. |
-| 400  | `-32600`   | Invalid `Mcp-Protocol-Version` header | T16-05. |
-| 400  | `-32600`   | Batch array on POST body | 2025-06-18 removed batch. |
-| 400  | `-32600`   | Missing `Accept` or non-SSE-compatible Accept | T12-08. |
-| 400  | `-32602`   | `_meta.progressToken` not string or non-empty number | T15-04. |
-| 400  | `-32600`   | `_meta` key uses MCP-reserved prefix | T15-05. |
+| 202  | n/a        | Notification accepted | |
+| 400  | `-32022`   | Protocol version absent or not `2026-07-28` | `data.supported: ["2026-07-28"]`; `data.requested` when a version was named. |
+| 400  | `-32020`   | `Mcp-Method`, `Mcp-Name` or `Mcp-Param-*` header does not match the body | |
+| 400  | `-32600`   | `id` violates JSON-RPC 2.0 (null, bool, object, array, empty string) | |
+| 400  | `-32600`   | `Mcp-Protocol-Version` header is not valid UTF-8 | |
+| 400  | `-32600`   | Batch array on POST body | |
+| 400  | `-32600`   | Missing `Accept` or non-SSE-compatible Accept | |
+| 400  | `-32602`   | `_meta.progressToken` not string or non-empty number | |
+| 400  | `-32600`   | `_meta` key uses an MCP-reserved prefix, or carries `requestState` / `inputResponses` | |
 | 401  | `-32000`   | Identity gate: a presented credential is invalid, expired, or bound to another audience | `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…"`. |
 | 401  | `-32003` / `-32022` | Policy refused a caller that presented **no** credential (trust floor, CEL `allow_if`) while a bearer verifier (`jwks` / `oidc_oauth`) is configured | `WWW-Authenticate: Bearer resource_metadata="…"`. The URL names the metadata of the hostname the request arrived on (`Host`, or `X-Forwarded-Host` behind a trusted proxy), so an OAuth host starts its flow against the URL it connected to. Without a verifier the refusal stays a 403. |
 | 402  | `-33042`   | Payment required (MPP, UCP, ACP) | Plugin-specific `-33050`..`-33061` when the plugin surfaces its own variant. |
 | 403  | `-32003`   | An authenticated caller is below a tool's trust floor, or lacks a required scope | A scope denial carries `error="insufficient_scope"` and the required `scope=` (SEP-2350); a bare 403 carries no challenge — re-authenticating cannot help. |
 | 403  | `-32022`   | CEL `allow_if` denial for an authenticated caller | |
-| 403  | n/a        | CORS rejection | Empty body. Origin not on `server.allowed_origins`. |
-| 404  | `-32600`   | Unknown session id on header | Operator-termed session never reuses an id. |
-| 409  | `-32600`   | Expired `Last-Event-Id` SSE cursor | Client must reinitialise the session. |
-| 429  | `-32099`   | Completion rate limit exceeded | T13-07. |
-| 429  | `-32099`   | Per-tenant session quota exceeded | T16-07; reply body includes `tenant` hint. |
+| 403  | n/a        | Origin rejection | Empty body. Origin not on `server.allowed_origins`. |
+| 404  | `-32601`   | Method the revision does not define | |
+| 405  | n/a        | `GET` / `HEAD` / `DELETE` on the MCP path | `Allow: POST`. |
+| 429  | `-32099`   | Completion rate limit exceeded | |
 | 500  | `-32603`   | Internal error | Last resort; the gateway prefers specific codes where possible. |
+| 503  | `-32000`   | Session capacity exhausted | The caller's principal holds `server.max_sessions_per_tenant` session rows. |
 
 Gateway-reserved JSON-RPC codes live in the **`-33000`..`-33099`**
 range to keep MCP's `-32000`..`-32099` reserved space untouched. See
-`apps/gateway/src/protocol/mod.rs` constants `PAYMENT_REQUIRED_CODE`,
-`URL_ELICITATION_REQUIRED_CODE`, etc.
+the `PAYMENT_REQUIRED_CODE` and `PAYMENT_VERIFICATION_FAILED_CODE`
+constants in `libs/mcp-wire/src/shared/error.rs`.
 
 **Rule of thumb for clients**: treat HTTP 2xx as "transport ok, read
 the envelope". Treat HTTP 4xx as "transport refused; the envelope may

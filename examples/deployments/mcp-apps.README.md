@@ -40,7 +40,7 @@ The four `crm.*` / `fin.*` tools are `mock` bindings with `passthrough: true`, s
 
 ## Verifying
 
-- `server/discover` (modern wire) / `initialize` (legacy) advertises `capabilities.extensions["io.modelcontextprotocol/ui"].mimeTypes = ["text/html;profile=mcp-app"]` when `enabled: true`.
+- `server/discover` advertises `capabilities.extensions["io.modelcontextprotocol/ui"].mimeTypes = ["text/html;profile=mcp-app"]` when `enabled: true`.
 - `resources/list` includes `ui://mcpg/customers`, `…/account`, `…/new-account`, `…/revenue` (mimeType `text/html;profile=mcp-app`); `resources/read` of any returns the rendered shell with a `mcpg-app-config` data island and a clamped `_meta.ui`.
 - `resources/read` of `ui://analytics/chart` returns the HTML with `_meta.ui.csp.connectDomains` already narrowed to the operator allow-list, and `clipboardWrite` retained while any other permission is stripped.
 - Render end-to-end against the upstream `ext-apps` examples in a host that supports Apps (e.g. Claude Desktop) with this gateway in front.

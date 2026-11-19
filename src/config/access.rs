@@ -93,12 +93,12 @@ pub struct AccessConfig {
     #[serde(default)]
     pub personal_agent: Option<super::personal_agent::PersonalAgentConfig>,
     /// Refuse every MCP request (`POST`, `GET` and `DELETE` on the MCP
-    /// path, every JSON-RPC method including `initialize`, `*/list` and
-    /// `server/discover`) from a caller below `verified` with HTTP 401
-    /// and the `WWW-Authenticate: Bearer resource_metadata="…"`
-    /// challenge. An OAuth or EMA client that authenticates only after
-    /// a 401 starts its flow from that challenge; with this off, an
-    /// anonymous `initialize` succeeds and such a client never
+    /// path, every JSON-RPC method including `server/discover` and
+    /// `*/list`) from a caller below `verified` with HTTP 401 and the
+    /// `WWW-Authenticate: Bearer resource_metadata="…"` challenge. An
+    /// OAuth or EMA client that authenticates only after a 401 starts
+    /// its flow from that challenge; with this off, an anonymous
+    /// `server/discover` succeeds and such a client never
     /// authenticates. A request whose `Origin` is not allowed is still
     /// refused with 403 first. Only the MCP path is covered: the
     /// well-known metadata, the embedded authorization server's

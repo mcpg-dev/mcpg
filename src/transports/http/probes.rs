@@ -129,11 +129,11 @@ pub(crate) async fn readiness_handler(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    let request = GatewayRequest::new(
-        ctx,
-        GatewayOperation::Diagnostics(DiagnosticsOperation::Readiness),
-    );
-    map_gateway_response(runtime.handle_request(request).await)
+    map_gateway_response(
+        runtime
+            .handle_request(ctx, DiagnosticsOperation::Readiness)
+            .await,
+    )
 }
 
 pub(crate) async fn runtime_handler(
@@ -157,9 +157,9 @@ pub(crate) async fn runtime_handler(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    let request = GatewayRequest::new(
-        ctx,
-        GatewayOperation::Diagnostics(DiagnosticsOperation::Runtime),
-    );
-    map_gateway_response(runtime.handle_request(request).await)
+    map_gateway_response(
+        runtime
+            .handle_request(ctx, DiagnosticsOperation::Runtime)
+            .await,
+    )
 }

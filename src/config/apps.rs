@@ -36,9 +36,9 @@ pub struct AppsConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// Advertise the Apps capability on MCPG's OUTGOING
-    /// (client→upstream) `initialize` so federated servers emit their
-    /// UI-enabled tools. A spec-compliant upstream checks the client's
+    /// Advertise the Apps capability in the client capabilities of
+    /// MCPG's OUTGOING (client→upstream) requests so federated servers
+    /// emit their UI-enabled tools. A spec-compliant upstream checks the client's
     /// `io.modelcontextprotocol/ui` capability before registering UI
     /// tools — omit this and such an upstream withholds every UI tool.
     /// `None` ⇒ inherit `enabled`. Set `true` explicitly to pull UI
@@ -174,9 +174,9 @@ impl AppsConfig {
         ]
     }
 
-    /// Whether MCPG advertises the Apps capability on its outgoing
-    /// (client→upstream) `initialize`. Inherits `enabled` when
-    /// `federate_upstream` is unset.
+    /// Whether MCPG advertises the Apps capability in the client
+    /// capabilities of its outgoing (client→upstream) requests.
+    /// Inherits `enabled` when `federate_upstream` is unset.
     pub fn federate_upstream_enabled(&self) -> bool {
         self.federate_upstream.unwrap_or(self.enabled)
     }

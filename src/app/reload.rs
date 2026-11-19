@@ -73,14 +73,6 @@ pub(crate) async fn reload_with_config(
         new_config = merged;
     }
 
-    let store_config = SessionStoreConfig {
-        replay_window_limit: new_config.gateway.server.replay_window_limit,
-        session_idle_timeout_ms: new_config.gateway.server.session_idle_timeout_ms,
-        max_sessions: 10_000,
-        max_sessions_per_tenant: new_config.gateway.server.max_sessions_per_tenant,
-    };
-    let _ = store_config; // session store is preserved, not rebuilt
-
     crate::runtime::feature_flags::install(&new_config.feature_flags);
 
     let jwt_verifier = build_jwt_verifier(&new_config).await?;
@@ -156,14 +148,8 @@ pub(crate) async fn reload_with_config(
         ));
 
     let task_policy = crate::runtime::task_store::TaskRetentionPolicy {
-        default_ttl_ms: new_config
-            .mcp
-            .capabilities
-            .tasks
-            .default_ttl_ms
-            .saturating_mul(1000),
+        default_ttl_ms: new_config.mcp.capabilities.tasks.default_ttl_ms,
         max_tasks_per_session: new_config.mcp.capabilities.tasks.max_tasks_per_session,
-        result_wait_ms: new_config.mcp.capabilities.tasks.result_wait_ms,
     };
     let task_kv: std::sync::Arc<dyn mcpg_cluster_api::KeyValueStore> = resolve_capability_kv(
         new_config.mcp.capabilities.tasks.store.as_ref(),
@@ -398,12 +384,8 @@ pub(crate) async fn reload_with_config(
 
     // SEP-1865 MCP Apps — re-wire on reload (mirrors boot path).
     let new_apps_cfg = &new_config.mcp.configurations.apps;
-    let new_apps_capability = new_apps_cfg
-        .enabled
-        .then(|| crate::protocol::shared::apps::capability_value(&[]));
     let new_apps_policy = new_apps_cfg.enabled.then(|| new_apps_cfg.compiled_policy());
     new_runtime.set_apps_config(
-        new_apps_capability,
         new_apps_cfg.federate_upstream_enabled(),
         new_apps_policy,
         &new_apps_cfg.registry,
@@ -464,7 +446,6 @@ pub(crate) async fn reload_with_config(
             format!("mcpg/{}", env!("CARGO_PKG_VERSION")),
             old_runtime.federation_engine(),
             !federations_unchanged,
-            tenant_seg.clone(),
         );
     }
 
@@ -549,16 +530,11 @@ pub(crate) async fn reload_with_config(
     let session_store = state.session_store.clone();
     let new_delivery_bus = new_runtime.delivery_bus().clone();
 
-    // Propagate the protocol registry + SharedServices installed on
-    // the previous runtime onto the new one. Both are
-    // immutable Arc handles and outlive any single reload; reusing
-    // them keeps `handle_request` routing through the version
-    // handler chain across hot reloads. (`SharedServices.runtime` is
-    // a `Weak` to the `Arc<ArcSwap<...>>` swap cell, so the swap
-    // below is transparent to it — no rebuild needed.)
-    if let Some(registry) = old_runtime.protocol_registry.load_full() {
-        new_runtime.set_protocol_registry(registry);
-    }
+    // Carry the SharedServices installed on the previous runtime onto the
+    // new one: an immutable Arc handle that outlives any single reload, so
+    // the protocol handler keeps its requestState codec across hot reloads.
+    // (`SharedServices.runtime` is a `Weak` to the `Arc<ArcSwap<...>>` swap
+    // cell, so the swap below is transparent to it — no rebuild needed.)
     if let Some(services) = old_runtime.shared_services.load_full() {
         new_runtime.set_shared_services(services);
     }
@@ -668,14 +644,12 @@ pub(crate) async fn reload_with_config(
     // subscriber's stream will end when the old coordinator drops.
     spawn_cluster_audit_taps(&state.runtime.load());
 
-    // MCP Events types are served on the 2026-07-28 wire only, so only its
-    // sessions hear that they changed.
     if events_listed_changed {
         crate::runtime::events::builtin::announce_list_changed(&session_store, &new_delivery_bus);
     }
 
-    // Emit list_changed notifications for any inventory changes.
-    // Only notify sessions that have completed initialization (Operational phase).
+    // Emit list_changed notifications for any inventory changes to every
+    // session; its listen streams keep the ones they subscribed to.
     let tools_changed = old_tools != new_tools;
     let prompts_changed = old_prompts != new_prompts;
     let resources_changed = old_resources != new_resources;
@@ -703,23 +677,19 @@ pub(crate) async fn reload_with_config(
         .collect();
 
         let sessions = session_store.list_sessions();
-        let operational_sessions: Vec<_> = sessions
-            .iter()
-            .filter(|s| s.phase == crate::runtime::session_store::SessionPhase::Operational)
-            .collect();
 
         info!(
             tools_changed,
             prompts_changed,
             resources_changed,
-            session_count = operational_sessions.len(),
+            session_count = sessions.len(),
             "emitting list_changed notifications after config reload"
         );
         // list_changed broadcast on the audit lane.
         // One event per kind (tools / prompts / resources) carrying
         // the recipient session count.
         let registry_for_audit = state.runtime.load().plugin_registry_arc();
-        let session_count = operational_sessions.len() as u64;
+        let session_count = sessions.len() as u64;
         for kind_label in [
             tools_changed.then_some("tools"),
             prompts_changed.then_some("prompts"),
@@ -733,7 +703,7 @@ pub(crate) async fn reload_with_config(
             let _ = registry_for_audit.emit_audit_event(&event).await;
         }
 
-        for session in &operational_sessions {
+        for session in &sessions {
             for method in &methods {
                 let notification = crate::protocol::ListChangedNotification {
                     jsonrpc: crate::protocol::JSONRPC_VERSION,
@@ -743,7 +713,6 @@ pub(crate) async fn reload_with_config(
                     let message = crate::runtime::pipeline_store::DeliveryMessage {
                         kind: crate::runtime::pipeline_store::DeliveryKind::Notification,
                         jsonrpc_message: json_value,
-                        delivery_id: String::new(),
                     };
                     let bus = new_delivery_bus.clone();
                     let sid = session.session_id.clone();

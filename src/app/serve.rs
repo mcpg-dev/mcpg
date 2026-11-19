@@ -100,23 +100,11 @@ pub async fn run(state: AppState) -> Result<()> {
         state.runtime.load().plugin_registry().cluster_backend()
     };
 
-    // Terminal-error delivery so the reaper unblocks the caller of an expiring
-    // SUSPENDED pipeline (whole-pipeline or per-step elicitation timeout)
-    // instead of deleting its state silently.
-    let reaper_runtime = state.runtime.load_full();
-    let terminal_error_delivery: crate::runtime::pipeline_reaper::TerminalErrorDelivery =
-        std::sync::Arc::new(move |session_id, jsonrpc_id, code, message| {
-            let rt = reaper_runtime.clone();
-            Box::pin(async move {
-                rt.deliver_pipeline_terminal_error(&session_id, &jsonrpc_id, code, message)
-                    .await;
-            })
-        });
     let reaper =
-        crate::runtime::pipeline_reaper::PipelineReaper::new(std::time::Duration::from_secs(30))
-            .with_terminal_error_delivery(terminal_error_delivery);
+        crate::runtime::pipeline_reaper::PipelineReaper::new(std::time::Duration::from_secs(30));
     let reaper_handle = reaper.spawn(
         state.runtime.load().pipeline_store(),
+        state.runtime.load().task_store(),
         reaper_leadership.clone(),
     );
 
@@ -129,9 +117,9 @@ pub async fn run(state: AppState) -> Result<()> {
     // Session end cleanup. The session store tells of every session that
     // ends without a terminate call — idle on every replica, or ended by
     // another replica — and the drain runs the runtime's per-session cleanup
-    // (tenant quota, subscriptions, progress, request-id tracker, task
-    // cancellation) that explicit terminate runs itself — without which such
-    // a session leaks that state forever (and its tenant-quota slot). The
+    // (tenant quota, subscriptions, progress, task cancellation) that
+    // explicit terminate runs itself — without which such a session leaks
+    // that state forever (and its tenant-quota slot). The
     // store is preserved across config reloads, so a single registration
     // suffices; the drain always cleans up on the CURRENT runtime.
     {
@@ -194,18 +182,6 @@ pub async fn run(state: AppState) -> Result<()> {
     // registries are configured.
     crate::runtime::registry_sync::RegistrySyncer::spawn(state.clone());
 
-    let ping_driver_handle = match config.gateway.server.server_ping_interval_ms {
-        Some(secs) if secs > 0 => {
-            let driver = crate::runtime::ping_driver::ServerPingDriver::new(secs);
-            Some(driver.spawn(
-                state.session_store.clone(),
-                state.runtime.load().delivery_bus().clone(),
-                shutdown_rx.clone(),
-            ))
-        }
-        _ => None,
-    };
-
     // Spawn per-binding health prober (if enabled)
     let health_prober_handle = if config.gateway.server.health_check.enabled {
         let prober = crate::runtime::backend_health::BackendHealthProber::new(
@@ -220,26 +196,14 @@ pub async fn run(state: AppState) -> Result<()> {
     };
 
     // Start every plugin-supplied transport declared in
-    // `gateway.server.transports[]` BEFORE the
-    // primary HTTP / stdio listener. Each entry's `kind:`
-    // resolves via `resolve_kind(SlotClass::Transport, ...)`
-    // (built-in keyword, short alias, or full plugin id);
-    // the resolved transport gets a `GatewayMessageDispatcher`
-    // wired to the same `state.runtime` ArcSwap the primary
-    // listener uses, so reloads propagate to extra transports
-    // without restarting them. An `http`-wire transport instead hands
-    // whole requests to the gateway's own router. Failure to start
-    // refuses boot — operators see the bind / config error directly.
+    // `gateway.server.transports[]` BEFORE the primary HTTP / stdio
+    // listener. Each entry's `kind:` resolves via
+    // `resolve_kind(SlotClass::Transport, ...)` (short alias or full plugin
+    // id), and the transport hands whole requests to the gateway's own
+    // router, which reads the live runtime, so reloads reach extra
+    // transports without restarting them. Failure to start refuses boot —
+    // operators see the bind / config error directly.
     let server = &config.gateway.server;
-    if !server.legacy_wire
-        && server.transport == TransportMode::Stdio
-        && !server.tunnel.as_ref().is_some_and(|t| t.enabled)
-    {
-        anyhow::bail!(
-            "gateway.server.legacy_wire: false serves only 2026-07-28, over HTTP; the \
-             stdio transport speaks 2025-11-25"
-        );
-    }
     let extra_context = if server.transports.is_empty() {
         ExtraTransportContext::default()
     } else {
@@ -255,14 +219,12 @@ pub async fn run(state: AppState) -> Result<()> {
                 .shared_services
                 .load_full()
                 .map(|services| std::sync::Arc::clone(&services.tunnel_public_url)),
-            legacy_wire: server.legacy_wire,
         }
     };
     let extra_transport_handles = start_extra_transports(
         &config.gateway.server.transports,
         &config.plugins,
         &config.cluster.kind,
-        state.runtime.clone(),
         &state.runtime.load().plugin_registry_arc(),
         &extra_context,
     )
@@ -461,31 +423,6 @@ pub async fn run(state: AppState) -> Result<()> {
         "initiating graceful shutdown"
     );
 
-    // Publish a goodbye notification so clients can reconnect cleanly.
-    {
-        let runtime = state.runtime.load();
-        let delivery = runtime.delivery_bus().clone();
-        let sessions = state.session_store.list_sessions();
-        let goodbye = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/mcpg/server_draining",
-            "params": {
-                "reason": "server shutting down; stream will close",
-                "retry_hint_ms": 3000u64,
-            }
-        });
-        let msg = crate::runtime::pipeline_store::DeliveryMessage {
-            kind: crate::runtime::pipeline_store::DeliveryKind::Notification,
-            jsonrpc_message: goodbye,
-            delivery_id: String::new(),
-        };
-        for session in sessions {
-            let _ = delivery.publish(&session.session_id, msg.clone()).await;
-        }
-        // brief nudge so the goodbye flushes before we yank the transport.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
     // Ship the CP agent's buffered tool-call samples before anything else
     // stops. They are billable, and the transport has already stopped
     // accepting new work, so this is the last moment they can be sent.
@@ -603,11 +540,6 @@ pub async fn run(state: AppState) -> Result<()> {
         info!("binding health prober stopped");
     }
 
-    if let Some(handle) = ping_driver_handle {
-        handle.abort();
-        info!("server ping driver stopped");
-    }
-
     // Cancel the admin listener (drains after MCP so operators can observe drain)
     if let Some(handle) = admin_handle {
         handle.abort();
@@ -641,37 +573,23 @@ pub async fn run(state: AppState) -> Result<()> {
     Ok(())
 }
 
-/// What `http`-wire transports need from the gateway, and the wire rule
-/// for `messages`-wire ones.
+/// What transport plugins need from the gateway.
+#[derive(Default)]
 pub(crate) struct ExtraTransportContext {
-    /// The router that answers `http`-wire requests; `None` refuses every
-    /// `http`-wire entry. Each entry gets its own server, which records the
-    /// peers that entry attests under its plugin id.
+    /// The router that answers the requests a transport hands in; `None`
+    /// refuses every entry. Each entry gets its own server, which records
+    /// the peers that entry attests under its plugin id.
     pub http_router: Option<axum::Router>,
-    /// Receives the first `http`-wire transport's public URL (the base for
-    /// webhook callbacks) while no other public address is known.
+    /// Receives the first transport's public URL (the base for webhook
+    /// callbacks) while no other public address is known.
     pub public_url: Option<std::sync::Arc<arc_swap::ArcSwapOption<String>>>,
-    /// `gateway.server.legacy_wire`. When false, `messages`-wire entries are
-    /// refused: they speak only 2025-11-25.
-    pub legacy_wire: bool,
-}
-
-impl Default for ExtraTransportContext {
-    fn default() -> Self {
-        Self {
-            http_router: None,
-            public_url: None,
-            legacy_wire: true,
-        }
-    }
 }
 
 /// Start every plugin-supplied transport declared in
 /// `gateway.server.transports[]`. Each entry's `kind:` resolves
-/// to a registered Transport plugin via the registry. A `messages`-wire
-/// plugin's `start(listener_config, dispatcher)` binds its listener; an
-/// `http`-wire plugin's `start_http(listener_config, server)` opens its
-/// ingress and hands each request to the gateway router.
+/// to a registered Transport plugin via the registry, whose
+/// `start_http(listener_config, server)` opens its ingress and hands
+/// each request to the gateway router.
 /// Returns the collected `TransportHandle` vec — the caller stores
 /// it for the duration of the gateway run; closing each handle on
 /// shutdown is wired into the same drain path that handles the
@@ -684,24 +602,18 @@ impl Default for ExtraTransportContext {
 /// - kind that resolves to `cluster` (transport is not a cluster
 ///   role);
 /// - plugin id that isn't loaded;
-/// - a `messages`-wire plugin while `legacy_wire` is false;
+/// - no gateway router in `context`;
 /// - any start failure (bind, invalid config, etc.).
 pub(crate) async fn start_extra_transports(
     transports_cfg: &[crate::config::wiring::KindRef],
     plugins: &[crate::config::PluginEntryConfig],
     cluster_kind: &str,
-    runtime_swap: std::sync::Arc<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>>,
     plugin_registry: &mcpg_plugin_host::PluginRegistry,
     context: &ExtraTransportContext,
 ) -> Result<Vec<Box<dyn mcpg_plugin_protocol::transport::TransportHandle>>> {
-    use mcpg_plugin_protocol::transport::TransportWire;
     if transports_cfg.is_empty() {
         return Ok(Vec::new());
     }
-    let dispatcher: std::sync::Arc<dyn mcpg_plugin_protocol::transport::MessageDispatcher> =
-        std::sync::Arc::new(
-            crate::runtime::message_dispatcher::GatewayMessageDispatcher::new(runtime_swap),
-        );
     let mut handles: Vec<Box<dyn mcpg_plugin_protocol::transport::TransportHandle>> =
         Vec::with_capacity(transports_cfg.len());
     for kref in transports_cfg {
@@ -724,8 +636,7 @@ pub(crate) async fn start_extra_transports(
                     "gateway.server.transports[]: built-in keyword `{name}` is \
                      governed by the primary `transport:` field, not by this \
                      list. Either remove the entry or replace it with a \
-                     plugin id (e.g. `kind: dev.mcpg.builtin.transport.memory` \
-                     to start the in-process memory transport)."
+                     transport plugin id (e.g. `kind: dev.mcpg.transport.ngrok`)."
                 );
             }
             crate::config::wiring::ResolvedKind::Cluster => {
@@ -743,43 +654,25 @@ pub(crate) async fn start_extra_transports(
                 kref.kind
             )
         })?;
-        let wire = transport.wire();
-        let started = match wire {
-            TransportWire::Messages => {
-                if !context.legacy_wire {
-                    anyhow::bail!(
-                        "gateway.server.transports[]: plugin `{plugin_id}` hands the \
-                         gateway JSON-RPC messages, which speak only 2025-11-25; \
-                         gateway.server.legacy_wire: false serves only 2026-07-28"
-                    );
-                }
-                transport
-                    .start(&kref.config, std::sync::Arc::clone(&dispatcher))
-                    .await
-            }
-            TransportWire::Http => {
-                let Some(router) = &context.http_router else {
-                    anyhow::bail!(
-                        "gateway.server.transports[]: plugin `{plugin_id}` hands the \
-                         gateway HTTP requests, but no gateway router is available"
-                    );
-                };
-                let server = crate::transports::ingress::GatewayHttpIngress::new(
-                    router.clone(),
-                    plugin_id.clone(),
-                );
-                transport.start_http(&kref.config, server).await
-            }
+        let Some(router) = &context.http_router else {
+            anyhow::bail!(
+                "gateway.server.transports[]: plugin `{plugin_id}` hands the \
+                 gateway HTTP requests, but no gateway router is available"
+            );
         };
-        let handle = started.map_err(|e| {
-            anyhow::anyhow!(
-                "gateway.server.transports[]: plugin `{plugin_id}` failed \
-                 to start: {e}"
-            )
-        })?;
+        let server =
+            crate::transports::ingress::GatewayHttpIngress::new(router.clone(), plugin_id.clone());
+        let handle = transport
+            .start_http(&kref.config, server)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "gateway.server.transports[]: plugin `{plugin_id}` failed \
+                     to start: {e}"
+                )
+            })?;
         let listen = handle.listen_address().await.unwrap_or_default();
-        if wire == TransportWire::Http
-            && (listen.starts_with("https://") || listen.starts_with("http://"))
+        if (listen.starts_with("https://") || listen.starts_with("http://"))
             && let Some(slot) = &context.public_url
             && slot.load().is_none()
         {
@@ -788,7 +681,6 @@ pub(crate) async fn start_extra_transports(
         info!(
             kind = %kref.kind,
             plugin_id = %plugin_id,
-            wire = wire.as_str(),
             listen = %listen,
             "extra transport started"
         );

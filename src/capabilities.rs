@@ -155,16 +155,7 @@ pub fn print() -> anyhow::Result<()> {
 }
 
 fn mcp_versions() -> Vec<&'static str> {
-    use mcpg_mcp_wire::version::ProtocolVersion as V;
-    // Listed explicitly; the match below fails to compile when a revision is
-    // added, which is the reminder to extend this list.
-    let all = [V::V_2025_11_25, V::V_2026_07_28];
-    for v in all {
-        match v {
-            V::V_2025_11_25 | V::V_2026_07_28 => {}
-        }
-    }
-    all.iter().map(|v| v.as_str()).collect()
+    vec![crate::protocol::SUPPORTED_PROTOCOL_VERSION]
 }
 
 /// One baked plugin per subdirectory that holds a plugin artifact. The dir
@@ -218,8 +209,7 @@ mod tests {
             m.plugin_abi_layout,
             mcpg_plugin_protocol::abi_fingerprint::plugin_abi_layout_fingerprint()
         );
-        assert!(m.mcp_protocol_versions.contains(&"2025-11-25"));
-        assert!(m.mcp_protocol_versions.contains(&"2026-07-28"));
+        assert_eq!(m.mcp_protocol_versions, vec!["2026-07-28"]);
         // The published schema keeps its prose; the hash is taken over the
         // structure alone, so reproducing it means stripping the doc text the
         // same way.

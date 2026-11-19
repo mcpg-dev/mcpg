@@ -19,8 +19,8 @@ use super::{AppConfig, TrustLevelConfig};
 /// only ever see anonymous callers.
 pub fn reachable_trust_ceiling(config: &AppConfig) -> TrustLevelConfig {
     let access = &config.governance.access;
-    // A transport plugin in `gateway.server.transports` may be an `http`-wire
-    // one that attests verified callers (a tailnet peer); whether it does is
+    // A transport plugin in `gateway.server.transports` may attest verified
+    // callers (a tailnet peer); whether it does is
     // known only once it is loaded, and the request path still refuses what
     // it does not attest.
     let attesting_transport = !config.gateway.server.transports.is_empty()
@@ -136,8 +136,8 @@ pub fn access_posture_warnings(config: &AppConfig) -> Vec<String> {
     if !access.require_authentication {
         warnings.push(
             "governance.access.authorization_server is set but \
-             governance.access.require_authentication is false: an anonymous initialize and \
-             */list succeed, so an EMA client that authenticates only after a 401 never \
+             governance.access.require_authentication is false: an anonymous server/discover \
+             and */list succeed, so an EMA client that authenticates only after a 401 never \
              starts the flow. Set require_authentication: true unless anonymous access is \
              intended"
                 .to_owned(),
@@ -624,7 +624,7 @@ governance:
         assert!(access_posture_warnings(&config(&imported)).is_empty());
     }
 
-    /// An EMA gateway that serves anonymous `initialize` never hands a
+    /// An EMA gateway that serves anonymous `server/discover` never hands a
     /// lazy-auth client the 401 it starts from.
     #[test]
     fn authorization_server_without_require_authentication_warns() {

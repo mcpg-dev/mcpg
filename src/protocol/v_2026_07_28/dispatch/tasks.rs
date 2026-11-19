@@ -1,4 +1,4 @@
-//! `tasks` dispatch arms for MCP revision `2026-07-28`.
+//! `tasks` dispatch arms (SEP-2663 tasks extension).
 
 use crate::protocol::shared::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcErrorBody, ProtocolHttpResponse, ProtocolResponse,
@@ -9,8 +9,11 @@ use crate::protocol::v_2026_07_28::dispatch::mrtr::{
 use crate::protocol::v_2026_07_28::dispatch::support::{
     handler_internal_error, serialize_jsonrpc_success,
 };
-use crate::runtime::RequestContext;
+use crate::protocol::v_2026_07_28::extensions::tasks::wire::{
+    Task as WireTask, TaskStatus as WireTaskStatus,
+};
 use crate::runtime::shared_services::SharedServices;
+use crate::runtime::{GatewayRuntime, RequestContext};
 use serde_json::Value;
 
 /// True when the per-request client capabilities declared the
@@ -19,7 +22,7 @@ use serde_json::Value;
 /// the `tasks/*` methods and the `tools/call` → `resultType:"task"`
 /// materialization gate on this.
 pub(crate) fn client_declared_tasks_extension(ctx: &RequestContext) -> bool {
-    ctx.modern_request_capabilities
+    ctx.request_capabilities
         .as_ref()
         .and_then(|caps| caps.extensions.as_ref())
         .map(|ext| {
@@ -45,6 +48,7 @@ pub(crate) fn client_declared_tasks_extension(ctx: &RequestContext) -> bool {
 /// input is a suspended MRTR pipeline.
 pub(crate) async fn dispatch_tasks_extension(
     ctx: &RequestContext,
+    runtime: &GatewayRuntime,
     services: &SharedServices,
     op: crate::protocol::v_2026_07_28::wire::operations::TasksExtensionOperation,
 ) -> ProtocolHttpResponse {
@@ -57,7 +61,6 @@ pub(crate) async fn dispatch_tasks_extension(
         let request_id = op.request_id_owned();
         return ProtocolHttpResponse {
             http_status: 404,
-            session_id_header: None,
             response: ProtocolResponse::JsonRpcError(JsonRpcError {
                 jsonrpc: JSONRPC_VERSION,
                 id: request_id,
@@ -70,10 +73,6 @@ pub(crate) async fn dispatch_tasks_extension(
         };
     }
 
-    let Some(runtime_handle) = services.runtime() else {
-        return handler_internal_error(op.request_id_owned(), "gateway runtime is shutting down");
-    };
-    let runtime = runtime_handle.load();
     let task_store = runtime.task_store();
 
     // Principal-bound ownership: cross-instance pollable.
@@ -89,7 +88,7 @@ pub(crate) async fn dispatch_tasks_extension(
             match task_store.get_task(&params.task_id, &owner_key) {
                 Ok(record) => serialize_jsonrpc_success(
                     request_id,
-                    &GetTaskResult::new(task_record_to_modern_task(&record)),
+                    &GetTaskResult::new(task_record_to_wire_task(&record)),
                     "tasks/get",
                 ),
                 Err(error) => task_store_error_to_response(error, Some(request_id), "tasks/get"),
@@ -100,8 +99,8 @@ pub(crate) async fn dispatch_tasks_extension(
             // empty (`resultType:"complete"`), NOT the task body.
             match task_store.cancel_task(&params.task_id, &owner_key) {
                 Ok(_) => {
-                    // Same cluster broadcast + metric the legacy arm emits, so
-                    // a cancel reaches a peer executing the task on either wire.
+                    // The cluster broadcast reaches a peer replica that
+                    // executes the task.
                     runtime.broadcast_task_cancellation(
                         &params.task_id,
                         &owner_key,
@@ -117,7 +116,7 @@ pub(crate) async fn dispatch_tasks_extension(
             }
         }
         TasksExtensionOperation::UpdateTask { request_id, params } => {
-            dispatch_tasks_update(ctx, services, &owner_key, request_id, params).await
+            dispatch_tasks_update(ctx, runtime, services, &owner_key, request_id, params).await
         }
     }
 }
@@ -132,6 +131,7 @@ pub(crate) async fn dispatch_tasks_extension(
 /// necessarily reflects the resume.
 pub(crate) async fn dispatch_tasks_update(
     ctx: &RequestContext,
+    runtime: &GatewayRuntime,
     services: &SharedServices,
     owner_key: &str,
     request_id: Value,
@@ -139,10 +139,6 @@ pub(crate) async fn dispatch_tasks_update(
 ) -> ProtocolHttpResponse {
     use crate::protocol::v_2026_07_28::extensions::tasks::wire::UpdateTaskResult;
 
-    let Some(runtime_handle) = services.runtime() else {
-        return handler_internal_error(Some(request_id), "gateway runtime is shutting down");
-    };
-    let runtime = runtime_handle.load();
     let task_store = runtime.task_store();
 
     // Ownership + existence check, and recover the MRTR resume handle
@@ -172,7 +168,8 @@ pub(crate) async fn dispatch_tasks_update(
         request_state,
         input_responses: params.input_responses.clone(),
     };
-    let resume_response = dispatch_mrtr_resumption(ctx, services, request_id.clone(), resume).await;
+    let resume_response =
+        dispatch_mrtr_resumption(ctx, runtime, services, request_id.clone(), resume).await;
 
     // Fold the resume outcome back onto the task record so the next
     // `tasks/get` reflects it.
@@ -246,27 +243,41 @@ pub(crate) fn fold_resume_outcome_onto_task(
     }
 }
 
-/// Project a stored `TaskRecord` into the modern SEP-2663 `Task`
-/// shape. Maps the internal `protocol::Task` metadata, inlines the
-/// terminal `result`/`error` from the `TerminalEnvelope`, and surfaces
-/// the outstanding `inputRequests` + `requestState` for an
-/// `input_required` task.
-pub(crate) fn task_record_to_modern_task(
-    record: &crate::runtime::task_store::TaskRecord,
-) -> crate::protocol::v_2026_07_28::extensions::tasks::wire::Task {
-    use crate::protocol::v_2026_07_28::extensions::tasks::wire::{
-        Task as ModernTask, TaskStatus as ModernTaskStatus,
+/// Project the stored task metadata into the SEP-2663 `Task` shape:
+/// status, timestamps and `ttlMs` / `pollIntervalMs`, with no terminal
+/// body and no outstanding requests. The `resultType:"task"` answer of a
+/// `tools/call` and the `notifications/tasks` status ping carry this.
+pub(crate) fn wire_task(task: &crate::protocol::Task) -> WireTask {
+    let status = match task.status {
+        crate::protocol::TaskStatus::Working => WireTaskStatus::Working,
+        crate::protocol::TaskStatus::InputRequired => WireTaskStatus::InputRequired,
+        crate::protocol::TaskStatus::Completed => WireTaskStatus::Completed,
+        crate::protocol::TaskStatus::Failed => WireTaskStatus::Failed,
+        crate::protocol::TaskStatus::Cancelled => WireTaskStatus::Cancelled,
     };
-    use crate::runtime::task_store::TerminalEnvelope;
+    WireTask {
+        task_id: task.task_id.clone(),
+        status,
+        status_message: task.status_message.clone(),
+        created_at: task.created_at.clone(),
+        last_updated_at: task.last_updated_at.clone(),
+        ttl_ms: task.ttl,
+        poll_interval_ms: task.poll_interval,
+        result: None,
+        error: None,
+        input_requests: None,
+        request_state: None,
+    }
+}
 
-    let legacy = &record.task;
-    let status = match legacy.status {
-        crate::protocol::TaskStatus::Working => ModernTaskStatus::Working,
-        crate::protocol::TaskStatus::Completed => ModernTaskStatus::Completed,
-        crate::protocol::TaskStatus::Failed => ModernTaskStatus::Failed,
-        crate::protocol::TaskStatus::Cancelled => ModernTaskStatus::Cancelled,
-        crate::protocol::TaskStatus::InputRequired => ModernTaskStatus::InputRequired,
-    };
+/// Project a stored `TaskRecord` into the SEP-2663 `Task` shape
+/// `tasks/get` returns: [`wire_task`], plus the terminal `result`/`error`
+/// from the `TerminalEnvelope`, and the outstanding `inputRequests` +
+/// `requestState` for an `input_required` task.
+pub(crate) fn task_record_to_wire_task(
+    record: &crate::runtime::task_store::TaskRecord,
+) -> WireTask {
+    use crate::runtime::task_store::TerminalEnvelope;
 
     // SEP-2663 splits the terminal body across `result` (on
     // `completed`) and `error` (on `failed`); the internal envelope
@@ -294,18 +305,12 @@ pub(crate) fn task_record_to_modern_task(
         .ok()
     });
 
-    ModernTask {
-        task_id: legacy.task_id.clone(),
-        status,
-        status_message: legacy.status_message.clone(),
-        created_at: legacy.created_at.clone(),
-        last_updated_at: legacy.last_updated_at.clone(),
-        ttl_ms: legacy.ttl,
-        poll_interval_ms: legacy.poll_interval,
+    WireTask {
         result,
         error,
         input_requests,
         request_state: record.request_state.clone(),
+        ..wire_task(&record.task)
     }
 }
 
@@ -319,20 +324,12 @@ pub(crate) fn task_store_error_to_response(
     use crate::runtime::task_store::TaskStoreError;
 
     let (http_status, code, message) = match error {
-        TaskStoreError::NotFound => (
+        // Another owner's task answers exactly like a missing one, so a
+        // caller cannot learn that a task id exists.
+        TaskStoreError::NotFound | TaskStoreError::Forbidden => (
             200,
             -32602,
             format!("{operation_label}: task not found (may have expired)"),
-        ),
-        TaskStoreError::Forbidden => (
-            200,
-            -32600,
-            format!("{operation_label}: task belongs to a different session"),
-        ),
-        TaskStoreError::NotCompleted => (
-            200,
-            -32602,
-            format!("{operation_label}: task is still in flight"),
         ),
         TaskStoreError::AlreadyTerminal => (
             200,
@@ -342,7 +339,7 @@ pub(crate) fn task_store_error_to_response(
         TaskStoreError::QuotaExceeded { limit } => (
             200,
             -32600,
-            format!("{operation_label}: session task quota exceeded (limit {limit})"),
+            format!("{operation_label}: owner task quota exceeded (limit {limit})"),
         ),
         TaskStoreError::Internal(detail) => (
             500,
@@ -352,7 +349,6 @@ pub(crate) fn task_store_error_to_response(
     };
     ProtocolHttpResponse {
         http_status,
-        session_id_header: None,
         response: ProtocolResponse::JsonRpcError(JsonRpcError {
             jsonrpc: JSONRPC_VERSION,
             id: jsonrpc_id,

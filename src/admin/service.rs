@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::app::AppState;
 use crate::config::{AdminConfig, AuditOnFailure, DisclosureLevel};
 use crate::runtime::GatewayRuntime;
-use crate::runtime::session_store::SessionStore;
+use crate::runtime::session_store::{SessionSnapshot, SessionStore};
 
 /// Map the gateway config's `AuditOnFailure` onto plugin-host's
 /// policy enum. Trivial one-to-one; lives here so the admin
@@ -93,38 +93,33 @@ impl AdminService {
 
     /// GET /admin/v1/sessions
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
-        let snapshots = self.session_store.list_sessions();
-        snapshots
+        self.session_store
+            .list_sessions()
             .into_iter()
-            .map(|s| SessionSummary {
-                session_id: s.session_id.clone(),
-                phase: format!("{:?}", s.phase),
-                created_at: s.created_at,
-                log_level: format!("{:?}", s.log_level),
-                subject_id: match self.config.disclosure {
-                    DisclosureLevel::Summary => None,
-                    _ => Some(s.session_id.clone()),
-                },
-            })
+            .map(|s| self.session_summary(s))
             .collect()
     }
 
     /// GET /admin/v1/sessions/{id}
     pub fn get_session(&self, session_id: &str) -> Option<SessionSummary> {
-        let snapshots = self.session_store.list_sessions();
-        snapshots
+        self.session_store
+            .list_sessions()
             .into_iter()
             .find(|s| s.session_id == session_id)
-            .map(|s| SessionSummary {
-                session_id: s.session_id.clone(),
-                phase: format!("{:?}", s.phase),
-                created_at: s.created_at,
-                log_level: format!("{:?}", s.log_level),
-                subject_id: match self.config.disclosure {
-                    DisclosureLevel::Summary => None,
-                    _ => Some(s.session_id.clone()),
-                },
-            })
+            .map(|s| self.session_summary(s))
+    }
+
+    /// The admin view of one session row: the owner principal is shown
+    /// only above the `summary` disclosure level.
+    fn session_summary(&self, s: SessionSnapshot) -> SessionSummary {
+        SessionSummary {
+            session_id: s.session_id,
+            created_at: s.created_at,
+            subject_id: match self.config.disclosure {
+                DisclosureLevel::Summary => None,
+                _ => s.owner_principal,
+            },
+        }
     }
 
     /// POST /admin/v1/sessions/{id}:terminate
@@ -631,12 +626,13 @@ pub struct ReadinessResponse {
     pub session_count: usize,
 }
 
+/// One internal session row, as the admin API shows it.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSummary {
     pub session_id: String,
-    pub phase: String,
     pub created_at: DateTime<Utc>,
-    pub log_level: String,
+    /// The principal that owns the row, when one does and the
+    /// disclosure level allows it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject_id: Option<String>,
 }

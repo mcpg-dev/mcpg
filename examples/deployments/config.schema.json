@@ -166,7 +166,7 @@
         },
         "require_authentication": {
           "default": false,
-          "description": "Refuse every MCP request (`POST`, `GET` and `DELETE` on the MCP path, every JSON-RPC method including `initialize`, `*/list` and `server/discover`) from a caller below `verified` with HTTP 401 and the `WWW-Authenticate: Bearer resource_metadata=\"…\"` challenge. An OAuth or EMA client that authenticates only after a 401 starts its flow from that challenge; with this off, an anonymous `initialize` succeeds and such a client never authenticates. A request whose `Origin` is not allowed is still refused with 403 first. Only the MCP path is covered: the well-known metadata, the embedded authorization server's `/oauth/*` endpoints (`token`, `jwks`, `revoke`, `register`, `authorize`, `consent`, `callback`, `connect`), the AAuth resource endpoints, health, readiness, metrics, `/runtime`, `/v0.1/servers`, the `/webhooks/*` callbacks and the plugin HTTP routes (`/plugins/{id}/{entity}` and override paths) stay open to anonymous callers, each gated as it is without this key. Needs at least one verifier: `jwks`, `oidc_oauth`, `authorization_server`, an `identity_provider` plugin, or a transport plugin in `gateway.server.transports` that attests callers (such as `dev.mcpg.transport.tailscale`).",
+          "description": "Refuse every MCP request (`POST`, `GET` and `DELETE` on the MCP path, every JSON-RPC method including `server/discover` and `*/list`) from a caller below `verified` with HTTP 401 and the `WWW-Authenticate: Bearer resource_metadata=\"…\"` challenge. An OAuth or EMA client that authenticates only after a 401 starts its flow from that challenge; with this off, an anonymous `server/discover` succeeds and such a client never authenticates. A request whose `Origin` is not allowed is still refused with 403 first. Only the MCP path is covered: the well-known metadata, the embedded authorization server's `/oauth/*` endpoints (`token`, `jwks`, `revoke`, `register`, `authorize`, `consent`, `callback`, `connect`), the AAuth resource endpoints, health, readiness, metrics, `/runtime`, `/v0.1/servers`, the `/webhooks/*` callbacks and the plugin HTTP routes (`/plugins/{id}/{entity}` and override paths) stay open to anonymous callers, each gated as it is without this key. Needs at least one verifier: `jwks`, `oidc_oauth`, `authorization_server`, an `identity_provider` plugin, or a transport plugin in `gateway.server.transports` that attests callers (such as `dev.mcpg.transport.tailscale`).",
           "type": "boolean"
         },
         "resource_metadata": {
@@ -656,7 +656,7 @@
           "type": "boolean"
         },
         "federate_upstream": {
-          "description": "Advertise the Apps capability on MCPG's OUTGOING (client→upstream) `initialize` so federated servers emit their UI-enabled tools. A spec-compliant upstream checks the client's `io.modelcontextprotocol/ui` capability before registering UI tools — omit this and such an upstream withholds every UI tool. `None` ⇒ inherit `enabled`. Set `true` explicitly to pull UI tools from upstreams while still withholding the capability from your own clients.",
+          "description": "Advertise the Apps capability in the client capabilities of MCPG's OUTGOING (client→upstream) requests so federated servers emit their UI-enabled tools. A spec-compliant upstream checks the client's `io.modelcontextprotocol/ui` capability before registering UI tools — omit this and such an upstream withholds every UI tool. `None` ⇒ inherit `enabled`. Set `true` explicitly to pull UI tools from upstreams while still withholding the capability from your own clients.",
           "type": [
             "boolean",
             "null"
@@ -1425,7 +1425,7 @@
         },
         "icons": {
           "default": null,
-          "description": "MCP 2025-11-25 descriptor extensions — icons and free-form `_meta`. Populated directly on the tool/prompt/resource/template descriptor that this binding produces.",
+          "description": "MCP descriptor extensions — icons and free-form `_meta`. Populated directly on the tool/prompt/resource/template descriptor that this binding produces.",
           "items": {
             "$ref": "#/definitions/BackendIconConfig"
           },
@@ -2178,7 +2178,7 @@
         },
         "allow_plaintext_state": {
           "default": false,
-          "description": "Permit a clustered (non-`single_node`) coordinator WITHOUT `state_encryption_key_env`. Defaults to `false`: `validate()` refuses to boot clustered without a state key, because the coordinator would hold session/pipeline/credential-adjacent state in plaintext and cross-replica modern-session resume (whose key derives from the same material) stays off. Set `true` ONLY as a migration escape hatch — boot then logs a loud warning naming the degraded surfaces. Inert for `single_node`. Gateway-only named field — kept out of the flattened plugin `config`.",
+          "description": "Permit a clustered (non-`single_node`) coordinator WITHOUT `state_encryption_key_env`. Defaults to `false`: `validate()` refuses to boot clustered without a state key, because the coordinator would hold session/pipeline/credential-adjacent state in plaintext and cross-replica session continuity and resume (whose keys derive from the same material) stay off. Set `true` ONLY as a migration escape hatch — boot then logs a loud warning naming the degraded surfaces. Inert for `single_node`. Gateway-only named field — kept out of the flattened plugin `config`.",
           "type": "boolean"
         },
         "kind": {
@@ -2202,7 +2202,7 @@
           "type": "boolean"
         },
         "state_encryption_key_env": {
-          "description": "Application-layer AEAD (XChaCha20-Poly1305) of ALL coordinator-backed *capability* state — sessions (incl. SSE replay), delivery, cancellation, tasks, pipelines, idempotency, request-state, subscriptions, quota, and the approvals backstop — and the derivation source for the cross-replica modern-session resume key. Names the **env var** holding a URL-safe-base64 32-byte key (the key itself never sits in the config artifact); generate one with `openssl rand -base64 32 | tr '+/' '-_'`. Required for every non-`single_node` kind: `validate()` refuses a clustered coordinator without it unless `allow_plaintext_state: true`. Unset (single_node, or via the escape hatch) = plaintext serde on the wire/at-rest; confidentiality then rests on the transport guard. Values are sealed per-key/per-topic (swap-resistant); keys/topics stay cleartext for routing. Does NOT cover the credential cache — it has its own `encryption_key` under the credentials config. Gateway-only named field — kept out of the flattened plugin `config`.",
+          "description": "Application-layer AEAD (XChaCha20-Poly1305) of ALL coordinator-backed *capability* state — sessions, delivery, cancellation, tasks, pipelines, idempotency, request-state, subscriptions, quota, and the approvals backstop — and the derivation source for the cross-replica session and resume keys. Names the **env var** holding a URL-safe-base64 32-byte key (the key itself never sits in the config artifact); generate one with `openssl rand -base64 32 | tr '+/' '-_'`. Required for every non-`single_node` kind: `validate()` refuses a clustered coordinator without it unless `allow_plaintext_state: true`. Unset (single_node, or via the escape hatch) = plaintext serde on the wire/at-rest; confidentiality then rests on the transport guard. Values are sealed per-key/per-topic (swap-resistant); keys/topics stay cleartext for routing. Does NOT cover the credential cache — it has its own `encryption_key` under the credentials config. Gateway-only named field — kept out of the flattened plugin `config`.",
           "type": [
             "string",
             "null"
@@ -2302,7 +2302,7 @@
     },
     "ConfigWatchConfig": {
       "additionalProperties": false,
-      "description": "`gateway.config_watch:` — operator-tunable file-watch reload trigger. Same semantics as SIGHUP and the admin endpoint: full `GatewayRuntime` rebuild via `ArcSwap`; session store preserved; credential cache rebuilt fresh; `list_changed` emitted per category for operational sessions on inventory delta.",
+      "description": "`gateway.config_watch:` — operator-tunable file-watch reload trigger. Same semantics as SIGHUP and the admin endpoint: full `GatewayRuntime` rebuild via `ArcSwap`; session store preserved; credential cache rebuilt fresh; `list_changed` emitted per category to the open `subscriptions/listen` streams on inventory delta.",
       "properties": {
         "enabled": {
           "default": false,
@@ -2446,15 +2446,15 @@
             "content-type",
             "accept",
             "authorization",
-            "mcp-session-id",
             "mcp-protocol-version",
-            "last-event-id",
+            "mcp-method",
+            "mcp-name",
             "idempotency-key",
             "traceparent",
             "tracestate",
             "dpop"
           ],
-          "description": "Request headers a page may send. Defaults to the set MCP needs — content negotiation, the session and protocol headers, the SSE resume cursor, bearer auth, the DPoP proof, idempotency and trace context. Add to it for a header a plugin reads.",
+          "description": "Request headers a page may send. Defaults to the set MCP needs — content negotiation, the protocol version, method and name headers (`Mcp-Protocol-Version`, `Mcp-Method`, `Mcp-Name`), bearer auth, the DPoP proof, idempotency and trace context. Add to it for a header a plugin reads, and for each `Mcp-Param-{Name}` header a client sends for a tool parameter: a preflight cannot match those by pattern.",
           "items": {
             "type": "string"
           },
@@ -2469,7 +2469,6 @@
         },
         "expose_headers": {
           "default": [
-            "mcp-session-id",
             "mcp-protocol-version",
             "x-mcpg-request-id",
             "www-authenticate",
@@ -2478,7 +2477,7 @@
             "idempotent-replayed-at",
             "dpop-nonce"
           ],
-          "description": "Response headers a page may READ. A browser hides every other header from script, so the session id, the request id, the auth challenge and the DPoP nonce have to be named here to be usable.",
+          "description": "Response headers a page may READ. A browser hides every other header from script, so the protocol version, the request id, the auth challenge and the DPoP nonce have to be named here to be usable.",
           "items": {
             "type": "string"
           },
@@ -2817,7 +2816,7 @@
     },
     "DeliveryConfig": {
       "additionalProperties": false,
-      "description": "`delivery:` config — delivery bus (the internal pub/sub that fans server-initiated messages out to the SSE stream owning each session) + per-capability `bus:` override. When `bus` is unset, the gateway inherits the cluster's `pub_sub()` primitive.",
+      "description": "`delivery:` config — delivery bus (the internal pub/sub that fans notifications out to the `subscriptions/listen` streams and in-flight responses of each session row, on whichever replica holds them) + per-capability `bus:` override. When `bus` is unset, the gateway inherits the cluster's `pub_sub()` primitive.",
       "properties": {
         "bus": {
           "anyOf": [
@@ -3392,7 +3391,7 @@
     },
     "EventsConfig": {
       "additionalProperties": false,
-      "description": "`events:` config — the experimental MCP Events extension.\n\nOff by default. With `enabled: false` the `events/*` methods answer `-32601` and `server/discover` does not mention events. The extension is served on the `2026-07-28` wire over HTTP only; the `2025-11-25` wire and stdio never carry it. Event types are declared under `mcp.capabilities.events`.",
+      "description": "`events:` config — the experimental MCP Events extension.\n\nOff by default. With `enabled: false` the `events/*` methods answer `-32601` and `server/discover` does not mention events. The `events/stream` delivery mode is served over HTTP; the stdio transport answers it with `-32601`. Event types are declared under `mcp.capabilities.events`.",
       "properties": {
         "advertise": {
           "default": [
@@ -4010,7 +4009,7 @@
           ],
           "default": {
             "poll_interval_ms": 30000,
-            "resources_updated": "auto"
+            "resources_updated": "poll"
           },
           "description": "Change-notification synthesis for upstreams that cannot push."
         },
@@ -4463,7 +4462,7 @@
             "anonymous_rate_limit_per_min": 600,
             "bind_address": "127.0.0.1:8787",
             "completion_rate_limit_per_sec": null,
-            "enforce_modern_request_meta": false,
+            "enforce_request_meta": false,
             "extra_resource_uri_schemes": [],
             "health_check": {
               "degraded_latency_threshold_ms": 1000,
@@ -4473,25 +4472,20 @@
               "unhealthy_threshold": 3
             },
             "health_path": "/health",
-            "legacy_wire": true,
             "max_request_body_mb": 4,
             "max_sessions_per_tenant": 0,
             "mcp_path": "/mcp",
-            "relax_request_id_uniqueness": false,
-            "replay_window_limit": 16,
             "request_timeout_ms": 30000,
             "revalidate_mutated_tool_arguments": false,
             "scrub_process_env_after_boot": false,
-            "server_ping_interval_ms": null,
             "session_idle_timeout_ms": 900000,
             "shutdown_timeout_ms": 30000,
             "tls": null,
             "transport": "http",
             "trust_proxy_ip": false,
-            "trust_subject_header": false,
-            "unary_json_fast_path": false
+            "trust_subject_header": false
           },
-          "description": "Listener configuration — bind address, transport mode (HTTP / stdio / SSE), TLS, allowed origins, and per-request timeouts. The block is mandatory in practice (the listener won't bind without `bind_address`) but defaults to a localhost dev-mode shape so out-of-the-box `mcpg` boots without any config."
+          "description": "Listener configuration — bind address, transport mode (HTTP / stdio), TLS, allowed origins, and per-request timeouts. The block is mandatory in practice (the listener won't bind without `bind_address`) but defaults to a localhost dev-mode shape so out-of-the-box `mcpg` boots without any config."
         }
       },
       "type": "object"
@@ -4690,7 +4684,7 @@
     },
     "IdempotencyConfig": {
       "additionalProperties": false,
-      "description": "`idempotency:` config — opt-in dedupe for `tools/call` and `tasks/create`. When `enabled: false` (the default), the gateway omits the `dev.mcpg/idempotency` extension from its `initialize` capability advertisement and silently ignores any `_meta[\"dev.mcpg/idempotency-key\"]` the caller sets.",
+      "description": "`idempotency:` config — opt-in dedupe for `tools/call`, with task-augmented calls in a namespace of their own (`tasks/create`). When `enabled: false` (the default), the gateway omits the `dev.mcpg/idempotency` extension from its `server/discover` capability advertisement and silently ignores any `_meta[\"dev.mcpg/idempotency-key\"]` the caller sets.",
       "properties": {
         "conflict_policy": {
           "allOf": [
@@ -4732,7 +4726,7 @@
             }
           ],
           "default": "per_identity",
-          "description": "Scope strategy — `per_identity` (default), `per_session`, or `per_tenant`."
+          "description": "Scope strategy — `per_identity` (default) or `per_tenant`."
         },
         "store": {
           "anyOf": [
@@ -4750,7 +4744,7 @@
             "tools/call",
             "tasks/create"
           ],
-          "description": "JSON-RPC methods this extension applies to. Default `[\"tools/call\", \"tasks/create\"]` — read-only methods (`resources/read`, `prompts/get`, `completion/complete`) are intentionally excluded as they're idempotent by nature.",
+          "description": "JSON-RPC methods this extension applies to. Default `[\"tools/call\", \"tasks/create\"]`, where `tasks/create` names a task-augmented `tools/call` — read-only methods (`resources/read`, `prompts/get`, `completion/complete`) are intentionally excluded as they're idempotent by nature.",
           "items": {
             "type": "string"
           },
@@ -4760,13 +4754,8 @@
       "type": "object"
     },
     "IdempotencyScopeKind": {
-      "description": "Default scope strategy for idempotency records. Operator can widen to `per_tenant` (service-account dedupe) or narrow to `per_session` (ephemeral test harnesses).\n\nNote: `global` is intentionally NOT a variant — cross-tenant replay is a known anti-pattern, so we don't expose the footgun.",
+      "description": "Default scope strategy for idempotency records. Operator can widen to `per_tenant` (service-account dedupe).\n\nNote: `global` is intentionally NOT a variant — cross-tenant replay is a known anti-pattern, so we don't expose the footgun.",
       "oneOf": [
-        {
-          "const": "per_session",
-          "description": "All requests sharing one MCP session share the namespace. Useful for ephemeral test harnesses; resets on every re-initialize.",
-          "type": "string"
-        },
         {
           "const": "per_identity",
           "description": "All requests sharing one resolved identity (OIDC subject + auth provider) share the namespace. The default — matches Stripe / Square idempotency semantics.",
@@ -4812,7 +4801,7 @@
       "properties": {
         "events": {
           "default": false,
-          "description": "Import the upstream's MCP Events types. Each serves downstream from the gateway's own log, in every delivery mode the gateway enables, and is fed by one upstream subscription per distinct set of arguments in demand, held with this federation's catalogue credential. Needs an upstream on the `2026-07-28` wire over `streamable_http` that advertises events; any other imports none.",
+          "description": "Import the upstream's MCP Events types. Each serves downstream from the gateway's own log, in every delivery mode the gateway enables, and is fed by one upstream subscription per distinct set of arguments in demand, held with this federation's catalogue credential. Needs a `streamable_http` upstream that advertises events; any other imports none.",
           "type": "boolean"
         },
         "prompts": {
@@ -5530,19 +5519,8 @@
     },
     "McpCapabilitiesConfig": {
       "additionalProperties": false,
-      "description": "`mcp.capabilities:` — the MCP protocol-advertised surface.\n\nMatches the protocol's `initialize` handshake's `capabilities` vocabulary: tools / prompts / resources / resource_templates, plus the gateway-side feature configs that govern protocol behaviour (tasks, elicitation, sampling, roots).",
+      "description": "`mcp.capabilities:` — the MCP protocol-advertised surface.\n\nMatches the `capabilities` vocabulary of `server/discover`: tools / prompts / resources / resource_templates / events, plus the task configuration that governs task-augmented tool calls.",
       "properties": {
-        "elicitation": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/McpElicitationConfig"
-            }
-          ],
-          "default": {
-            "timeout_ms": 60000
-          },
-          "description": "MCP elicitation — server-initiated prompt requests the gateway emits during pipeline execution."
-        },
         "events": {
           "description": "MCP Events (experimental) event types — what `events/list` offers and the delivery modes deliver. Each type binds one source: a plugin watch strategy, a signed inbound webhook route, a resource binding's watch, or an event the gateway raises itself. Served only while `mcp.configurations.events.enabled` is `true`.",
           "items": {
@@ -5574,28 +5552,6 @@
           },
           "type": "array"
         },
-        "roots": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/McpRootsConfig"
-            }
-          ],
-          "default": {
-            "timeout_ms": 30000
-          },
-          "description": "MCP roots-list — gateway requests roots from the client (e.g. for resource scoping)."
-        },
-        "sampling": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/McpSamplingConfig"
-            }
-          ],
-          "default": {
-            "timeout_ms": 60000
-          },
-          "description": "MCP sampling — server-initiated LLM completion requests forwarded back to the client."
-        },
         "tasks": {
           "allOf": [
             {
@@ -5605,8 +5561,7 @@
           "default": {
             "default_ttl_ms": 1800000,
             "max_tasks_per_session": 256,
-            "reaper_interval_ms": 60000,
-            "result_wait_ms": 30000
+            "reaper_interval_ms": 60000
           },
           "description": "MCP Tasks — task-augmented tool-call semantics. Carries the task store override, TTL/reaper tuning, and the task-supported tools list."
         },
@@ -5623,7 +5578,7 @@
     },
     "McpConfig": {
       "additionalProperties": false,
-      "description": "Top-level `mcp:` block — the MCP protocol surface.\n\nTwo children that mirror MCP's own vocabulary: - `capabilities:` — what the server advertises in the `initialize` handshake (tools, prompts, resources, resource_templates, tasks, elicitation, sampling, roots). - `configurations:` — runtime-emergent state handling (sessions, pipelines, subscriptions, delivery, cancellation). Operator only tunes persistence + constraints; the items themselves are created by clients at runtime.",
+      "description": "Top-level `mcp:` block — the MCP protocol surface.\n\nTwo children that mirror MCP's own vocabulary: - `capabilities:` — what the server advertises in `server/discover` (tools, prompts, resources, resource_templates, events, tasks). - `configurations:` — runtime-emergent state handling (sessions, pipelines, subscriptions, delivery, cancellation). Operator only tunes persistence + constraints; the items themselves are created by clients at runtime.",
       "properties": {
         "capabilities": {
           "allOf": [
@@ -5632,27 +5587,17 @@
             }
           ],
           "default": {
-            "elicitation": {
-              "timeout_ms": 60000
-            },
             "prompts": [],
             "resource_templates": [],
             "resources": [],
-            "roots": {
-              "timeout_ms": 30000
-            },
-            "sampling": {
-              "timeout_ms": 60000
-            },
             "tasks": {
               "default_ttl_ms": 1800000,
               "max_tasks_per_session": 256,
-              "reaper_interval_ms": 60000,
-              "result_wait_ms": 30000
+              "reaper_interval_ms": 60000
             },
             "tools": []
           },
-          "description": "What this MCP server advertises in the `initialize` handshake. Mirrors the protocol spec's `capabilities` vocabulary one-to-one."
+          "description": "What this MCP server advertises in `server/discover`. Mirrors the protocol spec's `capabilities` vocabulary one-to-one."
         },
         "configurations": {
           "allOf": [
@@ -5800,8 +5745,7 @@
               "strict_encryption": false
             },
             "sessions": {
-              "bind_session_owner": false,
-              "optional": false
+              "bind_session_owner": false
             },
             "subscriptions": {
               "max_per_session": 100
@@ -5818,14 +5762,14 @@
           "type": "array"
         },
         "instructions": {
-          "description": "The `instructions` a client receives in `server/discover` and in the `initialize` result, typically shown to the model: what this server is for and how to use its tools. At most 64 KiB. Unset keeps MCPG's own text.",
+          "description": "The `instructions` a client receives in `server/discover`, typically shown to the model: what this server is for and how to use its tools. At most 64 KiB. Unset keeps MCPG's own text.",
           "type": [
             "string",
             "null"
           ]
         },
         "list_page_size": {
-          "description": "How many entries one page of `tools/list`, `prompts/list`, `resources/list` and `resources/templates/list` holds, on every wire; a client follows `nextCursor` for the rest. 1 to 1 000; unset is 100. A client that reads only the first page sees only this many.",
+          "description": "How many entries one page of `tools/list`, `prompts/list`, `resources/list` and `resources/templates/list` holds; a client follows `nextCursor` for the rest. 1 to 1 000; unset is 100. A client that reads only the first page sees only this many.",
           "format": "uint",
           "maximum": 1000,
           "minimum": 1,
@@ -5869,7 +5813,7 @@
             }
           ],
           "default": {},
-          "description": "How the server presents itself to clients: `serverInfo` in `server/discover` and in the `initialize` result. Every field is optional; an unset field keeps MCPG's own value. `version` is always the gateway's."
+          "description": "How the server presents itself to clients: `serverInfo` in `server/discover`. Every field is optional; an unset field keeps MCPG's own value. `version` is always the gateway's."
         },
         "skills": {
           "allOf": [
@@ -6036,7 +5980,7 @@
               }
             }
           },
-          "description": "`io.modelcontextprotocol/events` (MCP Events, experimental) extension config. Off by default; `enabled: true` serves the `events/*` methods on the `2026-07-28` wire and advertises them in `server/discover`."
+          "description": "`io.modelcontextprotocol/events` (MCP Events, experimental) extension config. Off by default; `enabled: true` serves the `events/*` methods and advertises them in `server/discover`."
         },
         "idempotency": {
           "allOf": [
@@ -6075,7 +6019,7 @@
           "default": {
             "strict_encryption": false
           },
-          "description": "MRTR `requestState` codec configuration (2026-07-28 modern wire). Inert when no modern client connects; absent encryption_key the codec uses an ephemeral key at boot."
+          "description": "MRTR `requestState` codec configuration: how the gateway seals the state of a request that waits for input. Absent `encryption_key`, the codec uses an ephemeral key at boot."
         },
         "sessions": {
           "allOf": [
@@ -6084,8 +6028,7 @@
             }
           ],
           "default": {
-            "bind_session_owner": false,
-            "optional": false
+            "bind_session_owner": false
           }
         },
         "subscriptions": {
@@ -6097,20 +6040,6 @@
           "default": {
             "max_per_session": 100
           }
-        }
-      },
-      "type": "object"
-    },
-    "McpElicitationConfig": {
-      "additionalProperties": false,
-      "description": "`mcp.elicitation:` — gateway behavior for server-initiated elicitation prompts. Today carries only `timeout_ms`; future per-elicitation-type config can grow here.",
-      "properties": {
-        "timeout_ms": {
-          "default": 60000,
-          "description": "Maximum time the gateway waits for the client's response to an elicitation prompt before giving up. Default 60 000.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
         }
       },
       "type": "object"
@@ -6158,7 +6087,7 @@
             },
             "synthesize": {
               "poll_interval_ms": 30000,
-              "resources_updated": "auto"
+              "resources_updated": "poll"
             },
             "upstream_safety": {
               "allow_private_backends": false
@@ -6237,34 +6166,6 @@
         "name",
         "url"
       ],
-      "type": "object"
-    },
-    "McpRootsConfig": {
-      "additionalProperties": false,
-      "description": "`mcp.roots:` — gateway behavior for server-initiated roots-list requests forwarded to the client.",
-      "properties": {
-        "timeout_ms": {
-          "default": 30000,
-          "description": "Maximum time the gateway waits for the client's roots-list response. Default 30 000.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "type": "object"
-    },
-    "McpSamplingConfig": {
-      "additionalProperties": false,
-      "description": "`mcp.sampling:` — gateway behavior for server-initiated sampling (LLM completion) requests forwarded to the client.",
-      "properties": {
-        "timeout_ms": {
-          "default": 60000,
-          "description": "Maximum time the gateway waits for the client's sampling response. Default 60 000.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
       "type": "object"
     },
     "McpServerInfoConfig": {
@@ -7856,7 +7757,7 @@
           ],
           "default": {
             "poll_interval_ms": 30000,
-            "resources_updated": "auto"
+            "resources_updated": "poll"
           },
           "description": "Change-notification synthesis for push-less servers."
         },
@@ -8027,7 +7928,7 @@
     },
     "RequestStateConfig": {
       "additionalProperties": false,
-      "description": "`request_state:` config — the MRTR `requestState` codec used by the modern wire's suspending `tools/call` arm to encrypt pipeline-resumption blobs.\n\nInert until a modern client connects. Lives under `mcp.configurations` because the codec manages runtime-emergent resumption state alongside sessions / pipelines / subscriptions / delivery / cancellation / idempotency — operator tunes the encryption key, the runtime mints + serves the rest.\n\n```yaml mcp: configurations: request_state: # 32-byte ChaCha20-Poly1305 key, base64-encoded. # Generate via: head -c 32 /dev/urandom | base64 encryption_key: \"<base64-32-byte-secret>\" ```\n\nAbsent the key the gateway mints an ephemeral one at boot (with a WARN log) — pending resumptions issued before a gateway restart become undecodable after restart.",
+      "description": "`request_state:` config — the MRTR `requestState` codec that encrypts the resumption state of a request that waits for input (`InputRequiredResult`).\n\nLives under `mcp.configurations` because the codec manages runtime-emergent resumption state alongside sessions / pipelines / subscriptions / delivery / cancellation / idempotency — operator tunes the encryption key, the runtime mints + serves the rest.\n\n```yaml mcp: configurations: request_state: # 32-byte ChaCha20-Poly1305 key, base64-encoded. # Generate via: head -c 32 /dev/urandom | base64 encryption_key: \"<base64-32-byte-secret>\" ```\n\nAbsent the key the gateway mints an ephemeral one at boot (with a WARN log) — pending resumptions issued before a gateway restart become undecodable after restart.",
       "properties": {
         "encryption_key": {
           "description": "Base64-encoded 32-byte ChaCha20-Poly1305 secret. `None` ⇒ ephemeral key (random per process; resumptions lost on restart).\n\nIn a clustered deployment, if this is unset but `cluster.state_encryption_key_env` IS set, the codec key is derived (HMAC-SHA256, domain-separated) from that cluster-stable key so every replica decodes the same `requestState` blob — no separate secret needed.",
@@ -8038,7 +7939,7 @@
         },
         "strict_encryption": {
           "default": false,
-          "description": "Fail-closed guard for clustered modern resume. When `true` and the deployment is clustered (`cluster.kind != single_node`), the gateway REFUSES to boot if the `requestState` codec would fall back to an ephemeral per-process key — i.e. neither `encryption_key` nor a derivable `cluster.state_encryption_key_env` is available. An ephemeral key is undecodable on a peer, so a clustered modern (≤8 KiB inline) resume on another replica silently fails; this turns that silent fail-open into a loud boot error. Default `false` to keep existing clustered (e.g. legacy-only) deployments booting unchanged.",
+          "description": "Fail-closed guard for clustered resume. When `true` and the deployment is clustered (`cluster.kind != single_node`), the gateway REFUSES to boot if the `requestState` codec would fall back to an ephemeral per-process key — i.e. neither `encryption_key` nor a derivable `cluster.state_encryption_key_env` is available. An ephemeral key is undecodable on a peer, so a clustered (≤8 KiB inline) resume on another replica silently fails; this turns that silent fail-open into a loud boot error. Default `false`: a cluster whose clients never resume on another replica boots without a shared key.",
           "type": "boolean"
         }
       },
@@ -8338,7 +8239,7 @@
           "type": "string"
         },
         "browser_redirect_url": {
-          "description": "Browser hand-off for the MCP endpoint. When set, a plain browser NAVIGATION to the MCP path — method GET or HEAD, `Accept` includes `text/html` and does not include `text/event-stream` — is answered with `303 See Other` to exactly this URL, before identity or any other processing. No conformant MCP client matches: JSON-RPC rides POST, and SSE GETs send `text/event-stream`, so the redirect only claims requests that today dead-end in a 405/406. The value is served literally — request data never enters the Location header. Typical target: a hosted inspector pre-filled with this gateway's URL. Must be `http`/`https`.",
+          "description": "Browser hand-off for the MCP endpoint. When set, a plain browser NAVIGATION to the MCP path — method GET or HEAD, `Accept` includes `text/html` and does not include `text/event-stream` — is answered with `303 See Other` to exactly this URL, before identity or any other processing. No MCP client matches: every MCP request is a POST, so the redirect only claims requests the MCP path otherwise answers with 405. The value is served literally — request data never enters the Location header. Typical target: a hosted inspector pre-filled with this gateway's URL. Must be `http`/`https`.",
           "type": [
             "string",
             "null"
@@ -8353,7 +8254,7 @@
         },
         "completion_rate_limit_per_sec": {
           "default": null,
-          "description": "Per-session rate limit on `completion/complete` requests (cap per second). `None` disables. Guards against broken autocomplete UIs. Counted by the replica that serves the request.",
+          "description": "Per-principal rate limit on `completion/complete` requests (cap per second). `None` disables. Guards against broken autocomplete UIs. Anonymous callers share one bucket. Counted by the replica that serves the request.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -8372,9 +8273,9 @@
           ],
           "description": "Cross-origin access for browser clients. Unset (the default) means the gateway answers no preflight, so a browser cannot call it directly at all — `allowed_origins` alone is the DNS-rebinding guard, which checks the `Origin` of requests that arrive rather than granting a browser permission to send them. A page must then reach the gateway through a same-origin proxy.\n\nSet this to let listed origins call the gateway from a page. Every origin here must also be admitted by `allowed_origins`: the guard runs first, and a CORS grant for an origin the guard refuses would be a permission the browser is given and the gateway then denies. Config validation refuses that combination rather than serving it."
         },
-        "enforce_modern_request_meta": {
+        "enforce_request_meta": {
           "default": false,
-          "description": "Enforce the SEP-2575 per-request `_meta` identity triple (`io.modelcontextprotocol/{protocolVersion, clientInfo, clientCapabilities}`) on EVERY id-bearing modern (`2026-07-28`) request, not just `server/discover`. When false (the default), only `server/discover` requires the triple and other modern methods may carry minimal `_meta`. Has no effect on the `2025-11-25` wire. Opt-in so existing modern clients are unaffected until they adopt the triple.",
+          "description": "Enforce the SEP-2575 per-request `_meta` identity triple (`io.modelcontextprotocol/{protocolVersion, clientInfo, clientCapabilities}`) on EVERY id-bearing request, not just `server/discover`. When false (the default), only `server/discover` requires the triple and other methods may carry minimal `_meta`. Opt-in so clients that send only the protocol version are served until they adopt the triple.",
           "type": "boolean"
         },
         "extra_resource_uri_schemes": {
@@ -8404,11 +8305,6 @@
           "default": "/health",
           "type": "string"
         },
-        "legacy_wire": {
-          "default": true,
-          "description": "Serve the session wire of the `2025-xx` revisions: `initialize`, `Mcp-Session-Id`, and the GET stream and DELETE on the MCP path. Default `true`. With `false` the gateway serves only the stateless `2026-07-28` revision, over HTTP: a POST that negotiates a `2025-xx` revision (by header, by `initialize`, or by sending neither header nor `_meta` version) is refused with HTTP 400 and JSON-RPC `-32022` (`data.supported` is `[\"2026-07-28\"]`), a POST that carries `Mcp-Session-Id` is refused with HTTP 400 and `-32600`, GET and DELETE answer 405, and `server/discover` lists only `2026-07-28`. The stdio transport and `messages`-wire entries of `transports` speak `2025-11-25`, so they refuse to start with `false`; `http`-wire entries go through the HTTP router and follow this setting.",
-          "type": "boolean"
-        },
         "max_request_body_mb": {
           "default": 4,
           "description": "Maximum POST body accepted on the MCP endpoint, in MiB. Defaults to 4 MiB. `0` falls back to the default — an unbounded body is never acceptable on a public endpoint.",
@@ -8418,7 +8314,7 @@
         },
         "max_sessions_per_tenant": {
           "default": 0,
-          "description": "Per-tenant session quota. 0 = unlimited. The stricter of this and the global cap wins.\n\nA \"tenant\" is the trust-qualified principal, so the same subject string asserted by a header and verified by an IdP are separate tenants and cannot exhaust each other's quota.\n\nTwo limits worth knowing before setting this:\n\n- **It counts the fleet when the replicas share the session store** (`cluster.kind` other than `single_node`, and sessions not on a `memory` or `file` store). Each counted session keeps a slot next to its row in the store; a session that ends, on any replica, frees its slot. With a session store of its own per replica the cap counts that replica's sessions, so N replicas admit up to N x this value per tenant. - **Anonymous callers share one bucket**, because an unauthenticated request carries nothing to separate them by. Aggregate anonymous usage is capped rather than per-caller usage; per-caller protection for anonymous traffic is `anonymous_rate_limit_per_min`, which meters by source IP.",
+          "description": "Per-principal cap on internal session rows. 0 = unlimited. The stricter of this and the global cap wins.\n\nAn identified caller holds a row from its first request: one row per client it names in `_meta` when the caller is verified and a synthetic-session key or the cluster state key is set, otherwise one row on each replica that serves it. An anonymous caller gets a row only for a `subscriptions/listen` stream, a task, or a request that waits for input. A request that needs a new row beyond the cap is refused.\n\nThe principal is trust-qualified, so the same subject string asserted by a header and verified by an IdP are separate principals and cannot exhaust each other's cap.\n\nTwo limits worth knowing before setting this:\n\n- **Derived and anonymous rows count across the fleet when the replicas share the session store** (`cluster.kind` other than `single_node`, and sessions not on a `memory` or `file` store). Each such row keeps a slot next to it in the store; a session that ends, on any replica, frees its slot. A row one replica keeps for an identified caller counts on that replica only, as does every row with a session store of its own per replica, so N replicas admit up to N x this value per principal. - **Anonymous callers share one bucket**, because an unauthenticated request carries nothing to separate them by. Aggregate anonymous usage is capped rather than per-caller usage; per-caller protection for anonymous traffic is `anonymous_rate_limit_per_min`, which meters by source IP.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -8426,17 +8322,6 @@
         "mcp_path": {
           "default": "/mcp",
           "type": "string"
-        },
-        "relax_request_id_uniqueness": {
-          "default": false,
-          "description": "Relax the per-session JSON-RPC request-id uniqueness rule. When false (default) a client-supplied `id` that has already been used on the same MCP session is rejected with `-32600` (JSON-RPC forbids id reuse). Set `true` only for load generators that replay a fixed request body (e.g. the fortio proxy-overhead benchmark in `tools/bench/fortio/`), where every request carries the same `id`. Never enable in production — it removes a duplicate-delivery / replay guard.",
-          "type": "boolean"
-        },
-        "replay_window_limit": {
-          "default": 16,
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
         },
         "request_timeout_ms": {
           "default": 30000,
@@ -8454,19 +8339,9 @@
           "description": "After boot (plugins loaded, config-origin `env://` / `${env.X}` secrets already captured by the env secret provider's snapshot), remove those referenced env vars from the live process environment so a loaded cdylib can no longer read them via `std::env::var` / shared-process env. Opt-in defense-in-depth, default off. NOTE: this is NOT a hard boundary — it does not clear `/proc/self/environ` (the exec-time copy), so a hostile in-process plugin can still recover the original values there; it raises the bar against accidental/casual exposure. Enable only once every plugin resolves its secrets via the host (`cred://` / `env://`) rather than reading env directly.",
           "type": "boolean"
         },
-        "server_ping_interval_ms": {
-          "default": null,
-          "description": "Emit a server-initiated `ping` to each active session's SSE stream on this cadence. `None` or `0` disables. Reasonable value: 30s.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
         "session_idle_timeout_ms": {
           "default": 900000,
-          "description": "How long a session of the `2025-xx` revisions lives without use, in milliseconds. A session ends when it was not used for this long; its open streams end with it, and the client's next request gets 404.\n\nWhen the replicas share the session store, a replica in use writes the session's last use at most every quarter of this timeout (at least 1 s), so the fleet ends a session only once no replica used it for this timeout plus that quarter. The end — this or a `DELETE` — reaches every replica at once; a replica that misses the word stops serving the session the first time it uses it after that quarter, at most 30 s.",
+          "description": "How long an internal session row lives without use, in milliseconds. The gateway keeps a row for a caller while it holds state across requests: an open `subscriptions/listen` stream, a task, or a request that waits for input (`InputRequiredResult`). A row ends when it was not used for this long; its listen streams end with it, and the unfinished tasks it owns are cancelled. An identified caller's tasks belong to its principal, not to a row, and run until they finish or reach their TTL.\n\nWhen the replicas share the session store, a replica in use writes the row's last use at most every quarter of this timeout (at least 1 s), so the fleet ends a row only once no replica used it for this timeout plus that quarter. The end — this or an admin terminate — reaches every replica at once; a replica that misses the word stops serving the row the first time it uses it after that quarter, at most 30 s.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -8497,7 +8372,7 @@
           "default": "http"
         },
         "transports": {
-          "description": "Additional plugin-supplied transports started at boot alongside the primary HTTP / stdio listener (which continues to be governed by `transport:` and `bind_address:`). Each entry is a [`KindRef`] — `kind:` resolves to either a built-in transport keyword (today only `dev.mcpg.builtin.transport.memory` is wired; `builtin-http` / `builtin-stdio` map to the in-tree HTTP / stdio paths and don't need a list entry) or a registered Transport plugin id. Each entry starts once, with its `config`; transports that fail to start halt the boot. Empty list = no extra transports beyond the primary listener — today's default.\n\nA `messages`-wire plugin (websocket, grpc, custom RPC) gets the JSON-RPC dispatcher and speaks `2025-11-25`. An `http`-wire plugin (a tunnel such as `dev.mcpg.transport.ngrok`) hands whole HTTP requests to the gateway's own router, and its listen URL becomes the public address for webhook callbacks while no other is set.",
+          "description": "Additional plugin-supplied transports started at boot alongside the primary HTTP / stdio listener (which continues to be governed by `transport:` and `bind_address:`). Each entry is a [`KindRef`] whose `kind:` is a registered Transport plugin id (`builtin-http` / `builtin-stdio` map to the in-tree HTTP / stdio paths and need no list entry). Each entry starts once, with its `config`; transports that fail to start halt the boot. Empty list (the default) = no extra transports beyond the primary listener.\n\nA transport plugin (a tunnel such as `dev.mcpg.transport.ngrok`) hands whole HTTP requests to the gateway's own router, so it serves the same MCP endpoint as the primary listener, and its listen URL becomes the public address for webhook callbacks while no other is set.",
           "items": {
             "$ref": "#/definitions/KindRef"
           },
@@ -8534,11 +8409,6 @@
             }
           ],
           "description": "Reverse-federation ingress: how this gateway reaches same-org `tunnel://<name>` federation upstreams through the relay's federation ingress. Independent of `tunnel` (egress) — a gateway can federate other gateways' tunnels without dialing one of its own."
-        },
-        "unary_json_fast_path": {
-          "default": false,
-          "description": "On the legacy (`2025-11-25`) wire, answer a unary request whose result is immediately available and that emitted NO server→client notifications (`log` / `progress`) with a single `application/json` response instead of a one-frame `text/event-stream` reply. This is spec-permitted (Streamable HTTP lets the server pick JSON or SSE) and mirrors what the modern (`2026-07-28`) wire already does; it skips the per-request SSE stream bookkeeping (replay-window append, priming + logging frames, session snapshot) that otherwise runs under the session lock, which materially raises tool-call throughput. Default `false` (unchanged SSE behaviour). A request that DOES emit notifications, or suspends (MRTR), still streams regardless of this flag.",
-          "type": "boolean"
         }
       },
       "type": "object"
@@ -8558,16 +8428,11 @@
     },
     "SessionsConfig": {
       "additionalProperties": false,
-      "description": "`sessions:` config — session lifecycle store + per-capability `store:` override. When `store` is unset, the session KV inherits from the cluster's `key_value_store()` primitive; when set, the override pins to an in-process backend (memory / file).",
+      "description": "`sessions:` config — the store of the internal session rows the gateway keeps for callers that hold state across requests (tasks, requests that wait for input, `subscriptions/listen` streams), plus a per-capability `store:` override. Clients never see a session id. When `store` is unset, the session KV inherits from the cluster's `key_value_store()` primitive; when set, the override pins to an in-process backend (memory / file).",
       "properties": {
         "bind_session_owner": {
           "default": false,
-          "description": "Bind each session to the principal that created it. When true, session-scoped operations (GET→SSE stream, DELETE→terminate, subscriptions, POST→SSE continuation) require the caller's resolved principal to match the session's creator; a mismatch is refused as if the session did not exist (no existence leak). Default false (today's possession-only behaviour). An anonymous session (no creating principal) can only be driven anonymously.",
-          "type": "boolean"
-        },
-        "optional": {
-          "default": false,
-          "description": "Make sessions optional on the legacy (`2025-11-25`) wire. When false (default), a legacy request without an `Mcp-Session-Id` header is rejected (`-32600`, HTTP 400) — a legacy client MUST `initialize` first. When true, such a request is instead served through an ephemeral, row-less session (the same lane the modern wire uses for anonymous stateless calls): the gateway does not issue a session, so it does not demand one. Spec-permitted (a server chooses whether to issue sessions), and lets fixed-tool-set proxy deployments skip the handshake round-trip. Features that inherently need a durable session — SSE resume cursors, server-initiated requests, cross-request task/subscription continuity — still require a real session; a session-less request that would need one gets a clear error. `initialize` continues to mint real sessions regardless.",
+          "description": "Bind each session row to the principal that created it. When true, a `subscriptions/listen` stream opens on a row only when the caller's resolved principal matches the row's creator; a mismatch is refused as if the session did not exist (no existence leak). Default false. An anonymous row (no creating principal) can only be driven anonymously. Tasks, cancellation and resuming a request that waits for input check their own owner whatever this is set to.",
           "type": "boolean"
         },
         "store": {
@@ -8581,7 +8446,7 @@
           ]
         },
         "synthetic_session_key": {
-          "description": "Base64-encoded 32-byte secret used to derive the per-principal synthetic session id minted for modern (2026-07-28) stateless requests that arrive without a session header.\n\nWhen set **identically across every replica**, two requests from the same authenticated principal — on any replica — resolve to the same synthetic session id (HMAC of the principal id under this key), so `tasks/create` on replica A is readable via `tasks/get` on B and modern subscriptions converge. The id is an HMAC (not a bare hash), so a client that knows another principal's id still cannot compute — and therefore cannot hijack — that principal's synthetic session.\n\n`None` ⇒ each replica mints a random per-instance synthetic session (no cross-replica continuity); the gateway logs a boot WARN when a distributed coordinator is configured without this key.",
+          "description": "Base64-encoded 32-byte secret used to derive the id of the session row the gateway keeps for a verified caller.\n\nWhen set **identically across every replica**, two requests from the same verified principal and client — on any replica — resolve to the same session id (HMAC of the principal and the client name under this key), so a task created on replica A is readable via `tasks/get` on B and `subscriptions/listen` streams converge. The id is an HMAC (not a bare hash), so a client that knows another principal's id still cannot compute — and therefore cannot hijack — that principal's session.\n\nUnset, a clustered gateway derives the key from `cluster.state_encryption_key_env` when that is set; otherwise each replica mints a random per-instance session id (no cross-replica continuity), and the gateway logs a boot WARN when a distributed coordinator is configured.",
           "type": [
             "string",
             "null"
@@ -9054,23 +8919,18 @@
               "$ref": "#/definitions/SynthesizeMode"
             }
           ],
-          "default": "auto",
+          "default": "poll",
           "description": "When to poll-synthesize `resources/updated` for subscribed federated resources."
         }
       },
       "type": "object"
     },
     "SynthesizeMode": {
-      "description": "Gate on synthesized change notifications.",
+      "description": "Gate on synthesized change notifications. The gateway's listener on an upstream subscribes to list changes only, so `resources/updated` for subscribed federated resources comes from polling.",
       "oneOf": [
         {
-          "const": "auto",
-          "description": "Synthesize only when the upstream demonstrably cannot push resource updates: the modern (`2026-07-28`) wire and the `stdio` transport. A legacy streamable-http upstream keeps its GET-SSE push path and is not polled.",
-          "type": "string"
-        },
-        {
           "const": "poll",
-          "description": "Always poll, even for upstreams with a push channel (covers legacy servers that only emit `resources/updated` for subscriptions the gateway does not place upstream).",
+          "description": "Poll subscribed resources (the default).",
           "type": "string"
         },
         {
@@ -9128,18 +8988,18 @@
     },
     "TasksConfig": {
       "additionalProperties": false,
-      "description": "`tasks:` config (MCP 2025-11-25 tasks system) — task store + per-capability `store:` override + retention tuning. When `store` is unset, the task KV inherits from the cluster's `key_value_store()` primitive. Tuning fields (`default_ttl_ms`, `reaper_interval_ms`, `max_tasks_per_session`, `result_wait_ms`) are orthogonal and apply to whichever backend resolves.",
+      "description": "`tasks:` config (MCP Tasks) — task store + per-capability `store:` override + retention tuning. When `store` is unset, the task KV inherits from the cluster's `key_value_store()` primitive. Tuning fields (`default_ttl_ms`, `reaper_interval_ms`, `max_tasks_per_session`) are orthogonal and apply to whichever backend resolves.",
       "properties": {
         "default_ttl_ms": {
           "default": 1800000,
-          "description": "Default TTL applied to any task created without an explicit `task.ttl` from the client. Used by `tasks/create` and the reaper.",
+          "description": "TTL of a task the gateway creates for a task-augmented `tools/call`; the reaper deletes the task once it has elapsed.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
         },
         "max_tasks_per_session": {
           "default": 256,
-          "description": "Maximum concurrent tasks per session. Creation above this quota is rejected with JSON-RPC `-32603 Internal error` rather than silently succeeding. `0` disables the quota.",
+          "description": "Maximum concurrent tasks one task owner holds (the principal, or the session row of an anonymous caller). Creation above this quota is rejected with JSON-RPC `-32603 Internal error` rather than silently succeeding. `0` disables the quota.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -9147,13 +9007,6 @@
         "reaper_interval_ms": {
           "default": 60000,
           "description": "Background reaper sweep interval. The reaper deletes records whose `created_at + ttl` has elapsed.",
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "result_wait_ms": {
-          "default": 30000,
-          "description": "Upper bound on a single `tasks/result` HTTP blocking wait. Clients that need longer-running tasks reconnect via GET SSE and `Last-Event-Id` until the task goes terminal.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -9889,7 +9742,7 @@
     },
     "UpstreamConfig": {
       "additionalProperties": false,
-      "description": "Upstream connection details.",
+      "description": "Upstream connection details.\n\nMCPG connects to the upstream as an MCP 2026-07-28 client: it sends `server/discover` at connect and refuses an upstream whose `supportedVersions` leave out `2026-07-28`. Every request carries the per-request `_meta` identity; over `streamable_http` it also carries the `Mcp-Method` / `Mcp-Name` / `Mcp-Param-{Name}` routing headers.",
       "properties": {
         "args": {
           "default": [],
@@ -9932,15 +9785,6 @@
           },
           "description": "Static request headers sent on every upstream call (API-key style upstreams, e.g. `X-API-Key`); values support `${env.X}`. Reserved protocol headers (`authorization`, `mcp-*`, `content-type`, `accept`) are rejected — auth goes through `auth`, the wire headers stay MCPG's.",
           "type": "object"
-        },
-        "protocol_version": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/UpstreamProtocolVersion"
-            }
-          ],
-          "default": "auto",
-          "description": "MCP wire revision MCPG speaks to this upstream as a client.\n\nDefault `v2025_11_25` (the session-bound wire) keeps the federation client byte-identical to legacy traffic. Set `v2026_07_28` to speak the stateless modern client wire: no `initialize` handshake, no `Mcp-Session-Id`, per-request `_meta` identity, and the SEP-2243 `Mcp-Method` / `Mcp-Name` / `Mcp-Param-{Name}` routing headers. Only the `streamable_http` transport honors `v2026_07_28`."
         },
         "transport": {
           "allOf": [
@@ -10008,26 +9852,6 @@
         {
           "const": "per_principal",
           "description": "One upstream subscription per subscriber and set of arguments, held with that subscriber's own upstream credential, minted from their stored sign-in. Needs `auth.mode: oauth_impersonation` with `subject_token: idp_refresh_token` or `idp_id_token`.",
-          "type": "string"
-        }
-      ]
-    },
-    "UpstreamProtocolVersion": {
-      "description": "MCP wire revision the federation client speaks to an upstream.",
-      "oneOf": [
-        {
-          "const": "auto",
-          "description": "Detect the upstream's wire at connect time (the default): attempt the modern `server/discover`, and fall back to the legacy `initialize` handshake when the peer rejects it (the SEP-2575 backward-compatibility probe). The detected wire is cached per federation for the engine's lifetime. Pin one of the dated revisions to skip probing. The `stdio` transport never probes (it is legacy-only).",
-          "type": "string"
-        },
-        {
-          "const": "2025-11-25",
-          "description": "Session-bound `2025-11-25` wire (`initialize` handshake, `Mcp-Session-Id`, no SEP-2243 headers) — byte-identical to the legacy federation client.",
-          "type": "string"
-        },
-        {
-          "const": "2026-07-28",
-          "description": "Stateless `2026-07-28` wire (no handshake / session, per-request `_meta` identity, SEP-2243 routing headers).",
           "type": "string"
         }
       ]
@@ -10872,7 +10696,7 @@
           "anonymous_rate_limit_per_min": 600,
           "bind_address": "127.0.0.1:8787",
           "completion_rate_limit_per_sec": null,
-          "enforce_modern_request_meta": false,
+          "enforce_request_meta": false,
           "extra_resource_uri_schemes": [],
           "health_check": {
             "degraded_latency_threshold_ms": 1000,
@@ -10882,23 +10706,18 @@
             "unhealthy_threshold": 3
           },
           "health_path": "/health",
-          "legacy_wire": true,
           "max_request_body_mb": 4,
           "max_sessions_per_tenant": 0,
           "mcp_path": "/mcp",
-          "relax_request_id_uniqueness": false,
-          "replay_window_limit": 16,
           "request_timeout_ms": 30000,
           "revalidate_mutated_tool_arguments": false,
           "scrub_process_env_after_boot": false,
-          "server_ping_interval_ms": null,
           "session_idle_timeout_ms": 900000,
           "shutdown_timeout_ms": 30000,
           "tls": null,
           "transport": "http",
           "trust_proxy_ip": false,
-          "trust_subject_header": false,
-          "unary_json_fast_path": false
+          "trust_subject_header": false
         }
       },
       "description": "`gateway:` umbrella — the binary's network face: listener (`server`), admin surface (`admin`), Control Plane attachment (`control_plane`)."
@@ -10981,23 +10800,13 @@
       ],
       "default": {
         "capabilities": {
-          "elicitation": {
-            "timeout_ms": 60000
-          },
           "prompts": [],
           "resource_templates": [],
           "resources": [],
-          "roots": {
-            "timeout_ms": 30000
-          },
-          "sampling": {
-            "timeout_ms": 60000
-          },
           "tasks": {
             "default_ttl_ms": 1800000,
             "max_tasks_per_session": 256,
-            "reaper_interval_ms": 60000,
-            "result_wait_ms": 30000
+            "reaper_interval_ms": 60000
           },
           "tools": []
         },
@@ -11141,8 +10950,7 @@
             "strict_encryption": false
           },
           "sessions": {
-            "bind_session_owner": false,
-            "optional": false
+            "bind_session_owner": false
           },
           "subscriptions": {
             "max_per_session": 100
@@ -11156,7 +10964,7 @@
         },
         "server_info": {}
       },
-      "description": "`mcp:` namespace — the MCP protocol surface. Two children: `capabilities:` (tools / prompts / resources / resource_templates / tasks / elicitation / sampling / roots — what the server advertises in `initialize`) and `configurations:` (sessions / pipelines / subscriptions / delivery / cancellation — runtime-emergent state). Capability persistence (`store:` / `bus:`) defaults to `kind: cluster` — the cluster coordinator's primitive — and can be overridden per capability with `kind: memory` / `file`."
+      "description": "`mcp:` namespace — the MCP protocol surface. Two children: `capabilities:` (tools / prompts / resources / resource_templates / tasks — what the server advertises in `server/discover`) and `configurations:` (sessions / pipelines / subscriptions / delivery / cancellation — runtime-emergent state). Capability persistence (`store:` / `bus:`) defaults to `kind: cluster` — the cluster coordinator's primitive — and can be overridden per capability with `kind: memory` / `file`."
     },
     "observability": {
       "allOf": [

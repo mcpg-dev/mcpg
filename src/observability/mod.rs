@@ -54,11 +54,16 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     io::{self, Write},
+    mem,
     path::Path,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
+use tracing::{Metadata, level_filters::LevelFilter, subscriber::Interest};
 use tracing_subscriber::{
     EnvFilter, Layer, fmt, fmt::MakeWriter, layer::SubscriberExt, registry::Registry,
     util::SubscriberInitExt,
@@ -79,6 +84,55 @@ static LOGGING_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// this set is treated as a plugin id and routed through the
 /// log / telemetry bridges.
 const BUILTIN_SINK_KINDS: &[&str] = &["stderr", "stdout", "file"];
+
+/// Per-layer filter in front of a bridge layer. Open, the bridge sees every
+/// span and event; closed, it sees none, and its `OFF` hint lets a callsite
+/// that no other layer enables (DEBUG under an `info` stderr sink) be
+/// disabled at the callsite instead of being built for nobody.
+#[derive(Clone)]
+struct BridgeGate(Arc<AtomicBool>);
+
+impl Default for BridgeGate {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl BridgeGate {
+    fn is_open(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// A change rebuilds the callsite interest cache: cached interest and the
+    /// global max level would otherwise keep the old state.
+    fn set_open(&self, open: bool) {
+        if self.0.swap(open, Ordering::Relaxed) != open {
+            tracing::callsite::rebuild_interest_cache();
+        }
+    }
+}
+
+impl<S> tracing_subscriber::layer::Filter<S> for BridgeGate {
+    fn enabled(&self, _: &Metadata<'_>, _: &tracing_subscriber::layer::Context<'_, S>) -> bool {
+        self.is_open()
+    }
+
+    fn callsite_enabled(&self, _: &'static Metadata<'static>) -> Interest {
+        if self.is_open() {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(if self.is_open() {
+            LevelFilter::TRACE
+        } else {
+            LevelFilter::OFF
+        })
+    }
+}
 
 /// Owns the three bridge handles (logs / traces / metrics) that
 /// are consumed by `attach_*_bridge` once the runtime is up.
@@ -115,6 +169,12 @@ pub struct ObservabilityHandle {
     /// The log bridge layer reads it per event; `set_log_sink` installs one
     /// once the cp-attach agent exists. Empty (no-op) otherwise.
     log_sink: log_bridge::SharedLogSink,
+    /// Filter in front of the log bridge layer. Open until attach, so
+    /// boot events queue for the sinks; closed at attach when nothing
+    /// consumes a record.
+    log_gate: BridgeGate,
+    /// Filter in front of the telemetry bridge layer; see `log_gate`.
+    telemetry_gate: BridgeGate,
 }
 
 impl ObservabilityHandle {
@@ -132,8 +192,11 @@ impl ObservabilityHandle {
     /// runtime).
     /// Install the off-box log-capture sink (CP log shipping). Idempotent
     /// install-once: a second call is a no-op. Returns `true` when installed.
+    /// Opens the log gate, so the bridge layer sees every event again.
     pub fn set_log_sink(&self, sink: Arc<dyn log_bridge::LogSink>) -> bool {
-        self.log_sink.set(sink).is_ok()
+        let installed = self.log_sink.set(sink).is_ok();
+        self.log_gate.set_open(true);
+        installed
     }
 
     pub fn populate_target_map(&self, registry: &mcpg_plugin_host::PluginRegistry) {
@@ -161,7 +224,12 @@ impl ObservabilityHandle {
         per_plugin_filters: std::sync::Arc<HashMap<String, signal_router::SignalFilter>>,
     ) {
         if let Some(handle) = self.log_bridge.take() {
+            let consumed =
+                handle.feeds_plugins(&per_plugin_filters) || self.log_sink.get().is_some();
             handle.attach(runtime, per_plugin_filters);
+            if !consumed {
+                self.log_gate.set_open(false);
+            }
         }
     }
 
@@ -175,7 +243,11 @@ impl ObservabilityHandle {
         per_plugin_filters: std::sync::Arc<HashMap<String, signal_router::SignalFilter>>,
     ) {
         if let Some(handle) = self.telemetry_bridge.take() {
+            let consumed = handle.feeds_plugins(&per_plugin_filters);
             handle.attach(runtime, per_plugin_filters);
+            if !consumed {
+                self.telemetry_gate.set_open(false);
+            }
         }
     }
 
@@ -258,6 +330,8 @@ pub fn init(observability: &ObservabilityConfig) -> Result<ObservabilityHandle> 
             metrics_bridge,
             target_to_plugin_id,
             log_sink,
+            log_gate: BridgeGate::default(),
+            telemetry_gate: BridgeGate::default(),
         });
     }
 
@@ -271,6 +345,8 @@ pub fn init(observability: &ObservabilityConfig) -> Result<ObservabilityHandle> 
             metrics_bridge,
             target_to_plugin_id,
             log_sink,
+            log_gate: BridgeGate::default(),
+            telemetry_gate: BridgeGate::default(),
         });
     }
 
@@ -292,10 +368,12 @@ pub fn init(observability: &ObservabilityConfig) -> Result<ObservabilityHandle> 
     let (telemetry_bridge_layer, telemetry_bridge_handle) =
         telemetry_bridge::new_bridge(traces_plugin_ids, Arc::clone(&target_to_plugin_id));
 
+    let log_gate = BridgeGate::default();
+    let telemetry_gate = BridgeGate::default();
     tracing_subscriber::registry()
         .with(os_stream_layers)
-        .with(log_bridge_layer)
-        .with(telemetry_bridge_layer)
+        .with(log_bridge_layer.with_filter(log_gate.clone()))
+        .with(telemetry_bridge_layer.with_filter(telemetry_gate.clone()))
         .try_init()
         .context("failed to initialize structured logging")?;
 
@@ -307,6 +385,8 @@ pub fn init(observability: &ObservabilityConfig) -> Result<ObservabilityHandle> 
         metrics_bridge,
         target_to_plugin_id,
         log_sink,
+        log_gate,
+        telemetry_gate,
     })
 }
 
@@ -366,9 +446,14 @@ fn build_os_stream_layers(
     Ok(layers)
 }
 
-/// Writer for a `stderr` sink. Unit tests write through `eprint!`, which
-/// libtest captures per test thread; a raw process-stream write is not
-/// captured and floods the shared test log.
+/// The process-wide combiners of the `stderr` and `stdout` sinks.
+static STDERR: OnceLock<CombiningWriter<io::Stderr>> = OnceLock::new();
+static STDOUT: OnceLock<CombiningWriter<io::Stdout>> = OnceLock::new();
+
+/// Writer for a `stderr` sink: the process [`CombiningWriter`] of stderr.
+/// Unit tests write through `eprint!`, which libtest captures per test
+/// thread; a raw process-stream write is not captured and floods the
+/// shared test log.
 fn stderr_writer() -> impl for<'a> MakeWriter<'a> + Send + Sync + 'static {
     #[cfg(test)]
     {
@@ -376,7 +461,10 @@ fn stderr_writer() -> impl for<'a> MakeWriter<'a> + Send + Sync + 'static {
     }
     #[cfg(not(test))]
     {
-        io::stderr
+        OsStream(STDERR.get_or_init(|| {
+            write_queued_lines_on_panic();
+            CombiningWriter::new(io::stderr())
+        }))
     }
 }
 
@@ -389,7 +477,256 @@ fn stdout_writer() -> impl for<'a> MakeWriter<'a> + Send + Sync + 'static {
     }
     #[cfg(not(test))]
     {
-        io::stdout
+        OsStream(STDOUT.get_or_init(|| {
+            write_queued_lines_on_panic();
+            CombiningWriter::new(io::stdout())
+        }))
+    }
+}
+
+/// Writes every log line the `stderr` and `stdout` sinks still queue,
+/// waiting for a thread that is writing. The process calls it before it
+/// exits.
+pub fn flush_os_streams() {
+    if let Some(stderr) = STDERR.get() {
+        let _ = stderr.flush();
+    }
+    if let Some(stdout) = STDOUT.get() {
+        let _ = stdout.flush();
+    }
+}
+
+/// Installs, once, a panic hook that writes the queued log lines before the
+/// panic message, so the message follows the lines logged before it.
+#[cfg(not(test))]
+fn write_queued_lines_on_panic() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(stderr) = STDERR.get() {
+                stderr.flush_on_panic();
+            }
+            if let Some(stdout) = STDOUT.get() {
+                stdout.flush_on_panic();
+            }
+            previous(info);
+        }));
+    });
+}
+
+/// `MakeWriter` over a process-wide [`CombiningWriter`].
+#[cfg(not(test))]
+struct OsStream<S: 'static>(&'static CombiningWriter<S>);
+
+#[cfg(not(test))]
+impl<'a, S: Write + 'static> MakeWriter<'a> for OsStream<S> {
+    type Writer = EventWriter<'static, S>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.0.make_writer()
+    }
+
+    fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
+        self.0.make_writer_for(meta)
+    }
+}
+
+/// Largest write that a pipe delivers whole, never interleaved with the
+/// writes of another process to the same pipe (`PIPE_BUF` on Linux).
+const ATOMIC_WRITE_BYTES: usize = 4096;
+
+/// Queued bytes past which an event waits for the stream, so a stalled
+/// reader blocks the callers instead of growing the queue.
+const MAX_QUEUED_BYTES: usize = 256 * 1024;
+
+/// `MakeWriter` for a process stream that combines the events of concurrent
+/// threads into one write. Each event goes onto a queue; the thread that
+/// gets the stream writes the whole queue, and a thread that finds the
+/// stream busy returns at once, its event written by the holder. A write
+/// carries whole events in queue order, at most [`ATOMIC_WRITE_BYTES`]
+/// unless a single event is larger.
+struct CombiningWriter<S> {
+    queue: Mutex<Pending>,
+    stream: Mutex<Stream<S>>,
+}
+
+#[derive(Default)]
+struct Pending {
+    bytes: Vec<u8>,
+    /// End offset in `bytes` of each event.
+    ends: Vec<usize>,
+}
+
+impl Pending {
+    fn write_to(&self, sink: &mut impl Write) -> io::Result<()> {
+        let (mut start, mut end) = (0, 0);
+        for &event_end in &self.ends {
+            if event_end - start > ATOMIC_WRITE_BYTES && end > start {
+                sink.write_all(&self.bytes[start..end])?;
+                start = end;
+            }
+            end = event_end;
+        }
+        if end > start {
+            sink.write_all(&self.bytes[start..end])?;
+        }
+        Ok(())
+    }
+}
+
+struct Stream<S> {
+    sink: S,
+    /// Swapped with the queue, so both buffers keep their allocation.
+    batch: Pending,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl<S: Write> CombiningWriter<S> {
+    fn new(sink: S) -> Self {
+        Self {
+            queue: Mutex::default(),
+            stream: Mutex::new(Stream {
+                sink,
+                batch: Pending::default(),
+            }),
+        }
+    }
+
+    fn try_stream(&self) -> Option<MutexGuard<'_, Stream<S>>> {
+        match self.stream.try_lock() {
+            Ok(stream) => Some(stream),
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+
+    /// Queues `event` and writes the queue when the stream is free. With
+    /// `wait`, the caller waits for a busy stream, so its event is written
+    /// before the call returns.
+    fn submit(&self, event: &[u8], wait: bool) -> io::Result<()> {
+        let queued = {
+            let mut queue = lock(&self.queue);
+            queue.bytes.extend_from_slice(event);
+            let end = queue.bytes.len();
+            queue.ends.push(end);
+            end
+        };
+        let stream = if wait || queued > MAX_QUEUED_BYTES {
+            lock(&self.stream)
+        } else {
+            match self.try_stream() {
+                Some(stream) => stream,
+                None => return Ok(()),
+            }
+        };
+        self.drain(stream)
+    }
+
+    /// Writes the queue while it holds the stream. After it releases the
+    /// stream it looks at the queue once more: the writer of an event queued
+    /// during the last write saw the stream busy and returned.
+    fn drain<'a>(&'a self, mut stream: MutexGuard<'a, Stream<S>>) -> io::Result<()> {
+        let mut result = Ok(());
+        loop {
+            mem::swap(&mut *lock(&self.queue), &mut stream.batch);
+            let Stream { sink, batch } = &mut *stream;
+            let written = batch.write_to(sink);
+            batch.bytes.clear();
+            batch.ends.clear();
+            result = result.and(written);
+            drop(stream);
+            if lock(&self.queue).ends.is_empty() {
+                return result;
+            }
+            stream = match self.try_stream() {
+                Some(stream) => stream,
+                None => return result,
+            };
+        }
+    }
+
+    /// Writes the queue, waiting for a thread that holds the stream.
+    fn flush(&self) -> io::Result<()> {
+        self.drain(lock(&self.stream))?;
+        lock(&self.stream).sink.flush()
+    }
+
+    /// [`Self::flush`] from a panic hook. The panicking thread may hold the
+    /// stream itself, so it waits a bounded time and then gives up.
+    #[cfg(not(test))]
+    fn flush_on_panic(&self) {
+        let give_up = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        loop {
+            if let Some(stream) = self.try_stream() {
+                let _ = self.drain(stream);
+                return;
+            }
+            if std::time::Instant::now() >= give_up {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Whether an event at `level` waits for a busy stream: a warning or an
+/// error is on the stream before the code that logged it goes on, so it
+/// precedes a crash or a panic message that follows it.
+fn waits_for_stream(level: &tracing::Level) -> bool {
+    *level <= tracing::Level::WARN
+}
+
+impl<'a, S: Write + 'static> MakeWriter<'a> for CombiningWriter<S> {
+    type Writer = EventWriter<'a, S>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        EventWriter {
+            combiner: self,
+            wait: false,
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
+        EventWriter {
+            combiner: self,
+            wait: waits_for_stream(meta.level()),
+        }
+    }
+}
+
+/// The writer of one event through a [`CombiningWriter`].
+struct EventWriter<'a, S> {
+    combiner: &'a CombiningWriter<S>,
+    wait: bool,
+}
+
+impl<S: Write> Write for EventWriter<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !buf.is_empty() {
+            self.combiner.submit(buf, self.wait)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.combiner.flush()
+    }
+}
+
+impl<S: Write> Write for &CombiningWriter<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if !buf.is_empty() {
+            self.submit(buf, false)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        CombiningWriter::flush(self)
     }
 }
 
@@ -500,6 +837,7 @@ impl Write for SharedFileWriterGuard {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::{sync::mpsc, time::Duration};
 
     fn sink(kind: &str, config: serde_json::Value, level: Option<&str>) -> SinkConfig {
         SinkConfig {
@@ -622,6 +960,89 @@ mod tests {
         assert_eq!(layers.len(), 2);
     }
 
+    #[derive(Clone, Default)]
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    struct MessageSink(Arc<Mutex<Vec<String>>>);
+
+    impl log_bridge::LogSink for MessageSink {
+        fn record(&self, record: &mcpg_plugin_protocol::logs::LogRecord) {
+            self.0.lock().unwrap().push(record.message.clone());
+        }
+    }
+
+    #[test]
+    fn a_closed_bridge_gate_mutes_the_bridge_and_leaves_the_stream_sink() {
+        let bridged = Arc::new(Mutex::new(Vec::new()));
+        let sink: log_bridge::SharedLogSink = Arc::new(OnceLock::new());
+        let _ =
+            sink.set(Arc::new(MessageSink(Arc::clone(&bridged))) as Arc<dyn log_bridge::LogSink>);
+        let (bridge, _handle) = log_bridge::new_bridge(
+            Arc::new(HashSet::new()),
+            signal_router::new_target_map(),
+            sink,
+        );
+        let written = CapturedWriter::default();
+        let stream_sinks = vec![
+            build_fmt_layer(written.clone(), SinkFormat::Json)
+                .with_filter(EnvFilter::new("info"))
+                .boxed(),
+        ];
+        let gate = BridgeGate::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(stream_sinks)
+            .with(bridge.with_filter(gate.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let debug = |msg: &str| tracing::debug!(target: "bridge_gate_test", "{msg}");
+        let info = |msg: &str| tracing::info!(target: "bridge_gate_test", "{msg}");
+
+        debug("debug while open");
+        info("info while open");
+        gate.set_open(false);
+        debug("debug while closed");
+        info("info while closed");
+        gate.set_open(true);
+        debug("debug when reopened");
+
+        assert_eq!(
+            *bridged.lock().unwrap(),
+            ["debug while open", "info while open", "debug when reopened"]
+        );
+        let written = String::from_utf8(written.0.lock().unwrap().clone()).unwrap();
+        assert!(written.contains("info while open"), "{written}");
+        assert!(written.contains("info while closed"), "{written}");
+        assert!(!written.contains("debug while"), "{written}");
+        assert!(!written.contains("debug when"), "{written}");
+    }
+
+    #[test]
+    fn installing_a_log_sink_opens_the_log_gate() {
+        let handle = ObservabilityHandle::default();
+        handle.log_gate.set_open(false);
+        let bridged = Arc::new(Mutex::new(Vec::new()));
+        assert!(handle.set_log_sink(Arc::new(MessageSink(bridged))));
+        assert!(handle.log_gate.is_open());
+    }
+
     #[test]
     fn build_os_stream_layers_rejects_file_without_path() {
         let config = LogsConfig {
@@ -636,5 +1057,237 @@ mod tests {
             err.to_string().contains("config.path is required"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Records each write. With `hold`, the first write tells the test that
+    /// it started, then waits until the test releases it.
+    struct RecordingSink {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        hold: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+
+    impl Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some((started, release)) = self.hold.take() {
+                started.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            self.writes.lock().unwrap().push(buf.to_vec());
+            std::thread::yield_now();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct HeldStream {
+        writer: Arc<CombiningWriter<RecordingSink>>,
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        release: mpsc::Sender<()>,
+        holder: std::thread::JoinHandle<()>,
+    }
+
+    /// A combining writer whose stream is busy: another thread is inside
+    /// the write of `first` until `release`.
+    fn held_stream(first: &'static [u8]) -> HeldStream {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let (started_tx, started) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let writer = Arc::new(CombiningWriter::new(RecordingSink {
+            writes: Arc::clone(&writes),
+            hold: Some((started_tx, release_rx)),
+        }));
+        let holder = {
+            let writer = Arc::clone(&writer);
+            std::thread::spawn(move || (&*writer).write_all(first).unwrap())
+        };
+        started.recv().unwrap();
+        HeldStream {
+            writer,
+            writes,
+            release,
+            holder,
+        }
+    }
+
+    /// Writes `events` on a new thread; the receiver gets a message when the
+    /// last write returns.
+    fn write_on_thread(
+        writer: &Arc<CombiningWriter<RecordingSink>>,
+        events: Vec<Vec<u8>>,
+    ) -> mpsc::Receiver<()> {
+        let writer = Arc::clone(writer);
+        let (done, returned) = mpsc::channel();
+        std::thread::spawn(move || {
+            for event in events {
+                (&*writer).write_all(&event).unwrap();
+            }
+            done.send(()).unwrap();
+        });
+        returned
+    }
+
+    #[test]
+    fn a_busy_stream_queues_the_events_and_its_holder_writes_them_in_one_write() {
+        let held = held_stream(b"a\n");
+        write_on_thread(&held.writer, vec![b"b\n".to_vec(), b"c\n".to_vec()])
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a writer that finds the stream busy returns at once");
+        held.release.send(()).unwrap();
+        held.holder.join().unwrap();
+        assert_eq!(
+            *held.writes.lock().unwrap(),
+            [b"a\n".to_vec(), b"b\nc\n".to_vec()]
+        );
+    }
+
+    #[test]
+    fn a_batch_write_carries_whole_events_and_a_larger_event_goes_alone() {
+        let event = |len: usize, byte: u8| {
+            let mut event = vec![byte; len - 1];
+            event.push(b'\n');
+            event
+        };
+        let events = vec![
+            event(1500, b'b'),
+            event(1500, b'c'),
+            event(1500, b'd'),
+            event(5000, b'e'),
+            event(100, b'f'),
+            event(100, b'g'),
+        ];
+        let held = held_stream(b"a\n");
+        write_on_thread(&held.writer, events.clone())
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a writer that finds the stream busy returns at once");
+        held.release.send(()).unwrap();
+        held.holder.join().unwrap();
+        let writes = held.writes.lock().unwrap();
+        let lens: Vec<usize> = writes.iter().map(Vec::len).collect();
+        assert_eq!(lens, [2, 3000, 1500, 5000, 200]);
+        assert_eq!(writes[1..].concat(), events.concat());
+    }
+
+    #[test]
+    fn an_event_past_the_queue_ceiling_waits_for_the_stream() {
+        let held = held_stream(b"a\n");
+        let big = vec![b'x'; MAX_QUEUED_BYTES + 1];
+        let returned = write_on_thread(&held.writer, vec![big.clone()]);
+        assert!(
+            returned.recv_timeout(Duration::from_millis(100)).is_err(),
+            "returned while the stream was busy"
+        );
+        held.release.send(()).unwrap();
+        returned
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer gets the stream once it is free");
+        held.holder.join().unwrap();
+        assert_eq!(
+            held.writes.lock().unwrap().concat(),
+            [b"a\n".as_slice(), big.as_slice()].concat()
+        );
+    }
+
+    #[test]
+    fn only_warnings_and_errors_wait_for_the_stream() {
+        assert!(waits_for_stream(&tracing::Level::ERROR));
+        assert!(waits_for_stream(&tracing::Level::WARN));
+        assert!(!waits_for_stream(&tracing::Level::INFO));
+        assert!(!waits_for_stream(&tracing::Level::DEBUG));
+        assert!(!waits_for_stream(&tracing::Level::TRACE));
+    }
+
+    #[test]
+    fn a_waiting_event_is_written_before_its_write_returns() {
+        let held = held_stream(b"a\n");
+        let writer = Arc::clone(&held.writer);
+        let (done, returned) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut event = EventWriter {
+                combiner: &*writer,
+                wait: true,
+            };
+            event.write_all(b"w\n").unwrap();
+            done.send(()).unwrap();
+        });
+        assert!(
+            returned.recv_timeout(Duration::from_millis(100)).is_err(),
+            "returned while the stream was busy"
+        );
+        held.release.send(()).unwrap();
+        returned
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer gets the stream once it is free");
+        assert_eq!(held.writes.lock().unwrap().concat(), b"a\nw\n");
+        held.holder.join().unwrap();
+    }
+
+    #[test]
+    fn a_flush_waits_for_the_holder_and_leaves_nothing_queued() {
+        let held = held_stream(b"a\n");
+        write_on_thread(&held.writer, vec![b"b\n".to_vec()])
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a writer that finds the stream busy returns at once");
+        let writer = Arc::clone(&held.writer);
+        let (done, flushed) = mpsc::channel();
+        std::thread::spawn(move || {
+            writer.flush().unwrap();
+            done.send(()).unwrap();
+        });
+        assert!(
+            flushed.recv_timeout(Duration::from_millis(100)).is_err(),
+            "flushed while the stream was busy"
+        );
+        held.release.send(()).unwrap();
+        flushed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the flush gets the stream once it is free");
+        held.holder.join().unwrap();
+        assert_eq!(held.writes.lock().unwrap().concat(), b"a\nb\n");
+        assert!(lock(&held.writer.queue).ends.is_empty());
+    }
+
+    #[test]
+    fn events_from_many_threads_are_written_once_whole_and_in_order() {
+        const THREADS: usize = 8;
+        const EVENTS: usize = 500;
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let writer = CombiningWriter::new(RecordingSink {
+            writes: Arc::clone(&writes),
+            hold: None,
+        });
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry().with(build_fmt_layer(writer, SinkFormat::Json)),
+        );
+        let threads: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let dispatch = dispatch.clone();
+                std::thread::spawn(move || {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        for seq in 0..EVENTS {
+                            tracing::info!(target: "combining_writer_test", thread, seq, "event");
+                        }
+                    });
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let mut next = [0; THREADS];
+        for write in writes.lock().unwrap().iter() {
+            let lines: Vec<&[u8]> = write.split_inclusive(|&b| b == b'\n').collect();
+            assert!(lines.iter().all(|line| line.ends_with(b"\n")));
+            assert!(write.len() <= ATOMIC_WRITE_BYTES || lines.len() == 1);
+            for line in lines {
+                let event: serde_json::Value = serde_json::from_slice(line).unwrap();
+                let thread = event["fields"]["thread"].as_u64().unwrap() as usize;
+                assert_eq!(event["fields"]["seq"], next[thread]);
+                next[thread] += 1;
+            }
+        }
+        assert_eq!(next, [EVENTS; THREADS]);
     }
 }

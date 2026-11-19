@@ -58,10 +58,10 @@ pub struct ClusterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_gate: Option<ClusterReadinessGate>,
     /// Application-layer AEAD (XChaCha20-Poly1305) of ALL
-    /// coordinator-backed *capability* state — sessions (incl. SSE replay),
-    /// delivery, cancellation, tasks, pipelines, idempotency, request-state,
+    /// coordinator-backed *capability* state — sessions, delivery,
+    /// cancellation, tasks, pipelines, idempotency, request-state,
     /// subscriptions, quota, and the approvals backstop — and the derivation
-    /// source for the cross-replica modern-session resume key. Names the
+    /// source for the cross-replica session and resume keys. Names the
     /// **env var** holding a URL-safe-base64 32-byte key (the key itself
     /// never sits in the config artifact); generate one with
     /// `openssl rand -base64 32 | tr '+/' '-_'`. Required for every
@@ -80,8 +80,8 @@ pub struct ClusterConfig {
     /// `state_encryption_key_env`. Defaults to `false`: `validate()`
     /// refuses to boot clustered without a state key, because the
     /// coordinator would hold session/pipeline/credential-adjacent
-    /// state in plaintext and cross-replica modern-session resume
-    /// (whose key derives from the same material) stays off. Set
+    /// state in plaintext and cross-replica session continuity and
+    /// resume (whose keys derive from the same material) stay off. Set
     /// `true` ONLY as a migration escape hatch — boot then logs a
     /// loud warning naming the degraded surfaces. Inert for
     /// `single_node`. Gateway-only named field — kept out of the
@@ -215,11 +215,10 @@ impl ClusterConfig {
     /// state-encryption key, unless the operator explicitly opted in via
     /// `allow_plaintext_state: true` (which downgrades the hard failure
     /// to a loud warning). Without the key the coordinator holds every
-    /// capability's state — sessions (incl. SSE replay), pipelines,
-    /// tasks, delivery, cancellation, idempotency, request-state,
-    /// subscriptions, quota, approvals — in plaintext, and cross-replica
-    /// modern-session resume stays off (its key derives from the same
-    /// material).
+    /// capability's state — sessions, pipelines, tasks, delivery,
+    /// cancellation, idempotency, request-state, subscriptions, quota,
+    /// approvals — in plaintext, and cross-replica session continuity
+    /// and resume stay off (their keys derive from the same material).
     ///
     /// Runs in `AppConfig::validate()` so the misconfiguration fails at
     /// pre-flight (`mcpg config check`) and at boot, before any
@@ -237,7 +236,7 @@ impl ClusterConfig {
         anyhow::bail!(
             "cluster.kind='{}' requires cluster.state_encryption_key_env — without it the \
              coordinator holds session/pipeline/credential-adjacent state in plaintext and \
-             cross-replica modern-session resume stays off; set it to the name of an env var \
+             cross-replica session continuity and resume stay off; set it to the name of an env var \
              holding a URL-safe-base64 32-byte key (generate one: `openssl rand -base64 32 | \
              tr '+/' '-_'`), or set `cluster.allow_plaintext_state: true` to accept the \
              degraded posture (not recommended).",
@@ -261,11 +260,11 @@ impl ClusterConfig {
         tracing::warn!(
             cluster_kind = %self.kind,
             "cluster.allow_plaintext_state=true — running clustered WITHOUT a \
-             state-encryption key: all coordinator-backed capability state (sessions \
-             incl. SSE replay, pipelines, tasks, delivery, cancellation, idempotency, \
-             request-state, subscriptions, quota, approvals) is stored and published \
-             in PLAINTEXT on the coordinator, and cross-replica modern-session resume \
-             stays OFF (its key derives from cluster.state_encryption_key_env). Set \
+             state-encryption key: all coordinator-backed capability state (sessions, \
+             pipelines, tasks, delivery, cancellation, idempotency, request-state, \
+             subscriptions, quota, approvals) is stored and published in PLAINTEXT on \
+             the coordinator, and cross-replica session continuity and resume stay OFF \
+             (their keys derive from cluster.state_encryption_key_env). Set \
              cluster.state_encryption_key_env and remove allow_plaintext_state."
         );
     }

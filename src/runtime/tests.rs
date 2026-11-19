@@ -1,7 +1,3 @@
-use crate::protocol::{
-    CapabilityOperation, ListParams, LoggingLevel, LoggingOperation, ProtocolOperation,
-};
-
 use super::*;
 
 #[test]
@@ -53,254 +49,20 @@ fn request_context_keeps_gateway_and_upstream_request_ids() {
     let context = RequestContext::new(
         GatewayRequestId::new(),
         Some("upstream-123".to_owned()),
-        None,
-        None,
-        RequestIdentity::HttpHeader {
-            subject_id: "user-1".to_owned(),
-            source: "x-mcpg-subject-id".to_owned(),
-        },
+        header_asserted("user-1"),
         TransportKind::Http,
     );
 
     assert_eq!(context.upstream_request_id.as_deref(), Some("upstream-123"));
     assert_eq!(context.identity.label(), "http_header");
     assert!(!context.request_id.as_str().is_empty());
+    assert!(context.session_id.is_none(), "dispatch binds the session");
 }
 
-// -- Per-request session-snapshot cache ----------------------------
+// -- Dispatch through the protocol handler ----------------------------
 
-/// Session store wrapper that counts `load_session` calls so we can
-/// assert the cache short-circuits subsequent reads.
-struct CountingSessionStore {
-    inner: session_store::KvBackedSessionStore,
-    load_calls: std::sync::atomic::AtomicUsize,
-}
-
-impl CountingSessionStore {
-    fn new() -> Self {
-        Self {
-            inner: session_store::KvBackedSessionStore::new_in_memory(SessionStoreConfig::default()),
-            load_calls: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-    fn load_call_count(&self) -> usize {
-        self.load_calls.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl SessionStore for CountingSessionStore {
-    fn create_session(
-        &self,
-        negotiated_protocol_version: &str,
-        params: &crate::protocol::InitializeParams,
-    ) -> SessionSnapshot {
-        self.inner
-            .create_session(negotiated_protocol_version, params)
-    }
-    fn session_protocol_version(&self, session_id: &str) -> Option<String> {
-        self.inner.session_protocol_version(session_id)
-    }
-    fn load_session(
-        &self,
-        session_id: Option<&str>,
-        require_operational: bool,
-    ) -> Result<SessionSnapshot, SessionAccessError> {
-        self.load_calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.inner.load_session(session_id, require_operational)
-    }
-    fn transition_session_to_operational(
-        &self,
-        session_id: &str,
-    ) -> Result<(), SessionAccessError> {
-        self.inner.transition_session_to_operational(session_id)
-    }
-    fn set_session_log_level(
-        &self,
-        session_id: Option<&str>,
-        level: LoggingLevel,
-    ) -> Result<(), SessionAccessError> {
-        self.inner.set_session_log_level(session_id, level)
-    }
-    fn terminate_session(&self, session_id: &str) -> Option<session_store::EndedSession> {
-        self.inner.terminate_session(session_id)
-    }
-    fn open_sse_stream(
-        &self,
-        session_id: Option<&str>,
-        resume_cursor: Option<&ResumeCursor>,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        self.inner.open_sse_stream(session_id, resume_cursor)
-    }
-    fn stream_protocol_response_with_pending(
-        &self,
-        session_id: &str,
-        protocol_response: &crate::protocol::ProtocolResponse,
-        pending_notifications: &[String],
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        self.inner.stream_protocol_response_with_pending(
-            session_id,
-            protocol_response,
-            pending_notifications,
-        )
-    }
-    fn stream_raw_message(
-        &self,
-        session_id: &str,
-        message_json: &str,
-    ) -> Result<Vec<SseEventRecord>, StreamAccessError> {
-        self.inner.stream_raw_message(session_id, message_json)
-    }
-}
-
-fn fresh_init_params() -> crate::protocol::InitializeParams {
-    crate::protocol::InitializeParams {
-        protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-        capabilities: crate::protocol::ClientCapabilities::default(),
-        client_info: crate::protocol::ImplementationInfo {
-            name: "test-client".to_owned(),
-            title: None,
-            version: "0.0.0".to_owned(),
-            description: None,
-            website_url: None,
-            icons: None,
-        },
-    }
-}
-
-fn make_request_context(session_id: Option<String>) -> RequestContext {
-    RequestContext::new(
-        GatewayRequestId::new(),
-        None,
-        session_id,
-        None,
-        RequestIdentity::Anonymous {
-            source: "test".to_owned(),
-        },
-        TransportKind::Http,
-    )
-}
-
-#[test]
-fn load_session_cached_serves_first_call_from_store() {
-    let store = CountingSessionStore::new();
-    let snap = store.create_session("2025-11-25", &fresh_init_params());
-    let ctx = make_request_context(Some(snap.session_id.clone()));
-
-    let result = ctx.load_session_cached(&store, false).expect("first load");
-    assert_eq!(result.session_id, snap.session_id);
-    assert_eq!(store.load_call_count(), 1);
-}
-
-#[test]
-fn load_session_cached_skips_store_on_repeat_calls() {
-    let store = CountingSessionStore::new();
-    let snap = store.create_session("2025-11-25", &fresh_init_params());
-    let ctx = make_request_context(Some(snap.session_id.clone()));
-
-    let _ = ctx.load_session_cached(&store, false).unwrap();
-    let _ = ctx.load_session_cached(&store, false).unwrap();
-    let _ = ctx.load_session_cached(&store, false).unwrap();
-    assert_eq!(
-        store.load_call_count(),
-        1,
-        "repeat load_session_cached calls within one request must hit the cache",
-    );
-}
-
-#[test]
-fn load_session_cached_applies_require_operational_per_call() {
-    // Session is in AwaitingInitialized state until
-    // transition_session_to_operational. The cache stores the raw
-    // snapshot (require_operational=false semantics); each call
-    // applies its own filter.
-    let store = CountingSessionStore::new();
-    let snap = store.create_session("2025-11-25", &fresh_init_params());
-    let ctx = make_request_context(Some(snap.session_id.clone()));
-
-    // First call with require_operational=true → fails
-    // (AwaitingInitialized != Operational).
-    let err = ctx.load_session_cached(&store, true).unwrap_err();
-    assert_eq!(err, SessionAccessError::NotInitialized);
-
-    // Same cache, require_operational=false → succeeds.
-    let ok = ctx.load_session_cached(&store, false).unwrap();
-    assert_eq!(ok.session_id, snap.session_id);
-
-    // Both calls together drove exactly one underlying lookup.
-    assert_eq!(store.load_call_count(), 1);
-}
-
-#[test]
-fn load_session_cached_caches_unknown_session_error() {
-    let store = CountingSessionStore::new();
-    let ctx = make_request_context(Some("does-not-exist".to_owned()));
-
-    let e1 = ctx.load_session_cached(&store, false).unwrap_err();
-    let e2 = ctx.load_session_cached(&store, false).unwrap_err();
-    assert_eq!(e1, SessionAccessError::UnknownSession);
-    assert_eq!(e2, SessionAccessError::UnknownSession);
-    assert_eq!(
-        store.load_call_count(),
-        1,
-        "even error responses are cached — re-asking would yield the same answer",
-    );
-}
-
-#[test]
-fn load_session_cached_handles_missing_session_id() {
-    let store = CountingSessionStore::new();
-    let ctx = make_request_context(None);
-
-    let err = ctx.load_session_cached(&store, false).unwrap_err();
-    assert_eq!(err, SessionAccessError::MissingSessionId);
-    // Still drives one underlying call (the store decides "missing
-    // id" semantics; we don't short-circuit before reaching it).
-    assert_eq!(store.load_call_count(), 1);
-}
-
-#[test]
-fn load_session_cache_is_isolated_per_request_context() {
-    // Different RequestContext instances get fresh caches, even if
-    // they reference the same session — important so a second
-    // request sees a freshly-loaded snapshot (e.g. picks up a
-    // logging/setLevel change made between requests).
-    let store = CountingSessionStore::new();
-    let snap = store.create_session("2025-11-25", &fresh_init_params());
-    let ctx_a = make_request_context(Some(snap.session_id.clone()));
-    let ctx_b = make_request_context(Some(snap.session_id.clone()));
-
-    let _ = ctx_a.load_session_cached(&store, false).unwrap();
-    let _ = ctx_b.load_session_cached(&store, false).unwrap();
-    assert_eq!(
-        store.load_call_count(),
-        2,
-        "each RequestContext drives its own first-load",
-    );
-}
-
-#[test]
-fn load_session_cache_shared_across_clones_of_same_request() {
-    // Cloning a RequestContext (e.g. when threading it through
-    // layers) must share the cache so the inner clone serves from
-    // it — the OnceLock lives behind an Arc.
-    let store = CountingSessionStore::new();
-    let snap = store.create_session("2025-11-25", &fresh_init_params());
-    let ctx = make_request_context(Some(snap.session_id.clone()));
-
-    let _ = ctx.load_session_cached(&store, false).unwrap();
-    let cloned = ctx.clone();
-    let _ = cloned.load_session_cached(&store, false).unwrap();
-    assert_eq!(
-        store.load_call_count(),
-        1,
-        "Clone of RequestContext shares the OnceLock cache",
-    );
-}
-
-#[tokio::test]
-async fn runtime_handles_readiness_gateway_request() {
-    let runtime = GatewayRuntime::new(
+fn test_runtime() -> GatewayRuntime {
+    GatewayRuntime::new(
         "mcpg",
         "0.1.0",
         "127.0.0.1:8787",
@@ -313,22 +75,126 @@ async fn runtime_handles_readiness_gateway_request() {
             level: None,
         }],
         true,
-    );
-    let request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Diagnostics(DiagnosticsOperation::Readiness),
-    );
+    )
+}
 
-    let response = runtime.handle_request(request).await;
+/// A context of `identity` with no session yet.
+fn request_context(identity: RequestIdentity) -> RequestContext {
+    RequestContext::new(GatewayRequestId::new(), None, identity, TransportKind::Http)
+}
+
+fn anonymous() -> RequestIdentity {
+    RequestIdentity::Anonymous {
+        source: "test".to_owned(),
+    }
+}
+
+fn header_asserted(subject: &str) -> RequestIdentity {
+    RequestIdentity::HttpHeader {
+        subject_id: subject.to_owned(),
+        source: "x-mcpg-subject-id".to_owned(),
+    }
+}
+
+fn verified(subject: &str) -> RequestIdentity {
+    RequestIdentity::Verified {
+        subject_id: subject.to_owned(),
+        issuer: "https://auth.example.com/".to_owned(),
+        auth_provider: "jwks".to_owned(),
+        source: "authorization:jwt".to_owned(),
+        roles: Vec::new(),
+        groups: Vec::new(),
+        scopes: Vec::new(),
+        attributes: std::collections::BTreeMap::new(),
+    }
+}
+
+/// `runtime` behind the swap cell boot keeps it in, with the shared
+/// services installed, so [`GatewayRuntime::handle_protocol_message`]
+/// dispatches.
+fn serve(runtime: GatewayRuntime) -> Arc<arc_swap::ArcSwap<GatewayRuntime>> {
+    use crate::protocol::v_2026_07_28::dispatch::request_state::{
+        InMemoryRequestStateStore, RequestStateCodec,
+    };
+    let gateway = Arc::new(arc_swap::ArcSwap::from_pointee(runtime));
+    let services = shared_services::SharedServices::new(
+        Arc::new(crate::config::AppConfig::default()),
+        Arc::new(RequestStateCodec::new(
+            RequestStateCodec::ephemeral_key(),
+            Arc::new(InMemoryRequestStateStore::new()),
+        )),
+    );
+    gateway.load().set_shared_services(Arc::new(services));
+    gateway
+}
+
+/// Dispatch the JSON-RPC message `body` from `identity` as the transport
+/// does: bind the request to its session, parse the body, and hand both
+/// to the runtime.
+async fn send(
+    gateway: &Arc<arc_swap::ArcSwap<GatewayRuntime>>,
+    identity: RequestIdentity,
+    body: Value,
+) -> ProtocolHttpResponse {
+    let runtime = gateway.load_full();
+    let context = match runtime.ensure_session(request_context(identity)) {
+        SessionOutcome::Ready(context) => context,
+        SessionOutcome::CapacityExhausted => panic!("the session store has room"),
+    };
+    let message = crate::protocol::Handler
+        .parse(body)
+        .expect("a well-formed message");
+    runtime.handle_protocol_message(&context, message).await
+}
+
+/// The `result` of a JSON-RPC success.
+fn success_result(response: ProtocolHttpResponse) -> Value {
+    match response.response {
+        ProtocolResponse::JsonRpcSuccess(success) => success.result,
+        other => panic!("expected a JSON-RPC success, got {other:?}"),
+    }
+}
+
+/// The `error.code` of a JSON-RPC error.
+fn error_code(response: &ProtocolHttpResponse) -> i32 {
+    match &response.response {
+        ProtocolResponse::JsonRpcError(error) => error.error.code,
+        other => panic!("expected a JSON-RPC error, got {other:?}"),
+    }
+}
+
+fn tools_list(id: u64) -> Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "tools/list", "params": {} })
+}
+
+fn tools_call(id: u64, name: &str, arguments: Value) -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": arguments },
+    })
+}
+
+/// The tool names a `tools/list` result carries, in order.
+fn tool_names(result: &Value) -> Vec<String> {
+    result["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn runtime_handles_readiness_gateway_request() {
+    let runtime = test_runtime();
+    let response = runtime
+        .handle_request(
+            request_context(anonymous()),
+            DiagnosticsOperation::Readiness,
+        )
+        .await;
 
     match response.payload {
         GatewayResponsePayload::Readiness(snapshot) => {
@@ -338,948 +204,180 @@ async fn runtime_handles_readiness_gateway_request() {
     }
 }
 
+/// Before boot installs the shared services, a message answers `-32603`
+/// under its own id instead of reaching a handler.
 #[tokio::test]
-async fn runtime_handles_initialize_protocol_request() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
-    );
+async fn a_message_before_the_shared_services_are_installed_is_an_internal_error() {
+    let runtime = test_runtime();
+    let message = crate::protocol::Handler
+        .parse(tools_list(7))
+        .expect("a well-formed message");
 
-    let response = runtime.handle_request(request).await;
+    let response = runtime
+        .handle_protocol_message(&request_context(anonymous()), message)
+        .await;
 
-    match response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => {
-            assert_eq!(protocol_response.http_status, 200);
-            assert!(protocol_response.session_id_header.is_some());
-            let ProtocolResponse::JsonRpcSuccess(success) = protocol_response.response else {
-                panic!("unexpected protocol response")
-            };
-            assert_eq!(success.id, serde_json::json!(1));
-            assert_eq!(
-                success.result["protocolVersion"],
-                SUPPORTED_PROTOCOL_VERSION
-            );
-            assert_eq!(success.result["serverInfo"]["name"], "mcpg");
-        }
-        payload => panic!("unexpected payload: {payload:?}"),
-    }
+    assert_eq!(response.http_status, 500);
+    let ProtocolResponse::JsonRpcError(error) = response.response else {
+        panic!("expected a JSON-RPC error");
+    };
+    assert_eq!(error.id, Some(serde_json::json!(7)));
+    assert_eq!(error.error.code, -32603);
 }
 
 #[tokio::test]
 async fn runtime_handles_tools_list_protocol_request() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
+    let gateway = serve(test_runtime());
+
+    let names = tool_names(&success_result(
+        send(&gateway, header_asserted("user-1"), tools_list(2)).await,
+    ));
+
+    // tools are returned lexicographically. The first debug tool
+    // registered for this runtime is `mcpg.debug.command_probe`;
+    // `mcpg.runtime.snapshot` still appears later in the list.
+    assert_eq!(
+        names.first().map(String::as_str),
+        Some("mcpg.debug.command_probe")
     );
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
+    assert!(names.iter().any(|n| n == "mcpg.runtime.snapshot"));
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(
+        names, sorted,
+        "tools/list must be lexicographically ordered"
     );
-
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-
-    let initialized_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session_id.clone()),
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialized,
-        )),
-    );
-    let _ = runtime.handle_request(initialized_request).await;
-
-    let request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session_id),
-            None,
-            RequestIdentity::HttpHeader {
-                subject_id: "user-1".to_owned(),
-                source: "x-mcpg-subject-id".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-            CapabilityOperation::ToolsList {
-                request_id: serde_json::json!(2),
-                params: ListParams::default(),
-            },
-        )),
-    );
-
-    let response = runtime.handle_request(request).await;
-
-    match response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = protocol_response.response else {
-                panic!("unexpected protocol response")
-            };
-            // tools are returned lexicographically. The
-            // first debug tool registered for this runtime is
-            // `mcpg.debug.command_probe`; `mcpg.runtime.snapshot`
-            // still appears later in the list.
-            let names: Vec<_> = success.result["tools"]
-                .as_array()
-                .expect("tools array")
-                .iter()
-                .map(|t| t["name"].as_str().unwrap().to_owned())
-                .collect();
-            assert_eq!(
-                names.first().map(String::as_str),
-                Some("mcpg.debug.command_probe")
-            );
-            assert!(names.iter().any(|n| n == "mcpg.runtime.snapshot"));
-            let mut sorted = names.clone();
-            sorted.sort();
-            assert_eq!(
-                names, sorted,
-                "tools/list must be lexicographically ordered"
-            );
-        }
-        payload => panic!("unexpected payload: {payload:?}"),
-    }
 }
 
 #[tokio::test]
 async fn tools_list_invalid_cursor_returns_invalid_params() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
-    );
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(p) => p.session_id_header.expect("session id"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-    let initialized = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session_id.clone()),
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialized,
-        )),
-    );
-    let _ = runtime.handle_request(initialized).await;
+    let gateway = serve(test_runtime());
 
-    // A cursor that does not decode against the session-bound key must
+    // A cursor that does not decode against the request's bound key must
     // surface -32602, not silently restart at page 1.
-    let request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session_id),
-            None,
-            RequestIdentity::HttpHeader {
-                subject_id: "user-1".to_owned(),
-                source: "x-mcpg-subject-id".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-            CapabilityOperation::ToolsList {
-                request_id: serde_json::json!(2),
-                params: ListParams {
-                    cursor: Some("not-a-valid-cursor".to_owned()),
-                    meta: None,
-                },
-            },
-        )),
-    );
-    let response = runtime.handle_request(request).await;
-    match response.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            let ProtocolResponse::JsonRpcError(err) = p.response else {
-                panic!("expected JsonRpcError for invalid cursor")
-            };
-            assert_eq!(err.error.code, -32602, "invalid cursor → -32602");
-        }
-        payload => panic!("unexpected payload: {payload:?}"),
-    }
+    let response = send(
+        &gateway,
+        header_asserted("user-1"),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": { "cursor": "not-a-valid-cursor" },
+        }),
+    )
+    .await;
+
+    assert_eq!(error_code(&response), -32602, "invalid cursor → -32602");
 }
 
 #[tokio::test]
 async fn runtime_handles_prompts_get_protocol_request() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
+    let gateway = serve(test_runtime());
+
+    let result = success_result(
+        send(
+            &gateway,
+            header_asserted("user-1"),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 31,
+                "method": "prompts/get",
+                "params": { "name": "mcpg_operational_overview" },
+            }),
+        )
+        .await,
     );
 
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id),
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::PromptsGet {
-                    request_id: serde_json::json!(31),
-                    params: crate::protocol::PromptGetParams {
-                        name: "mcpg_operational_overview".to_owned(),
-                        arguments: None,
-                        meta: None,
-                    },
-                },
-            )),
-        ))
-        .await;
-
-    match response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = protocol_response.response else {
-                panic!("unexpected protocol response")
-            };
-            assert_eq!(success.result["messages"][0]["role"], "system");
-            assert!(
-                success.result["messages"][0]["content"]["text"]
-                    .as_str()
-                    .expect("prompt text")
-                    .contains("Available tools")
-            );
-        }
-        payload => panic!("unexpected payload: {payload:?}"),
-    }
+    assert_eq!(result["messages"][0]["role"], "system");
+    assert!(
+        result["messages"][0]["content"]["text"]
+            .as_str()
+            .expect("prompt text")
+            .contains("Available tools")
+    );
 }
 
 #[tokio::test]
 async fn runtime_handles_resources_read_protocol_request() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
+    let gateway = serve(test_runtime());
+
+    let result = success_result(
+        send(
+            &gateway,
+            header_asserted("user-1"),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 32,
+                "method": "resources/read",
+                "params": { "uri": "mcpg://runtime/overview" },
+            }),
+        )
+        .await,
     );
 
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id),
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesRead {
-                    request_id: serde_json::json!(32),
-                    params: crate::protocol::ResourceReadParams {
-                        uri: "mcpg://runtime/overview".to_owned(),
-                        meta: None,
-                    },
-                },
-            )),
-        ))
-        .await;
-
-    match response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = protocol_response.response else {
-                panic!("unexpected protocol response")
-            };
-            assert_eq!(
-                success.result["contents"][0]["uri"],
-                "mcpg://runtime/overview"
-            );
-            assert_eq!(
-                success.result["contents"][0]["mimeType"],
-                "application/json"
-            );
-            assert!(
-                success.result["contents"][0]["text"]
-                    .as_str()
-                    .expect("resource text")
-                    .contains("\"service\": \"mcpg\"")
-            );
-        }
-        payload => panic!("unexpected payload: {payload:?}"),
-    }
-}
-
-#[tokio::test]
-async fn runtime_handles_resources_subscribe_and_unsubscribe() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let init_ctx = RequestContext::new(
-        GatewayRequestId::new(),
-        None,
-        None,
-        None,
-        RequestIdentity::Anonymous {
-            source: "test".to_owned(),
-        },
-        TransportKind::Http,
-    );
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            init_ctx,
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialize {
-                    request_id: serde_json::json!(1),
-                    params: crate::protocol::InitializeParams {
-                        protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                        capabilities: crate::protocol::ClientCapabilities::default(),
-                        client_info: crate::protocol::ImplementationInfo {
-                            name: "client".to_owned(),
-                            title: None,
-                            version: "1.0.0".to_owned(),
-                            description: None,
-                            website_url: None,
-                            icons: None,
-                        },
-                    },
-                },
-            )),
-        ))
-        .await;
-    let session_id = match &response.payload {
-        GatewayResponsePayload::Protocol(p) => p.session_id_header.clone().unwrap(),
-        _ => panic!("expected protocol response"),
-    };
-    runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    // Subscribe to the debug resource
-    let sub_response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesSubscribe {
-                    request_id: serde_json::json!(10),
-                    params: crate::protocol::ResourceSubscribeParams {
-                        uri: "mcpg://runtime/overview".to_owned(),
-                    },
-                },
-            )),
-        ))
-        .await;
-    match &sub_response.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = &p.response else {
-                panic!("expected success, got: {:?}", p.response)
-            };
-            assert_eq!(success.id, serde_json::json!(10));
-        }
-        _ => panic!("expected protocol response"),
-    }
-
-    // Verify subscription exists
-    assert_eq!(
-        runtime
-            .subscription_store
-            .subscriptions_for_session(&session_id)
-            .len(),
-        1
-    );
-
-    // Subscribe to unknown resource returns error
-    let unknown_response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesSubscribe {
-                    request_id: serde_json::json!(11),
-                    params: crate::protocol::ResourceSubscribeParams {
-                        uri: "nonexistent://resource".to_owned(),
-                    },
-                },
-            )),
-        ))
-        .await;
-    match &unknown_response.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            assert!(matches!(&p.response, ProtocolResponse::JsonRpcError(_)));
-        }
-        _ => panic!("expected protocol response"),
-    }
-
-    // Unsubscribe
-    let unsub_response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesUnsubscribe {
-                    request_id: serde_json::json!(12),
-                    params: crate::protocol::ResourceSubscribeParams {
-                        uri: "mcpg://runtime/overview".to_owned(),
-                    },
-                },
-            )),
-        ))
-        .await;
-    match &unsub_response.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = &p.response else {
-                panic!("expected success")
-            };
-            assert_eq!(success.id, serde_json::json!(12));
-        }
-        _ => panic!("expected protocol response"),
-    }
-
-    // Subscription cleared
-    assert_eq!(
-        runtime
-            .subscription_store
-            .subscriptions_for_session(&session_id)
-            .len(),
-        0
+    assert_eq!(result["contents"][0]["uri"], "mcpg://runtime/overview");
+    assert_eq!(result["contents"][0]["mimeType"], "application/json");
+    assert!(
+        result["contents"][0]["text"]
+            .as_str()
+            .expect("resource text")
+            .contains("\"service\": \"mcpg\"")
     );
 }
 
 #[tokio::test]
 async fn runtime_handles_resources_templates_list() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let init_ctx = RequestContext::new(
-        GatewayRequestId::new(),
-        None,
-        None,
-        None,
-        RequestIdentity::Anonymous {
-            source: "test".to_owned(),
-        },
-        TransportKind::Http,
-    );
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            init_ctx,
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialize {
-                    request_id: serde_json::json!(1),
-                    params: crate::protocol::InitializeParams {
-                        protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                        capabilities: crate::protocol::ClientCapabilities::default(),
-                        client_info: crate::protocol::ImplementationInfo {
-                            name: "client".to_owned(),
-                            title: None,
-                            version: "1.0.0".to_owned(),
-                            description: None,
-                            website_url: None,
-                            icons: None,
-                        },
-                    },
-                },
-            )),
-        ))
-        .await;
-    let session_id = match &response.payload {
-        GatewayResponsePayload::Protocol(p) => p.session_id_header.clone().unwrap(),
-        _ => panic!("expected protocol response"),
-    };
-    runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
+    let gateway = serve(test_runtime());
 
-    let tl_response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesTemplatesList {
-                    request_id: serde_json::json!(20),
-                    params: ListParams::default(),
-                },
-            )),
-        ))
-        .await;
-    match &tl_response.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = &p.response else {
-                panic!("expected success")
-            };
-            assert_eq!(success.id, serde_json::json!(20));
-            // Templates list is currently empty
-            assert_eq!(success.result["resourceTemplates"], serde_json::json!([]));
-        }
-        _ => panic!("expected protocol response"),
-    }
+    let result = success_result(
+        send(
+            &gateway,
+            anonymous(),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "resources/templates/list",
+                "params": {},
+            }),
+        )
+        .await,
+    );
+
+    // This runtime binds no resource templates.
+    assert_eq!(result["resourceTemplates"], serde_json::json!([]));
 }
 
 #[tokio::test]
 async fn runtime_handles_notification_cancelled() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let init_ctx = RequestContext::new(
-        GatewayRequestId::new(),
-        None,
-        None,
-        None,
-        RequestIdentity::Anonymous {
-            source: "test".to_owned(),
-        },
-        TransportKind::Http,
-    );
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            init_ctx,
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialize {
-                    request_id: serde_json::json!(1),
-                    params: crate::protocol::InitializeParams {
-                        protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                        capabilities: crate::protocol::ClientCapabilities::default(),
-                        client_info: crate::protocol::ImplementationInfo {
-                            name: "client".to_owned(),
-                            title: None,
-                            version: "1.0.0".to_owned(),
-                            description: None,
-                            website_url: None,
-                            icons: None,
-                        },
-                    },
-                },
-            )),
-        ))
-        .await;
-    let session_id = match &response.payload {
-        GatewayResponsePayload::Protocol(p) => p.session_id_header.clone().unwrap(),
-        _ => panic!("expected protocol response"),
-    };
+    let gateway = serve(test_runtime());
 
-    // Send notifications/cancelled
-    let cancel_response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::NotificationCancelled {
-                    request_id: serde_json::json!(999),
-                    reason: Some("user abort".to_owned()),
-                },
-            )),
-        ))
-        .await;
-    match &cancel_response.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            assert_eq!(p.http_status, 202);
-        }
-        _ => panic!("expected protocol response"),
-    }
+    let response = send(
+        &gateway,
+        anonymous(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 999, "reason": "user abort" },
+        }),
+    )
+    .await;
+
+    assert_eq!(response.http_status, 202);
 }
 
+/// A `notifications/cancelled` reaches the principal-partitioned
+/// cancellation bus, which carries it to the replica running the request.
 #[tokio::test]
-async fn modern_notification_cancelled_reaches_cancellation_bus() {
-    // CANCEL-1: a modern (`2026-07-28`) `notifications/cancelled` must
-    // reach the SAME principal-partitioned cancellation bus the legacy
-    // wire uses (not be collapsed into a bare 202). We install an
-    // in-memory bus, subscribe, route a cancel through the shared
-    // `handle_request_cancellation` entry-point with a modern-version
-    // context, and assert the event lands on the bus.
+async fn notification_cancelled_reaches_cancellation_bus() {
     use crate::runtime::cancellation_bus::{BusBackedCancellationBus, CancellationBus};
 
-    let mut runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
+    let mut runtime = test_runtime();
     let bus = std::sync::Arc::new(BusBackedCancellationBus::new_in_memory());
     let mut rx = bus.subscribe().await;
     runtime.set_cancellation_bus(bus);
 
-    let mut ctx = RequestContext::new(
-        GatewayRequestId::new(),
-        None,
-        Some("sess-modern".to_owned()),
-        None,
-        RequestIdentity::Anonymous {
-            source: "test".to_owned(),
-        },
-        TransportKind::Http,
-    );
-    ctx.negotiated_version = crate::protocol::version::ProtocolVersion::V_2026_07_28;
+    let mut ctx = request_context(anonymous());
+    ctx.session_id = Some("sess-1".to_owned());
 
     runtime
         .handle_request_cancellation(&ctx, &serde_json::json!("req-42"), Some("user abort"))
@@ -1290,8 +388,9 @@ async fn modern_notification_cancelled_reaches_cancellation_bus() {
         .expect("cancellation event should be broadcast within timeout")
         .expect("bus should deliver the event");
     // target_id is the JSON-RPC id stringified (a JSON string value
-    // serialises with surrounding quotes), matching the legacy arm.
+    // serialises with surrounding quotes).
     assert_eq!(event.target_id, serde_json::json!("req-42").to_string());
+    assert_eq!(event.session_id, "sess-1");
     assert_eq!(event.reason.as_deref(), Some("user abort"));
     assert!(matches!(
         event.kind,
@@ -1300,207 +399,14 @@ async fn modern_notification_cancelled_reaches_cancellation_bus() {
 }
 
 #[tokio::test]
-async fn cancellation_targeting_initialize_is_dropped() {
-    // §Cancellation MUST-NOT: a cancel aimed at `initialize` is ignored
-    // (no bus broadcast) on the shared path.
-    use crate::runtime::cancellation_bus::{BusBackedCancellationBus, CancellationBus};
-
-    let mut runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let bus = std::sync::Arc::new(BusBackedCancellationBus::new_in_memory());
-    let mut rx = bus.subscribe().await;
-    runtime.set_cancellation_bus(bus);
-
-    let ctx = RequestContext::new(
-        GatewayRequestId::new(),
-        None,
-        Some("s".to_owned()),
-        None,
-        RequestIdentity::Anonymous {
-            source: "test".to_owned(),
-        },
-        TransportKind::Http,
-    );
-    runtime
-        .handle_request_cancellation(&ctx, &serde_json::json!("initialize"), None)
-        .await;
-
-    // Nothing should arrive.
-    let got = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
-    assert!(
-        got.is_err(),
-        "no cancellation event should be broadcast for initialize"
-    );
-}
-
-#[tokio::test]
-async fn initialize_response_includes_subscribe_capability() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                None,
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialize {
-                    request_id: serde_json::json!(1),
-                    params: crate::protocol::InitializeParams {
-                        protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                        capabilities: crate::protocol::ClientCapabilities::default(),
-                        client_info: crate::protocol::ImplementationInfo {
-                            name: "client".to_owned(),
-                            title: None,
-                            version: "1.0.0".to_owned(),
-                            description: None,
-                            website_url: None,
-                            icons: None,
-                        },
-                    },
-                },
-            )),
-        ))
-        .await;
-    match &response.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = &p.response else {
-                panic!("expected success")
-            };
-            assert_eq!(
-                success.result["capabilities"]["resources"]["subscribe"],
-                true
-            );
-        }
-        _ => panic!("expected protocol response"),
-    }
-}
-
-#[tokio::test]
 async fn session_termination_clears_subscriptions() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                None,
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialize {
-                    request_id: serde_json::json!(1),
-                    params: crate::protocol::InitializeParams {
-                        protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                        capabilities: crate::protocol::ClientCapabilities::default(),
-                        client_info: crate::protocol::ImplementationInfo {
-                            name: "client".to_owned(),
-                            title: None,
-                            version: "1.0.0".to_owned(),
-                            description: None,
-                            website_url: None,
-                            icons: None,
-                        },
-                    },
-                },
-            )),
-        ))
-        .await;
-    let session_id = match &response.payload {
-        GatewayResponsePayload::Protocol(p) => p.session_id_header.clone().unwrap(),
-        _ => panic!("expected protocol response"),
-    };
-    runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    // Subscribe
-    runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesSubscribe {
-                    request_id: serde_json::json!(10),
-                    params: crate::protocol::ResourceSubscribeParams {
-                        uri: "mcpg://runtime/overview".to_owned(),
-                    },
-                },
-            )),
-        ))
-        .await;
+    let runtime = test_runtime();
+    let session_id = runtime.session_store.create_session().session_id;
+    let _lease = runtime
+        .subscriptions()
+        .acquire(&session_id, "mcpg://runtime/overview", None)
+        .await
+        .expect("the store takes the subscription");
     assert_eq!(
         runtime
             .subscription_store
@@ -1509,7 +415,6 @@ async fn session_termination_clears_subscriptions() {
         1
     );
 
-    // Terminate
     runtime.terminate_session(&session_id);
     assert_eq!(
         runtime
@@ -1522,235 +427,42 @@ async fn session_termination_clears_subscriptions() {
 
 #[tokio::test]
 async fn runtime_handles_adapter_backed_tool_call_protocol_request() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
+    let gateway = serve(test_runtime());
+
+    let result = success_result(
+        send(
+            &gateway,
+            header_asserted("user-1"),
+            tools_call(
+                33,
+                "mcpg.request.echo",
+                serde_json::json!({ "message": "hello" }),
+            ),
+        )
+        .await,
     );
 
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                Some("upstream-1".to_owned()),
-                Some(session_id),
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ToolsCall {
-                    request_id: serde_json::json!(33),
-                    params: crate::protocol::ToolCallParams {
-                        name: "mcpg.request.echo".to_owned(),
-                        arguments: Some(serde_json::json!({
-                            "message": "hello"
-                        })),
-                        meta: None,
-                        task: None,
-                    },
-                },
-            )),
-        ))
-        .await;
-
-    match response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = protocol_response.response else {
-                panic!("unexpected protocol response")
-            };
-            assert_eq!(
-                success.result["structuredContent"]["toolName"],
-                "mcpg.request.echo"
-            );
-            assert_eq!(
-                success.result["structuredContent"]["arguments"]["message"],
-                "hello"
-            );
-            assert_eq!(
-                success.result["structuredContent"]["request"]["principalId"],
-                "user-1"
-            );
-        }
-        payload => panic!("unexpected payload: {payload:?}"),
-    }
+    assert_eq!(result["structuredContent"]["toolName"], "mcpg.request.echo");
+    assert_eq!(result["structuredContent"]["arguments"]["message"], "hello");
+    assert_eq!(
+        result["structuredContent"]["request"]["principalId"],
+        "user-1"
+    );
 }
 
 #[tokio::test]
 async fn runtime_rejects_anonymous_tool_call_before_dispatch() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
-    );
+    let gateway = serve(test_runtime());
 
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
+    let response = send(
+        &gateway,
+        anonymous(),
+        tools_call(404, "mcpg.runtime.snapshot", serde_json::json!({})),
+    )
+    .await;
 
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ToolsCall {
-                    request_id: serde_json::json!(404),
-                    params: crate::protocol::ToolCallParams {
-                        name: "mcpg.runtime.snapshot".to_owned(),
-                        arguments: Some(serde_json::json!({})),
-                        meta: None,
-                        task: None,
-                    },
-                },
-            )),
-        ))
-        .await;
-
-    match response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => {
-            assert_eq!(protocol_response.http_status, 403);
-            let ProtocolResponse::JsonRpcError(error) = protocol_response.response else {
-                panic!("unexpected protocol response")
-            };
-            assert_eq!(error.error.code, -32003);
-        }
-        payload => panic!("unexpected payload: {payload:?}"),
-    }
+    assert_eq!(response.http_status, 403);
+    assert_eq!(error_code(&response), -32003);
 }
 
 #[tokio::test]
@@ -1781,775 +493,37 @@ async fn runtime_allows_anonymous_tool_call_when_policy_lowers_required_trust() 
             }],
         },
     );
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
+    let gateway = serve(runtime);
+
+    let response = send(
+        &gateway,
+        anonymous(),
+        tools_call(405, "mcpg.runtime.snapshot", serde_json::json!({})),
+    )
+    .await;
+
+    assert_eq!(response.http_status, 200);
+    assert_eq!(
+        success_result(response)["structuredContent"]["service"],
+        "mcpg"
     );
-
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ToolsCall {
-                    request_id: serde_json::json!(405),
-                    params: crate::protocol::ToolCallParams {
-                        name: "mcpg.runtime.snapshot".to_owned(),
-                        arguments: Some(serde_json::json!({})),
-                        meta: None,
-                        task: None,
-                    },
-                },
-            )),
-        ))
-        .await;
-
-    match response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => {
-            assert_eq!(protocol_response.http_status, 200);
-            let ProtocolResponse::JsonRpcSuccess(success) = protocol_response.response else {
-                panic!("unexpected protocol response")
-            };
-            assert_eq!(success.result["structuredContent"]["service"], "mcpg");
-        }
-        payload => panic!("unexpected payload: {payload:?}"),
-    }
 }
 
 #[tokio::test]
 async fn runtime_handles_tool_call_protocol_request() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
-    );
+    let gateway = serve(test_runtime());
 
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-
-    let initialized_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session_id.clone()),
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialized,
-        )),
-    );
-    let _ = runtime.handle_request(initialized_request).await;
-
-    let request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session_id),
-            None,
-            RequestIdentity::HttpHeader {
-                subject_id: "user-1".to_owned(),
-                source: "x-mcpg-subject-id".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-            CapabilityOperation::ToolsCall {
-                request_id: serde_json::json!(3),
-                params: crate::protocol::ToolCallParams {
-                    name: "mcpg.runtime.snapshot".to_owned(),
-                    arguments: Some(serde_json::json!({})),
-                    meta: None,
-                    task: None,
-                },
-            },
-        )),
-    );
-
-    let response = runtime.handle_request(request).await;
-
-    match response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = protocol_response.response else {
-                panic!("unexpected protocol response")
-            };
-            assert_eq!(success.result["content"][0]["type"], "text");
-            assert_eq!(success.result["structuredContent"]["service"], "mcpg");
-        }
-        payload => panic!("unexpected payload: {payload:?}"),
-    }
-}
-
-#[tokio::test]
-async fn wait_for_task_terminal_unblocks_when_task_transitions() {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    let runtime = Arc::new(GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    ));
-    let session_id = "sess-wait";
-    let record = runtime
-        .task_store
-        .create_task(session_id, serde_json::json!(1), "noop", None)
-        .expect("create_task");
-    let task_id = record.task.task_id.clone();
-
-    // Drive the terminal transition from another task slightly after
-    // wait_for_task_terminal starts polling.
-    let store = runtime.task_store.clone();
-    let task_id_write = task_id.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let _ = store.store_task_terminal(
-            &task_id_write,
-            crate::protocol::TaskStatus::Completed,
-            task_store::TerminalEnvelope::success(serde_json::json!({"ok": true})),
-        );
-    });
-
-    let got = tokio::time::timeout(
-        Duration::from_secs(5),
-        runtime.wait_for_task_terminal(&task_id, session_id),
-    )
-    .await
-    .expect("wait_for_task_terminal did not hang past its bound")
-    .expect("terminal envelope available");
-    match got {
-        task_store::TerminalEnvelope::Success { result } => {
-            assert_eq!(result["ok"], true);
-        }
-        other => panic!("expected Success, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn open_sse_stream_returns_priming_event_for_operational_session() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
-    );
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    let events = runtime
-        .open_sse_stream(&RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session_id),
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ))
-        .expect("stream opened");
-
-    assert_eq!(events.len(), 2);
-    assert!(events[0].event_id.starts_with("stream-"));
-    assert_eq!(events[0].data, "");
-    assert_eq!(events[0].retry_ms, Some(1500));
-    assert!(events[1].data.contains("notifications/message"));
-}
-
-#[tokio::test]
-async fn stream_protocol_response_can_be_replayed_from_last_event_id() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
-    );
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    let streamed_events = runtime
-        .stream_protocol_response(
-            &session_id,
-            &ProtocolResponse::JsonRpcSuccess(crate::protocol::JsonRpcSuccess {
-                jsonrpc: JSONRPC_VERSION,
-                id: serde_json::json!(2),
-                result: serde_json::json!({"ok": true}),
-            }),
+    let result = success_result(
+        send(
+            &gateway,
+            header_asserted("user-1"),
+            tools_call(3, "mcpg.runtime.snapshot", serde_json::json!({})),
         )
-        .expect("streamed response");
-
-    let replayed_events = runtime
-        .open_sse_stream(&RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session_id),
-            Some(ResumeCursor {
-                last_event_id: streamed_events[0].event_id.clone(),
-            }),
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ))
-        .expect("replayed stream");
-
-    assert_eq!(replayed_events.len(), 2);
-    assert!(replayed_events[0].data.contains("notifications/message"));
-    assert!(replayed_events[1].data.contains("\"jsonrpc\":\"2.0\""));
-}
-
-#[tokio::test]
-async fn runtime_handles_logging_set_level_request() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
+        .await,
     );
 
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
-    );
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    let response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Logging(LoggingOperation::SetLevel {
-                request_id: serde_json::json!(44),
-                params: crate::protocol::LoggingSetLevelParams {
-                    level: LoggingLevel::Error,
-                },
-            })),
-        ))
-        .await;
-
-    match response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = protocol_response.response else {
-                panic!("unexpected protocol response")
-            };
-            assert_eq!(success.id, serde_json::json!(44));
-            assert_eq!(success.result, serde_json::json!({}));
-        }
-        payload => panic!("unexpected payload: {payload:?}"),
-    }
-}
-
-#[tokio::test]
-async fn open_sse_stream_hard_fails_when_cursor_has_expired() {
-    let runtime = GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
-    );
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    let streamed_events = runtime
-        .stream_protocol_response(
-            &session_id,
-            &ProtocolResponse::JsonRpcSuccess(crate::protocol::JsonRpcSuccess {
-                jsonrpc: JSONRPC_VERSION,
-                id: serde_json::json!(2),
-                result: serde_json::json!({"ok": true}),
-            }),
-        )
-        .expect("streamed response");
-
-    let expired = runtime
-        .open_sse_stream(&RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session_id),
-            Some(ResumeCursor {
-                last_event_id: format!(
-                    "{}:999",
-                    streamed_events[0]
-                        .event_id
-                        .split(':')
-                        .next()
-                        .expect("stream id")
-                ),
-            }),
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ))
-        .expect_err("expired cursor rejected");
-
-    assert!(matches!(
-        expired,
-        StreamAccessError::ExpiredCursor | StreamAccessError::InvalidCursor
-    ));
-}
-
-#[tokio::test]
-async fn replay_window_limit_from_store_config_is_enforced() {
-    let runtime = GatewayRuntime::new_with_store_config(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-        SessionStoreConfig {
-            replay_window_limit: 1,
-            session_idle_timeout_ms: 900_000,
-            max_sessions: 10_000,
-            max_sessions_per_tenant: 0,
-        },
-    );
-
-    let initialize_request = GatewayRequest::new(
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            None,
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ),
-        GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-            LifecycleOperation::Initialize {
-                request_id: serde_json::json!(1),
-                params: crate::protocol::InitializeParams {
-                    protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                    capabilities: crate::protocol::ClientCapabilities::default(),
-                    client_info: crate::protocol::ImplementationInfo {
-                        name: "client".to_owned(),
-                        title: None,
-                        version: "1.0.0".to_owned(),
-                        description: None,
-                        website_url: None,
-                        icons: None,
-                    },
-                },
-            },
-        )),
-    );
-    let initialize_response = runtime.handle_request(initialize_request).await;
-    let session_id = match initialize_response.payload {
-        GatewayResponsePayload::Protocol(protocol_response) => protocol_response
-            .session_id_header
-            .expect("session id returned"),
-        payload => panic!("unexpected payload: {payload:?}"),
-    };
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
-
-    let streamed_events = runtime
-        .stream_protocol_response(
-            &session_id,
-            &ProtocolResponse::JsonRpcSuccess(crate::protocol::JsonRpcSuccess {
-                jsonrpc: JSONRPC_VERSION,
-                id: serde_json::json!(77),
-                result: serde_json::json!({"ok": true}),
-            }),
-        )
-        .expect("streamed response");
-
-    let expired = runtime
-        .open_sse_stream(&RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session_id),
-            Some(ResumeCursor {
-                last_event_id: streamed_events[0].event_id.clone(),
-            }),
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        ))
-        .expect_err("cursor should expire when replay window keeps only the last event");
-
-    assert!(matches!(expired, StreamAccessError::ExpiredCursor));
+    assert_eq!(result["content"][0]["type"], "text");
+    assert_eq!(result["structuredContent"]["service"], "mcpg");
 }
 
 #[test]
@@ -2593,6 +567,26 @@ fn anonymous_and_header_asserted_have_no_auth_provider_or_issuer() {
     };
     assert_eq!(header.auth_provider(), None);
     assert_eq!(header.issuer(), None);
+}
+
+/// A task owner key is a principal key exactly when a principal owns the
+/// task; an anonymous caller's task is owned by a session id.
+#[test]
+fn principal_keys_are_told_apart_from_session_ids() {
+    for identity in [header_asserted("alice"), verified("alice")] {
+        let key = identity.synthetic_principal_key().expect("a principal key");
+        assert!(RequestIdentity::is_principal_key(&key), "{key}");
+    }
+    assert!(anonymous().synthetic_principal_key().is_none());
+    for session_id in [
+        uuid::Uuid::new_v4().to_string(),
+        GatewayRuntime::derive_synthetic_session_id(&[7u8; 32], "verified::p::i::alice"),
+    ] {
+        assert!(
+            !RequestIdentity::is_principal_key(&session_id),
+            "{session_id}"
+        );
+    }
 }
 
 #[test]
@@ -2701,98 +695,12 @@ async fn tools_list_filters_tools_by_caller_identity() {
         Arc::new(delivery_bus::BusBackedDeliveryBus::new_in_memory()),
     )
     .expect("valid runtime config");
-
-    // Initialize session
-    let init_response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                None,
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialize {
-                    request_id: serde_json::json!(1),
-                    params: crate::protocol::InitializeParams {
-                        protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                        capabilities: crate::protocol::ClientCapabilities::default(),
-                        client_info: crate::protocol::ImplementationInfo {
-                            name: "client".to_owned(),
-                            title: None,
-                            version: "1.0.0".to_owned(),
-                            description: None,
-                            website_url: None,
-                            icons: None,
-                        },
-                    },
-                },
-            )),
-        ))
-        .await;
-    let session_id = match init_response.payload {
-        GatewayResponsePayload::Protocol(p) => p.session_id_header.expect("session"),
-        _ => panic!("expected protocol response"),
-    };
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
+    let gateway = serve(runtime);
 
     // HeaderAsserted caller should NOT see mcpg.runtime.snapshot (requires Verified)
-    let header_response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                RequestIdentity::HttpHeader {
-                    subject_id: "user-1".to_owned(),
-                    source: "x-mcpg-subject-id".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ToolsList {
-                    request_id: serde_json::json!(2),
-                    params: ListParams::default(),
-                },
-            )),
-        ))
-        .await;
-
-    let header_tools = match header_response.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = p.response else {
-                panic!("expected success");
-            };
-            success.result["tools"]
-                .as_array()
-                .expect("tools array")
-                .iter()
-                .map(|t| t["name"].as_str().unwrap().to_owned())
-                .collect::<Vec<_>>()
-        }
-        _ => panic!("expected protocol response"),
-    };
+    let header_tools = tool_names(&success_result(
+        send(&gateway, header_asserted("user-1"), tools_list(2)).await,
+    ));
     assert!(
         !header_tools.contains(&"mcpg.runtime.snapshot".to_owned()),
         "header-asserted caller should not see verified-only tool, got: {:?}",
@@ -2800,48 +708,9 @@ async fn tools_list_filters_tools_by_caller_identity() {
     );
 
     // Verified caller SHOULD see mcpg.runtime.snapshot
-    let verified_response = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id),
-                None,
-                RequestIdentity::Verified {
-                    subject_id: "user-1".to_owned(),
-                    issuer: "https://auth.example.com/".to_owned(),
-                    auth_provider: "jwks".to_owned(),
-                    source: "authorization:jwt".to_owned(),
-                    roles: Vec::new(),
-                    groups: Vec::new(),
-                    scopes: Vec::new(),
-                    attributes: std::collections::BTreeMap::new(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ToolsList {
-                    request_id: serde_json::json!(3),
-                    params: ListParams::default(),
-                },
-            )),
-        ))
-        .await;
-
-    let verified_tools = match verified_response.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = p.response else {
-                panic!("expected success");
-            };
-            success.result["tools"]
-                .as_array()
-                .expect("tools array")
-                .iter()
-                .map(|t| t["name"].as_str().unwrap().to_owned())
-                .collect::<Vec<_>>()
-        }
-        _ => panic!("expected protocol response"),
-    };
+    let verified_tools = tool_names(&success_result(
+        send(&gateway, verified("user-1"), tools_list(3)).await,
+    ));
     assert!(
         verified_tools.contains(&"mcpg.runtime.snapshot".to_owned()),
         "verified caller should see verified-only tool, got: {:?}",
@@ -2950,9 +819,9 @@ fn cursor_signing_key_is_shared_through_the_cluster_state_key() {
 }
 
 /// An ephemeral session's id is new on every request, so its cursors bind to
-/// the principal: a stateless caller's page-2 cursor verifies on its next
-/// request, and never for another principal. A real session still binds to
-/// its own id.
+/// the principal: the caller's page-2 cursor verifies on its next request,
+/// and never for another principal. A stored session still binds to its own
+/// id.
 #[test]
 fn ephemeral_session_cursors_bind_to_the_principal() {
     let runtime = GatewayRuntime::new(
@@ -2966,14 +835,8 @@ fn ephemeral_session_cursors_bind_to_the_principal() {
         true,
     );
     let context = |session: &str, ephemeral: bool, identity: RequestIdentity| {
-        let mut ctx = RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session.to_owned()),
-            None,
-            identity,
-            TransportKind::Http,
-        );
+        let mut ctx = request_context(identity);
+        ctx.session_id = Some(session.to_owned());
         ctx.session_ephemeral = ephemeral;
         ctx
     };
@@ -3064,10 +927,10 @@ fn composite_cursor_rejects_cross_session_replay() {
 }
 
 #[test]
-fn composite_cursor_rejects_legacy_bare_offset() {
+fn composite_cursor_rejects_bare_offset() {
     // A bare-offset cursor (from `encode_cursor`) is NOT a
-    // composite cursor — the resources/list handler keeps a
-    // legacy fallback path, but `decode_composite_cursor`
+    // composite cursor — the resources/list handler pages the
+    // static catalog on one, but `decode_composite_cursor`
     // alone should reject it cleanly.
     let bare = super::encode_cursor(100, Some(b"key"));
     assert!(super::decode_composite_cursor(&bare, Some(b"key")).is_none());
@@ -3831,7 +1694,7 @@ fn apps_offered_from_tools_empty_when_no_ui_tools() {
     assert!(super::apps_offered_from_tools(&plain).is_empty());
 }
 
-// Deterministic modern synthetic session id derivation.
+// Deterministic synthetic session id derivation.
 #[test]
 fn derive_synthetic_session_id_is_deterministic_and_principal_scoped() {
     let key = [7u8; 32];
@@ -3855,6 +1718,43 @@ fn derive_synthetic_session_id_changes_with_the_key() {
     let id_k1 = GatewayRuntime::derive_synthetic_session_id(&[1u8; 32], "user:alice");
     let id_k2 = GatewayRuntime::derive_synthetic_session_id(&[2u8; 32], "user:alice");
     assert_ne!(id_k1, id_k2);
+}
+
+/// The derived id is the lowercase hex HMAC-SHA256 over the domain prefix,
+/// the principal key and the client the request names.
+#[test]
+fn derived_session_ids_keep_their_bytes() {
+    assert_eq!(
+        GatewayRuntime::derive_synthetic_session_id(&[7u8; 32], "verified::p::i::alice"),
+        "mcpg-m-8732e1b1170bf0cdefaffa7aa2b0bc513c40ee3b67d79dd8fbe712e08086c0f7"
+    );
+    let mut config = crate::config::AppConfig::default();
+    // Bytes 0..32.
+    config.mcp.configurations.sessions.synthetic_session_key =
+        Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".to_owned());
+    let runtime = test_runtime();
+    runtime.set_shared_services(Arc::new(shared_services::SharedServices::for_tests(
+        Arc::new(config),
+    )));
+    let session = |client: Option<&str>| {
+        let mut context = request_context(verified("alice"));
+        context.client = client.map(|name| mcpg_plugin_protocol::ClientInfo {
+            name: name.to_owned(),
+            version: None,
+        });
+        match runtime.ensure_session(context) {
+            SessionOutcome::Ready(bound) => bound.session_id.expect("a derived session"),
+            SessionOutcome::CapacityExhausted => panic!("the session store has room"),
+        }
+    };
+    assert_eq!(
+        session(None),
+        "mcpg-m-0d7d7e2f304a538177fd2b4cf2891c94e0b2b648d4e9c784e9ed93e66b72144e"
+    );
+    assert_eq!(
+        session(Some("claude")),
+        "mcpg-m-f7d138cb8e386ea23c1f523f6b50b5fe9b87a618405a4a33b150ed648fce6bb6"
+    );
 }
 
 #[tokio::test]
@@ -3881,148 +1781,56 @@ async fn gateway_apps_listed_and_read_end_to_end() {
     )
     .unwrap();
     runtime.set_apps_config(
-        Some(crate::protocol::shared::apps::capability_value(&[])),
         apps_cfg.federate_upstream_enabled(),
         Some(apps_cfg.compiled_policy()),
         &apps_cfg.registry,
     );
-
-    // initialize → session
-    let init = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                None,
-                None,
-                RequestIdentity::Anonymous {
-                    source: "test".to_owned(),
-                },
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialize {
-                    request_id: serde_json::json!(1),
-                    params: crate::protocol::InitializeParams {
-                        protocol_version: SUPPORTED_PROTOCOL_VERSION.to_owned(),
-                        capabilities: crate::protocol::ClientCapabilities::default(),
-                        client_info: crate::protocol::ImplementationInfo {
-                            name: "client".to_owned(),
-                            title: None,
-                            version: "1.0.0".to_owned(),
-                            description: None,
-                            website_url: None,
-                            icons: None,
-                        },
-                    },
-                },
-            )),
-        ))
-        .await;
-    let session_id = match init.payload {
-        GatewayResponsePayload::Protocol(p) => p.session_id_header.expect("session id"),
-        other => panic!("unexpected payload: {other:?}"),
-    };
-    let ident = || RequestIdentity::HttpHeader {
-        subject_id: "user-1".to_owned(),
-        source: "x-mcpg-subject-id".to_owned(),
-    };
-
-    // complete the lifecycle handshake before issuing capability requests
-    let _ = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                ident(),
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Lifecycle(
-                LifecycleOperation::Initialized,
-            )),
-        ))
-        .await;
+    let gateway = serve(runtime);
 
     // resources/list includes the gateway app descriptor
-    let list = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id.clone()),
-                None,
-                ident(),
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesList {
-                    request_id: serde_json::json!(2),
-                    params: ListParams::default(),
-                },
-            )),
-        ))
-        .await;
-    match list.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = p.response else {
-                panic!("expected list success, got {:?}", p.response)
-            };
-            let found = success.result["resources"]
-                .as_array()
-                .expect("resources array")
-                .iter()
-                .find(|r| r["uri"] == "ui://mcpg/customers")
-                .expect("gateway app listed");
-            assert_eq!(found["mimeType"], "text/html;profile=mcp-app");
-        }
-        other => panic!("unexpected payload: {other:?}"),
-    }
+    let list = success_result(
+        send(
+            &gateway,
+            header_asserted("user-1"),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "resources/list", "params": {} }),
+        )
+        .await,
+    );
+    let found = list["resources"]
+        .as_array()
+        .expect("resources array")
+        .iter()
+        .find(|r| r["uri"] == "ui://mcpg/customers")
+        .expect("gateway app listed");
+    assert_eq!(found["mimeType"], "text/html;profile=mcp-app");
 
     // resources/read serves the authored body + clamped _meta.ui
-    let read = runtime
-        .handle_request(GatewayRequest::new(
-            RequestContext::new(
-                GatewayRequestId::new(),
-                None,
-                Some(session_id),
-                None,
-                ident(),
-                TransportKind::Http,
-            ),
-            GatewayOperation::Protocol(ProtocolOperation::Capabilities(
-                CapabilityOperation::ResourcesRead {
-                    request_id: serde_json::json!(3),
-                    params: crate::protocol::ResourceReadParams {
-                        uri: "ui://mcpg/customers".to_owned(),
-                        meta: None,
-                    },
-                },
-            )),
-        ))
-        .await;
-    match read.payload {
-        GatewayResponsePayload::Protocol(p) => {
-            let ProtocolResponse::JsonRpcSuccess(success) = p.response else {
-                panic!("expected read success")
-            };
-            let content = &success.result["contents"][0];
-            assert_eq!(content["uri"], "ui://mcpg/customers");
-            assert_eq!(content["mimeType"], "text/html;profile=mcp-app");
-            assert_eq!(content["_meta"]["ui"]["resourceUri"], "ui://mcpg/customers");
-            let html = content["text"].as_str().expect("html body");
-            assert!(
-                html.contains("id=\"mcpg-app-config\""),
-                "data island present"
-            );
-            assert!(
-                html.contains("\"kind\":\"table\""),
-                "compiled binding injected"
-            );
-        }
-        other => panic!("unexpected payload: {other:?}"),
-    }
+    let read = success_result(
+        send(
+            &gateway,
+            header_asserted("user-1"),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "resources/read",
+                "params": { "uri": "ui://mcpg/customers" },
+            }),
+        )
+        .await,
+    );
+    let content = &read["contents"][0];
+    assert_eq!(content["uri"], "ui://mcpg/customers");
+    assert_eq!(content["mimeType"], "text/html;profile=mcp-app");
+    assert_eq!(content["_meta"]["ui"]["resourceUri"], "ui://mcpg/customers");
+    let html = content["text"].as_str().expect("html body");
+    assert!(
+        html.contains("id=\"mcpg-app-config\""),
+        "data island present"
+    );
+    assert!(
+        html.contains("\"kind\":\"table\""),
+        "compiled binding injected"
+    );
 }
 
 /// A pre gate that asks for an approval on every request.
@@ -4085,23 +1893,16 @@ async fn a_surface_gate_that_cannot_wait_refuses_a_pending_approval() {
         )
         .unwrap();
     runtime.plugin_registry = Arc::new(registry);
-    let ctx = RequestContext::new(
-        GatewayRequestId::new(),
-        None,
-        None,
-        None,
-        RequestIdentity::Verified {
-            subject_id: "alice".to_owned(),
-            issuer: "https://idp.example".to_owned(),
-            auth_provider: "oidc".to_owned(),
-            source: "test".to_owned(),
-            roles: Vec::new(),
-            groups: Vec::new(),
-            scopes: Vec::new(),
-            attributes: Default::default(),
-        },
-        TransportKind::Http,
-    );
+    let ctx = request_context(RequestIdentity::Verified {
+        subject_id: "alice".to_owned(),
+        issuer: "https://idp.example".to_owned(),
+        auth_provider: "oidc".to_owned(),
+        source: "test".to_owned(),
+        roles: Vec::new(),
+        groups: Vec::new(),
+        scopes: Vec::new(),
+        attributes: Default::default(),
+    });
     let arguments = serde_json::json!({});
     let refused = tokio::time::timeout(
         std::time::Duration::from_secs(5),

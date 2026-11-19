@@ -1,778 +1,268 @@
+//! `prompts/get` and `resources/read`: the runtime reads the dispatch arms
+//! call, behind the same pre-dispatch gate as `tools/call`.
+
 use super::super::*;
+use crate::protocol::{
+    JSONRPC_VERSION, JsonRpcSuccess, PromptGetParams, PromptGetResult, PromptMessage,
+    PromptMessageContent, ProtocolHttpResponse, ProtocolResponse, ResourceContents,
+    ResourceReadParams, ResourceReadResult, ResourceTextContents,
+};
+use serde_json::Value;
 
 impl GatewayRuntime {
-    pub(crate) async fn handle_capabilities_list_operation(
+    /// `prompts/get`: the surface gate, then the prompt's backend. A binding
+    /// whose pipeline suspends answers with an MRTR `InputRequiredResult`.
+    pub(crate) async fn handle_prompt_get(
         &self,
-        operation: CapabilityOperation,
+        request_id: Value,
+        params: PromptGetParams,
         request_context: &RequestContext,
     ) -> ProtocolHttpResponse {
-        match operation {
-            CapabilityOperation::ToolsList { request_id, params } => {
-                match request_context.load_session_cached(&*self.session_store, true) {
-                    Ok(_) => {
-                        // An opaque cursor that does not decode is invalid
-                        // params (-32602), not a silent restart at page 1.
-                        if !self.cursor_is_valid(params.cursor.as_deref(), request_context) {
-                            return protocol_http_error(
-                                200,
-                                Some(request_id),
-                                -32602,
-                                "invalid pagination cursor".to_owned(),
-                                self.debug_error_data(
-                                    request_context,
-                                    "Omit `cursor` to start from the first page; \
-                                     reuse only a `nextCursor` returned by this server.",
-                                ),
-                            );
-                        }
-                        let (page, next_cursor) = self
-                            .enumerate_tools_page(request_context, params.cursor.as_deref())
-                            .await;
-                        // Audit: tool catalog enumeration.
-                        let event = mcpg_plugin_host::audit_events::list_call_event(
-                            plugin_identity_from_request(request_context),
-                            request_context.request_id.as_str(),
-                            request_context.session_id.as_deref(),
-                            "tool",
-                            page.len() as u64,
-                            transport_label(&request_context.transport),
-                        );
-                        let _ = self.plugin_registry.emit_audit_event(&event).await;
-                        // MCP Apps audit: which UI apps
-                        // this listing offered the caller.
-                        self.audit_apps_offered(request_context, &page).await;
-                        ProtocolHttpResponse {
-                            http_status: 200,
-                            session_id_header: None,
-                            response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
-                                jsonrpc: JSONRPC_VERSION,
-                                id: request_id,
-                                result: serde_json::to_value(ToolsListResult {
-                                    tools: page,
-                                    next_cursor,
-                                    ttl_ms: Some(
-                                        crate::protocol::shared::caching::DEFAULT_LIST_TTL_MS,
-                                    ),
-                                    cache_scope: Some(
-                                        crate::protocol::shared::caching::CacheScope::Private,
-                                    ),
-                                    cache_token: None,
-                                })
-                                .expect("tools list serialized"),
-                            }),
-                        }
-                    }
-                    Err(error) => {
-                        self.map_session_error_to_protocol_response(error, Some(request_id))
-                    }
+        let audit_ctx = |surface: &str| mcpg_plugin_protocol::PluginContext {
+            request_id: request_context.request_id.as_str().to_owned(),
+            session_id: request_context.session_id.clone(),
+            tool_name: params.name.clone(),
+            identity: plugin_identity_from_request(request_context),
+            transport: transport_label(&request_context.transport).to_owned(),
+            surface: surface.to_owned(),
+        };
+        let Some(route) = self.capability_registry.prompt_route(&params.name) else {
+            // Audit: prompts/get against an unregistered name.
+            let event = mcpg_plugin_host::audit_events::prompt_get_not_found_event(
+                &audit_ctx("prompt"),
+                &params.name,
+            );
+            let _ = self.plugin_registry.emit_audit_event(&event).await;
+            return protocol_http_error(
+                200,
+                Some(request_id),
+                -32602,
+                format!("unknown prompt: {}", params.name),
+                self.debug_error_data(
+                    request_context,
+                    "Use prompts/list to discover available prompt names.",
+                ),
+            );
+        };
+        // Surface-aware gate plugins run before the backend, so prompt
+        // traffic is mediated the same way tool traffic is.
+        let args_value = params.arguments.clone().unwrap_or(serde_json::json!({}));
+        if let Err(gate_response) = self
+            .evaluate_surface_gate(
+                "prompt",
+                "prompt.get.pre",
+                &params.name,
+                PolicyRoute::for_prompt(&route),
+                &args_value,
+                request_context,
+                &request_id,
+            )
+            .await
+        {
+            // Audit: prompts/get denied.
+            let event = mcpg_plugin_host::audit_events::prompt_get_denied_event(
+                &audit_ctx("prompt"),
+                &params.name,
+                "surface_gate",
+            );
+            let _ = self.plugin_registry.emit_audit_event(&event).await;
+            return gate_response;
+        }
+        // A binding whose pipeline carries elicitation / sampling /
+        // roots_list steps runs the suspending pipeline path, which answers
+        // a suspension with an MRTR `InputRequiredResult`. The synchronous
+        // path (`prompt_get_result` → `dispatch_tool_call` →
+        // `execute_pipeline_binding`) cannot suspend.
+        if let Some(response) = self
+            .try_dispatch_prompt_with_suspension(&route, &params, request_context, &request_id)
+            .await
+        {
+            return response;
+        }
+        match self.prompt_get_result(route, &params, request_context) {
+            Ok(result) => {
+                // Audit: prompts/get success.
+                let event = mcpg_plugin_host::audit_events::prompt_get_success_event(
+                    &audit_ctx("prompt"),
+                    &params.name,
+                );
+                let _ = self.plugin_registry.emit_audit_event(&event).await;
+                ProtocolHttpResponse {
+                    http_status: 200,
+                    response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
+                        jsonrpc: JSONRPC_VERSION,
+                        id: request_id,
+                        result: serde_json::to_value(result).expect("prompt get result serialized"),
+                    }),
                 }
             }
-            CapabilityOperation::PromptsList { request_id, params } => {
-                match request_context.load_session_cached(&*self.session_store, true) {
-                    Ok(_) => {
-                        let (page, next_cursor) =
-                            self.enumerate_prompts_page(request_context, params.cursor.as_deref());
-                        // Audit: prompt catalog enumeration.
-                        let event = mcpg_plugin_host::audit_events::list_call_event(
-                            plugin_identity_from_request(request_context),
-                            request_context.request_id.as_str(),
-                            request_context.session_id.as_deref(),
-                            "prompt",
-                            page.len() as u64,
-                            transport_label(&request_context.transport),
-                        );
-                        let _ = self.plugin_registry.emit_audit_event(&event).await;
-                        ProtocolHttpResponse {
-                            http_status: 200,
-                            session_id_header: None,
-                            response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
-                                jsonrpc: JSONRPC_VERSION,
-                                id: request_id,
-                                result: serde_json::to_value(PromptsListResult {
-                                    prompts: page,
-                                    next_cursor,
-                                    ttl_ms: Some(
-                                        crate::protocol::shared::caching::DEFAULT_LIST_TTL_MS,
-                                    ),
-                                    cache_scope: Some(
-                                        crate::protocol::shared::caching::CacheScope::Private,
-                                    ),
-                                    cache_token: None,
-                                })
-                                .expect("prompts list serialized"),
-                            }),
-                        }
-                    }
-                    Err(error) => {
-                        self.map_session_error_to_protocol_response(error, Some(request_id))
-                    }
-                }
-            }
-            CapabilityOperation::PromptsGet { request_id, params } => {
-                match request_context.load_session_cached(&*self.session_store, true) {
-                    Ok(_) => match self.capability_registry.prompt_route(&params.name) {
-                        Some(route) => {
-                            // run surface-aware gate plugins before
-                            // dispatching to the backend so prompt traffic is
-                            // mediated the same way tool traffic is.
-                            let args_value =
-                                params.arguments.clone().unwrap_or(serde_json::json!({}));
-                            if let Err(gate_response) = self
-                                .evaluate_surface_gate(
-                                    "prompt",
-                                    "prompt.get.pre",
-                                    &params.name,
-                                    PolicyRoute::for_prompt(&route),
-                                    &args_value,
-                                    request_context,
-                                    &request_id,
-                                )
-                                .await
-                            {
-                                // Audit: prompts/get denied.
-                                let audit_ctx = mcpg_plugin_protocol::PluginContext {
-                                    request_id: request_context.request_id.as_str().to_owned(),
-                                    session_id: request_context.session_id.clone(),
-                                    tool_name: params.name.clone(),
-                                    identity: plugin_identity_from_request(request_context),
-                                    transport: transport_label(&request_context.transport)
-                                        .to_owned(),
-                                    surface: "prompt".to_owned(),
-                                };
-                                let event = mcpg_plugin_host::audit_events::prompt_get_denied_event(
-                                    &audit_ctx,
-                                    &params.name,
-                                    "surface_gate",
-                                );
-                                let _ = self.plugin_registry.emit_audit_event(&event).await;
-                                return gate_response;
-                            }
-                            // `prompts/get` against a binding whose
-                            // pipeline carries elicitation / sampling /
-                            // roots_list steps goes through the suspending
-                            // pipeline path. The synchronous fast path
-                            // (`prompt_get_result` → `dispatch_tool_call`
-                            // → `execute_pipeline_binding`) errors on
-                            // suspending steps because the fast executor
-                            // can't suspend; route those bindings to
-                            // `execute_pipeline` and translate the
-                            // suspended outcome into an MRTR
-                            // `InputRequiredResult` (modern) or HTTP 202 +
-                            // bus-delivered server request (legacy).
-                            if let Some(response) = self
-                                .try_dispatch_prompt_with_suspension(
-                                    &route,
-                                    &params,
-                                    request_context,
-                                    &request_id,
-                                )
-                                .await
-                            {
-                                return response;
-                            }
-                            match self.prompt_get_result(route, &params, request_context) {
-                                Ok(result) => {
-                                    // Audit: prompts/get success.
-                                    let audit_ctx = mcpg_plugin_protocol::PluginContext {
-                                        request_id: request_context
-                                            .request_id
-                                            .as_str()
-                                            .to_owned(),
-                                        session_id: request_context.session_id.clone(),
-                                        tool_name: params.name.clone(),
-                                        identity: plugin_identity_from_request(request_context),
-                                        transport: transport_label(&request_context.transport)
-                                            .to_owned(),
-                                        surface: "prompt".to_owned(),
-                                    };
-                                    let event = mcpg_plugin_host::audit_events::prompt_get_success_event(
-                                        &audit_ctx,
-                                        &params.name,
-                                    );
-                                    let _ = self
-                                        .plugin_registry
-                                        .emit_audit_event(&event)
-                                        .await;
-                                    ProtocolHttpResponse {
-                                        http_status: 200,
-                                        session_id_header: None,
-                                        response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
-                                            jsonrpc: JSONRPC_VERSION,
-                                            id: request_id,
-                                            result: serde_json::to_value(result)
-                                                .expect("prompt get result serialized"),
-                                        }),
-                                    }
-                                }
-                                Err(decode_err) => protocol_http_error(
-                                    200,
-                                    Some(request_id),
-                                    -32603,
-                                    format!("prompt backend produced a non-conforming response: {decode_err}"),
-                                    self.debug_error_data(
-                                        request_context,
-                                        "The backend for this prompt binding must return `{ messages: [...] }` with spec-shaped entries.",
-                                    ),
-                                ),
-                            }
-                        }
-                        None => {
-                            // Audit: prompts/get against an
-                            // unregistered name.
-                            let audit_ctx = mcpg_plugin_protocol::PluginContext {
-                                request_id: request_context.request_id.as_str().to_owned(),
-                                session_id: request_context.session_id.clone(),
-                                tool_name: params.name.clone(),
-                                identity: plugin_identity_from_request(request_context),
-                                transport: transport_label(&request_context.transport).to_owned(),
-                                surface: "prompt".to_owned(),
-                            };
-                            let event = mcpg_plugin_host::audit_events::prompt_get_not_found_event(
-                                &audit_ctx,
-                                &params.name,
-                            );
-                            let _ = self.plugin_registry.emit_audit_event(&event).await;
-                            protocol_http_error(
-                                200,
-                                Some(request_id),
-                                -32602,
-                                format!("unknown prompt: {}", params.name),
-                                self.debug_error_data(
-                                    request_context,
-                                    "Use prompts/list to discover available prompt names.",
-                                ),
-                            )
-                        }
-                    },
-                    Err(error) => {
-                        self.map_session_error_to_protocol_response(error, Some(request_id))
-                    }
-                }
-            }
-            CapabilityOperation::ResourcesList { request_id, params } => {
-                match request_context.load_session_cached(&*self.session_store, true) {
-                    Ok(_) => {
-                        let (page, next_cursor) = self
-                            .enumerate_resources_page(request_context, params.cursor.as_deref())
-                            .await;
+            Err(decode_err) => protocol_http_error(
+                200,
+                Some(request_id),
+                -32603,
+                format!("prompt backend produced a non-conforming response: {decode_err}"),
+                self.debug_error_data(
+                    request_context,
+                    "The backend for this prompt binding must return `{ messages: [...] }` with \
+                     spec-shaped entries.",
+                ),
+            ),
+        }
+    }
 
-                        // Audit: resource catalog enumeration.
-                        let event = mcpg_plugin_host::audit_events::list_call_event(
-                            plugin_identity_from_request(request_context),
-                            request_context.request_id.as_str(),
-                            request_context.session_id.as_deref(),
-                            "resource",
-                            page.len() as u64,
-                            transport_label(&request_context.transport),
-                        );
-                        let _ = self.plugin_registry.emit_audit_event(&event).await;
-                        // SEP-1865 MCP Apps: clamp each list entry's `_meta.ui`
-                        // (CSP / permissions / domain) to operator policy on
-                        // the legacy wire too; no-op unless Apps is enabled,
-                        // strict rejects an out-of-policy descriptor.
-                        let mut result_value = serde_json::to_value(ResourcesListResult {
-                            resources: page,
-                            next_cursor,
-                            ttl_ms: Some(crate::protocol::shared::caching::DEFAULT_LIST_TTL_MS),
-                            cache_scope: Some(
-                                crate::protocol::shared::caching::CacheScope::Private,
-                            ),
-                            cache_token: None,
-                        })
-                        .expect("resources list serialized");
-                        if let Some(entries) = result_value
-                            .get_mut("resources")
-                            .and_then(|r| r.as_array_mut())
-                            && let Err(msg) =
-                                self.apply_apps_policy_to_items(entries, "resources/list")
-                        {
-                            return protocol_http_error(200, Some(request_id), -32603, msg, None);
-                        }
-                        ProtocolHttpResponse {
-                            http_status: 200,
-                            session_id_header: None,
-                            response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
-                                jsonrpc: JSONRPC_VERSION,
-                                id: request_id,
-                                result: result_value,
-                            }),
-                        }
-                    }
-                    Err(error) => {
-                        self.map_session_error_to_protocol_response(error, Some(request_id))
-                    }
-                }
+    /// `resources/read`: a gateway-managed `mcpg-resource://` read, a skill
+    /// file, or an operator-configured resource, each behind the surface
+    /// gate.
+    pub(crate) async fn handle_resource_read(
+        &self,
+        request_id: Value,
+        params: ResourceReadParams,
+        request_context: &RequestContext,
+    ) -> ProtocolHttpResponse {
+        // Gateway-managed dynamic resources produced by bindings via
+        // `host.store_content` surface under the `mcpg-resource://` scheme
+        // and are served from the content store.
+        if let Some(rest) = params.uri.strip_prefix("mcpg-resource://") {
+            // Managed reads run the same pre-dispatch authz stack as
+            // operator-configured resources — they must not bypass the trust
+            // floor / CEL / policy chain just because the content is
+            // gateway-produced.
+            let args_value = serde_json::json!({ "uri": params.uri });
+            if let Err(gate_response) = self
+                .evaluate_surface_gate(
+                    "resource",
+                    "resource.read.pre",
+                    &params.uri,
+                    PolicyRoute::gateway().on(PolicySurface::Resource),
+                    &args_value,
+                    request_context,
+                    &request_id,
+                )
+                .await
+            {
+                return gate_response;
             }
-            CapabilityOperation::ResourcesRead { request_id, params } => {
-                match request_context.load_session_cached(&*self.session_store, true) {
-                    Ok(_) => {
-                        // Gateway-managed dynamic resources
-                        // produced by bindings via `host.store_content`
-                        // surface here under the `mcpg-resource://`
-                        // scheme. Serve directly from the content store
-                        // before falling through to operator-configured
-                        // resource bindings.
-                        if let Some(rest) = params.uri.strip_prefix("mcpg-resource://") {
-                            // Managed `mcpg-resource://` reads run the same
-                            // pre-dispatch authz stack as operator-configured
-                            // resources — they must not bypass the trust floor
-                            // / CEL / policy chain just because the content is
-                            // gateway-produced.
-                            let args_value = serde_json::json!({ "uri": params.uri });
-                            if let Err(gate_response) = self
-                                .evaluate_surface_gate(
-                                    "resource",
-                                    "resource.read.pre",
-                                    &params.uri,
-                                    PolicyRoute::gateway().on(PolicySurface::Resource),
-                                    &args_value,
-                                    request_context,
-                                    &request_id,
-                                )
-                                .await
-                            {
-                                return gate_response;
-                            }
-                            return self
-                                .resource_read_managed(
-                                    rest,
-                                    &params.uri,
-                                    request_id,
-                                    request_context,
-                                )
-                                .await;
-                        }
-                        if let Some(response) = self
-                            .read_skill_file(&params.uri, &request_id, request_context)
-                            .await
-                        {
-                            return response;
-                        }
-                        match self.resolve_resource_route(&params.uri) {
-                            Some(route) => {
-                                // surface-aware gate for resources/read.
-                                let surface_label = match &route {
-                                    ResourceRoute::Template { .. } => "resource_template",
-                                    _ => "resource",
-                                };
-                                if let Err(gate_response) = self
-                                    .evaluate_resource_gate(
-                                        surface_label,
-                                        "resource.read.pre",
-                                        &params.uri,
-                                        &route,
-                                        request_context,
-                                        &request_id,
-                                    )
-                                    .await
-                                {
-                                    // Audit: resources/read denied.
-                                    let audit_ctx = mcpg_plugin_protocol::PluginContext {
-                                        request_id: request_context.request_id.as_str().to_owned(),
-                                        session_id: request_context.session_id.clone(),
-                                        tool_name: params.uri.clone(),
-                                        identity: plugin_identity_from_request(request_context),
-                                        transport: transport_label(&request_context.transport)
-                                            .to_owned(),
-                                        surface: surface_label.to_owned(),
-                                    };
-                                    let event =
-                                        mcpg_plugin_host::audit_events::resource_read_denied_event(
-                                            &audit_ctx,
-                                            &params.uri,
-                                            "surface_gate",
-                                        );
-                                    let _ = self.plugin_registry.emit_audit_event(&event).await;
-                                    return gate_response;
-                                }
-                                match self.resource_read_result(route, &params, request_context) {
-                                Ok(mut result) => {
-                                    // SEP-1865 MCP Apps: a `ui://` resource
-                                    // body may embed session-shaped data, so
-                                    // never let it land in a shared cache —
-                                    // force `private` scope regardless of what
-                                    // the backend/upstream declared.
-                                    if crate::protocol::shared::apps::is_ui_uri(&params.uri) {
-                                        result.cache_scope = Some(
-                                            crate::protocol::shared::caching::CacheScope::Private,
-                                        );
-                                    }
-                                    // Audit: resources/read success.
-                                    let bytes = serde_json::to_string(&result)
-                                        .map(|s| s.len() as u64)
-                                        .unwrap_or(0);
-                                    let audit_ctx = mcpg_plugin_protocol::PluginContext {
-                                        request_id: request_context
-                                            .request_id
-                                            .as_str()
-                                            .to_owned(),
-                                        session_id: request_context.session_id.clone(),
-                                        tool_name: params.uri.clone(),
-                                        identity: plugin_identity_from_request(request_context),
-                                        transport: transport_label(&request_context.transport)
-                                            .to_owned(),
-                                        surface: surface_label.to_owned(),
-                                    };
-                                    let event = mcpg_plugin_host::audit_events::resource_read_success_event(
-                                        &audit_ctx,
-                                        &params.uri,
-                                        bytes,
-                                    );
-                                    let _ = self
-                                        .plugin_registry
-                                        .emit_audit_event(&event)
-                                        .await;
-                                    // SEP-1865 MCP Apps: clamp `_meta.ui`
-                                    // (CSP / permissions / domain) on each
-                                    // content block before egress. No-op
-                                    // unless Apps is enabled; `strict`
-                                    // rejects an out-of-policy `ui://`.
-                                    let mut result_value = serde_json::to_value(result)
-                                        .expect("resource read result serialized");
-                                    if let Some(contents) = result_value
-                                        .get_mut("contents")
-                                        .and_then(|c| c.as_array_mut())
-                                        && let Err(msg) = self
-                                            .apply_apps_policy_to_items(contents, &params.uri)
-                                    {
-                                        return protocol_http_error(
-                                            200,
-                                            Some(request_id),
-                                            -32603,
-                                            msg,
-                                            None,
-                                        );
-                                    }
-                                    ProtocolHttpResponse {
-                                        http_status: 200,
-                                        session_id_header: None,
-                                        response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
-                                            jsonrpc: JSONRPC_VERSION,
-                                            id: request_id,
-                                            result: result_value,
-                                        }),
-                                    }
-                                }
-                                Err(decode_err) => protocol_http_error(
-                                    200,
-                                    Some(request_id),
-                                    -32603,
-                                    format!("resource backend produced a non-conforming response: {decode_err}"),
-                                    self.debug_error_data(
-                                        request_context,
-                                        "The backend for this resource binding must return `{ contents: [...] }` with spec-shaped entries.",
-                                    ),
-                                ),
-                            }
-                            }
-                            None => {
-                                // Audit: resources/read against an
-                                // unregistered URI. Distinguishes attacker
-                                // enumeration from a typo'd legitimate caller.
-                                let audit_ctx = mcpg_plugin_protocol::PluginContext {
-                                    request_id: request_context.request_id.as_str().to_owned(),
-                                    session_id: request_context.session_id.clone(),
-                                    tool_name: params.uri.clone(),
-                                    identity: plugin_identity_from_request(request_context),
-                                    transport: transport_label(&request_context.transport)
-                                        .to_owned(),
-                                    surface: "resource".to_owned(),
-                                };
-                                let event =
-                                    mcpg_plugin_host::audit_events::resource_read_not_found_event(
-                                        &audit_ctx,
-                                        &params.uri,
-                                    );
-                                let _ = self.plugin_registry.emit_audit_event(&event).await;
-                                protocol_http_error(
-                                    200,
-                                    Some(request_id),
-                                    -32602,
-                                    format!("unknown resource: {}", params.uri),
-                                    self.debug_error_data(
-                                        request_context,
-                                        "Use resources/list to discover available resource URIs.",
-                                    ),
-                                )
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        self.map_session_error_to_protocol_response(error, Some(request_id))
-                    }
-                }
+            return self
+                .resource_read_managed(rest, &params.uri, request_id, request_context)
+                .await;
+        }
+        if let Some(response) = self
+            .read_skill_file(&params.uri, &request_id, request_context)
+            .await
+        {
+            return response;
+        }
+        let audit_ctx = |surface: &str| mcpg_plugin_protocol::PluginContext {
+            request_id: request_context.request_id.as_str().to_owned(),
+            session_id: request_context.session_id.clone(),
+            tool_name: params.uri.clone(),
+            identity: plugin_identity_from_request(request_context),
+            transport: transport_label(&request_context.transport).to_owned(),
+            surface: surface.to_owned(),
+        };
+        let Some(route) = self.resolve_resource_route(&params.uri) else {
+            // Audit: resources/read against an unregistered URI.
+            // Distinguishes attacker enumeration from a typo'd legitimate
+            // caller.
+            let event = mcpg_plugin_host::audit_events::resource_read_not_found_event(
+                &audit_ctx("resource"),
+                &params.uri,
+            );
+            let _ = self.plugin_registry.emit_audit_event(&event).await;
+            return protocol_http_error(
+                200,
+                Some(request_id),
+                -32602,
+                format!("unknown resource: {}", params.uri),
+                self.debug_error_data(
+                    request_context,
+                    "Use resources/list to discover available resource URIs.",
+                ),
+            );
+        };
+        let surface_label = match &route {
+            ResourceRoute::Template { .. } => "resource_template",
+            _ => "resource",
+        };
+        if let Err(gate_response) = self
+            .evaluate_resource_gate(
+                surface_label,
+                "resource.read.pre",
+                &params.uri,
+                &route,
+                request_context,
+                &request_id,
+            )
+            .await
+        {
+            // Audit: resources/read denied.
+            let event = mcpg_plugin_host::audit_events::resource_read_denied_event(
+                &audit_ctx(surface_label),
+                &params.uri,
+                "surface_gate",
+            );
+            let _ = self.plugin_registry.emit_audit_event(&event).await;
+            return gate_response;
+        }
+        let mut result = match self.resource_read_result(route, &params, request_context) {
+            Ok(result) => result,
+            Err(decode_err) => {
+                return protocol_http_error(
+                    200,
+                    Some(request_id),
+                    -32603,
+                    format!("resource backend produced a non-conforming response: {decode_err}"),
+                    self.debug_error_data(
+                        request_context,
+                        "The backend for this resource binding must return `{ contents: [...] }` \
+                         with spec-shaped entries.",
+                    ),
+                );
             }
-            CapabilityOperation::ResourcesSubscribe { request_id, params } => {
-                match request_context.load_session_cached(&*self.session_store, true) {
-                    Ok(_) => {
-                        let session_id = request_context.session_id.as_deref().unwrap_or("");
-                        // Verify the resource exists
-                        let Some(route) = self.resolve_resource_route(&params.uri) else {
-                            return protocol_http_error(
-                                200,
-                                Some(request_id),
-                                -32602,
-                                format!("unknown resource: {}", params.uri),
-                                self.debug_error_data(
-                                    request_context,
-                                    "Use resources/list to discover available resource URIs.",
-                                ),
-                            );
-                        };
-                        // A subscription is a read that keeps arriving, and the
-                        // first holder starts a backend poll watcher, so it runs
-                        // the same authz stack `resources/read` does. Without
-                        // this the trust floor, CEL `allow_if`, the policy chain
-                        // and the per-resource governance a federated import
-                        // attaches were all skipped for the streaming surface.
-                        if let Err(gate_response) = self
-                            .evaluate_resource_gate(
-                                "resource",
-                                "resource.subscribe.pre",
-                                &params.uri,
-                                &route,
-                                request_context,
-                                &request_id,
-                            )
-                            .await
-                        {
-                            return gate_response;
-                        }
-                        // The realtime admission decides whether this caller
-                        // may hold the subscription; its refusal is the
-                        // caller's error as the admission wrote it.
-                        let admission_lease = crate::runtime::admission::session_resource_lease(
-                            session_id,
-                            &params.uri,
-                        );
-                        let admission_client = request_context.client();
-                        let admission_grant = match self
-                            .realtime_admit(
-                                crate::runtime::admission::AdmissionOp::Admit,
-                                &request_context.identity,
-                                admission_client.as_ref(),
-                                &admission_lease,
-                            )
-                            .await
-                        {
-                            Ok(grant) => grant,
-                            Err(denial) => {
-                                return protocol_http_error(
-                                    200,
-                                    Some(request_id),
-                                    denial.code,
-                                    denial.message,
-                                    denial.data,
-                                );
-                            }
-                        };
-                        // Subscriber identity, for subject-scoped notification
-                        // filtering.
-                        let subscriber_identity =
-                            Some(crate::runtime::subscription_store::SubscriberIdentity::
-                                from_request_context(session_id, request_context));
-                        let subscribed = self
-                            .subscriptions()
-                            .subscribe_once(session_id, &params.uri, subscriber_identity)
-                            .await;
-                        match (&subscribed, admission_grant) {
-                            // A repeat subscribe keeps the renewal it has.
-                            (Ok(true), Some(grant)) => self.keep_session_subscription_admitted(
-                                session_id,
-                                &params.uri,
-                                &request_context.identity,
-                                admission_client.clone(),
-                                admission_lease.clone(),
-                                grant,
-                            ),
-                            (Err(_), Some(_)) => {
-                                self.realtime_release(
-                                    &request_context.identity,
-                                    admission_client.as_ref(),
-                                    &admission_lease,
-                                )
-                                .await;
-                            }
-                            _ => {}
-                        }
-                        match subscribed {
-                            Ok(_established) => {
-                                // Audit: resources/subscribe success.
-                                let audit_ctx = mcpg_plugin_protocol::PluginContext {
-                                    request_id: request_context.request_id.as_str().to_owned(),
-                                    session_id: request_context.session_id.clone(),
-                                    tool_name: params.uri.clone(),
-                                    identity: plugin_identity_from_request(request_context),
-                                    transport: transport_label(&request_context.transport)
-                                        .to_owned(),
-                                    surface: "resource".to_owned(),
-                                };
-                                let event = crate::runtime::audit_with_client(
-                                    mcpg_plugin_host::audit_events::resource_subscribe_event(
-                                        &audit_ctx,
-                                        &params.uri,
-                                    ),
-                                    request_context,
-                                );
-                                // Under `on_failure: fail_closed` a subscription
-                                // the audit trail lost is not kept.
-                                if let Err(failure) =
-                                    self.plugin_registry.emit_request_audit_event(&event).await
-                                {
-                                    self.subscriptions()
-                                        .unsubscribe_once(session_id, &params.uri)
-                                        .await;
-                                    return protocol_http_error(
-                                        200,
-                                        Some(request_id),
-                                        -32603,
-                                        format!("resources/subscribe refused: {failure}"),
-                                        None,
-                                    );
-                                }
-                                ProtocolHttpResponse {
-                                    http_status: 200,
-                                    session_id_header: None,
-                                    response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
-                                        jsonrpc: JSONRPC_VERSION,
-                                        id: request_id,
-                                        result: serde_json::to_value(EmptyResult {})
-                                            .expect("empty result serialized"),
-                                    }),
-                                }
-                            }
-                            Err(e) => protocol_http_error(
-                                200,
-                                Some(request_id),
-                                -32602,
-                                e.to_string(),
-                                None,
-                            ),
-                        }
-                    }
-                    Err(error) => {
-                        self.map_session_error_to_protocol_response(error, Some(request_id))
-                    }
-                }
-            }
-            CapabilityOperation::ResourcesUnsubscribe { request_id, params } => {
-                match request_context.load_session_cached(&*self.session_store, true) {
-                    Ok(_) => {
-                        let session_id = request_context.session_id.as_deref().unwrap_or("");
-                        let was_subscribed = self
-                            .subscriptions()
-                            .unsubscribe_once(session_id, &params.uri)
-                            .await;
-                        // Audit: resources/unsubscribe.
-                        let audit_ctx = mcpg_plugin_protocol::PluginContext {
-                            request_id: request_context.request_id.as_str().to_owned(),
-                            session_id: request_context.session_id.clone(),
-                            tool_name: params.uri.clone(),
-                            identity: plugin_identity_from_request(request_context),
-                            transport: transport_label(&request_context.transport).to_owned(),
-                            surface: "resource".to_owned(),
-                        };
-                        let event = mcpg_plugin_host::audit_events::resource_unsubscribe_event(
-                            &audit_ctx,
-                            &params.uri,
-                            was_subscribed,
-                        );
-                        let _ = self.plugin_registry.emit_audit_event(&event).await;
-                        if was_subscribed {
-                            self.realtime_release(
-                                &request_context.identity,
-                                request_context.client().as_ref(),
-                                &crate::runtime::admission::session_resource_lease(
-                                    session_id,
-                                    &params.uri,
-                                ),
-                            )
-                            .await;
-                            let watch = self.watch_engine.clone();
-                            let uri = params.uri.clone();
-                            tokio::spawn(async move {
-                                watch.notify_unsubscribe(&uri).await;
-                            });
-                        }
-                        ProtocolHttpResponse {
-                            http_status: 200,
-                            session_id_header: None,
-                            response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
-                                jsonrpc: JSONRPC_VERSION,
-                                id: request_id,
-                                result: serde_json::to_value(EmptyResult {})
-                                    .expect("empty result serialized"),
-                            }),
-                        }
-                    }
-                    Err(error) => {
-                        self.map_session_error_to_protocol_response(error, Some(request_id))
-                    }
-                }
-            }
-            CapabilityOperation::ResourcesTemplatesList { request_id, params } => {
-                match request_context.load_session_cached(&*self.session_store, true) {
-                    Ok(_) => {
-                        let (page, next_cursor) = self.enumerate_resource_templates_page(
-                            request_context,
-                            params.cursor.as_deref(),
-                        );
-                        // Audit: resource-template enumeration.
-                        let event = mcpg_plugin_host::audit_events::list_call_event(
-                            plugin_identity_from_request(request_context),
-                            request_context.request_id.as_str(),
-                            request_context.session_id.as_deref(),
-                            "resource_template",
-                            page.len() as u64,
-                            transport_label(&request_context.transport),
-                        );
-                        let _ = self.plugin_registry.emit_audit_event(&event).await;
-                        // SEP-1865 MCP Apps: clamp each template's `_meta.ui`
-                        // to operator policy on the legacy wire too; no-op
-                        // unless Apps is enabled, strict rejects out-of-policy.
-                        let mut result_value = serde_json::to_value(ResourceTemplatesListResult {
-                            resource_templates: page,
-                            next_cursor,
-                            ttl_ms: Some(crate::protocol::shared::caching::DEFAULT_LIST_TTL_MS),
-                            cache_scope: Some(
-                                crate::protocol::shared::caching::CacheScope::Private,
-                            ),
-                            cache_token: None,
-                        })
-                        .expect("resource templates list serialized");
-                        if let Some(entries) = result_value
-                            .get_mut("resourceTemplates")
-                            .and_then(|r| r.as_array_mut())
-                            && let Err(msg) =
-                                self.apply_apps_policy_to_items(entries, "resources/templates/list")
-                        {
-                            return protocol_http_error(200, Some(request_id), -32603, msg, None);
-                        }
-                        ProtocolHttpResponse {
-                            http_status: 200,
-                            session_id_header: None,
-                            response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
-                                jsonrpc: JSONRPC_VERSION,
-                                id: request_id,
-                                result: result_value,
-                            }),
-                        }
-                    }
-                    Err(error) => {
-                        self.map_session_error_to_protocol_response(error, Some(request_id))
-                    }
-                }
-            }
-            CapabilityOperation::ToolsCall { .. } | CapabilityOperation::Complete { .. } => {
-                unreachable!("tools/call and completion are dispatched before list operations")
-            }
+        };
+        // SEP-1865 MCP Apps: a `ui://` resource body may embed
+        // session-shaped data, so never let it land in a shared cache —
+        // force `private` scope regardless of what the backend/upstream
+        // declared.
+        if crate::protocol::shared::apps::is_ui_uri(&params.uri) {
+            result.cache_scope = Some(crate::protocol::shared::caching::CacheScope::Private);
+        }
+        // Audit: resources/read success.
+        let bytes = serde_json::to_string(&result)
+            .map(|s| s.len() as u64)
+            .unwrap_or(0);
+        let event = mcpg_plugin_host::audit_events::resource_read_success_event(
+            &audit_ctx(surface_label),
+            &params.uri,
+            bytes,
+        );
+        let _ = self.plugin_registry.emit_audit_event(&event).await;
+        // SEP-1865 MCP Apps: clamp `_meta.ui` (CSP / permissions / domain)
+        // on each content block before egress. No-op unless Apps is
+        // enabled; `strict` rejects an out-of-policy `ui://`.
+        let mut result_value =
+            serde_json::to_value(result).expect("resource read result serialized");
+        if let Some(contents) = result_value
+            .get_mut("contents")
+            .and_then(|c| c.as_array_mut())
+            && let Err(msg) = self.apply_apps_policy_to_items(contents, &params.uri)
+        {
+            return protocol_http_error(200, Some(request_id), -32603, msg, None);
+        }
+        ProtocolHttpResponse {
+            http_status: 200,
+            response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
+                jsonrpc: JSONRPC_VERSION,
+                id: request_id,
+                result: result_value,
+            }),
         }
     }
 
     fn prompt_get_result(
         &self,
         route: PromptRoute,
-        params: &crate::protocol::PromptGetParams,
+        params: &PromptGetParams,
         request_context: &RequestContext,
     ) -> Result<PromptGetResult, invocation::SurfaceDecodeError> {
         match route {
@@ -801,12 +291,8 @@ impl GatewayRuntime {
                     arguments: params.arguments.clone(),
                     expr_ctx: request_context.to_expr_context(profile, params.arguments.as_ref()),
                     progress_token: None,
-                    request_log_level: extract_request_log_level(
-                        params.meta.as_ref(),
-                        request_context.negotiated_version,
-                    )
-                    .unwrap_or(None),
-                    legacy_session_log_level: self.legacy_session_log_level(request_context),
+                    request_log_level: extract_request_log_level(params.meta.as_ref())
+                        .unwrap_or(None),
                     client_capabilities: self.client_capabilities_for_context(request_context),
                     cancellation_token: None,
                     idempotency_hint: None,
@@ -871,9 +357,8 @@ impl GatewayRuntime {
                         // The upstream error carries issuer diagnostics — a
                         // preview of the raw Vault response body, provider
                         // names and endpoint status, upstream URLs and
-                        // internal hostnames. `tools/call` already keeps
-                        // those operator-only; these sibling surfaces
-                        // returned them straight to the caller.
+                        // internal hostnames. They stay in the operator log;
+                        // the caller gets the request id.
                         tracing::warn!(
                             request_id = %request_context.request_id.as_str(),
                             prompt = %params.name,
@@ -896,7 +381,7 @@ impl GatewayRuntime {
     fn resource_read_result(
         &self,
         route: ResourceRoute,
-        params: &crate::protocol::ResourceReadParams,
+        params: &ResourceReadParams,
         request_context: &RequestContext,
     ) -> Result<ResourceReadResult, invocation::SurfaceDecodeError> {
         match route {
@@ -941,12 +426,8 @@ impl GatewayRuntime {
                     arguments: Some(args.clone()),
                     expr_ctx: request_context.to_expr_context(profile, Some(&args)),
                     progress_token: None,
-                    request_log_level: extract_request_log_level(
-                        params.meta.as_ref(),
-                        request_context.negotiated_version,
-                    )
-                    .unwrap_or(None),
-                    legacy_session_log_level: self.legacy_session_log_level(request_context),
+                    request_log_level: extract_request_log_level(params.meta.as_ref())
+                        .unwrap_or(None),
                     client_capabilities: self.client_capabilities_for_context(request_context),
                     cancellation_token: None,
                     idempotency_hint: None,
@@ -1000,7 +481,6 @@ impl GatewayRuntime {
                     expr_ctx: request_context.to_expr_context(profile, Some(&args_value)),
                     progress_token: None,
                     request_log_level: None,
-                    legacy_session_log_level: self.legacy_session_log_level(request_context),
                     client_capabilities: self.client_capabilities_for_context(request_context),
                     cancellation_token: None,
                     idempotency_hint: None,
@@ -1103,7 +583,7 @@ impl GatewayRuntime {
         &self,
         id: &str,
         full_uri: &str,
-        request_id: serde_json::Value,
+        request_id: Value,
         request_context: &RequestContext,
     ) -> ProtocolHttpResponse {
         let Some(registry) = self.content_stores.as_ref() else {
@@ -1119,12 +599,11 @@ impl GatewayRuntime {
             );
         };
 
-        // Parse `mcpg-resource://<id>/<resource>` (or bare-resource
-        // legacy form). The `id` arg is what was already stripped of
-        // the `mcpg-resource://` scheme; `full_uri` is the original.
+        // Parse `mcpg-resource://<id>/<resource>` (or the bare-resource
+        // form). The `id` arg is what was already stripped of the
+        // `mcpg-resource://` scheme; `full_uri` is the original.
         let (storage_id, resolved_id) = registry.parse_resource_uri(full_uri);
-        // Fall back to the passed `id` when parse returned a bare value —
-        // keeps callers that pre-stripped the scheme working.
+        // Fall back to the passed `id` when parse returned a bare value.
         let resolved_id = if resolved_id.is_empty() {
             id.to_owned()
         } else {
@@ -1202,41 +681,28 @@ impl GatewayRuntime {
         let is_text = content.mime_type.starts_with("text/")
             || content.mime_type == "application/json"
             || content.mime_type == "application/xml";
-        let contents = if is_text {
-            match std::str::from_utf8(&content.bytes) {
-                Ok(s) => {
-                    crate::protocol::ResourceContents::Text(crate::protocol::ResourceTextContents {
-                        uri: full_uri.to_owned(),
-                        mime_type: Some(content.mime_type.clone()),
-                        text: s.to_owned(),
-                        meta: None,
-                    })
-                }
-                Err(_) => {
-                    crate::protocol::ResourceContents::Blob(crate::protocol::BlobResourceContents {
-                        uri: full_uri.to_owned(),
-                        mime_type: Some(content.mime_type.clone()),
-                        blob: {
-                            use base64::Engine;
-                            base64::engine::general_purpose::STANDARD.encode(&content.bytes)
-                        },
-                        meta: None,
-                    })
-                }
-            }
-        } else {
-            crate::protocol::ResourceContents::Blob(crate::protocol::BlobResourceContents {
+        let text = is_text
+            .then(|| std::str::from_utf8(&content.bytes).ok())
+            .flatten();
+        let contents = match text {
+            Some(text) => ResourceContents::Text(ResourceTextContents {
                 uri: full_uri.to_owned(),
                 mime_type: Some(content.mime_type.clone()),
-                blob: {
-                    use base64::Engine;
-                    base64::engine::general_purpose::STANDARD.encode(&content.bytes)
-                },
+                text: text.to_owned(),
                 meta: None,
-            })
+            }),
+            None => {
+                use base64::Engine;
+                ResourceContents::Blob(crate::protocol::BlobResourceContents {
+                    uri: full_uri.to_owned(),
+                    mime_type: Some(content.mime_type.clone()),
+                    blob: base64::engine::general_purpose::STANDARD.encode(&content.bytes),
+                    meta: None,
+                })
+            }
         };
 
-        let result = crate::protocol::ResourceReadResult {
+        let result = ResourceReadResult {
             contents: vec![contents],
             ttl_ms: Some(crate::protocol::shared::caching::DEFAULT_READ_TTL_MS),
             cache_scope: Some(crate::protocol::shared::caching::CacheScope::Private),
@@ -1244,7 +710,6 @@ impl GatewayRuntime {
         };
         ProtocolHttpResponse {
             http_status: 200,
-            session_id_header: None,
             response: ProtocolResponse::JsonRpcSuccess(JsonRpcSuccess {
                 jsonrpc: JSONRPC_VERSION,
                 id: request_id,

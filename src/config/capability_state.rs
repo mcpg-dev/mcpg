@@ -9,8 +9,8 @@
 //! `key_value_store()` / `pub_sub()`.
 //!
 //! Tasks + Subscriptions also carry runtime tuning fields (TTL /
-//! reaper interval / per-session quota / blocking-wait cap) that
-//! are orthogonal to which backend resolves.
+//! reaper interval / per-session quota) that are orthogonal to which
+//! backend resolves.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -21,61 +21,48 @@ use super::store_override::{BusOverrideConfig, StoreOverrideConfig};
 // Sessions
 // ---------------------------------------------------------------------------
 
-/// `sessions:` config — session lifecycle store + per-capability
-/// `store:` override. When `store` is unset, the session KV inherits
-/// from the cluster's `key_value_store()` primitive; when set, the
-/// override pins to an in-process backend (memory / file).
+/// `sessions:` config — the store of the internal session rows the
+/// gateway keeps for callers that hold state across requests (tasks,
+/// requests that wait for input, `subscriptions/listen` streams), plus
+/// a per-capability `store:` override. Clients never see a session id.
+/// When `store` is unset, the session KV inherits from the cluster's
+/// `key_value_store()` primitive; when set, the override pins to an
+/// in-process backend (memory / file).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SessionsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<StoreOverrideConfig>,
 
-    /// Base64-encoded 32-byte secret used to derive the per-principal
-    /// synthetic session id minted for modern (2026-07-28) stateless
-    /// requests that arrive without a session header.
+    /// Base64-encoded 32-byte secret used to derive the id of the session
+    /// row the gateway keeps for a verified caller.
     ///
     /// When set **identically across every replica**, two requests from
-    /// the same authenticated principal — on any replica — resolve to the
-    /// same synthetic session id (HMAC of the principal id under this
-    /// key), so `tasks/create` on replica A is readable via `tasks/get`
-    /// on B and modern subscriptions converge. The id is an HMAC (not a
-    /// bare hash), so a client that knows another principal's id still
-    /// cannot compute — and therefore cannot hijack — that principal's
-    /// synthetic session.
+    /// the same verified principal and client — on any replica — resolve
+    /// to the same session id (HMAC of the principal and the client name
+    /// under this key), so a task created on replica A is readable via
+    /// `tasks/get` on B and `subscriptions/listen` streams converge. The
+    /// id is an HMAC (not a bare hash), so a client that knows another
+    /// principal's id still cannot compute — and therefore cannot
+    /// hijack — that principal's session.
     ///
-    /// `None` ⇒ each replica mints a random per-instance synthetic session
-    /// (no cross-replica continuity); the gateway logs a boot WARN when a
-    /// distributed coordinator is configured without this key.
+    /// Unset, a clustered gateway derives the key from
+    /// `cluster.state_encryption_key_env` when that is set; otherwise each
+    /// replica mints a random per-instance session id (no cross-replica
+    /// continuity), and the gateway logs a boot WARN when a distributed
+    /// coordinator is configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub synthetic_session_key: Option<String>,
 
-    /// Bind each session to the principal that created it. When true,
-    /// session-scoped operations (GET→SSE stream, DELETE→terminate,
-    /// subscriptions, POST→SSE continuation) require the caller's
-    /// resolved principal to match the session's creator; a mismatch is
-    /// refused as if the session did not exist (no existence leak).
-    /// Default false (today's possession-only behaviour). An anonymous
-    /// session (no creating principal) can only be driven anonymously.
+    /// Bind each session row to the principal that created it. When true,
+    /// a `subscriptions/listen` stream opens on a row only when the
+    /// caller's resolved principal matches the row's creator; a mismatch
+    /// is refused as if the session did not exist (no existence leak).
+    /// Default false. An anonymous row (no creating principal) can only be
+    /// driven anonymously. Tasks, cancellation and resuming a request that
+    /// waits for input check their own owner whatever this is set to.
     #[serde(default)]
     pub bind_session_owner: bool,
-
-    /// Make sessions optional on the legacy (`2025-11-25`) wire. When
-    /// false (default), a legacy request without an `Mcp-Session-Id`
-    /// header is rejected (`-32600`, HTTP 400) — a legacy client MUST
-    /// `initialize` first. When true, such a request is instead served
-    /// through an ephemeral, row-less session (the same lane the modern
-    /// wire uses for anonymous stateless calls): the gateway does not
-    /// issue a session, so it does not demand one. Spec-permitted (a
-    /// server chooses whether to issue sessions), and lets fixed-tool-set
-    /// proxy deployments skip the handshake round-trip. Features that
-    /// inherently need a durable session — SSE resume cursors,
-    /// server-initiated requests, cross-request task/subscription
-    /// continuity — still require a real session; a session-less request
-    /// that would need one gets a clear error. `initialize` continues to
-    /// mint real sessions regardless.
-    #[serde(default)]
-    pub optional: bool,
 }
 
 impl SessionsConfig {
@@ -121,20 +108,20 @@ impl PipelinesConfig {
 // Tasks
 // ---------------------------------------------------------------------------
 
-/// `tasks:` config (MCP 2025-11-25 tasks system) — task store +
-/// per-capability `store:` override + retention tuning. When
-/// `store` is unset, the task KV inherits from the cluster's
-/// `key_value_store()` primitive. Tuning fields (`default_ttl_ms`,
-/// `reaper_interval_ms`, `max_tasks_per_session`, `result_wait_ms`)
-/// are orthogonal and apply to whichever backend resolves.
+/// `tasks:` config (MCP Tasks) — task store + per-capability
+/// `store:` override + retention tuning. When `store` is unset, the
+/// task KV inherits from the cluster's `key_value_store()` primitive.
+/// Tuning fields (`default_ttl_ms`, `reaper_interval_ms`,
+/// `max_tasks_per_session`) are orthogonal and apply to whichever
+/// backend resolves.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TasksConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<StoreOverrideConfig>,
 
-    /// Default TTL applied to any task created without an explicit
-    /// `task.ttl` from the client. Used by `tasks/create` and the reaper.
+    /// TTL of a task the gateway creates for a task-augmented
+    /// `tools/call`; the reaper deletes the task once it has elapsed.
     #[serde(default = "TasksConfig::default_task_ttl_ms")]
     pub default_ttl_ms: u64,
 
@@ -143,17 +130,12 @@ pub struct TasksConfig {
     #[serde(default = "TasksConfig::default_reaper_interval_ms")]
     pub reaper_interval_ms: u64,
 
-    /// Maximum concurrent tasks per session. Creation above this quota is
-    /// rejected with JSON-RPC `-32603 Internal error` rather than silently
-    /// succeeding. `0` disables the quota.
+    /// Maximum concurrent tasks one task owner holds (the principal, or
+    /// the session row of an anonymous caller). Creation above this quota
+    /// is rejected with JSON-RPC `-32603 Internal error` rather than
+    /// silently succeeding. `0` disables the quota.
     #[serde(default = "TasksConfig::default_max_tasks_per_session")]
     pub max_tasks_per_session: usize,
-
-    /// Upper bound on a single `tasks/result` HTTP blocking wait.
-    /// Clients that need longer-running tasks reconnect via GET SSE and
-    /// `Last-Event-Id` until the task goes terminal.
-    #[serde(default = "TasksConfig::default_result_wait_ms")]
-    pub result_wait_ms: u64,
 }
 
 impl Default for TasksConfig {
@@ -163,7 +145,6 @@ impl Default for TasksConfig {
             default_ttl_ms: Self::default_task_ttl_ms(),
             reaper_interval_ms: Self::default_reaper_interval_ms(),
             max_tasks_per_session: Self::default_max_tasks_per_session(),
-            result_wait_ms: Self::default_result_wait_ms(),
         }
     }
 }
@@ -183,10 +164,6 @@ impl TasksConfig {
         // 256 concurrent tasks per session is generous for interactive
         // workloads and still caps abuse / runaway producers.
         256
-    }
-
-    fn default_result_wait_ms() -> u64 {
-        30000
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
@@ -246,8 +223,9 @@ impl SubscriptionsConfig {
 // ---------------------------------------------------------------------------
 
 /// `delivery:` config — delivery bus (the internal pub/sub that
-/// fans server-initiated messages out to the SSE stream owning each
-/// session) + per-capability `bus:` override. When `bus` is unset,
+/// fans notifications out to the `subscriptions/listen` streams and
+/// in-flight responses of each session row, on whichever replica
+/// holds them) + per-capability `bus:` override. When `bus` is unset,
 /// the gateway inherits the cluster's `pub_sub()` primitive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -301,8 +279,7 @@ impl CancellationConfig {
 // ---------------------------------------------------------------------------
 
 /// Default scope strategy for idempotency records. Operator can
-/// widen to `per_tenant` (service-account dedupe) or narrow to
-/// `per_session` (ephemeral test harnesses).
+/// widen to `per_tenant` (service-account dedupe).
 ///
 /// Note: `global` is intentionally NOT a variant — cross-tenant
 /// replay is a known anti-pattern, so we don't expose the footgun.
@@ -311,10 +288,6 @@ impl CancellationConfig {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum IdempotencyScopeKind {
-    /// All requests sharing one MCP session share the namespace.
-    /// Useful for ephemeral test harnesses; resets on every
-    /// re-initialize.
-    PerSession,
     /// All requests sharing one resolved identity (OIDC subject +
     /// auth provider) share the namespace. The default — matches
     /// Stripe / Square idempotency semantics.
@@ -327,12 +300,11 @@ pub enum IdempotencyScopeKind {
 }
 
 impl IdempotencyScopeKind {
-    /// Serialised label emitted in the `initialize` capability
+    /// Serialised label emitted in the `server/discover` capability
     /// advertisement (kebab-case for human readability there;
     /// snake_case in YAML to match the rest of the config).
     pub fn advertisement_label(self) -> &'static str {
         match self {
-            Self::PerSession => "per-session",
             Self::PerIdentity => "per-identity",
             Self::PerTenant => "per-tenant",
         }
@@ -361,12 +333,12 @@ impl ConflictPolicy {
     }
 }
 
-/// `idempotency:` config — opt-in dedupe for
-/// `tools/call` and `tasks/create`. When `enabled: false` (the
-/// default), the gateway omits the `dev.mcpg/idempotency`
-/// extension from its `initialize` capability advertisement and
-/// silently ignores any `_meta["dev.mcpg/idempotency-key"]` the
-/// caller sets.
+/// `idempotency:` config — opt-in dedupe for `tools/call`, with
+/// task-augmented calls in a namespace of their own (`tasks/create`).
+/// When `enabled: false` (the default), the gateway omits the
+/// `dev.mcpg/idempotency` extension from its `server/discover`
+/// capability advertisement and silently ignores any
+/// `_meta["dev.mcpg/idempotency-key"]` the caller sets.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct IdempotencyConfig {
@@ -386,8 +358,7 @@ pub struct IdempotencyConfig {
     #[serde(default = "IdempotencyConfig::default_max_ttl_ms")]
     pub max_ttl_ms: u64,
 
-    /// Scope strategy — `per_identity` (default), `per_session`,
-    /// or `per_tenant`.
+    /// Scope strategy — `per_identity` (default) or `per_tenant`.
     #[serde(default)]
     pub scope: IdempotencyScopeKind,
 
@@ -396,7 +367,8 @@ pub struct IdempotencyConfig {
     pub conflict_policy: ConflictPolicy,
 
     /// JSON-RPC methods this extension applies to. Default
-    /// `["tools/call", "tasks/create"]` — read-only methods
+    /// `["tools/call", "tasks/create"]`, where `tasks/create` names a
+    /// task-augmented `tools/call` — read-only methods
     /// (`resources/read`, `prompts/get`, `completion/complete`)
     /// are intentionally excluded as they're idempotent by nature.
     #[serde(default = "IdempotencyConfig::default_supported_methods")]
@@ -448,16 +420,14 @@ impl IdempotencyConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
-        // per_session / per_tenant are advertised but NOT honored — the
-        // dispatcher always builds a per-identity scope. Reject them rather
-        // than silently widening an operator's chosen namespace (an operator
-        // selecting per_session for isolation would otherwise get cross-session
-        // replay). Lift this once IdempotencyScope carries session/tenant.
+        // The dispatcher always builds a per-identity scope, so a
+        // per_tenant choice would silently change the operator's chosen
+        // dedupe namespace.
         if self.enabled && !matches!(self.scope, IdempotencyScopeKind::PerIdentity) {
             anyhow::bail!(
                 "idempotency.scope '{}' is not yet implemented (only per_identity is honored by \
-                 the dispatcher); selecting it would silently widen the dedupe namespace. Use \
-                 per_identity until per_session/per_tenant scoping is wired.",
+                 the dispatcher); selecting it would silently change the dedupe namespace. Use \
+                 per_identity until per_tenant scoping is wired.",
                 self.scope.advertisement_label()
             );
         }
@@ -496,15 +466,14 @@ impl IdempotencyConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Request-state (MRTR — 2026-07-28)
+// Request-state (MRTR)
 // ---------------------------------------------------------------------------
 
-/// `request_state:` config — the MRTR `requestState` codec used by
-/// the modern wire's suspending `tools/call` arm to encrypt
-/// pipeline-resumption blobs.
+/// `request_state:` config — the MRTR `requestState` codec that
+/// encrypts the resumption state of a request that waits for input
+/// (`InputRequiredResult`).
 ///
-/// Inert until a modern client connects. Lives under
-/// `mcp.configurations` because the codec manages runtime-emergent
+/// Lives under `mcp.configurations` because the codec manages runtime-emergent
 /// resumption state alongside sessions / pipelines / subscriptions /
 /// delivery / cancellation / idempotency — operator tunes the
 /// encryption key, the runtime mints + serves the rest.
@@ -535,15 +504,16 @@ pub struct RequestStateConfig {
     /// separate secret needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_key: Option<String>,
-    /// Fail-closed guard for clustered modern resume. When `true` and the
+    /// Fail-closed guard for clustered resume. When `true` and the
     /// deployment is clustered (`cluster.kind != single_node`), the gateway
     /// REFUSES to boot if the `requestState` codec would fall back to an
     /// ephemeral per-process key — i.e. neither `encryption_key` nor a
     /// derivable `cluster.state_encryption_key_env` is available. An
-    /// ephemeral key is undecodable on a peer, so a clustered modern (≤8 KiB
+    /// ephemeral key is undecodable on a peer, so a clustered (≤8 KiB
     /// inline) resume on another replica silently fails; this turns that
-    /// silent fail-open into a loud boot error. Default `false` to keep
-    /// existing clustered (e.g. legacy-only) deployments booting unchanged.
+    /// silent fail-open into a loud boot error. Default `false`: a cluster
+    /// whose clients never resume on another replica boots without a
+    /// shared key.
     #[serde(default)]
     pub strict_encryption: bool,
 }
@@ -603,27 +573,17 @@ mod idempotency_config_tests {
         cfg.validate().expect("valid");
     }
 
-    /// Regression: an enabled config selecting the unimplemented
-    /// per_session / per_tenant scope is rejected, not silently downgraded to
-    /// per_identity (which would be cross-session replay for someone who chose
-    /// per_session for isolation).
+    /// An enabled config selecting the unimplemented per_tenant scope is
+    /// rejected, not silently served as per_identity.
     #[test]
     fn idempotency_unimplemented_scopes_rejected_when_enabled() {
-        for scope in [
-            IdempotencyScopeKind::PerSession,
-            IdempotencyScopeKind::PerTenant,
-        ] {
-            let cfg = IdempotencyConfig {
-                enabled: true,
-                scope,
-                ..IdempotencyConfig::default()
-            };
-            let err = cfg.validate().unwrap_err().to_string();
-            assert!(
-                err.contains("not yet implemented"),
-                "scope {scope:?}: {err}"
-            );
-        }
+        let cfg = IdempotencyConfig {
+            enabled: true,
+            scope: IdempotencyScopeKind::PerTenant,
+            ..IdempotencyConfig::default()
+        };
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("not yet implemented"), "{err}");
         // Disabled config with the same scope is fine (nothing is enforced).
         let disabled = IdempotencyConfig {
             enabled: false,

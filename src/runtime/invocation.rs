@@ -68,10 +68,10 @@ impl std::fmt::Display for SurfaceDecodeError {
 }
 
 /// Extract the first textual body from a tool-call-shaped backend response.
-/// MCP 2025-11-25 prompt and resource bindings produce their native shapes
-/// as JSON which, for legacy backend compatibility, is delivered through a
-/// `ToolContent::Text` entry. This helper pulls that body out deterministically
-/// rather than relying on the "try every content item" scan the old code used.
+/// Prompt and resource bindings produce their native MCP shapes as JSON,
+/// delivered through a `ToolContent::Text` entry. This helper pulls that
+/// body out deterministically: the first text item, not a scan of every
+/// content item.
 fn primary_text_body(result: &ToolCallResult) -> Option<&str> {
     for content in &result.content {
         if let ToolContent::Text { text, .. } = content {
@@ -112,12 +112,12 @@ pub fn decode_prompt_result(
         })?
         .clone();
 
-    // accept the full MCP 2025-11-25 content-block surface
-    // (text / image / audio / resource_link / resource) by leaning on
-    // serde — `PromptMessage` and `PromptMessageContent` now
-    // round-trip. serde enforces the variant-specific required fields
-    // (e.g. image.data + image.mimeType); any deviation surfaces as a
-    // MalformedResponse error.
+    // accept the full MCP content-block surface (text / image / audio /
+    // resource_link / resource) by leaning on serde — `PromptMessage`
+    // and `PromptMessageContent` round-trip. serde enforces the
+    // variant-specific required fields (e.g. image.data +
+    // image.mimeType); any deviation surfaces as a MalformedResponse
+    // error.
     let messages: Vec<PromptMessage> = serde_json::from_value(messages_value).map_err(|err| {
         SurfaceDecodeError::MalformedResponse {
             reason: format!("prompt `messages` does not match the spec content-block shape: {err}"),

@@ -28,17 +28,22 @@ fn network_profiles(
     std::collections::BTreeMap::from([(DEFAULT_NETWORK_PROFILE.to_owned(), profile)])
 }
 
-fn sample_request() -> BackendInvocationRequest {
-    let ctx = RequestContext::new(
+/// An anonymous context bound to `session`.
+fn anonymous_context_in(session: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
         GatewayRequestId::new(),
-        None,
-        Some("session-1".to_owned()),
         None,
         RequestIdentity::Anonymous {
             source: "test".to_owned(),
         },
         TransportKind::Http,
     );
+    ctx.session_id = Some(session.to_owned());
+    ctx
+}
+
+fn sample_request() -> BackendInvocationRequest {
+    let ctx = anonymous_context_in("session-1");
     let expr_ctx = ctx.to_expr_context("mcpg.runtime.snapshot", Some(&serde_json::json!({})));
     BackendInvocationRequest {
         context: ctx,
@@ -47,7 +52,6 @@ fn sample_request() -> BackendInvocationRequest {
         expr_ctx,
         progress_token: None,
         request_log_level: None,
-        legacy_session_log_level: None,
         client_capabilities: crate::protocol::ClientCapabilities::default(),
         cancellation_token: None,
         idempotency_hint: None,
@@ -2022,10 +2026,9 @@ fn plugin_transform_step_unknown_plugin_is_error() {
 }
 
 // ---------------------------------------------------------------------------
-// LOG-1 (SEP-2575) — per-request logLevel suppression on the modern wire.
-// publish_log_notification gates `notifications/message` by the per-request
-// floor only when the negotiated wire is modern; the legacy wire emits
-// unconditionally (byte-identical to pre-Phase-5 behaviour).
+// SEP-2575 — per-request logLevel suppression. publish_log_notification
+// gates `notifications/message` by the request's floor; no floor emits
+// nothing.
 // ---------------------------------------------------------------------------
 
 use crate::protocol::v_2026_07_28::wire::meta::LogLevel;
@@ -2090,7 +2093,7 @@ impl DeliveryBus for RecordingDeliveryBus {
     }
 }
 
-fn emit(bus: &Arc<RecordingDeliveryBus>, level: &str, modern: bool, floor: Option<LogLevel>) {
+fn emit(bus: &Arc<RecordingDeliveryBus>, level: &str, floor: Option<LogLevel>) {
     let dyn_bus: Arc<dyn DeliveryBus> = Arc::clone(bus) as Arc<dyn DeliveryBus>;
     super::publish_log_notification(
         Some(&dyn_bus),
@@ -2099,47 +2102,35 @@ fn emit(bus: &Arc<RecordingDeliveryBus>, level: &str, modern: bool, floor: Optio
         level,
         Some("test"),
         &serde_json::json!("hello"),
-        modern,
         floor,
-        None,
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn modern_log_below_floor_is_suppressed() {
+async fn log_below_floor_is_suppressed() {
     let bus = Arc::new(RecordingDeliveryBus::default());
     // Floor = warning. An `info` message is below → suppressed.
-    emit(&bus, "info", true, Some(LogLevel::Warning));
+    emit(&bus, "info", Some(LogLevel::Warning));
     assert_eq!(bus.count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn modern_log_at_or_above_floor_is_emitted() {
+async fn log_at_or_above_floor_is_emitted() {
     let bus = Arc::new(RecordingDeliveryBus::default());
     // Floor = info: `info` (at) and `error` (above) emit; `debug` (below) drops.
-    emit(&bus, "debug", true, Some(LogLevel::Info));
-    emit(&bus, "info", true, Some(LogLevel::Info));
-    emit(&bus, "error", true, Some(LogLevel::Info));
+    emit(&bus, "debug", Some(LogLevel::Info));
+    emit(&bus, "info", Some(LogLevel::Info));
+    emit(&bus, "error", Some(LogLevel::Info));
     assert_eq!(bus.levels(), vec!["info".to_owned(), "error".to_owned()]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn modern_log_absent_floor_suppresses_everything() {
-    // SEP-2575 MUST: absent logLevel on the modern wire → emit nothing.
+async fn log_absent_floor_suppresses_everything() {
+    // SEP-2575 MUST: absent logLevel → emit nothing.
     let bus = Arc::new(RecordingDeliveryBus::default());
-    emit(&bus, "emergency", true, None);
-    emit(&bus, "error", true, None);
+    emit(&bus, "emergency", None);
+    emit(&bus, "error", None);
     assert_eq!(bus.count(), 0);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn legacy_log_emits_unconditionally_ignoring_floor() {
-    // Legacy wire: the per-request floor is never consulted — every
-    // message emits, byte-identical to pre-Phase-5 behaviour.
-    let bus = Arc::new(RecordingDeliveryBus::default());
-    emit(&bus, "debug", false, None);
-    emit(&bus, "info", false, Some(LogLevel::Emergency));
-    assert_eq!(bus.count(), 2);
 }
 
 #[test]
@@ -2298,18 +2289,7 @@ async fn progress_never_goes_back_and_ends_with_its_session() {
     let bus = Arc::new(RecordingDeliveryBus::default());
     let mut dispatcher = ExecutionDispatcher::default();
     dispatcher.set_delivery_bus(Arc::clone(&bus) as Arc<dyn DeliveryBus>);
-    let context = |session: &str| {
-        RequestContext::new(
-            GatewayRequestId::new(),
-            None,
-            Some(session.to_owned()),
-            None,
-            RequestIdentity::Anonymous {
-                source: "test".to_owned(),
-            },
-            TransportKind::Http,
-        )
-    };
+    let context = anonymous_context_in;
     let token = serde_json::json!("t");
     dispatcher.emit_pipeline_progress(&context("a"), &token, 2.0, 3.0);
     dispatcher.emit_pipeline_progress(&context("a"), &token, 1.0, 3.0);
@@ -2351,6 +2331,21 @@ async fn progress_never_goes_back_and_ends_with_its_session() {
     );
 }
 
+/// A session keeps a bounded number of progress tokens: a new token
+/// replaces the one used longest ago, and a token in use stays checked.
+#[test]
+fn a_session_keeps_a_bounded_number_of_progress_tokens() {
+    let mut marks = ProgressMarks::default();
+    marks.advance(0, 1.0).unwrap();
+    for token in 1..=(MAX_PROGRESS_TOKENS_PER_SESSION as u64 * 4) {
+        marks.advance(token, 0.0).unwrap();
+        marks.advance(0, 1.0).unwrap();
+    }
+    assert_eq!(marks.0.len(), MAX_PROGRESS_TOKENS_PER_SESSION);
+    assert_eq!(marks.advance(0, 0.5), Err(1.0), "token 0 is still checked");
+    assert_eq!(marks.advance(1, 0.0), Ok(()), "token 1 gave way long ago");
+}
+
 /// The http plugin owns the spec's field set: a field the gateway's read of
 /// the spec does not name keeps the binding's network profile, which every
 /// call of the binding needs.
@@ -2389,4 +2384,331 @@ fn an_http_binding_keeps_its_profile_beside_a_field_the_plugin_reads() {
             .network_profiles
             .contains_key("flow._step_.fetch")
     );
+}
+
+/// A backend that answers from a blocking thread, as a ferried native plugin
+/// does, with the arguments and the header names it received. The thread
+/// takes `delay`; the first `failures` calls fail with a transport error.
+struct FerriedEchoBackend {
+    manifest: mcpg_plugin_protocol::PluginManifest,
+    calls: std::sync::atomic::AtomicU32,
+    failures: u32,
+    delay: std::time::Duration,
+}
+
+#[mcpg_plugin_protocol::async_trait]
+impl mcpg_plugin_protocol::BackendPlugin for FerriedEchoBackend {
+    fn manifest(&self) -> &mcpg_plugin_protocol::PluginManifest {
+        &self.manifest
+    }
+    fn kind(&self) -> &str {
+        "echo.test"
+    }
+    async fn register_profile(
+        &self,
+        _profile_name: &str,
+        _spec: &serde_json::Value,
+        _host: std::sync::Arc<dyn mcpg_plugin_protocol::BackendHost>,
+    ) -> Result<(), mcpg_plugin_protocol::BackendError> {
+        Ok(())
+    }
+    async fn execute(
+        &self,
+        _profile_name: &str,
+        request: mcpg_plugin_protocol::BackendRequest,
+    ) -> Result<mcpg_plugin_protocol::BackendResponse, mcpg_plugin_protocol::BackendError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let headers: Vec<String> = request.headers.iter().map(|(k, _)| k.clone()).collect();
+        let payload = request.payload;
+        let delay = self.delay;
+        let value = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(delay);
+            serde_json::json!({
+                "arguments": serde_json::from_slice::<serde_json::Value>(&payload).unwrap(),
+                "headers": headers,
+                "downstreamError": null,
+            })
+        })
+        .await
+        .unwrap();
+        if call < self.failures {
+            return Err(mcpg_plugin_protocol::BackendError::Transport {
+                message: "connection reset".to_owned(),
+            });
+        }
+        Ok(mcpg_plugin_protocol::BackendResponse {
+            payload: serde_json::to_vec(&value).unwrap(),
+            truncated: false,
+        })
+    }
+}
+
+fn test_manifest(
+    id: &str,
+    plugin_class: mcpg_plugin_protocol::PluginClass,
+) -> mcpg_plugin_protocol::PluginManifest {
+    mcpg_plugin_protocol::PluginManifest {
+        id: id.into(),
+        version: "0.1.0".into(),
+        name: id.into(),
+        plugin_class,
+        protocol_version: "1.0".to_owned(),
+        license: None,
+        required_capabilities: vec![],
+        tags: Vec::new(),
+        provides: Vec::new(),
+        provides_schemes: Vec::new(),
+        module_path_prefix: String::new(),
+        backend_profile: None,
+    }
+}
+
+fn echo_backend(failures: u32, delay: std::time::Duration) -> Arc<FerriedEchoBackend> {
+    Arc::new(FerriedEchoBackend {
+        manifest: test_manifest("test.echo", mcpg_plugin_protocol::PluginClass::Backend),
+        calls: std::sync::atomic::AtomicU32::new(0),
+        failures,
+        delay,
+    })
+}
+
+fn dispatcher_with_echo_backend(failures: u32) -> (ExecutionDispatcher, Arc<FerriedEchoBackend>) {
+    let backend = echo_backend(failures, std::time::Duration::ZERO);
+    let mut registry = mcpg_plugin_host::PluginRegistry::new();
+    registry
+        .register_backend(backend.clone(), mcpg_plugin_protocol::PluginTier::Native)
+        .expect("register the echo backend");
+    let mut dispatcher = ExecutionDispatcher::default();
+    dispatcher.set_plugin_registry(Arc::new(registry));
+    (dispatcher, backend)
+}
+
+type RecordedAudit = Arc<tokio::sync::Mutex<Vec<mcpg_plugin_protocol::audit::AuditEvent>>>;
+
+/// An audit sink that keeps every event.
+struct RecordingAuditSink {
+    manifest: mcpg_plugin_protocol::PluginManifest,
+    events: RecordedAudit,
+}
+
+#[mcpg_plugin_protocol::async_trait]
+impl mcpg_plugin_protocol::audit::AuditSink for RecordingAuditSink {
+    fn manifest(&self) -> &mcpg_plugin_protocol::PluginManifest {
+        &self.manifest
+    }
+    async fn emit(
+        &self,
+        event: &mcpg_plugin_protocol::audit::AuditEvent,
+    ) -> Result<mcpg_plugin_protocol::audit::AuditReceipt, mcpg_plugin_protocol::audit::AuditError>
+    {
+        self.events.lock().await.push(event.clone());
+        Ok(mcpg_plugin_protocol::audit::AuditReceipt {
+            sink_id: self.manifest.id.clone(),
+            persisted_at: "2026-11-19T00:00:00Z".to_owned(),
+            durable_hash: "0".repeat(64),
+        })
+    }
+}
+
+/// A dispatch dropped while its ferried plugin call runs, as a request whose
+/// client goes away drops it, finishes on a task of its own: the plugin stays
+/// referenced until its call returns, and the call lands on the audit lane.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_dispatch_finishes_its_plugin_call_and_audits_it() {
+    let backend = echo_backend(0, std::time::Duration::from_millis(200));
+    let events = RecordedAudit::default();
+    let mut registry = mcpg_plugin_host::PluginRegistry::new();
+    registry
+        .register_backend(backend.clone(), mcpg_plugin_protocol::PluginTier::Native)
+        .expect("register the echo backend");
+    registry
+        .register_audit_sink(
+            Arc::new(RecordingAuditSink {
+                manifest: test_manifest("test.audit", mcpg_plugin_protocol::PluginClass::AuditSink),
+                events: Arc::clone(&events),
+            }),
+            mcpg_plugin_protocol::PluginTier::Native,
+        )
+        .expect("register the audit sink");
+    let mut dispatcher = ExecutionDispatcher::default();
+    dispatcher.set_plugin_registry(Arc::new(registry));
+    let dispatcher = Arc::new(dispatcher);
+
+    let request = sample_request();
+    let in_time = crate::transports::request_deadline::tests::drop_request_after(
+        std::time::Duration::from_millis(50),
+        {
+            let dispatcher = Arc::clone(&dispatcher);
+            async move {
+                dispatcher
+                    .dispatch_tool_call_async(echo_route(), &request, None)
+                    .await
+            }
+        },
+    )
+    .await;
+    assert!(!in_time, "the plugin call outlasts the request");
+    drop(dispatcher);
+    assert!(
+        Arc::strong_count(&backend) > 1,
+        "the detached dispatch still holds the plugin"
+    );
+
+    for _ in 0..300 {
+        if !events.lock().await.is_empty() && Arc::strong_count(&backend) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let events = events.lock().await;
+    assert_eq!(events.len(), 1, "one audit event for the one call");
+    assert_eq!(events[0].action, "mcpg.backend.executed");
+    assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        Arc::strong_count(&backend),
+        1,
+        "the finished dispatch lets the plugin go"
+    );
+}
+
+fn echo_route() -> BackendInvocationRoute {
+    BackendInvocationRoute::EnvelopePlugin {
+        kind: "echo.test".to_owned(),
+        profile: "echo".to_owned(),
+    }
+}
+
+/// The awaited dispatch of a plugin route sends the plugin the request of
+/// the blocking dispatch and gives the same result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_awaited_plugin_call_answers_as_the_blocking_one() {
+    let (dispatcher, backend) = dispatcher_with_echo_backend(0);
+    let mut request = sample_request();
+    request.arguments = Some(serde_json::json!({"pad": "x"}));
+
+    let blocking = dispatcher.dispatch_tool_call(echo_route(), &request, None);
+    let awaited = dispatcher
+        .dispatch_tool_call_async(echo_route(), &request, None)
+        .await;
+
+    assert_eq!(
+        serde_json::to_value(&awaited).unwrap(),
+        serde_json::to_value(&blocking).unwrap()
+    );
+    assert!(!awaited.is_error);
+    let structured = awaited.structured_content.expect("structured content");
+    assert_eq!(structured["arguments"], serde_json::json!({"pad": "x"}));
+    assert_eq!(
+        structured["headers"],
+        serde_json::json!(["mcpg-tool-name", mcpg_plugin_protocol::ACCEPT_USAGE_HEADER])
+    );
+    assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// The awaited dispatch retries a retryable plugin error, and a client's
+/// progress token sees one 0/1 and one 1/1 around all the attempts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_awaited_plugin_call_retries_a_retryable_error() {
+    let (mut dispatcher, backend) = dispatcher_with_echo_backend(1);
+    let bus = Arc::new(RecordingDeliveryBus::default());
+    dispatcher.set_delivery_bus(Arc::clone(&bus) as Arc<dyn DeliveryBus>);
+    let mut request = sample_request();
+    request.progress_token = Some(serde_json::json!("tok"));
+    dispatcher.retry_configs.insert(
+        request.tool_name.clone(),
+        crate::config::RetryConfig {
+            max_attempts: 2,
+            initial_backoff_ms: 1,
+            retry_on_status_codes: vec![],
+            retry_on_transport_error: true,
+        },
+    );
+
+    let result = dispatcher
+        .dispatch_tool_call_async(echo_route(), &request, None)
+        .await;
+
+    assert!(!result.is_error, "the second attempt succeeds");
+    assert_eq!(backend.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let mut progress = Vec::new();
+    for _ in 0..200 {
+        progress = bus
+            .published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, m)| m.jsonrpc_message["params"]["progress"].as_f64())
+            .collect::<Vec<_>>();
+        if progress.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    progress.sort_by(f64::total_cmp);
+    assert_eq!(progress, vec![0.0, 1.0]);
+}
+
+/// Every plugin-backed route answers the awaited dispatch as it answers the
+/// blocking one (here with no plugin registered), and every other route
+/// keeps the blocking dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_plugin_route_answers_alike_awaited_and_blocking() {
+    let dispatcher = ExecutionDispatcher::default();
+    let request = sample_request();
+    let p = || "p".to_owned();
+    let plugin_routes = [
+        BackendInvocationRoute::NatsRequest { profile: p() },
+        BackendInvocationRoute::KafkaRequest { profile: p() },
+        BackendInvocationRoute::SqlRequest { profile: p() },
+        BackendInvocationRoute::LlmRequest {
+            profile: p(),
+            kind: crate::backends::LlmKind::OpenaiChat,
+        },
+        BackendInvocationRoute::NetworkJsonCall { profile: p() },
+        BackendInvocationRoute::NetworkQueryCall { profile: p() },
+        BackendInvocationRoute::GraphqlCall { profile: p() },
+        BackendInvocationRoute::OpenapiCall { profile: p() },
+        BackendInvocationRoute::CommandJsonCall {
+            profile: p(),
+            require_json_stdout: false,
+        },
+        BackendInvocationRoute::MockResponse { profile: p() },
+        BackendInvocationRoute::EnvelopePlugin {
+            kind: "soap".to_owned(),
+            profile: p(),
+        },
+    ];
+    for route in plugin_routes {
+        assert!(
+            PluginRoute::of(&route, &dispatcher.network_profiles).is_some(),
+            "{route:?}"
+        );
+        let blocking = dispatcher.dispatch_tool_call(route.clone(), &request, None);
+        let awaited = dispatcher
+            .dispatch_tool_call_async(route.clone(), &request, None)
+            .await;
+        assert!(blocking.is_error, "{route:?}");
+        assert_eq!(
+            serde_json::to_value(&awaited).unwrap(),
+            serde_json::to_value(&blocking).unwrap(),
+            "{route:?}"
+        );
+    }
+    let gateway_routes = [
+        BackendInvocationRoute::RuntimeSnapshot,
+        BackendInvocationRoute::RequestEcho,
+        BackendInvocationRoute::CommandProbe { profile: p() },
+        BackendInvocationRoute::NetworkProbe { profile: p() },
+        BackendInvocationRoute::Pipeline { profile: p() },
+        BackendInvocationRoute::Federated {
+            source: p(),
+            upstream_name: p(),
+        },
+    ];
+    for route in gateway_routes {
+        assert!(
+            PluginRoute::of(&route, &dispatcher.network_profiles).is_none(),
+            "{route:?}"
+        );
+    }
 }

@@ -1,4 +1,4 @@
-//! Task store — persistent storage for MCP 2025-11-25 tasks.
+//! Task store — persistent storage for MCP tasks (SEP-2663).
 //!
 //! All backends go through `KvBackedTaskStore` over an
 //! `Arc<dyn KeyValueStore>`. Single-node deployments use `MemoryKv`;
@@ -8,14 +8,13 @@
 //! Task authorization binding: tasks are scoped to an owner key — the
 //! caller's authorization context, passed as the `session_id`
 //! parameter on every accessor. Only the owning caller can
-//! query/cancel/retrieve a task; the gate is an exact-string compare.
+//! query/update/cancel a task; the gate is an exact-string compare.
 //!
-//! The owner key is caller-chosen. The modern (2026-07-28) wire binds
-//! it to the request **principal** (`RequestContext::task_owner_key`)
-//! so a task created on one cluster replica is pollable from another
-//! via `tasks/get` (the principal is identical everywhere; the
-//! per-replica synthetic session is not). The legacy (2025-11-25) wire
-//! passes the session id, which is its authorization context.
+//! The owner key is the request **principal**
+//! (`RequestContext::task_owner_key`), so a task created on one cluster
+//! replica is pollable from another via `tasks/get` (the principal is
+//! identical everywhere; a per-replica session is not). An anonymous
+//! caller's tasks are owned by its session.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,14 +29,10 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 2000;
 /// Retention + quota policy threaded through every backend.
 #[derive(Debug, Clone, Copy)]
 pub struct TaskRetentionPolicy {
-    /// TTL applied when the client does not pass an explicit `task.ttl`.
+    /// TTL of every task the gateway creates.
     pub default_ttl_ms: u64,
-    /// Maximum concurrent tasks per session (`0` disables the quota).
+    /// Maximum concurrent tasks per owner (`0` disables the quota).
     pub max_tasks_per_session: usize,
-    /// Upper bound on a single `tasks/result` HTTP blocking wait.
-    /// Clients that need longer-running tasks reconnect via
-    /// GET SSE + `Last-Event-Id` until the task goes terminal.
-    pub result_wait_ms: u64,
 }
 
 impl Default for TaskRetentionPolicy {
@@ -45,7 +40,6 @@ impl Default for TaskRetentionPolicy {
         Self {
             default_ttl_ms: 1_800_000, // 30 minutes
             max_tasks_per_session: 256,
-            result_wait_ms: 30_000,
         }
     }
 }
@@ -53,11 +47,11 @@ impl Default for TaskRetentionPolicy {
 /// Terminal envelope for a task — the exact JSON-RPC response body the wrapped
 /// request would have produced.
 ///
-/// MCP 2025-11-25 requires `tasks/result` to return exactly what the underlying
-/// request would have returned. Persisting the request-level payload (e.g. the
-/// `ToolCallResult`) is not enough — we need to replay whichever of the two
-/// JSON-RPC response shapes the original request would have taken, preserving
-/// JSON-RPC errors with their code/message/data.
+/// `tasks/get` of a terminal task answers what the underlying request would
+/// have returned. Persisting the request-level payload (e.g. the
+/// `ToolCallResult`) is not enough — whichever of the two JSON-RPC response
+/// shapes the original request would have taken is kept, JSON-RPC errors
+/// with their code/message/data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TerminalEnvelope {
@@ -108,7 +102,7 @@ pub struct TaskRecord {
     /// Internal creation timestamp for TTL computation.
     pub created_at_utc: DateTime<Utc>,
     /// Terminal envelope, present once the task reaches any terminal state
-    /// (Completed, Failed, or Cancelled). Drives `tasks/result` replay.
+    /// (Completed, Failed, or Cancelled).
     pub terminal_envelope: Option<TerminalEnvelope>,
     /// MRTR resume handle for an `input_required` task. The same
     /// opaque, principal-bound `requestState` blob the inline
@@ -130,10 +124,8 @@ pub struct TaskRecord {
 pub enum TaskStoreError {
     /// Task not found (or expired).
     NotFound,
-    /// Task belongs to a different session.
+    /// Task belongs to a different owner.
     Forbidden,
-    /// Task is not in a terminal state (for result retrieval).
-    NotCompleted,
     /// The task has already reached a terminal state; the requested
     /// mutation would break MCP's "terminal tasks stay terminal" rule.
     /// Used for `tasks/cancel` on completed/failed/cancelled tasks and for
@@ -150,7 +142,6 @@ impl std::fmt::Display for TaskStoreError {
         match self {
             TaskStoreError::NotFound => write!(f, "task not found"),
             TaskStoreError::Forbidden => write!(f, "task access forbidden"),
-            TaskStoreError::NotCompleted => write!(f, "task not yet completed"),
             TaskStoreError::AlreadyTerminal => {
                 write!(f, "task has already reached a terminal state")
             }
@@ -187,7 +178,6 @@ pub trait TaskStore: Send + Sync + std::fmt::Debug {
         session_id: &str,
         original_request_id: Value,
         tool_name: &str,
-        ttl_ms: Option<u64>,
     ) -> Result<TaskRecord, TaskStoreError>;
 
     /// Get a task by ID, with session authorization check.
@@ -195,9 +185,9 @@ pub trait TaskStore: Send + Sync + std::fmt::Debug {
 
     /// Update a non-terminal task's status and optional status message.
     ///
-    /// MCP 2025-11-25 requires terminal tasks to stay terminal. Implementations
-    /// MUST return [`TaskStoreError::AlreadyTerminal`] if the task has already
-    /// reached Completed, Failed, or Cancelled.
+    /// Terminal tasks stay terminal. Implementations MUST return
+    /// [`TaskStoreError::AlreadyTerminal`] if the task has already reached
+    /// Completed, Failed, or Cancelled.
     ///
     /// Ownership: implementations MUST return
     /// [`TaskStoreError::Forbidden`] — **before** mutating — when
@@ -213,8 +203,8 @@ pub trait TaskStore: Send + Sync + std::fmt::Debug {
 
     /// Update a non-terminal task's `pollInterval` hint. SEP-2663
     /// `updateTask` carries this as a separate field from status —
-    /// modern servers patch it when they want clients to back off
-    /// or speed up between `getTask` calls.
+    /// a server patches it when it wants clients to back off or speed
+    /// up between `getTask` calls.
     ///
     /// The default implementation is a no-op so external `TaskStore`
     /// impls that haven't been updated keep compiling; the in-memory
@@ -280,25 +270,11 @@ pub trait TaskStore: Send + Sync + std::fmt::Debug {
         envelope: TerminalEnvelope,
     ) -> Result<(), TaskStoreError>;
 
-    /// Fetch the terminal envelope for a task. Returns `NotCompleted` while
-    /// the task is still non-terminal. All terminal states (Completed, Failed,
-    /// Cancelled) have a retrievable envelope so `tasks/result` can replay it.
-    fn get_task_result(
-        &self,
-        task_id: &str,
-        session_id: &str,
-    ) -> Result<TerminalEnvelope, TaskStoreError>;
-
     /// Cancel a task. Returns updated record. Best-effort — task may already be terminal.
     fn cancel_task(&self, task_id: &str, session_id: &str) -> Result<TaskRecord, TaskStoreError>;
 
-    /// List tasks for a session (with optional cursor pagination).
-    fn list_tasks(
-        &self,
-        session_id: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<(Vec<Task>, Option<String>), TaskStoreError>;
+    /// The tasks `session_id` owns, newest first.
+    fn list_tasks(&self, session_id: &str) -> Result<Vec<Task>, TaskStoreError>;
 
     /// Garbage-collect expired tasks. Returns number of tasks removed.
     fn gc_expired_tasks(&self) -> usize;
@@ -321,8 +297,8 @@ pub trait TaskStore: Send + Sync + std::fmt::Debug {
 /// fully async is a future migration.
 ///
 /// Key scheme: `task:{task_id}` → JSON-encoded [`TaskRecord`], and
-/// `task-s:{session}:{task_id}` → the session's task index, so the
-/// per-session limit and `tasks/list` read one session's tasks.
+/// `task-s:{session}:{task_id}` → the owner's task index, so the per-owner
+/// limit and the session-end cleanup read one owner's tasks.
 /// Per-key TTL is the originally-supplied `task.ttl`; backends auto-expire
 /// stale entries so [`gc_expired_tasks`] is a no-op for KV-backed stores.
 /// Told of every status a task store writes, after it is stored. Called
@@ -435,7 +411,6 @@ impl TaskStore for KvBackedTaskStore {
         session_id: &str,
         original_request_id: Value,
         tool_name: &str,
-        ttl_ms: Option<u64>,
     ) -> Result<TaskRecord, TaskStoreError> {
         Self::block(async {
             if self.policy.max_tasks_per_session > 0 {
@@ -457,7 +432,7 @@ impl TaskStore for KvBackedTaskStore {
             }
             let now = Utc::now();
             let task_id = Uuid::new_v4().to_string();
-            let ttl = ttl_ms.unwrap_or(self.policy.default_ttl_ms);
+            let ttl = self.policy.default_ttl_ms;
             let record = TaskRecord {
                 task: Task {
                     task_id: task_id.clone(),
@@ -685,15 +660,6 @@ impl TaskStore for KvBackedTaskStore {
         })
     }
 
-    fn get_task_result(
-        &self,
-        task_id: &str,
-        session_id: &str,
-    ) -> Result<TerminalEnvelope, TaskStoreError> {
-        let record = self.get_task(task_id, session_id)?;
-        record.terminal_envelope.ok_or(TaskStoreError::NotCompleted)
-    }
-
     fn cancel_task(&self, task_id: &str, session_id: &str) -> Result<TaskRecord, TaskStoreError> {
         let key = Self::task_key(task_id);
         Self::block(async {
@@ -729,14 +695,9 @@ impl TaskStore for KvBackedTaskStore {
         })
     }
 
-    fn list_tasks(
-        &self,
-        session_id: &str,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<(Vec<Task>, Option<String>), TaskStoreError> {
+    fn list_tasks(&self, session_id: &str) -> Result<Vec<Task>, TaskStoreError> {
         Self::block(async {
-            let mut session_tasks: Vec<TaskRecord> = Vec::new();
+            let mut owned: Vec<TaskRecord> = Vec::new();
             for task_id in self.session_task_ids(session_id).await? {
                 let value = self
                     .state
@@ -747,31 +708,11 @@ impl TaskStore for KvBackedTaskStore {
                     .and_then(|v| serde_json::from_slice::<TaskRecord>(&v.bytes).ok())
                     .filter(|r| r.session_id == session_id)
                 {
-                    session_tasks.push(record);
+                    owned.push(record);
                 }
             }
-            session_tasks.sort_by_key(|t| std::cmp::Reverse(t.created_at_utc));
-            let start_index = if let Some(cursor_id) = cursor {
-                session_tasks
-                    .iter()
-                    .position(|r| r.task.task_id == cursor_id)
-                    .map(|i| i + 1)
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            let page: Vec<Task> = session_tasks
-                .iter()
-                .skip(start_index)
-                .take(limit)
-                .map(|r| r.task.clone())
-                .collect();
-            let next_cursor = if start_index + limit < session_tasks.len() {
-                page.last().map(|t| t.task_id.clone())
-            } else {
-                None
-            };
-            Ok((page, next_cursor))
+            owned.sort_by_key(|t| std::cmp::Reverse(t.created_at_utc));
+            Ok(owned.into_iter().map(|record| record.task).collect())
         })
     }
 
@@ -793,32 +734,29 @@ mod tests {
         KvBackedTaskStore::new_in_memory_default()
     }
 
-    /// More tasks in the store than the old 4096 listing cap: the
-    /// per-session limit and `tasks/list` read the session's own tasks.
+    /// More tasks in the store than one 4096-entry listing page: the
+    /// per-owner limit and the listing read the owner's own tasks.
     #[test]
     fn a_session_sees_its_own_tasks_among_many() {
         let store = KvBackedTaskStore::new_in_memory(TaskRetentionPolicy {
             default_ttl_ms: 600_000,
             max_tasks_per_session: 3,
-            result_wait_ms: 30_000,
         });
         for i in 0..4_500 {
             store
-                .create_task(&format!("other-{i}"), serde_json::json!(i), "tool", None)
+                .create_task(&format!("other-{i}"), serde_json::json!(i), "tool")
                 .unwrap();
         }
         for i in 0..3 {
             store
-                .create_task("mine", serde_json::json!(i), "tool", None)
+                .create_task("mine", serde_json::json!(i), "tool")
                 .expect("under the limit");
         }
         let err = store
-            .create_task("mine", serde_json::json!(9), "tool", None)
+            .create_task("mine", serde_json::json!(9), "tool")
             .expect_err("the fourth is over the limit");
         assert!(matches!(err, TaskStoreError::QuotaExceeded { limit: 3 }));
-        let (tasks, next) = store.list_tasks("mine", None, 100).unwrap();
-        assert_eq!(tasks.len(), 3);
-        assert_eq!(next, None);
+        assert_eq!(store.list_tasks("mine").unwrap().len(), 3);
     }
 
     #[test]
@@ -826,21 +764,20 @@ mod tests {
         let store = KvBackedTaskStore::new_in_memory(TaskRetentionPolicy {
             default_ttl_ms: 60_000,
             max_tasks_per_session: 2,
-            result_wait_ms: 30_000,
         });
         store
-            .create_task("sess-1", serde_json::json!(1), "tool", None)
+            .create_task("sess-1", serde_json::json!(1), "tool")
             .expect("first create");
         store
-            .create_task("sess-1", serde_json::json!(2), "tool", None)
+            .create_task("sess-1", serde_json::json!(2), "tool")
             .expect("second create");
         let err = store
-            .create_task("sess-1", serde_json::json!(3), "tool", None)
+            .create_task("sess-1", serde_json::json!(3), "tool")
             .expect_err("quota should reject the third");
         assert!(matches!(err, TaskStoreError::QuotaExceeded { limit: 2 }));
         // A different session still has room under its own per-session quota.
         store
-            .create_task("sess-2", serde_json::json!(9), "tool", None)
+            .create_task("sess-2", serde_json::json!(9), "tool")
             .expect("different session unaffected");
     }
 
@@ -849,10 +786,9 @@ mod tests {
         let store = KvBackedTaskStore::new_in_memory(TaskRetentionPolicy {
             default_ttl_ms: 12_345,
             max_tasks_per_session: 0,
-            result_wait_ms: 30_000,
         });
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "tool", None)
+            .create_task("sess-1", serde_json::json!(1), "tool")
             .expect("create");
         assert_eq!(record.task.ttl, Some(12_345));
     }
@@ -861,7 +797,7 @@ mod tests {
     fn create_and_get_task() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         assert_eq!(record.task.status, TaskStatus::Working);
         assert_eq!(record.session_id, "sess-1");
@@ -874,7 +810,7 @@ mod tests {
     fn get_task_forbidden_for_other_session() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         let err = store
             .get_task(&record.task.task_id, "sess-other")
@@ -886,7 +822,7 @@ mod tests {
     fn update_status_advances_working_task() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         store
             .update_task_status(
@@ -904,7 +840,7 @@ mod tests {
     fn update_status_rejects_terminal_transitions() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         // Callers must use store_task_terminal for Completed/Failed/Cancelled.
         let err = store
@@ -920,7 +856,7 @@ mod tests {
     fn update_status_forbidden_for_other_session() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         let err = store
             .update_task_status(
@@ -941,7 +877,7 @@ mod tests {
     fn store_and_get_terminal_envelope_success() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         let envelope = TerminalEnvelope::success(
             serde_json::json!({"content": [{"type": "text", "text": "hello"}]}),
@@ -950,10 +886,7 @@ mod tests {
             .store_task_terminal(&record.task.task_id, TaskStatus::Completed, envelope)
             .unwrap();
 
-        let got = store
-            .get_task_result(&record.task.task_id, "sess-1")
-            .unwrap();
-        match got {
+        match terminal_envelope(&store, &record.task.task_id) {
             TerminalEnvelope::Success { result } => {
                 assert_eq!(result["content"][0]["text"], "hello");
             }
@@ -961,11 +894,20 @@ mod tests {
         }
     }
 
+    /// The terminal envelope `sess-1`'s task `task_id` holds.
+    fn terminal_envelope(store: &KvBackedTaskStore, task_id: &str) -> TerminalEnvelope {
+        store
+            .get_task(task_id, "sess-1")
+            .unwrap()
+            .terminal_envelope
+            .expect("a terminal task holds its envelope")
+    }
+
     #[test]
     fn store_task_terminal_rejects_rewrite() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         store
             .store_task_terminal(
@@ -989,10 +931,10 @@ mod tests {
     }
 
     #[test]
-    fn get_result_forbidden_for_other_session() {
+    fn a_terminal_task_is_forbidden_to_another_owner() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         store
             .store_task_terminal(
@@ -1002,28 +944,26 @@ mod tests {
             )
             .unwrap();
         let err = store
-            .get_task_result(&record.task.task_id, "sess-other")
+            .get_task(&record.task.task_id, "sess-other")
             .unwrap_err();
         assert!(matches!(err, TaskStoreError::Forbidden));
     }
 
     #[test]
-    fn get_result_not_completed() {
+    fn a_working_task_has_no_terminal_envelope() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
-        let err = store
-            .get_task_result(&record.task.task_id, "sess-1")
-            .unwrap_err();
-        assert!(matches!(err, TaskStoreError::NotCompleted));
+        let fetched = store.get_task(&record.task.task_id, "sess-1").unwrap();
+        assert!(fetched.terminal_envelope.is_none());
     }
 
     #[test]
     fn set_task_poll_interval_persists_for_subsequent_get() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         let initial = record.task.poll_interval;
 
@@ -1050,7 +990,7 @@ mod tests {
     fn set_task_poll_interval_refuses_terminal_task() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         store
             .store_task_terminal(
@@ -1072,7 +1012,7 @@ mod tests {
     fn set_task_poll_interval_forbidden_for_other_session() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         let err = store
             .set_task_poll_interval(&record.task.task_id, "sess-attacker", Some(9_999))
@@ -1086,14 +1026,11 @@ mod tests {
     fn cancel_task_stores_cancelled_envelope() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         let cancelled = store.cancel_task(&record.task.task_id, "sess-1").unwrap();
         assert_eq!(cancelled.task.status, TaskStatus::Cancelled);
-        let got = store
-            .get_task_result(&record.task.task_id, "sess-1")
-            .unwrap();
-        match got {
+        match terminal_envelope(&store, &record.task.task_id) {
             TerminalEnvelope::Error { error } => assert_eq!(error.code, -32800),
             other => panic!("expected cancellation error envelope, got {other:?}"),
         }
@@ -1103,7 +1040,7 @@ mod tests {
     fn cancel_task_forbidden() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         let err = store
             .cancel_task(&record.task.task_id, "sess-other")
@@ -1115,7 +1052,7 @@ mod tests {
     fn cancel_already_terminal_is_rejected() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "test.tool", None)
+            .create_task("sess-1", serde_json::json!(1), "test.tool")
             .unwrap();
         store
             .store_task_terminal(
@@ -1134,47 +1071,50 @@ mod tests {
     fn list_tasks_filters_by_session() {
         let store = make_store();
         store
-            .create_task("sess-1", serde_json::json!(1), "tool-a", None)
+            .create_task("sess-1", serde_json::json!(1), "tool-a")
             .unwrap();
-        let _ = store.create_task("sess-1", serde_json::json!(2), "tool-b", None);
-        let _ = store.create_task("sess-2", serde_json::json!(3), "tool-c", None);
+        let _ = store.create_task("sess-1", serde_json::json!(2), "tool-b");
+        let _ = store.create_task("sess-2", serde_json::json!(3), "tool-c");
 
-        let (tasks, _) = store.list_tasks("sess-1", None, 100).unwrap();
-        assert_eq!(tasks.len(), 2);
-        let (tasks2, _) = store.list_tasks("sess-2", None, 100).unwrap();
-        assert_eq!(tasks2.len(), 1);
+        assert_eq!(store.list_tasks("sess-1").unwrap().len(), 2);
+        assert_eq!(store.list_tasks("sess-2").unwrap().len(), 1);
     }
 
     #[test]
-    fn list_tasks_pagination() {
+    fn list_tasks_returns_every_owned_task_newest_first() {
         let store = make_store();
+        let mut created = Vec::new();
         for i in 0..5 {
-            store
-                .create_task("sess-1", serde_json::json!(i), "tool", None)
-                .expect("create_task");
+            created.push(
+                store
+                    .create_task("sess-1", serde_json::json!(i), "tool")
+                    .expect("create_task")
+                    .task
+                    .task_id,
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
-
-        let (page1, cursor) = store.list_tasks("sess-1", None, 2).unwrap();
-        assert_eq!(page1.len(), 2);
-        assert!(cursor.is_some());
-
-        let (page2, cursor2) = store.list_tasks("sess-1", cursor.as_deref(), 2).unwrap();
-        assert_eq!(page2.len(), 2);
-        assert!(cursor2.is_some());
-
-        let (page3, cursor3) = store.list_tasks("sess-1", cursor2.as_deref(), 2).unwrap();
-        assert_eq!(page3.len(), 1);
-        assert!(cursor3.is_none());
+        let listed: Vec<String> = store
+            .list_tasks("sess-1")
+            .unwrap()
+            .into_iter()
+            .map(|task| task.task_id)
+            .collect();
+        created.reverse();
+        assert_eq!(listed, created);
     }
 
     #[test]
     fn kv_auto_expires_via_ttl() {
         // KV-backed stores auto-expire entries through the TTL passed to
-        // `put`; the legacy gc-loop is a no-op (returns 0). Verify the
+        // `put`; the gc loop is a no-op (returns 0). Verify the
         // record is reachable while TTL is alive and gone after it lapses.
-        let store = make_store();
+        let store = KvBackedTaskStore::new_in_memory(TaskRetentionPolicy {
+            default_ttl_ms: 50,
+            ..TaskRetentionPolicy::default()
+        });
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "tool", Some(50))
+            .create_task("sess-1", serde_json::json!(1), "tool")
             .unwrap();
         assert!(store.get_task(&record.task.task_id, "sess-1").is_ok());
 
@@ -1190,7 +1130,7 @@ mod tests {
     fn set_awaiting_input_records_request_state_and_input_requests() {
         let store = make_store();
         let record = store
-            .create_task("owner-1", serde_json::json!(1), "tool", None)
+            .create_task("owner-1", serde_json::json!(1), "tool")
             .unwrap();
         // Fresh task carries no resume handle.
         assert!(
@@ -1221,14 +1161,14 @@ mod tests {
         assert!(updated.input_requests.is_some());
     }
 
-    /// CPN-4 regression: the awaiting-input transition is
-    /// ownership-gated — a foreign owner key cannot drive a task into
-    /// `input_required` or read its resume handle.
+    /// The awaiting-input transition is ownership-gated — a foreign owner
+    /// key cannot drive a task into `input_required` or read its resume
+    /// handle.
     #[test]
     fn set_awaiting_input_forbidden_for_other_owner() {
         let store = make_store();
         let record = store
-            .create_task("owner-1", serde_json::json!(1), "tool", None)
+            .create_task("owner-1", serde_json::json!(1), "tool")
             .unwrap();
         let err = store
             .set_task_awaiting_input(
@@ -1249,7 +1189,7 @@ mod tests {
     fn store_failed_terminal_envelope() {
         let store = make_store();
         let record = store
-            .create_task("sess-1", serde_json::json!(1), "tool", None)
+            .create_task("sess-1", serde_json::json!(1), "tool")
             .unwrap();
         let envelope = TerminalEnvelope::error(JsonRpcErrorBody {
             code: -32000,
@@ -1259,10 +1199,7 @@ mod tests {
         store
             .store_task_terminal(&record.task.task_id, TaskStatus::Failed, envelope)
             .unwrap();
-        let got = store
-            .get_task_result(&record.task.task_id, "sess-1")
-            .unwrap();
-        match got {
+        match terminal_envelope(&store, &record.task.task_id) {
             TerminalEnvelope::Error { error } => {
                 assert_eq!(error.code, -32000);
                 assert_eq!(error.message, "rate limit exceeded");

@@ -41,9 +41,9 @@ cluster:
   password: "${env.MCPG_REDIS_PASSWORD}"
   key_prefix: "mcpg:prod"
   # Required for any non-single_node cluster: seals all coordinator-backed
-  # capability state (sessions incl. SSE replay, pipelines, tasks, delivery,
-  # cancellation, …) with XChaCha20-Poly1305 and derives the key that makes
-  # modern-session resume work across replicas. Names the env var (no
+  # capability state (sessions, pipelines, tasks, delivery, cancellation, …)
+  # with XChaCha20-Poly1305 and derives the keys that make sessions and
+  # resumed requests work across replicas. Names the env var (no
   # `${env.…}` — the key itself never sits in the config); the var must hold
   # a URL-safe-base64 32-byte key, IDENTICAL on every replica:
   #   openssl rand -base64 32 | tr '+/' '-_'

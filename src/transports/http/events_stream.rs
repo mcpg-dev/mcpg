@@ -3,46 +3,43 @@
 //!
 //! The method exists under the same conditions as the other `events/*`
 //! methods. A request that is refused gets one JSON-RPC error and no
-//! stream. The stream holds no session server-push slot: it is one
-//! subscription, bounded by its own per-principal cap. Heartbeats are SSE
-//! data frames, never comments, because they carry the cursor; there is no
-//! SSE keep-alive and no event id, since a client resumes with its cursor.
+//! stream. The stream takes no `subscriptions/listen` slot of the session:
+//! it is one subscription, bounded by its own per-principal cap. Heartbeats
+//! are SSE data frames, never comments, because they carry the cursor; there
+//! is no SSE keep-alive and no event id, since a client resumes with its
+//! cursor.
 
 use super::*;
 use crate::protocol::v_2026_07_28::dispatch::events::{
-    events_error_response, events_served, live_events_config, method_not_found, plan_rps_refusal,
+    events_error_response, events_served, method_not_found, plan_rps_refusal,
 };
 use crate::protocol::v_2026_07_28::extensions::events::errors::EventsError;
 use crate::protocol::v_2026_07_28::extensions::events::wire::{
     METHOD_STREAM_EVENTS, StreamEventsParams,
 };
 
-pub(crate) async fn modern_events_stream_handler(
+pub(crate) async fn events_stream_handler(
     state: AppState,
     request_context: RequestContext,
     body: Value,
     client_accepts_sse: bool,
 ) -> Response {
     let request_id = body.get("id").cloned().unwrap_or(Value::Null);
-    let services = state.runtime.load().shared_services.load_full();
+    let runtime = state.runtime.load_full();
+    let config = runtime.events_config();
+    let services = runtime.shared_services.load_full();
     let core = services
         .as_ref()
-        .filter(|services| {
-            events_served(
-                &live_events_config(services),
-                services,
-                &request_context.transport,
-            )
-        })
+        .filter(|services| events_served(config, services, &request_context.transport))
         .and_then(|services| services.events_core.get().cloned());
-    let (Some(services), Some(core)) = (services, core) else {
+    let (Some(_), Some(core)) = (services, core) else {
         return finish(
             method_not_found(request_id, METHOD_STREAM_EVENTS),
             &request_context,
         );
     };
-    let numbering = live_events_config(&services).error_codes.numbering();
-    if let Err(limit) = state.runtime.load().admit_plan_rps("events") {
+    let numbering = config.error_codes.numbering();
+    if let Err(limit) = runtime.admit_plan_rps("events") {
         return finish(
             plan_rps_refusal(Some(request_id.clone()), limit, numbering),
             &request_context,

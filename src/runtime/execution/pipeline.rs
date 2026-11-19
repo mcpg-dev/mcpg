@@ -23,9 +23,8 @@ impl ExecutionDispatcher {
         state: &mut PipelineExecutionState,
         profile: &str,
         request: &BackendInvocationRequest,
-        // Backend steps build their own per-step context locally; the
-        // caller's context is no longer threaded through (all backend
-        // step types now dispatch via plugin helpers).
+        // Backend steps dispatch through the plugin helpers, which build
+        // their own per-step context.
         _execution_context: &ToolExecutionContext,
         pipeline_store: &dyn PipelineStore,
     ) -> PipelineOutcome {
@@ -195,19 +194,10 @@ impl ExecutionDispatcher {
                         .clone()
                         .unwrap_or_else(|| mint_server_request_id(&request.context));
                     // project the full elicitation surface onto the
-                    // outgoing params, including URL-mode fields.
-                    //
-                    // URL-mode `elicitationId` is set to the same
-                    // `server_request_id` used for the pending-request
-                    // lookup so the cluster-safe
-                    // `pipeline_store.load_pending_server_request` resolves
-                    // the owning pipeline when the client later posts
-                    // `notifications/elicitation/complete`, regardless of
-                    // which instance receives the notification.
-                    // Operator-pinned `elicitation_id` in config is
-                    // ignored in favour of the request_id to preserve
-                    // resumability; the operator override was originally
-                    // intended only for deduplication across retries.
+                    // outgoing params, including URL-mode fields. A
+                    // URL-mode `elicitationId` is the `server_request_id`,
+                    // the key the pending-request lookup resolves the
+                    // owning pipeline by on any replica.
                     let (mode_string, elicitation_id, url) = match elicitation.mode {
                         crate::config::PipelineElicitationMode::Form => {
                             ("form".to_owned(), None, None)
@@ -340,32 +330,28 @@ impl ExecutionDispatcher {
                             meta: None,
                         });
                     }
-                    let version_is_modern = request.context.negotiated_version
-                        == crate::protocol::version::ProtocolVersion::V_2026_07_28;
-                    // SEP-2577: Sampling is deprecated on the modern wire.
-                    if version_is_modern {
-                        crate::protocol::shared::deprecation::meter_deprecated_feature(
-                            crate::protocol::shared::deprecation::FEATURE_SAMPLING,
+                    // SEP-2577: Sampling is deprecated.
+                    crate::protocol::shared::deprecation::meter_deprecated_feature(
+                        crate::protocol::shared::deprecation::FEATURE_SAMPLING,
+                    );
+                    // SEP-2596: the `includeContext` values
+                    // `"thisServer"`/`"allServers"` are deprecated.
+                    // Don't silently forward them — warn so the emission
+                    // is steered toward removal.
+                    use crate::protocol::SamplingIncludeContext;
+                    if matches!(
+                        sampling.include_context,
+                        Some(SamplingIncludeContext::ThisServer)
+                            | Some(SamplingIncludeContext::AllServers)
+                    ) {
+                        tracing::warn!(
+                            step = %sampling.id,
+                            "sampling step uses the deprecated includeContext value \
+                             (SEP-2596 thisServer/allServers); migrate before removal"
                         );
-                        // SEP-2596: the `includeContext` values
-                        // `"thisServer"`/`"allServers"` are deprecated.
-                        // Don't silently forward them — warn so the
-                        // emission is steered toward removal.
-                        use crate::protocol::SamplingIncludeContext;
-                        if matches!(
-                            sampling.include_context,
-                            Some(SamplingIncludeContext::ThisServer)
-                                | Some(SamplingIncludeContext::AllServers)
-                        ) {
-                            tracing::warn!(
-                                step = %sampling.id,
-                                "sampling step uses the deprecated includeContext value \
-                                 (SEP-2596 thisServer/allServers); migrate before removal"
-                            );
-                            crate::protocol::shared::deprecation::meter_deprecated_feature(
-                                "include_context",
-                            );
-                        }
+                        crate::protocol::shared::deprecation::meter_deprecated_feature(
+                            "include_context",
+                        );
                     }
                     let server_request_id = sampling
                         .correlation_token
@@ -538,16 +524,12 @@ impl ExecutionDispatcher {
                         "pipeline" => profile.to_owned(),
                     )
                     .increment(1);
-                    // SEP-2577: Roots is deprecated on the modern wire.
-                    // Meter use so operators can track migration pressure
-                    // during the SEP-2596 deprecation window.
-                    if request.context.negotiated_version
-                        == crate::protocol::version::ProtocolVersion::V_2026_07_28
-                    {
-                        crate::protocol::shared::deprecation::meter_deprecated_feature(
-                            crate::protocol::shared::deprecation::FEATURE_ROOTS,
-                        );
-                    }
+                    // SEP-2577: Roots is deprecated. Meter use so
+                    // operators can track migration pressure during the
+                    // SEP-2596 deprecation window.
+                    crate::protocol::shared::deprecation::meter_deprecated_feature(
+                        crate::protocol::shared::deprecation::FEATURE_ROOTS,
+                    );
                     // Audit the roots/list request.
                     if let Some(registry) = self.plugin_registry.clone() {
                         let actor = crate::runtime::plugin_identity_from_request(&request.context);
@@ -574,9 +556,9 @@ impl ExecutionDispatcher {
                 crate::config::PipelineStepConfig::Gather(gather) => {
                     // SEP-2322 multi-entry MRTR. Build one server
                     // request per input, pruning any whose required
-                    // client capability wasn't advertised (the modern
-                    // wire's "only emit supported inputRequests"
-                    // contract). All surviving requests are emitted in
+                    // client capability wasn't advertised (the "only
+                    // emit supported inputRequests" contract). All
+                    // surviving requests are emitted in
                     // one suspension; the pipeline resumes when the
                     // client answers them together.
                     let mut requests: Vec<ServerJsonRpcRequest> = Vec::new();
@@ -790,10 +772,7 @@ impl ExecutionDispatcher {
                         &log_step.level,
                         log_step.logger.as_deref().or(Some(profile)),
                         &log_step.data,
-                        request.context.negotiated_version
-                            == crate::protocol::version::ProtocolVersion::V_2026_07_28,
                         request.request_log_level,
-                        request.legacy_session_log_level,
                     );
                     // Log steps don't produce useful step outputs; return
                     // the configured payload so downstream steps that
@@ -990,8 +969,8 @@ impl ExecutionDispatcher {
         &self,
         profile: &str,
         request: &BackendInvocationRequest,
-        // Backend steps dispatch via plugin helpers now; the caller's
-        // context is no longer threaded into per-step dispatch.
+        // Backend steps dispatch through the plugin helpers, which build
+        // their own per-step context.
         _execution_context: &ToolExecutionContext,
     ) -> ToolCallResult {
         use crate::config::PipelineStepConfig;
@@ -1164,10 +1143,7 @@ impl ExecutionDispatcher {
                         &log_step.level,
                         log_step.logger.as_deref().or(Some(profile)),
                         &log_step.data,
-                        request.context.negotiated_version
-                            == crate::protocol::version::ProtocolVersion::V_2026_07_28,
                         request.request_log_level,
-                        request.legacy_session_log_level,
                     );
                     StepOutcome::Success(log_step.data.clone())
                 }
@@ -1418,7 +1394,6 @@ pub(super) fn build_step_request(
         expr_ctx,
         progress_token: original_request.progress_token.clone(),
         request_log_level: original_request.request_log_level,
-        legacy_session_log_level: original_request.legacy_session_log_level,
         client_capabilities: original_request.client_capabilities.clone(),
         cancellation_token: original_request.cancellation_token.clone(),
         // Sub-steps inherit the same hint (no per-hop derivation;
@@ -1574,6 +1549,23 @@ pub(super) fn run_transform_in_sync_context(
     })
 }
 
+/// Decide whether a pipeline `log` step's `notifications/message` is
+/// suppressed by the SEP-2575 per-request `request_log_level` floor:
+/// absent ⇒ suppress all (the spec MUST); present ⇒ suppress below the
+/// floor. An unrecognised level string emits under a floor.
+pub(super) fn log_step_suppressed(
+    level: &str,
+    request_log_level: Option<crate::protocol::v_2026_07_28::wire::meta::LogLevel>,
+) -> bool {
+    use crate::protocol::v_2026_07_28::wire::meta::LogLevel;
+    match request_log_level {
+        None => true,
+        Some(minimum) => LogLevel::parse_str(level)
+            .map(|msg_level| !msg_level.permits(minimum))
+            .unwrap_or(false),
+    }
+}
+
 /// Publish a `notifications/message` on a session's delivery bus.
 /// Used by the `log` pipeline step; non-suspending so the pipeline
 /// proceeds immediately to the next step after the bus accepts.
@@ -1584,52 +1576,8 @@ pub(super) fn run_transform_in_sync_context(
 /// returned regardless so the pipeline doesn't break on the
 /// observability side-effect.
 ///
-/// `request_log_level` carries the per-request SEP-2575 emission gate.
-/// It is `Some(_)` **only** on the modern (`2026-07-28`) wire when the
-/// request set `_meta.io.modelcontextprotocol/logLevel`, in which case
-/// `version_is_modern` is `true` and only messages at or above that
-/// floor are emitted. On the modern wire with no floor set
-/// (`request_log_level == None && version_is_modern`), the spec MUST
-/// applies: emit nothing. On the legacy wire (`version_is_modern ==
-/// false`) the gate is bypassed entirely — log notifications are
-/// emitted unconditionally, preserving byte-identical 2025-11-25
-/// behaviour, except the session-wide `logging/setLevel` floor is now
-/// applied (LOG-2): `legacy_session_log_level` carries the session's
-/// stored minimum and a pipeline `log` step below it is suppressed.
-/// Decide whether a pipeline `log` step's `notifications/message` is
-/// suppressed by the active log-level floor.
-///
-/// - Modern wire (`version_is_modern`): the SEP-2575 per-request
-///   `request_log_level` gate applies — absent ⇒ suppress all; present
-///   ⇒ suppress below the floor. An unrecognised level string emits.
-/// - Legacy wire: the session-wide `logging/setLevel` floor
-///   (`legacy_session_log_level`) applies (LOG-2) — a message below the
-///   session minimum is suppressed; `None` floor or an unrecognised
-///   level string emits unconditionally (byte-identical default).
-pub(super) fn log_step_suppressed(
-    level: &str,
-    version_is_modern: bool,
-    request_log_level: Option<crate::protocol::v_2026_07_28::wire::meta::LogLevel>,
-    legacy_session_log_level: Option<crate::protocol::LoggingLevel>,
-) -> bool {
-    if version_is_modern {
-        use crate::protocol::v_2026_07_28::wire::meta::LogLevel;
-        match request_log_level {
-            None => true,
-            Some(minimum) => LogLevel::parse_str(level)
-                .map(|msg_level| !msg_level.permits(minimum))
-                .unwrap_or(false),
-        }
-    } else if let Some(min) = legacy_session_log_level {
-        serde_json::from_value::<crate::protocol::LoggingLevel>(Value::String(level.to_owned()))
-            .map(|msg_level| msg_level < min)
-            .unwrap_or(false)
-    } else {
-        false
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
+/// `request_log_level` carries the per-request SEP-2575 emission gate
+/// ([`log_step_suppressed`]).
 pub(super) fn publish_log_notification(
     bus: Option<&std::sync::Arc<dyn super::delivery_bus::DeliveryBus>>,
     pipeline_store: Option<&std::sync::Arc<dyn super::pipeline_store::PipelineStore>>,
@@ -1637,25 +1585,16 @@ pub(super) fn publish_log_notification(
     level: &str,
     logger: Option<&str>,
     data: &Value,
-    version_is_modern: bool,
     request_log_level: Option<crate::protocol::v_2026_07_28::wire::meta::LogLevel>,
-    legacy_session_log_level: Option<crate::protocol::LoggingLevel>,
 ) {
-    if log_step_suppressed(
-        level,
-        version_is_modern,
-        request_log_level,
-        legacy_session_log_level,
-    ) {
+    if log_step_suppressed(level, request_log_level) {
         return;
     }
-    // SEP-2577: Logging is deprecated on the modern wire. Meter each
-    // emission that passes the level floor.
-    if version_is_modern {
-        crate::protocol::shared::deprecation::meter_deprecated_feature(
-            crate::protocol::shared::deprecation::FEATURE_LOGGING,
-        );
-    }
+    // SEP-2577: Logging is deprecated. Meter each emission that passes
+    // the level floor.
+    crate::protocol::shared::deprecation::meter_deprecated_feature(
+        crate::protocol::shared::deprecation::FEATURE_LOGGING,
+    );
     if bus.is_none() && pipeline_store.is_none() {
         return;
     }
@@ -1673,7 +1612,6 @@ pub(super) fn publish_log_notification(
     let message = super::pipeline_store::DeliveryMessage {
         kind: super::pipeline_store::DeliveryKind::Notification,
         jsonrpc_message: notification,
-        delivery_id: String::new(),
     };
     if let Some(store) = pipeline_store
         && let Err(error) = store.store_pending_delivery(session_id, &message)
@@ -1681,7 +1619,7 @@ pub(super) fn publish_log_notification(
         tracing::warn!(
             session_id = %session_id,
             error = %error,
-            "pipeline log: failed to buffer notification for late-subscriber replay"
+            "pipeline log: failed to buffer notification in the session backlog"
         );
     }
     let Some(bus) = bus else { return };
@@ -1732,7 +1670,6 @@ pub(super) fn publish_progress_notification(
     let message = super::pipeline_store::DeliveryMessage {
         kind: super::pipeline_store::DeliveryKind::ProgressNotification,
         jsonrpc_message: notification,
-        delivery_id: String::new(),
     };
     if let Some(store) = pipeline_store
         && let Err(error) = store.store_pending_delivery(session_id, &message)
@@ -1740,7 +1677,7 @@ pub(super) fn publish_progress_notification(
         tracing::warn!(
             session_id = %session_id,
             error = %error,
-            "pipeline progress: failed to buffer notification for late-subscriber replay"
+            "pipeline progress: failed to buffer notification in the session backlog"
         );
     }
     let Some(bus) = bus else { return };

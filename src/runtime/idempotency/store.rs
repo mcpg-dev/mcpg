@@ -26,8 +26,8 @@ use uuid::Uuid;
 /// - `identity_hash` — BLAKE3 of the canonicalised caller identity
 ///   (subject ID + auth provider + issuer). Hash, not raw bytes,
 ///   so the storage key cannot leak PII.
-/// - `method` — JSON-RPC method name (`tools/call` or
-///   `tasks/create`).
+/// - `method` — the dedupe namespace: `tools/call` for an inline call,
+///   `tasks/create` for a call accepted as a task.
 /// - `tool_name` — narrow to the binding being invoked. Two
 ///   different tools cannot collide on the same key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,9 +76,9 @@ pub enum ReservationOutcome {
 /// the end of the first call and the store hands it back wholesale
 /// on a hit.
 ///
-/// Tasks integration reuses this struct with
-/// `envelope = { "task_id": "..." }` to dedupe `tasks/create`
-/// handles per design doc §4. Streaming integration caches the
+/// A call accepted as a task reuses this struct with the task handle as
+/// `envelope` (`{ "task_id", "session_id" }`, the latter holding the
+/// task-store owner key) to dedupe the task. Streaming caches the
 /// assembled envelope at stream completion, or marks
 /// `payload_truncated` and skips caching when the envelope exceeds
 /// `PAYLOAD_CAPTURE_CAP_BYTES`.
@@ -194,7 +194,7 @@ pub trait IdempotencyStore: Send + Sync + fmt::Debug {
     ///
     /// `ttl_override` lets the caller bound the reservation's
     /// wall-clock expiry below the store's configured default —
-    /// used by the tasks/create integration so an idempotency
+    /// used for a call accepted as a task, so an idempotency
     /// record never outlives the task it points at. `None` means
     /// "use the configured default".
     ///

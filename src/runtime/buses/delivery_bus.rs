@@ -1,5 +1,6 @@
-//! Delivery bus — internal pub/sub for routing server-initiated messages
-//! (deferred results, resource updates, progress) to the correct SSE stream.
+//! Delivery bus — internal pub/sub for routing server-initiated
+//! notifications (list changes, resource updates, progress) to the streams
+//! of a session.
 //!
 //! Single concrete impl `BusBackedDeliveryBus` over any
 //! `Arc<dyn mcpg_cluster_api::PubSub>`. Single-node deployments use
@@ -13,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::runtime::pipeline_store::DeliveryMessage;
 
 /// Internal pub/sub channel for routing server-initiated messages
-/// to the MCPG instance holding the client's active SSE stream.
+/// to the MCPG instance holding the client's stream.
 pub trait DeliveryBus: Send + Sync + std::fmt::Debug {
     /// Subscribe to delivery messages for a session.
     fn subscribe(
@@ -133,9 +134,8 @@ mod tests {
         let mut rx = bus.subscribe("sess-1").await;
 
         let msg = DeliveryMessage {
-            kind: DeliveryKind::ServerRequest,
-            jsonrpc_message: serde_json::json!({"method": "elicitation/create"}),
-            delivery_id: String::new(),
+            kind: DeliveryKind::Notification,
+            jsonrpc_message: serde_json::json!({"method": "notifications/tools/list_changed"}),
         };
         bus.publish("sess-1", msg).await.unwrap();
 
@@ -143,16 +143,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(received.kind, DeliveryKind::ServerRequest);
+        assert_eq!(received.kind, DeliveryKind::Notification);
     }
 
     #[tokio::test]
     async fn in_process_no_subscriber_does_not_error() {
         let bus = BusBackedDeliveryBus::new_in_memory();
         let msg = DeliveryMessage {
-            kind: DeliveryKind::DeferredToolResult,
+            kind: DeliveryKind::ProgressNotification,
             jsonrpc_message: serde_json::json!({}),
-            delivery_id: String::new(),
         };
         bus.publish("sess-no-sub", msg).await.unwrap();
     }
@@ -164,9 +163,8 @@ mod tests {
         let _rx2 = bus.subscribe("sess-2").await;
 
         let msg = DeliveryMessage {
-            kind: DeliveryKind::PipelineError,
-            jsonrpc_message: serde_json::json!({"error": true}),
-            delivery_id: String::new(),
+            kind: DeliveryKind::ResourceUpdated,
+            jsonrpc_message: serde_json::json!({"method": "notifications/resources/updated"}),
         };
         bus.publish("sess-1", msg).await.unwrap();
 
@@ -174,7 +172,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(received.kind, DeliveryKind::PipelineError);
+        assert_eq!(received.kind, DeliveryKind::ResourceUpdated);
     }
 
     /// A bus that counts the subscriptions alive on it.

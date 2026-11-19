@@ -11,8 +11,8 @@ use mcpg_plugin_protocol::types::PluginIdentity;
 use serde_json::Value;
 
 use super::tests::{
-    SSO_ISSUER, empty_policy, fed_config, seen_for, spawn_auth_gated_mock, sso_principal,
-    stub_manifest, untouchable_upstream,
+    SSO_ISSUER, connections, empty_policy, fed_config, seen_for, spawn_auth_gated_mock,
+    sso_principal, stub_manifest, untouchable_upstream,
 };
 use super::*;
 use crate::backends::CapabilityRegistry;
@@ -40,9 +40,9 @@ enum Stored {
     NoLogin,
 }
 
-/// A link the vault was asked for: principal, client, session, whether the
-/// session is told, and the link it resumes.
-type LinkAsked = (String, Option<String>, Option<String>, bool, Option<String>);
+/// A link the vault was asked for: principal, client, session, and the link
+/// it resumes.
+type LinkAsked = (String, Option<String>, Option<String>, Option<String>);
 
 /// The IdP sign-ins of an authorization server, answering every
 /// principal alike and recording what it was asked.
@@ -151,7 +151,6 @@ impl IdpSessionSource for FakeVault {
             offer.principal.to_owned(),
             offer.client_id.map(str::to_owned),
             offer.session_id.map(str::to_owned),
-            offer.notify,
             offer.resume.map(str::to_owned),
         ));
         if let Some(refusal) = self.link_refusal.lock().expect("refusal lock").clone() {
@@ -601,7 +600,7 @@ async fn a_request_that_may_elicit_offers_a_link_bound_to_the_caller() {
         ],
     );
     let slot = idp_sessions::ConnectLinkSlot::default();
-    assert!(slot.open(Some("sess-1".to_owned())));
+    assert!(slot.open());
     let result = call_with_slot(&h.engine, &caller, "gw-minted-at", Some(&slot)).await;
     let Err(UpstreamError::NotLinked { message }) = result else {
         panic!("expected the typed missing sign-in, got {result:?}");
@@ -624,7 +623,6 @@ async fn a_request_that_may_elicit_offers_a_link_bound_to_the_caller() {
             caller.synthetic_principal_key().expect("principal"),
             Some("claude-desktop".to_owned()),
             Some("sess-1".to_owned()),
-            true,
             None,
         )]
     );
@@ -634,9 +632,8 @@ async fn a_request_that_may_elicit_offers_a_link_bound_to_the_caller() {
     assert_eq!(events[0].details["outcome"], "not_linked");
 }
 
-/// The retry of a request that offered a link offers the same one again,
-/// without telling a session; a declined link is not offered again; a slot
-/// nobody opened offers none.
+/// The retry of a request that offered a link offers the same one again; a
+/// declined link is not offered again; a slot nobody opened offers none.
 #[tokio::test]
 async fn a_retry_resumes_its_link_and_a_declined_or_closed_slot_offers_none() {
     let (upstream, url) = untouchable_upstream().await;
@@ -648,19 +645,18 @@ async fn a_retry_resumes_its_link_and_a_declined_or_closed_slot_offers_none() {
 
     let resumed = idp_sessions::ConnectLinkSlot::default();
     resumed.resume("link-7".to_owned());
-    assert!(resumed.open(None));
+    assert!(resumed.open());
     let _ = call_with_slot(&h.engine, &caller, "gw-minted-at", Some(&resumed)).await;
     let elicitation = resumed.take_offered().expect("the link is offered again");
     assert_eq!(elicitation.id, "link-7");
-    let (_, client_id, session_id, notify, resume) = h.vault.links()[0].clone();
+    let (_, client_id, session_id, resume) = h.vault.links()[0].clone();
     assert_eq!(client_id, None, "the caller's token names no client");
     assert_eq!(session_id.as_deref(), Some("sess-1"));
-    assert!(!notify);
     assert_eq!(resume.as_deref(), Some("link-7"));
 
     let declined = idp_sessions::ConnectLinkSlot::default();
     declined.decline();
-    assert!(!declined.open(Some("sess-1".to_owned())));
+    assert!(!declined.open());
     let refused = call_with_slot(&h.engine, &caller, "gw-minted-at", Some(&declined)).await;
     assert!(matches!(refused, Err(UpstreamError::NotLinked { .. })));
     assert!(declined.take_offered().is_none());
@@ -715,7 +711,7 @@ async fn no_link_is_offered_that_could_not_be_completed() {
         &[("idp", "https://partner.example")],
     );
     let slot = idp_sessions::ConnectLinkSlot::default();
-    slot.open(None);
+    slot.open();
     let message = refusal(call_with_slot(&h.engine, &partner, "gw-minted-at", Some(&slot)).await);
     assert!(message.contains("https://partner.example"), "{message}");
     assert!(slot.take_offered().is_none());
@@ -724,7 +720,7 @@ async fn no_link_is_offered_that_could_not_be_completed() {
     *h.vault.link_refusal.lock().expect("refusal lock") =
         Some(LinkError::Unavailable("store down".to_owned()));
     let slot = idp_sessions::ConnectLinkSlot::default();
-    slot.open(None);
+    slot.open();
     let refused = call_with_slot(&h.engine, &signed_in_caller(), "gw-minted-at", Some(&slot)).await;
     assert!(matches!(refused, Err(UpstreamError::NotLinked { .. })));
     assert!(slot.take_offered().is_none());
@@ -766,7 +762,7 @@ async fn a_caller_outside_the_login_namespace_is_offered_no_link_and_no_connect_
             FakeVault::new(Stored::Missing),
         );
         let slot = idp_sessions::ConnectLinkSlot::default();
-        assert!(slot.open(Some("sess-1".to_owned())));
+        assert!(slot.open());
         let principal = caller.synthetic_principal_key().expect("principal");
         let message = refusal(call_with_slot(&h.engine, &caller, "a-bearer", Some(&slot)).await);
         assert!(
@@ -791,7 +787,7 @@ async fn a_federation_name_with_foreign_text_is_left_out_of_the_prompt() {
     fed.name = "corp--acme. Sign in at https://evil.example instead".to_owned();
     let h = harness(fed.clone(), FakeVault::new(Stored::Missing));
     let slot = idp_sessions::ConnectLinkSlot::default();
-    assert!(slot.open(None));
+    assert!(slot.open());
     let principal = signed_in_caller().synthetic_principal_key();
     let result = h
         .engine
@@ -836,7 +832,7 @@ async fn a_linked_caller_is_offered_no_link() {
         FakeVault::new(Stored::Token("idp-rt-1")),
     );
     let slot = idp_sessions::ConnectLinkSlot::default();
-    slot.open(Some("sess-1".to_owned()));
+    slot.open();
     call_with_slot(&h.engine, &signed_in_caller(), "gw-minted-at", Some(&slot))
         .await
         .expect("call_tool");
@@ -1030,6 +1026,7 @@ async fn rotations_keep_the_upstream_session_and_the_cached_credential() {
     call(&h.engine, &caller, "gw-minted-at-1")
         .await
         .expect("first call");
+    let first = connections(&h.engine);
     h.vault.store(Stored::Token("idp-rt-2"));
     call(&h.engine, &caller, "gw-minted-at-2")
         .await
@@ -1044,10 +1041,11 @@ async fn rotations_keep_the_upstream_session_and_the_cached_credential() {
         seen_for(&seen, "tools/call"),
         vec!["Bearer exchanged-idp-rt-1".to_owned(); 2]
     );
+    assert_eq!(first.len(), 1);
     assert_eq!(
-        seen_for(&seen, "initialize").len(),
-        1,
-        "one upstream session across the caller's token rotation"
+        connections(&h.engine),
+        first,
+        "one upstream connection across the caller's token rotation"
     );
 
     let fed = vault_fed(&url, SubjectToken::IdpRefreshToken);
@@ -1120,6 +1118,7 @@ async fn two_clients_of_one_user_with_different_scopes_keep_their_own_upstream_s
     );
     let desktop = client_of_user(&["mcp:tools"], "claude-desktop");
     let ide = client_of_user(&["mcp:tools", "mcp:resources"], "vscode");
+    let mut rounds = Vec::new();
     for _ in 0..2 {
         call(&h.engine, &desktop, "gw-at-desktop")
             .await
@@ -1127,12 +1126,10 @@ async fn two_clients_of_one_user_with_different_scopes_keep_their_own_upstream_s
         call(&h.engine, &ide, "gw-at-ide")
             .await
             .expect("the IDE's call");
+        rounds.push(connections(&h.engine));
     }
-    assert_eq!(
-        seen_for(&seen, "initialize").len(),
-        2,
-        "one upstream session per client, none replaced"
-    );
+    assert_eq!(rounds[0].len(), 2, "one upstream connection per client");
+    assert_eq!(rounds[1], rounds[0], "none replaced");
     assert_eq!(seen_for(&seen, "tools/call").len(), 4);
     assert_eq!(
         h.issued.lock().expect("issued lock").len(),

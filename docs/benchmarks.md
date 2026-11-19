@@ -2,9 +2,8 @@
 
 The measured figures of the current build are on the benchmarks page,
 [mcpg.dev/docs/operations/benchmarks](https://mcpg.dev/docs/operations/benchmarks):
-tool calls on one gateway and on NATS and Redis fleets, sessions,
-notifications, watches, limits, MCP Events, the coordinator store, the plugin
-boundary, request costs, memory and threads, and how to size a deployment from
+tool calls on one gateway and on NATS and Redis fleets, watches and
+failover, limits, MCP Events, the coordinator store, the plugin boundary, request costs, memory and threads, and how to size a deployment from
 them.
 
 This file names the gateway's own bench suites and how to run them.
@@ -29,11 +28,11 @@ Each test starts a gateway with mock bindings and drives it over HTTP.
 
 | Test | What it measures |
 |---|---|
-| `tests/bench_load.rs` | sustained `tools/call` load: throughput, latency, memory growth and session leaks; `bench_sustained_load_high` runs 250, 500 and 1 000 sessions (`BENCH_MAX_SESSIONS` caps the tiers) |
-| `tests/bench_gateway.rs` | the full session lifecycle from 1 to 500 clients, `tools/list` throughput, the time of one session |
-| `tests/bench_plugins.rs` | what plugins, the debug tools and the number of bindings cost at 100 sessions |
-| `tests/bench_backend_latency.rs` | throughput and latency when the backend takes 0 to 500 ms, at 10, 50 and 100 sessions |
-| `tests/bench_backends.rs` | the HTTP, GraphQL and command backends against a local upstream; gate costs; `bench_memory`: memory per session, idle memory and memory after a drain, against ceilings |
+| `tests/bench_load.rs` | sustained `tools/call` load: throughput, latency and memory growth; `bench_sustained_load_high` runs tiers of 250, 500 and 1 000 concurrent clients (`BENCH_MAX_SESSIONS` caps the tiers) |
+| `tests/bench_gateway.rs` | `server/discover` → `tools/list` → `tools/call` ×10 from 1 to 500 concurrent clients, and `tools/list` throughput |
+| `tests/bench_plugins.rs` | what plugins, the debug tools and the number of bindings cost at 100 concurrent clients |
+| `tests/bench_backend_latency.rs` | throughput and latency when the backend takes 0 to 500 ms, at 10, 50 and 100 concurrent clients |
+| `tests/bench_backends.rs` | the HTTP, GraphQL and command backends against a local upstream; gate costs; `bench_memory`: memory per concurrent client, idle memory and memory after a drain, against ceilings |
 | `tests/bench_pipeline.rs` | the cost of each request-pipeline stage, of idempotency, of an out-of-process plugin, and the throughput ceiling |
 
 ```sh

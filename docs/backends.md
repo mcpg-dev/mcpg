@@ -638,10 +638,10 @@ LISTEN connection per watcher and re-emits NOTIFY payloads as
 Both plumb through the same fan-out (P2.6): once a plugin emits
 a `WatchEvent`, it flows through `notification_filter` (All /
 SubjectId / SessionId / CEL `Expression`) → `SubscriptionStore`
-→ `DeliveryBus` → MCP session SSE. The cluster delivery bus
-routes per-session, so a watch event firing on replica A
-reaches a subscriber session pinned to replica B with no extra
-wiring. Every replica runs its own watch loop — DB load scales
+→ `DeliveryBus` → the subscriber's `subscriptions/listen` stream.
+The cluster delivery bus routes per session row, so a watch event
+firing on replica A reaches a listen stream held on replica B with
+no extra wiring. Every replica runs its own watch loop — DB load scales
 with replica count for both polling and LISTEN — but the
 cluster bus deduplicates delivery to one wire per subscriber.
 

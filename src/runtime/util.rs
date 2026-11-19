@@ -283,9 +283,6 @@ pub(crate) fn build_watch_resource_fetcher(
             expr_ctx: request_context.to_expr_context(&profile, Some(&args_value)),
             progress_token: None,
             request_log_level: None,
-            // Synthetic watch context — no client session, so no
-            // legacy `logging/setLevel` floor applies.
-            legacy_session_log_level: None,
             client_capabilities: crate::protocol::ClientCapabilities::default(),
             cancellation_token: None,
             idempotency_hint: None,
@@ -336,14 +333,11 @@ pub(crate) fn build_watch_resource_fetcher(
 /// Build a synthetic [`RequestContext`] for the watch-engine fetcher.
 /// The fetcher is system-initiated — there's no real session, identity,
 /// or transport — so we pin every field to a fixed anonymous value.
-/// The request id changes on every poll so request-id de-dup logic
-/// further down the stack doesn't accidentally treat a series of polls
-/// as one repeated client call.
+/// The request id changes on every poll, so the polls stay distinct
+/// requests in the logs and the audit trail.
 pub(crate) fn synthetic_watch_request_context() -> RequestContext {
     RequestContext::new(
         GatewayRequestId::new(),
-        None,
-        None,
         None,
         RequestIdentity::Anonymous {
             source: "watch-resource-fetcher".to_owned(),
@@ -352,30 +346,20 @@ pub(crate) fn synthetic_watch_request_context() -> RequestContext {
     )
 }
 
-/// Version-aware extraction of the request progress token from a
-/// request's `_meta`.
-///
-/// - Modern (`2026-07-28`): the token lives under the reverse-DNS
-///   key `io.modelcontextprotocol/progressToken` (SEP-2575 moved every
-///   per-request hint under the spec namespace). Falls back to the
-///   bare `progressToken` so a transitional client that mixes shapes
-///   still tokens progress.
-/// - Legacy (`2025-11-25`): the bare `_meta.progressToken`.
+/// The request progress token from a request's `_meta`: the reverse-DNS
+/// key `io.modelcontextprotocol/progressToken` (SEP-2575 puts every
+/// per-request hint under the spec namespace), else the bare
+/// `progressToken`.
 ///
 /// Returns the validated token (`String` or `Number`) or an error
 /// message when present but the wrong JSON type. Absent ⇒ `Ok(None)`.
 pub(crate) fn extract_request_progress_token(
     meta: Option<&Value>,
-    version: crate::protocol::version::ProtocolVersion,
 ) -> Result<Option<Value>, &'static str> {
     use crate::protocol::v_2026_07_28::wire::meta::META_KEY_PROGRESS_TOKEN;
     let raw = meta.and_then(|m| {
-        if version == crate::protocol::version::ProtocolVersion::V_2026_07_28 {
-            m.get(META_KEY_PROGRESS_TOKEN)
-                .or_else(|| m.get("progressToken"))
-        } else {
-            m.get("progressToken")
-        }
+        m.get(META_KEY_PROGRESS_TOKEN)
+            .or_else(|| m.get("progressToken"))
     });
     match raw {
         None => Ok(None),
@@ -385,45 +369,25 @@ pub(crate) fn extract_request_progress_token(
     }
 }
 
-/// SEP-2575 per-request log-level floor. Modern (`2026-07-28`) wire
-/// only: parse `_meta.io.modelcontextprotocol/logLevel` into the typed
+/// SEP-2575 per-request log-level floor: parse
+/// `_meta.io.modelcontextprotocol/logLevel` into the typed
 /// [`LogLevel`](crate::protocol::v_2026_07_28::wire::meta::LogLevel).
 ///
-/// Returns `Ok(None)` on the legacy wire (the field is never consulted
-/// there) and when the key is absent on the modern wire. Returns
-/// `Err` when present but not a recognised level string — a malformed
-/// hint should surface as a `-32602`, not silently emit everything.
-///
-/// Note the *meaning* of `None` differs by wire and is interpreted at
-/// the emission site: on the modern wire `None` means "suppress every
-/// `notifications/message` for this request" (the spec MUST), while on
-/// the legacy wire log notifications are emitted unconditionally.
+/// Returns `Ok(None)` when the key is absent, which the emission site
+/// reads as "suppress every `notifications/message` for this request"
+/// (the spec MUST). Returns `Err` when present but not a recognised
+/// level string — a malformed hint should surface as a `-32602`, not
+/// silently emit everything.
 pub(crate) fn extract_request_log_level(
     meta: Option<&Value>,
-    version: crate::protocol::version::ProtocolVersion,
 ) -> Result<Option<crate::protocol::v_2026_07_28::wire::meta::LogLevel>, &'static str> {
     use crate::protocol::v_2026_07_28::wire::meta::{LogLevel, META_KEY_LOG_LEVEL};
-    if version != crate::protocol::version::ProtocolVersion::V_2026_07_28 {
-        return Ok(None);
-    }
     match meta.and_then(|m| m.get(META_KEY_LOG_LEVEL)) {
         None => Ok(None),
         Some(Value::String(s)) => LogLevel::parse_str(s).map(Some).ok_or(
             "_meta.io.modelcontextprotocol/logLevel must be one of the eight RFC-5424 levels",
         ),
         Some(_) => Err("_meta.io.modelcontextprotocol/logLevel must be a string"),
-    }
-}
-
-pub(crate) fn negotiate_protocol_version(requested_version: &str) -> &str {
-    // Echo the client's requested revision when the gateway serves it
-    // through the session-based `initialize` lifecycle; otherwise fall back
-    // to the gateway's preferred revision. The stateless modern revision
-    // has no `initialize`, so the served set here is exactly the
-    // session-requiring revisions.
-    match crate::protocol::version::ProtocolVersion::parse(requested_version) {
-        Some(version) if version.requires_session() => version.as_str(),
-        _ => SUPPORTED_PROTOCOL_VERSION,
     }
 }
 
@@ -582,13 +546,13 @@ pub(crate) fn merge_plugin_gate_meta(
     result_value
 }
 
-/// Map a single suspended server request into the modern SEP-2322
+/// Map a single suspended server request into the SEP-2322
 /// `inputRequests` map (keyed by the server-minted correlation token),
 /// serialized as the `Value` the task store persists. Mirrors the
-/// translation in `build_modern_input_required_response_multi` so a
+/// translation in `build_input_required_response_multi` so a
 /// task awaiting input surfaces the same `inputRequests` shape on
 /// `tasks/get` that the inline MRTR path emits.
-pub(crate) fn modern_input_requests_from_server_request(
+pub(crate) fn input_requests_from_server_request(
     server_request: &crate::protocol::ServerJsonRpcRequest,
 ) -> Result<serde_json::Value, String> {
     use crate::protocol::v_2026_07_28::wire::mrtr::InputRequest;
@@ -605,7 +569,7 @@ pub(crate) fn modern_input_requests_from_server_request(
         },
         other => {
             return Err(format!(
-                "modern task input cannot translate `{other}` to InputRequest"
+                "task input cannot translate `{other}` to InputRequest"
             ));
         }
     };
@@ -628,17 +592,6 @@ pub(crate) fn scopeguard_cancellation(
     }
 }
 
-/// Extract the JSON-RPC `id` of a client-initiated request operation.
-///
-/// Delegates to [`ProtocolOperation::client_request_id`] rather than
-/// re-matching the variants: the two copies drifted once already, and the
-/// consequence was silent — the duplicate kept reporting the id that
-/// `notifications/cancelled` merely *targets*, so the dedup gate rejected
-/// every cancellation of a request the client had actually issued.
-pub(crate) fn client_request_id(op: &ProtocolOperation) -> Option<Value> {
-    op.client_request_id()
-}
-
 pub(crate) fn protocol_http_error(
     http_status: u16,
     id: Option<serde_json::Value>,
@@ -655,7 +608,6 @@ pub(crate) fn protocol_http_error(
     .increment(1);
     ProtocolHttpResponse {
         http_status,
-        session_id_header: None,
         response: ProtocolResponse::JsonRpcError(JsonRpcError {
             jsonrpc: JSONRPC_VERSION,
             id,

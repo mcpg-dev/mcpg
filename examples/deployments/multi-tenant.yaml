@@ -27,7 +27,8 @@ gateway:
       - "https://gateway.example.com"
     request_timeout_ms: 30000
     session_idle_timeout_ms: 900000
-    # Per-tenant concurrent-session cap (keyed by resolved tenant id).
+    # Per-principal cap on the internal session rows the gateway keeps for
+    # listen streams, tasks and requests that wait for input.
     # 0 = unlimited; 100 is a starting point — raise per SLA tier.
     max_sessions_per_tenant: 100
 
@@ -41,9 +42,9 @@ cluster:
   password: "${env.MCPG_REDIS_PASSWORD}"
   key_prefix: "mcpg:multi-tenant"
   # Required for any non-single_node cluster: seals all Redis-held tenant
-  # state (sessions incl. SSE replay, pipelines, tasks, delivery, …) with
-  # XChaCha20-Poly1305 and derives the cross-replica modern-session resume
-  # key. Names the env var (no `${env.…}`); the var must hold a
+  # state (sessions, pipelines, tasks, delivery, …) with
+  # XChaCha20-Poly1305 and derives the cross-replica session and resume
+  # keys. Names the env var (no `${env.…}`); the var must hold a
   # URL-safe-base64 32-byte key, IDENTICAL on every replica:
   #   openssl rand -base64 32 | tr '+/' '-_'
   state_encryption_key_env: "MCPG_CLUSTER_STATE_KEY"
@@ -111,8 +112,8 @@ plugins:
       oci: "ghcr.io/mcpg-dev/plugins/rate-limit:0.1.0-alpha.42"
     config:
       # per_principal scope (the default) keys the bucket on the
-      # authenticated principal; unauthenticated requests fall back
-      # to the session id.
+      # authenticated principal; unauthenticated requests share one
+      # `_anon` bucket.
       default_limit: 600
       default_window_ms: 60000
       default_burst: 50

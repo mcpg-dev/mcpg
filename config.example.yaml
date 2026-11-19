@@ -335,8 +335,9 @@ mcp:
 
       # --- Pipeline with elicitation (human-in-the-loop) ---
       # This pipeline suspends and asks the client for confirmation before proceeding.
-      # The initial tools/call returns 202 Accepted, and the server sends an
-      # elicitation/create request via SSE. The client responds, and the pipeline resumes.
+      # The tools/call answers with an InputRequiredResult that carries the
+      # elicitation/create request and a requestState. The client retries the call
+      # with its inputResponses and that requestState, and the pipeline resumes.
 
       - name: orders.place_with_confirmation
         title: Place Order with Confirmation
@@ -506,7 +507,7 @@ mcp:
     #       url: https://api.example.com/config
     #       method: get
     #       timeout_ms: 5000
-    #     watch:                              # enables resources/subscribe for this binding
+    #     watch:                              # sends notifications/resources/updated to subscriptions/listen streams
     #       strategy:
     #         type: poll                      # poll | nats_topic | kafka_topic | webhook
     #         interval_ms: 30000
@@ -541,7 +542,6 @@ gateway:
     mcp_path: /mcp
     allowed_origins:
       - http://localhost:3000
-    replay_window_limit: 16
     session_idle_timeout_ms: 900000
 
   # --- Sessions / subscriptions / delivery ---
@@ -750,9 +750,9 @@ governance:
 #   key_prefix: "mcpg:cluster:"
 
 # --- Delivery bus ---
-# The delivery bus routes server-initiated messages (elicitation,
-# sampling, deferred results) to the MCPG instance holding the
-# client's active SSE stream. Configured under
+# The delivery bus routes notifications (list changes, task status,
+# resource updates) to the MCPG instance holding the client's
+# `subscriptions/listen` stream. Configured under
 # `mcp.configurations.delivery.bus:` (or omitted to inherit
 # `kind: cluster`, which delegates to the cluster backend's
 # primitive).
@@ -764,10 +764,9 @@ governance:
 # - `bus: { kind: memory }` — explicit in-process; only correct on
 #   single-instance deploys.
 #
-# Multi-instance deploys with pipeline / elicitation / sampling
-# bindings need a non-memory delivery bus so the gateway holding
-# the client SSE stream can be reached by the gateway that
-# triggered the suspension. Today that means
+# Multi-instance deploys need a non-memory delivery bus so the
+# gateway holding a client's listen stream can be reached by the
+# gateway that raised the notification. That means
 # `cluster.kind: redis` or `cluster.kind: nats`.
 
 # ---------------------------------------------------------------------------

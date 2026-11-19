@@ -3,13 +3,11 @@
 # a local MCPG built from this worktree.
 #
 # Usage:
-#   ./run.sh 2025-11-25       # legacy wire
-#   ./run.sh 2026-07-28       # modern wire (alias: DRAFT-2026-v1)
-#   ./run.sh both             # run both sequentially
+#   ./run.sh 2026-07-28       # the MCP revision MCPG serves (the default)
 #
 # Env:
 #   CONFORMANCE_VERSION  npm tag of the suite to use
-#                        (default: 0.2.0-alpha.0 — has DRAFT-2026 scenarios)
+#                        (default: 0.2.0-alpha.9 — knows the 2026-07-28 spec id)
 #   MCPG_CONFIG          path to MCPG config yaml
 #                        (default: ./config-everything.yaml — the full fixture
 #                        catalog every tools-call/resources-read/prompts-get
@@ -21,7 +19,7 @@
 #                        gateway config field.)
 #   RESULTS_DIR          output directory for checks.json
 #                        (default: ./results/<version>-<timestamp>/)
-#   SCENARIO             optional single scenario name (e.g. server-initialize)
+#   SCENARIO             optional single scenario name (e.g. server-discover)
 #
 #   --- cross-platform build knobs (the conformance.yml windows lane) ---
 #   CONFORMANCE_TARGET       cargo target triple to build/run for (e.g.
@@ -43,9 +41,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-VERSION="${1:-2025-11-25}"
-# 0.2.0-alpha.5+ knows the ratified `2026-07-28` spec id; older alphas only
-# accept its pre-ratification name and abort the modern-wire run at arg parse.
+VERSION="${1:-2026-07-28}"
+# The suite has to know the `2026-07-28` spec id (0.2.0-alpha.5 and later).
 CONFORMANCE_VERSION="${CONFORMANCE_VERSION:-0.2.0-alpha.9}"
 # Default to the FULL fixture catalog: config-baseline.yaml defines no
 # tools/resources/prompts, so it fails every tools-call/resources-read/
@@ -104,9 +101,8 @@ winpath() {
   esac
 }
 
-# Build (or accept a prebuilt) gateway + mock backend cdylib. Spec-version-
-# independent, so it runs ONCE up front and both wires reuse it. The mock
-# backend is a runtime-loaded cdylib (no static backends since the backend-
+# Build (or accept a prebuilt) gateway + mock backend cdylib, ONCE up front.
+# The mock backend is a runtime-loaded cdylib (no static backends since the backend-
 # plugin migration); the everything/baseline configs drive every tool/resource/
 # prompt through `kind: mock`, so without it each call returns "mock backend
 # plugin not registered" and the content scenarios fail. run_one_version injects
@@ -274,34 +270,21 @@ YAML
   return "${exit_code}"
 }
 
-# Build (or accept prebuilt) the gateway + mock cdylib ONCE — both wires reuse
-# the one build. CONFORMANCE_BUILD_ONLY stops here (the linux cross-build half
-# of the windows lane just produces+uploads the artifacts).
+case "${VERSION}" in
+  2026-07-28) ;;
+  *)
+    echo "error: unknown version '${VERSION}'. MCPG serves MCP 2026-07-28." >&2
+    exit 2
+    ;;
+esac
+
+# Build (or accept prebuilt) the gateway + mock cdylib. CONFORMANCE_BUILD_ONLY
+# stops here (the linux cross-build half of the windows lane just
+# produces+uploads the artifacts).
 build_artifacts
 if [ "${BUILD_ONLY}" = 1 ]; then
   echo "==> build-only: artifacts ready at ${ART_DIR} (skipping suite run)"
   exit 0
 fi
 
-case "${VERSION}" in
-  2025-11-25|2026-07-28)
-    run_one_version "${VERSION}"
-    ;;
-  # Accept the pre-final modern label as an alias for `2026-07-28`.
-  DRAFT-2026-v1)
-    run_one_version 2026-07-28
-    ;;
-  both)
-    # Run both wires regardless of the first's outcome, but propagate
-    # a non-zero exit if EITHER fails so the conformance run
-    # (and CI) treat a regression on either wire as a failure.
-    both_status=0
-    run_one_version 2025-11-25 || both_status=1
-    run_one_version 2026-07-28 || both_status=1
-    exit "${both_status}"
-    ;;
-  *)
-    echo "error: unknown version '${VERSION}'. Use 2025-11-25 or 2026-07-28 or both." >&2
-    exit 2
-    ;;
-esac
+run_one_version "${VERSION}"

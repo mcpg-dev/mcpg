@@ -1,4 +1,5 @@
-//! `lifecycle` dispatch arms for MCP revision `2026-07-28`.
+//! `server/discover`: the server's identity, supported versions and
+//! capabilities.
 
 use serde_json::{Value, json};
 
@@ -11,8 +12,8 @@ use crate::protocol::v_2026_07_28::wire::lifecycle::{
     PromptsCapability, ResourcesCapability, ServerCapabilities, ToolsCapability,
 };
 use crate::protocol::v_2026_07_28::wire::tools::CacheScope;
-use crate::runtime::TransportKind;
 use crate::runtime::shared_services::SharedServices;
+use crate::runtime::{GatewayRuntime, TransportKind};
 
 /// `server/discover`'s `instructions` when `mcp.instructions` is unset.
 const DEFAULT_INSTRUCTIONS: &str = "MCPG is speaking 2026-07-28. Capabilities reflect the \
@@ -20,6 +21,7 @@ const DEFAULT_INSTRUCTIONS: &str = "MCPG is speaking 2026-07-28. Capabilities re
 
 pub(crate) fn build_discover_result(
     services: &SharedServices,
+    runtime: &GatewayRuntime,
     transport: &TransportKind,
 ) -> DiscoverResult {
     use crate::protocol::v_2026_07_28::extensions::tasks::wire::{
@@ -38,25 +40,20 @@ pub(crate) fn build_discover_result(
     //
     // Config is only half the catalog. Federated, registry-synthesized and
     // gateway-app capabilities arrive after boot and live in the capability
-    // registry, so gating on the config snapshot alone made a gateway whose
-    // tools ALL come from upstreams — the registry-sync mainline — advertise
-    // no tools at all, while legacy `initialize` advertised them fine.
+    // registry, so the live runtime is consulted too: a gateway whose tools
+    // ALL come from upstreams — the registry-sync mainline — advertises them.
     let caps = &services.config_snapshot.mcp.capabilities;
-    let live = services.runtime().map(|swap| swap.load_full());
-    let live = live.as_deref();
-    let has_tools = !caps.tools.is_empty() || live.is_some_and(|rt| rt.has_live_tools());
-    let has_prompts = !caps.prompts.is_empty() || live.is_some_and(|rt| rt.has_live_prompts());
+    let has_tools = !caps.tools.is_empty() || runtime.has_live_tools();
+    let has_prompts = !caps.prompts.is_empty() || runtime.has_live_prompts();
     let has_resources = !caps.resources.is_empty()
         || !caps.resource_templates.is_empty()
-        || live.is_some_and(|rt| rt.has_live_resources());
-    let has_completions =
-        caps.has_completions() || live.is_some_and(|rt| rt.has_live_completions());
+        || runtime.has_live_resources();
+    let has_completions = caps.has_completions() || runtime.has_live_completions();
 
     // SEP-2133 extensions map. Each entry is keyed by the
     // extension's reverse-DNS namespace; the value is a free-form
     // capability object the extension owns. Tasks is advertised
-    // whenever any operator tool has `task_support` enabled —
-    // matches the legacy initialize behaviour.
+    // whenever any operator tool has `task_support` enabled.
     let mut extensions = serde_json::Map::new();
     // `task_support` is an opt-in per-tool string (e.g.
     // `"required"` / `"optional"`). Any tool declaring it
@@ -87,37 +84,28 @@ pub(crate) fn build_discover_result(
     }
 
     // Enterprise-Managed Authorization: declared while the embedded
-    // authorization server is installed. The live runtime is authoritative
+    // authorization server is installed. The runtime is authoritative
     // because a reload rebuilds the server but not this config snapshot.
     // An HTTP-transport auth flow; stdio carries no bearer.
-    let ema_installed = match live {
-        Some(rt) => rt.ema_authorization_server().is_some(),
-        None => services
-            .config_snapshot
-            .governance
-            .access
-            .authorization_server
-            .is_some(),
-    };
-    if ema_installed && *transport == TransportKind::Http {
+    if runtime.ema_authorization_server().is_some() && *transport == TransportKind::Http {
         extensions.insert(
             crate::runtime::authorization_server::EXTENSION_ID.to_owned(),
             serde_json::json!({}),
         );
     }
 
-    // SEP-2640 Skills, from the live runtime: a reload that adds or drops
-    // every source changes it.
-    if let Some(skills) = live.and_then(|rt| rt.skills_capability()) {
+    // SEP-2640 Skills, from the runtime: a reload that adds or drops every
+    // source changes it.
+    if let Some(skills) = runtime.skills_capability() {
         extensions.insert(
             crate::protocol::shared::skills::EXTENSION_ID.to_owned(),
             skills,
         );
     }
 
-    // `dev.mcpg/idempotency`, advertised exactly as legacy `initialize`
-    // advertises it: only while the operator enabled the extension.
-    if let Some(idempotency) = live.and_then(|rt| rt.idempotency_capability()) {
+    // `dev.mcpg/idempotency`: advertised only while the operator enabled
+    // the extension.
+    if let Some(idempotency) = runtime.idempotency_capability() {
         extensions.insert(
             crate::runtime::idempotency::EXTENSION_ID.to_owned(),
             idempotency.clone(),
@@ -127,10 +115,9 @@ pub(crate) fn build_discover_result(
     // MCP Events, in each location the operator chose. Config and the
     // installed core decide it, never the caller, because this result is
     // publicly cacheable.
-    let events_config =
-        crate::protocol::v_2026_07_28::dispatch::events::live_events_config(services);
+    let events_config = runtime.events_config();
     let events_served = crate::protocol::v_2026_07_28::dispatch::events::events_served(
-        &events_config,
+        events_config,
         services,
         transport,
     );
@@ -145,13 +132,10 @@ pub(crate) fn build_discover_result(
         extensions.insert(EVENTS_EXTENSION_ID.to_owned(), served_capability.to_value());
     }
 
-    // Same supported-versions surface as the unsupported-version
-    // error response — keep the two correlated so the conformance
-    // suite's `ServerUnsupportedVersionError` check sees a strict
-    // subset relationship.
-    let supported_versions = crate::protocol::served_protocol_versions(
-        services.config_snapshot.gateway.server.legacy_wire,
-    );
+    // The same list the `-32022` refusal carries in `data.supported`, so
+    // the conformance suite's `ServerUnsupportedVersionError` check sees
+    // the two agree.
+    let supported_versions = vec![crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_owned()];
 
     let identity = &services.config_snapshot.mcp.server_info;
     DiscoverResult {
@@ -190,10 +174,9 @@ pub(crate) fn build_discover_result(
                 subscribe: Some(true),
                 cache: Some(CacheCapability {}),
             }),
-            // SEP-2575 / PR-02: advertise the `completions` capability
-            // (plural wire key) only when the operator wired an
-            // argument-completion source, matching the legacy
-            // `initialize` gate.
+            // SEP-2575: advertise the `completions` capability (plural
+            // wire key) only when the operator wired an
+            // argument-completion source.
             completions: has_completions.then_some(CompletionCapability {}),
             events: events_capability,
             extensions: if extensions.is_empty() {
@@ -216,13 +199,13 @@ pub(crate) fn build_discover_result(
         cache_scope: CacheScope::Public,
         // SEP-2596 feature-lifecycle advisory: surface the SEP-2577
         // Roots/Sampling/Logging deprecation status under the
-        // vendor-namespaced `_meta` key so a modern client can steer
+        // vendor-namespaced `_meta` key so a client can steer
         // migration before the removal window closes.
         meta: Some(discover_meta_advisory()),
     }
 }
 
-/// Build the SEP-2596 deprecation advisory value for the modern
+/// Build the SEP-2596 deprecation advisory value for the
 /// `server/discover` result `_meta`. Each entry names the feature, its
 /// lifecycle state, the deprecating SEP, and the migration pointer the
 /// spec prose carries.
@@ -310,7 +293,7 @@ mod events_advertisement_tests {
         let mut config = AppConfig::default();
         config.mcp.configurations.events.enabled = enabled;
         config.mcp.configurations.events.advertise = advertise;
-        let services = SharedServices::with_no_runtime(Arc::new(config));
+        let services = SharedServices::for_tests(Arc::new(config));
         if installed {
             services
                 .events
@@ -320,9 +303,14 @@ mod events_advertisement_tests {
         services
     }
 
+    /// `server/discover` over the runtime the services' config builds.
+    fn discover(services: &SharedServices, transport: TransportKind) -> DiscoverResult {
+        let runtime = crate::runtime::shared_services::test_runtime(&services.config_snapshot);
+        build_discover_result(services, &runtime, &transport)
+    }
+
     fn capabilities(services: &SharedServices, transport: TransportKind) -> Value {
-        let result = build_discover_result(services, &transport);
-        serde_json::to_value(&result).unwrap()["capabilities"].clone()
+        serde_json::to_value(discover(services, transport)).unwrap()["capabilities"].clone()
     }
 
     fn both() -> Vec<EventsAdvertiseLocation> {
@@ -366,10 +354,10 @@ mod events_advertisement_tests {
     /// entry.
     #[test]
     fn disabled_events_leave_discover_unchanged() {
-        let off = build_discover_result(&services(false, both(), true), &TransportKind::Http);
-        let baseline = build_discover_result(
-            &SharedServices::with_no_runtime(Arc::new(AppConfig::default())),
-            &TransportKind::Http,
+        let off = discover(&services(false, both(), true), TransportKind::Http);
+        let baseline = discover(
+            &SharedServices::for_tests(Arc::new(AppConfig::default())),
+            TransportKind::Http,
         );
         let off = serde_json::to_string(&off).unwrap();
         assert_eq!(off, serde_json::to_string(&baseline).unwrap());

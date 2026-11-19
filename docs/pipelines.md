@@ -204,12 +204,16 @@ The plugin receives the full pipeline context — `steps.<id>.output`, `argument
 
 ### Notification Steps (2)
 
-Non-suspending steps that emit a server-to-client notification on the
-session's SSE channel and then continue immediately.
+Non-suspending steps that emit a server-to-client notification for the
+request and then continue immediately. A `tools/call` that emitted any
+answers with a per-request SSE stream when the client accepts one: the
+notifications first, then the result.
 
 #### Log Step
 
-Emits a `notifications/message`.
+Emits a `notifications/message` when the request's `_meta` carries
+`io.modelcontextprotocol/logLevel` and the step's `level` is at or above it.
+A request without that key gets no log notifications.
 
 ```yaml
 - kind: log
@@ -273,7 +277,7 @@ standalone SQL `await` binding, exposed for pipeline composability.
 
 ### Suspending Steps (4)
 
-Suspending steps interrupt pipeline execution to interact with the client. The pipeline state is persisted to the pipeline store, and a server-initiated JSON-RPC request is delivered to the client via the delivery bus.
+Suspending steps interrupt pipeline execution to ask the client for input (Multi Round-Trip Requests). The pipeline state is persisted to the pipeline store, and the `tools/call` answers with an `InputRequiredResult` whose `inputRequests` carry the request and whose `requestState` names the paused pipeline.
 
 #### Elicitation Step
 
@@ -297,11 +301,13 @@ before anything is asked. Text without `${` is sent as written.
 
 **Execution flow**:
 1. Pipeline state serialized to pipeline store
-2. Server sends `elicitation/create` JSON-RPC request to client via delivery bus/SSE
-3. Pipeline suspends — `tools/call` returns HTTP 202 Accepted
-4. Client responds with `elicitation/create` response
-5. Pipeline resumes from the next step
-6. Client's response becomes the step's `output`
+2. `tools/call` returns HTTP 200 with an `InputRequiredResult`: an
+   `elicitation/create` entry in `inputRequests`, and a `requestState`
+3. Client collects the answer and calls the tool again with the
+   `requestState` and its answer in `inputResponses`
+4. The gateway checks the `requestState` (bound to the caller, accepted
+   once), claims the pipeline, and resumes from the next step
+5. Client's answer becomes the step's `output`
 
 #### Sampling Step
 
@@ -355,7 +361,7 @@ Each answered input lands in this step's output under its
 `correlation_token`, so downstream `transform` steps read
 `steps.collect_inputs.output.confirm`, etc.
 
-**Capability check**: Before suspending, the gateway checks `client_capabilities` from the session's `initialize` response. If the client does not support the requested interaction (elicitation / sampling / roots), the step returns an error instead of suspending.
+**Capability check**: Before suspending, the gateway checks the client capabilities the request carries in `_meta` (`io.modelcontextprotocol/clientCapabilities`). If the client does not support the requested interaction (elicitation / sampling / roots), the step returns an error instead of suspending.
 
 ## Pipeline Execution Lifecycle
 
@@ -379,12 +385,13 @@ tools/call with pipeline binding
            ├── Step error → Return error result
            │
            ├── Suspending step → Serialize state
-           │   │                  Send server request
-           │   │                  Return 202 Accepted
+           │   │                  Return InputRequiredResult
+           │   │                  (inputRequests + requestState)
            │   │
-           │   └── Client responds → Load state
-           │                         Resume from next step
-           │                         Continue sequential execution
+           │   └── Client retries with requestState
+           │       + inputResponses → Load + claim state
+           │                          Resume from next step
+           │                          Continue sequential execution
            │
            └── Timeout → Return timeout error
 ```
@@ -403,13 +410,17 @@ Persists pipeline execution state for suspension/resumption across load-balanced
 
 **CAS Fencing**: `state_version` field implements compare-and-set semantics. When resuming, the gateway claims the pipeline with `try_claim_pipeline(id, expected_version)`. Only one instance can resume a pipeline.
 
-### Delivery Bus
+### requestState Codec
 
-Routes server-initiated messages (elicitation requests, sampling requests, deferred results) to the SSE-stream-holding instance.
+Every replica derives the same `requestState` codec key (from
+`mcp.configurations.request_state.encryption_key`, or from
+`cluster.state_encryption_key_env`), so the retry can land on any replica.
 
-**Auto-selection**: NATS > Redis > InProcess
+### Pending Deliveries
 
-**Pending delivery fallback**: If no subscriber is connected, messages are stored as pending deliveries in the pipeline store. When the client reconnects via SSE, pending deliveries are replayed.
+`log` and `progress` steps store their notifications as pending deliveries on
+the request's session row; the transport drains them when the `tools/call`
+returns and sends them on the per-request SSE stream.
 
 ### Pipeline Reaper
 

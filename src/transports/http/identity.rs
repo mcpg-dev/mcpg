@@ -19,8 +19,8 @@ use crate::runtime::authorization_server::{EmaBearerOutcome, ExternalDpop, Exter
 /// metadata (stamped by the [`crate::transports::tls`] acceptor; absent on
 /// plain HTTP) threads through to `RequestMetadata.tls` so identity plugins
 /// like `dev.mcpg.identity.workload`'s X.509-SVID source can consume the
-/// peer cert chain. Its attested peer (from an `http`-wire transport such
-/// as a tailnet) names a caller whose request carries no verified
+/// peer cert chain. Its attested peer (from a transport plugin such as a
+/// tailnet) names a caller whose request carries no verified
 /// credential of its own; identity plugins run after it and may still
 /// replace it.
 ///
@@ -218,22 +218,11 @@ pub(crate) async fn build_request_context(
         .get(UPSTREAM_REQUEST_ID_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let session_id = headers
-        .get(SESSION_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let resume_cursor = headers
-        .get(LAST_EVENT_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.trim().is_empty())
-        .map(|last_event_id| ResumeCursor {
-            last_event_id: last_event_id.to_owned(),
-        });
 
     // Identity resolution priority:
     // 0. Gateway-minted EMA access tokens (embedded authorization server)
     // 1. OIDC/OAuth (enterprise identity) — async, supports discovery/introspection
-    // 2. JWKS (legacy JWT verification) — sync
+    // 2. JWKS (static JWT verification) — sync
     // 3. Header-asserted
     // 4. Anonymous
     //
@@ -526,8 +515,6 @@ pub(crate) async fn build_request_context(
     let ctx = RequestContext::new(
         request_id,
         upstream_request_id,
-        session_id,
-        resume_cursor,
         identity,
         TransportKind::Http,
     )
@@ -555,15 +542,13 @@ async fn enrich_identity_via_plugins(
     }
 
     // Convert HeaderMap to plugin-friendly (String, String) pairs
-    let header_pairs: Vec<(String, String)> = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|v| (name.as_str().to_owned(), v.to_owned()))
-        })
-        .collect();
+    let mut header_pairs: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    header_pairs.extend(headers.iter().filter_map(|(name, value)| {
+        value
+            .to_str()
+            .ok()
+            .map(|v| (name.as_str().to_owned(), v.to_owned()))
+    }));
 
     // Protocol 1.1: thread `RequestMetadata` (including TLS info,
     // when the gateway terminates mTLS) through to the identity

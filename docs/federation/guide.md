@@ -22,10 +22,10 @@ they look native: they appear in `tools/list` / `resources/list` / etc. under
 your prefixes, tagged with their source in `_meta`, and enforce *your*
 governance. A `tools/call` (or resource read / prompt get) for a federated
 capability is dispatched to the owning upstream over a **per-client satellite
-session** and the result returned. Upstream changes (`list_changed`,
-`resources/updated`) are forwarded to your clients, and upstream
-server-requests (sampling / elicitation / roots) + progress are bridged through
-to the real client and back.
+connection** and the result returned. Upstream `list_changed` notifications are
+forwarded to your clients, `resources/updated` for a federated resource comes
+from polling it, and upstream progress is passed through to the caller. MCPG
+speaks MCP `2026-07-28` to every upstream.
 
 ```
   client ──MCP──▶  MCPG  ──MCP──▶  upstream A (HTTP)
@@ -88,15 +88,9 @@ mcp:
       upstream:
         url: https://notion-mcp.example.com/mcp   # required for streamable_http; omit for stdio
         transport: streamable_http  # streamable_http (default) | stdio
-        protocol_version: auto      # MCP wire MCPG speaks AS A CLIENT to this upstream.
-                                     #   auto (default; probe server/discover, fall back to the
-                                     #   legacy initialize handshake, cache the detected wire) |
-                                     #   2025-11-25 (pin the session-bound handshake) |
-                                     #   2026-07-28 (pin the stateless modern wire: no handshake /
-                                     #   Mcp-Session-Id, per-request _meta identity, SEP-2243
-                                     #   routing headers).
-                                     #   2026-07-28 is only honored on streamable_http (rejected
-                                     #   on stdio); auto on stdio resolves to legacy, no probe.
+                                     #   Either way MCPG speaks MCP 2026-07-28 to the upstream:
+                                     #   server/discover at connect, per-request _meta identity,
+                                     #   SEP-2243 routing headers.
 
         # stdio transport only:
         command: my-mcp-server      # the child process to spawn
@@ -122,8 +116,7 @@ mcp:
         resources: false
         resource_templates: false
         prompts: false
-        events: false               # MCP Events types; needs the 2026-07-28 wire over
-                                    #   streamable_http (§5a)
+        events: false               # MCP Events types; needs streamable_http (§5a)
 
       naming:                       # prefixes applied to imported names/URIs (collision-avoidance)
         tool_prefix: "notion."
@@ -146,11 +139,11 @@ mcp:
                                     #   subscriber, with their stored sign-in)
 
       cache:
-        capability_ttl_secs: 300    # poll-refresh interval (re-list even without a push); default 300
+        capability_ttl_secs: 300    # poll-refresh interval (re-list even without a
+                                    #   list_changed notification); default 300
 
-      synthesize:                   # change-notification synthesis for push-less upstreams
-        resources_updated: auto     #   auto (default; poll only when the upstream can't push:
-                                    #   modern wire / stdio) | poll (always) | off (never)
+      synthesize:                   # resources/updated for subscribed federated resources
+        resources_updated: poll     #   poll (default): poll subscribed resources | off: never
         poll_interval_ms: 30000     # poll cadence; subscriber-gated (no subscribers → no polling)
 
       session:
@@ -224,9 +217,9 @@ Servers whose remote declares required URL variables or secret headers
 you have not supplied are skipped and reported
 (`mcpg_registry_server_skipped_total{reason}`), as are packages-only
 entries (npm/pypi/oci installables are a provisioning concern, not an
-auto-federation one). Each synthesized upstream uses
-`protocol_version: auto`, so legacy and modern registry servers both
-work without per-server wire config.
+auto-federation one). Each synthesized upstream speaks MCP `2026-07-28`;
+a server whose `server/discover` does not list that version fails to
+connect and serves no capabilities.
 
 #### Per-server credentials without per-server config
 
@@ -538,9 +531,8 @@ enables, whatever modes the upstream offers.
   ends its subscriptions as a removed type does — except while a federation
   that imports events has not completed its first import.
 
-An upstream on the legacy wire, or one that does not advertise events,
-imports no event types, with a warning. `import.events` on `stdio`, or on an
-upstream pinned to `2025-11-25`, fails validation.
+An upstream that does not advertise events imports no event types, with a
+warning. `import.events` on `stdio` fails validation.
 
 ---
 
@@ -826,7 +818,7 @@ MCP client presents an OAuth access token, which Okta refuses with
 `invalid_grant`. With users signing in to the gateway, present their
 [stored enterprise sign-in](#stored-sign-in) instead.
 
-Enterprise-managed upstreams usually refuse `initialize` and `tools/list`
+Enterprise-managed upstreams usually refuse `server/discover` and `tools/list`
 without a token, so give the federation a
 [catalogue credential](#catalogue-credential-authimport) as well.
 
@@ -909,21 +901,24 @@ mcp:
 - The upstream token is cached per user and sign-in, so the IdP rotating
   the stored refresh token costs no new exchange.
 - It needs interactive sign-in: validation refuses `idp_*` without a
-  `login` block, and inside `auth.import`, whose sessions have no caller.
-  The catalogue sessions connect anonymously unless `auth.import` is set.
+  `login` block, and inside `auth.import`, whose connections have no caller.
+  The catalogue connections are anonymous unless `auth.import` is set.
 - Registry-synced federations accept it in `defaults.auth` and
   `servers.<name>.auth`.
 
 #### <a id="stored-sign-in-links"></a>A link to store the sign-in (URL-mode elicitation)
 
 When a verified caller has no stored sign-in and its client declared
-`elicitation.url`, the `tools/call` answers with a link that stores it,
-in the shape of the negotiated MCP version:
+`elicitation.url`, the `tools/call` answers with a link that stores it: an
+`InputRequiredResult` whose `inputRequests.connect_sign_in` is a URL-mode
+`elicitation/create` (no id), with a `requestState`.
 
-| Version | Answer | How the client continues |
-|---|---|---|
-| `2025-11-25` | JSON-RPC error `-32042` whose `data.elicitations` holds one URL-mode elicitation (`mode`, `elicitationId`, `url`, `message`); the error's own `message` repeats that text and the link, for a client that shows only it | The session receives `notifications/elicitation/complete` with the `elicitationId` once the user completes the link, and the client retries the call |
-| `2026-07-28` | `InputRequiredResult` whose `inputRequests.connect_sign_in` is a URL-mode `elicitation/create` (no id), with a `requestState` | The client retries with the `requestState` and its answer in `inputResponses`: `accept` waits up to 10 s (a third of `request_timeout_ms` at most) for the user's sign-in to be stored; `decline` or `cancel` returns the failed call; no answer offers the same link again. A `requestState` whose link expired runs the call again: it succeeds when the sign-in is stored, else offers a link |
+The client retries with the `requestState` and its answer in
+`inputResponses`: `accept` waits up to 10 s (a third of `request_timeout_ms`
+at most) for the user's sign-in to be stored; `decline` or `cancel` returns
+the failed call; no answer offers the same link again. A `requestState` whose
+link expired runs the call again: it succeeds when the sign-in is stored,
+else offers a link.
 
 - The link is `{issuer}/oauth/connect?e=<id>`. The id is random and names
   nobody; the link carries no token and does not sign anyone in.
@@ -932,10 +927,10 @@ in the shape of the negotiated MCP version:
   user, nothing is stored, the page says so, and
   `mcpg.as.connect_refused` is audited. A link is completed once, and
   lives as long as a sign-in transaction (`transaction_ttl_secs`).
-- A retry on the same MCP session is offered the link that session is
-  pending, so the store holds one link per user and session. A user is
-  offered at most 20 new links per `transaction_ttl_secs`; past that, a
-  call fails with the message that names the connect page.
+- A retry with the `requestState` of a pending link is offered that link
+  again. A user is offered at most 20 new links per
+  `transaction_ttl_secs`; past that, a call fails with the message that
+  names the connect page.
 - The `requestState` is sealed with the sign-in state key and bound to the
   caller and the tool; another user or another tool cannot present it.
 - The message next to the link names the federation only when its name
@@ -949,16 +944,16 @@ in the shape of the negotiated MCP version:
 
 ### Catalogue credential (`auth.import`)
 
-Some upstream sessions have no caller: the catalogue import at boot and
+Some upstream connections have no caller: the catalogue import at boot and
 reload, the `list_changed` and TTL refreshes, and the notification
 listener. With `pass_through` and `oauth_impersonation` there is nothing
-to forward or exchange, so these sessions are anonymous by default. An
+to forward or exchange, so these connections are anonymous by default. An
 upstream that requires a token to list its tools refuses them, and the
 federation imports nothing: MCPG logs a warning that names
 `upstream.auth.import` and counts
 `mcpg_federation_import_failed_total{reason="unauthorized"}`.
 
-`upstream.auth.import` gives those sessions their own credential:
+`upstream.auth.import` gives those connections their own credential:
 
 ```yaml
 mcp:
@@ -977,7 +972,7 @@ mcp:
 - `mode` is `service_token` (with `token`) or `oauth_client_credentials`
   (with `credential`, and optionally `credential_config`). The
   caller-derived modes and a nested `import` fail validation.
-- Only the catalogue sessions use it. Tool calls, resource reads and
+- Only the catalogue connections use it. Tool calls, resource reads and
   prompt fetches keep the outer `mode`: an impersonated call carries the
   caller's exchanged token, and a call without a caller bearer never
   falls back to the catalogue credential.
@@ -1013,7 +1008,7 @@ mcp:
 ## 8. Transports
 
 ### `streamable_http` (default)
-Modern MCP Streamable HTTP (`POST` + SSE). All HTTP upstreams go through the
+MCP Streamable HTTP (`POST` + SSE). All HTTP upstreams go through the
 gateway's **DNS-rebinding / SSRF guard**: the upstream host is resolved + pinned
 to a validated public address. Private/loopback addresses and `http://` are
 rejected unless explicitly permitted:
@@ -1045,9 +1040,12 @@ upstream:
     allow_stdio: true
 ```
 
-`url` is unused for stdio. The child is reaped on shutdown / reload. (stdio has
-no separate notification channel, so `*/list_changed` pushes between calls are
-picked up on the next call or the TTL refresh, not in real time.)
+`url` is unused for stdio. The child is reaped on shutdown / reload. The child
+must speak MCP `2026-07-28`: every request carries the `_meta` protocol
+version, client info and capabilities, and a request the child sends to MCPG is
+declined with `-32601`. (stdio has no separate notification channel, so
+`*/list_changed` changes between calls are picked up on the next call or the
+TTL refresh, not in real time.)
 
 ### `tunnel://` — reverse federation
 
@@ -1092,85 +1090,63 @@ the gateway fails closed at boot otherwise. It is independent of
 
 ## 9. Runtime behaviour
 
-### Upstream protocol version — federation as a wire adapter
+### Upstream protocol version
 
-The wire MCPG serves each **client** and the wire it speaks to each
-**upstream** are independent. Clients negotiate their revision per
-request (`2025-11-25` or `2026-07-28`); `upstream.protocol_version`
-selects the upstream side — so one federation entry adapts a remote MCP
-server to whichever revision each caller uses, in both directions:
-
-| Upstream speaks | Client speaks | What MCPG does |
-|---|---|---|
-| legacy `2025-11-25` | modern `2026-07-28` | holds the upstream session + handshake; serves a stateless face |
-| modern `2026-07-28` | legacy `2025-11-25` | answers `initialize`, holds the client session; speaks stateless upstream |
-| same on both sides | — | pass-through |
-
-With the default `protocol_version: auto`, MCPG detects the upstream's
-revision at connect: it attempts the modern `server/discover` and, if
-the peer rejects it (HTTP 400 unsupported-version, method-not-found),
-falls back to the legacy `initialize` handshake. The verdict is cached
-per federation (re-detected on reload/restart), so satellites and
-listeners connect without re-probing. Pin a dated revision to skip the
-probe entirely.
+MCPG speaks MCP `2026-07-28` to every upstream. Each connect sends
+`server/discover` and fails when the upstream refuses it or does not list
+`2026-07-28` in `supportedVersions` (the error is kept whole, e.g. HTTP 400
+with `-32022`); the federation then imports nothing. No session id is sent
+or read, and closing a satellite sends nothing.
 
 ### Staying fresh
 Two refresh triggers keep the federated catalog current:
-- **Push:** a persistent listener reacts to upstream catalog-change
-  pushes and re-imports that federation. On a legacy upstream this is
-  the standalone `GET` SSE stream; on a modern (`2026-07-28`) upstream
-  it is a long-lived `subscriptions/listen` stream subscribed to the
-  three `*ListChanged` targets (an upstream without the method degrades
-  quietly to poll-only). (HTTP transports only.)
+- **Listen:** a persistent `subscriptions/listen` stream on the upstream,
+  subscribed to the three `*ListChanged` targets, re-imports that
+  federation on each catalog-change notification. When the upstream
+  refuses the method, the listener backs off and the TTL refresh keeps
+  the catalog current. (HTTP transports only.)
 - **Poll:** `cache.capability_ttl_secs` re-imports on an interval — the
-  fallback for upstreams that never push (and for stdio).
+  fallback for upstreams that never notify (and for stdio).
 
 Either trigger broadcasts `list_changed` to *your* connected clients
 **only for the kinds whose client-visible catalog actually changed**
 (descriptor-level diff against the previous import) — a TTL poll that
-detects a change notifies clients just like a push does, and an
-upstream push that your filters make invisible wakes nobody.
+detects a change notifies clients just like the listener does, and an
+upstream change that your filters make invisible wakes nobody.
 
 A single upstream's change re-imports only *that* federation; the others keep
 their capabilities.
 
 ### Resource subscriptions
-If a client `resources/subscribe`s to a federated resource, an upstream
-`notifications/resources/updated` is re-prefixed and forwarded to that
-subscriber. When the upstream **cannot** push resource updates (the
-modern wire's listener carries only catalog changes; stdio has no push
-channel at all), the `synthesize` block manufactures them instead: the
-first subscriber starts a poll watcher that re-reads the resource
+When a client lists a federated resource in the `resourceSubscriptions` of a
+`subscriptions/listen` stream, the `synthesize` block produces its updates:
+the first subscriber starts a poll watcher that re-reads the resource
 through the normal federated dispatch on `poll_interval_ms` and emits
-`resources/updated` when the content hash changes; the last unsubscribe
-stops it. Polling runs under the gateway's machine identity — per-caller
-upstream resources are not poll-watchable.
+`notifications/resources/updated` when the content hash changes; the last
+subscriber leaving stops it. Polling runs under the gateway's machine
+identity — per-caller upstream resources are not poll-watchable.
 
-### Server-request bridging (sampling / elicitation / roots)
-If an upstream needs to sample an LLM, elicit user input, or list roots **during
-a tool call**, MCPG bridges the request to the *real* client and the answer
-back. MCPG advertises to the upstream only the capabilities the **downstream
-session** actually supports (so it never surfaces a request the client can't
-handle). Upstream `notifications/progress` is forwarded too, correlated to the
-client's own progress token.
+### Progress and client input
+Upstream `notifications/progress` is forwarded to the caller, correlated to
+the client's own progress token. MCPG advertises no client capabilities to an
+upstream (except the MCP Apps extension when configured), and a
+server-to-client request an upstream sends is declined.
 
-### Sessions & reload
-Dispatch uses one **satellite** (an upstream session) per `(caller,
+### Satellites & reload
+Dispatch uses one **satellite** (an upstream connection) per `(caller,
 federation)`, torn down after `session.idle_timeout_secs` idle. The
-caller key is the authenticated principal — stable across that
-principal's sessions and gateway replicas — falling back to the session
-id for anonymous callers; for `pass_through` / `oauth_impersonation` a
-fingerprint of the caller's bearer joins the key, so two tokens of the
-same principal (scope change, rotation) never share an upstream
-session. The upstream credential is re-resolved on every dispatch: a
+caller key is the authenticated principal — stable across gateway
+replicas; for `pass_through` / `oauth_impersonation` a fingerprint of the
+caller's bearer joins the key, so two tokens of the same principal (scope
+change, rotation) never share an upstream connection. The upstream
+credential is re-resolved on every dispatch: a
 rotated token replaces the satellite's connection instead of riding the
 stale one into an upstream 401. On a config reload, capabilities carry
 across with no flicker and are governed by the **reloaded** config from the
 first request: a tightened `minimum_trust`, `required_scopes` or `allow_if`,
 a newly excluded tool (`filter.exclude_tools`) or an `import` switched off
-applies before the re-import finishes. Satellites (and detected wires) for
-**unchanged** federations are reused (no reconnect, no re-probe);
-changed/removed ones re-establish.
+applies before the re-import finishes. Satellites for **unchanged**
+federations are reused (no reconnect); changed/removed ones re-establish.
 
 ---
 
@@ -1184,8 +1160,8 @@ changed/removed ones re-establish.
 | `mcpg_credential_cache_total{plugin_id,outcome}` | host credential-cache hit/miss |
 | `mcpg_federation_import_failed_total{reason}` | failed catalogue imports and refreshes; `unauthorized` = the upstream answered 401/403, `error` = anything else |
 | `mcpg_federation_subject_token_total{mode,outcome}` | calls of `idp_refresh_token` / `idp_id_token` federations; `used` = the issuer exchanged the stored sign-in, `not_linked` = the caller has none, `refused` = the caller, the sign-in or the issuer plugin cannot be used, or the issuer refused the exchange, `unavailable` = the sign-in state, the issuer or the IdP cannot be reached now |
-| `mcpg_federation_connect_link_total{outcome}` | links offered to callers with no stored sign-in; `offered` = a new link, `resumed` = the pending link of a retry or of the session, `limited` = the user was offered as many new links as one link lifetime allows, `unavailable` = the sign-in state could not store one |
-| `mcpg_federation_url_elicitation_total{protocol_version}` | tool calls answered with a link, by MCP version |
+| `mcpg_federation_connect_link_total{outcome}` | links offered to callers with no stored sign-in; `offered` = a new link, `resumed` = the pending link of a retry, `limited` = the user was offered as many new links as one link lifetime allows, `unavailable` = the sign-in state could not store one |
+| `mcpg_federation_url_elicitation_total` | tool calls answered with a link |
 | `mcpg_as_connect_total{purpose,outcome}` | the connect page; `purpose` = `connect` or `link`, `outcome` = `shown`, `refused`, `approved` or `denied` |
 | `mcpg_registry_server_skipped_total{registry,reason}` | registry servers left unfederated; `oauth_discovery` = no metadata ever discovered, `no_id_jag_support` = an `oauth-id-jag` server whose AS does not offer jwt-bearer |
 | `mcpg_registry_oauth_discovery_warning_total{registry,reason}` | servers federated despite a discovery warning; `id_jag_profile_missing` = the AS lists jwt-bearer but not the id-jag grant profile |
@@ -1237,7 +1213,7 @@ the link was for; never the link id.
 **Sizing & resilience**
 - Set `response.max_response_bytes` to bound a misbehaving upstream.
 - Tune `cache.capability_ttl_secs` down for upstreams that change often (and
-  can't push), up for stable ones.
+  do not serve `subscriptions/listen`), up for stable ones.
 - A failing upstream is logged and skipped at import — it never takes down the
   gateway or other federations.
 
@@ -1316,8 +1292,10 @@ mcp:
 ## 13. Limitations / roadmap
 
 - **Wildcard per-tenant federation** — not yet implemented.
-- **stdio notifications** — drained during calls / TTL, not pushed in real time
-  (stdio has no standalone notification channel).
+- **stdio notifications** — drained during calls / TTL, not delivered in real
+  time (stdio has no standalone notification channel).
+- **Client input for an upstream** — an upstream's `InputRequiredResult` and
+  its server-to-client requests are not relayed to the caller.
 
 ---
 

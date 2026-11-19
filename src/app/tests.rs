@@ -1614,61 +1614,13 @@ fn plugin_source_validates_xor() {
 
 // -- start_extra_transports (gateway.server.transports[]) ---------
 
-fn registry_with_memory_transport() -> mcpg_plugin_host::PluginRegistry {
-    let mut reg = mcpg_plugin_host::PluginRegistry::new();
-    let plugin = crate::builtins::transport_memory::MemoryTransport::new();
-    reg.register_transport(plugin, mcpg_plugin_protocol::PluginTier::Native)
-        .expect("memory transport registers");
-    reg
-}
-
-fn memory_transport_entry() -> crate::config::PluginEntryConfig {
-    crate::config::PluginEntryConfig {
-        id: "dev.mcpg.builtin.transport.memory".to_owned(),
-        r#ref: None,
-        kind: "native".to_owned(),
-        class: "transport".to_owned(),
-        source: crate::config::PluginSourceConfig::default(),
-        config: serde_json::Value::Null,
-        signature: None,
-        granted_capabilities: Vec::new(),
-        limits: None,
-        enforce: true,
-        disabled: false,
-        inline_dispatch: false,
-        http_route: None,
-        observability: None,
-        ffi_limits: None,
-    }
-}
-
-fn empty_runtime_swap() -> std::sync::Arc<arc_swap::ArcSwap<crate::runtime::GatewayRuntime>> {
-    let runtime = crate::runtime::GatewayRuntime::new(
-        "mcpg",
-        "0.1.0",
-        "127.0.0.1:8787",
-        "/health",
-        "/mcp",
-        "info",
-        vec![crate::config::SinkConfig {
-            kind: "stdout".to_owned(),
-            config: serde_json::json!({"format": "json"}),
-            level: None,
-        }],
-        true,
-    );
-    std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(runtime))
-}
-
 #[tokio::test]
 async fn start_extra_transports_empty_returns_empty() {
-    let reg = registry_with_memory_transport();
-    let swap = empty_runtime_swap();
+    let reg = registry_with_ingress_stub(IngressStub::new());
     let handles = start_extra_transports(
         &[],
         &[],
         "single_node",
-        swap,
         &reg,
         &ExtraTransportContext::default(),
     )
@@ -1678,36 +1630,12 @@ async fn start_extra_transports_empty_returns_empty() {
 }
 
 #[tokio::test]
-async fn start_extra_transports_starts_memory_plugin_by_id() {
-    let reg = registry_with_memory_transport();
-    let swap = empty_runtime_swap();
-    let entries = vec![memory_transport_entry()];
-    let handles = start_extra_transports(
-        &[kind_ref("dev.mcpg.builtin.transport.memory")],
-        &entries,
-        "single_node",
-        swap,
-        &reg,
-        &ExtraTransportContext::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(handles.len(), 1);
-    assert_eq!(handles[0].listen_address().await.as_deref(), Some("memory"),);
-    for h in handles {
-        h.close().await;
-    }
-}
-
-#[tokio::test]
 async fn start_extra_transports_refuses_builtin_keyword() {
-    let reg = registry_with_memory_transport();
-    let swap = empty_runtime_swap();
+    let reg = registry_with_ingress_stub(IngressStub::new());
     let res = start_extra_transports(
         &[kind_ref("builtin-http")],
         &[],
         "single_node",
-        swap,
         &reg,
         &ExtraTransportContext::default(),
     )
@@ -1725,13 +1653,11 @@ async fn start_extra_transports_refuses_builtin_keyword() {
 
 #[tokio::test]
 async fn start_extra_transports_refuses_unknown_plugin_id() {
-    let reg = registry_with_memory_transport();
-    let swap = empty_runtime_swap();
+    let reg = registry_with_ingress_stub(IngressStub::new());
     let res = start_extra_transports(
         &[kind_ref("dev.mcpg.transport.does-not-exist")],
         &[],
         "single_node",
-        swap,
         &reg,
         &ExtraTransportContext::default(),
     )
@@ -1749,13 +1675,11 @@ async fn start_extra_transports_refuses_unknown_plugin_id() {
 
 #[tokio::test]
 async fn start_extra_transports_refuses_kind_cluster() {
-    let reg = registry_with_memory_transport();
-    let swap = empty_runtime_swap();
+    let reg = registry_with_ingress_stub(IngressStub::new());
     let res = start_extra_transports(
         &[kind_ref("cluster")],
         &[],
         "single_node",
-        swap,
         &reg,
         &ExtraTransportContext::default(),
     )
@@ -1775,8 +1699,8 @@ async fn start_extra_transports_refuses_kind_cluster() {
     );
 }
 
-/// An `http`-wire transport stand-in: keeps the server it is started
-/// with and reports a public URL.
+/// A transport stand-in: keeps the server it is started with and reports a
+/// public URL.
 struct IngressStub {
     manifest: mcpg_plugin_protocol::PluginManifest,
     server: std::sync::Mutex<
@@ -1788,12 +1712,25 @@ const INGRESS_STUB_ID: &str = "dev.test.transport.ingress";
 
 impl IngressStub {
     fn new() -> std::sync::Arc<Self> {
-        let memory = crate::builtins::transport_memory::MemoryTransport::new();
-        let mut manifest =
-            mcpg_plugin_protocol::transport::Transport::manifest(memory.as_ref()).clone();
-        manifest.id = INGRESS_STUB_ID.into();
         std::sync::Arc::new(Self {
-            manifest,
+            manifest: mcpg_plugin_protocol::PluginManifest {
+                id: INGRESS_STUB_ID.into(),
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                name: "Ingress stub".into(),
+                plugin_class: mcpg_plugin_protocol::PluginClass::Transport,
+                protocol_version: mcpg_plugin_protocol::PROTOCOL_VERSION.into(),
+                license: None,
+                required_capabilities: Vec::new(),
+                tags: Vec::new(),
+                provides: Vec::new(),
+                provides_schemes: Vec::new(),
+                module_path_prefix: ::std::module_path!()
+                    .split("::")
+                    .next()
+                    .unwrap_or("")
+                    .to_owned(),
+                backend_profile: None,
+            },
             server: std::sync::Mutex::new(None),
         })
     }
@@ -1817,19 +1754,6 @@ impl mcpg_plugin_protocol::transport::Transport for IngressStub {
     fn name(&self) -> &str {
         "ingress-stub-v1"
     }
-    async fn start(
-        &self,
-        _listener_config: &serde_json::Value,
-        _dispatcher: std::sync::Arc<dyn mcpg_plugin_protocol::transport::MessageDispatcher>,
-    ) -> Result<
-        Box<dyn mcpg_plugin_protocol::transport::TransportHandle>,
-        mcpg_plugin_protocol::transport::TransportError,
-    > {
-        panic!("an http-wire transport is never started on the messages wire");
-    }
-    fn wire(&self) -> mcpg_plugin_protocol::transport::TransportWire {
-        mcpg_plugin_protocol::transport::TransportWire::Http
-    }
     async fn start_http(
         &self,
         _listener_config: &serde_json::Value,
@@ -1843,10 +1767,10 @@ impl mcpg_plugin_protocol::transport::Transport for IngressStub {
     }
 }
 
-fn registry_with_both_transports(
+fn registry_with_ingress_stub(
     stub: std::sync::Arc<IngressStub>,
 ) -> mcpg_plugin_host::PluginRegistry {
-    let mut reg = registry_with_memory_transport();
+    let mut reg = mcpg_plugin_host::PluginRegistry::new();
     reg.register_transport(stub, mcpg_plugin_protocol::PluginTier::Native)
         .expect("ingress stub registers");
     reg
@@ -1855,13 +1779,25 @@ fn registry_with_both_transports(
 fn ingress_stub_entry() -> crate::config::PluginEntryConfig {
     crate::config::PluginEntryConfig {
         id: INGRESS_STUB_ID.to_owned(),
-        ..memory_transport_entry()
+        r#ref: None,
+        kind: "native".to_owned(),
+        class: "transport".to_owned(),
+        source: crate::config::PluginSourceConfig::default(),
+        config: serde_json::Value::Null,
+        signature: None,
+        granted_capabilities: Vec::new(),
+        limits: None,
+        enforce: true,
+        disabled: false,
+        inline_dispatch: false,
+        http_route: None,
+        observability: None,
+        ffi_limits: None,
     }
 }
 
 fn http_context(
     router: axum::Router,
-    legacy_wire: bool,
 ) -> (
     ExtraTransportContext,
     std::sync::Arc<arc_swap::ArcSwapOption<String>>,
@@ -1870,22 +1806,20 @@ fn http_context(
     let context = ExtraTransportContext {
         http_router: Some(router),
         public_url: Some(std::sync::Arc::clone(&public_url)),
-        legacy_wire,
     };
     (context, public_url)
 }
 
 #[tokio::test]
-async fn an_http_wire_transport_starts_with_the_router_and_publishes_its_url() {
+async fn a_transport_starts_with_the_router_and_publishes_its_url() {
     let stub = IngressStub::new();
-    let reg = registry_with_both_transports(std::sync::Arc::clone(&stub));
+    let reg = registry_with_ingress_stub(std::sync::Arc::clone(&stub));
     let router = axum::Router::new().route("/mcp", axum::routing::post(|| async { "from router" }));
-    let (context, public_url) = http_context(router, true);
+    let (context, public_url) = http_context(router);
     let handles = start_extra_transports(
         &[kind_ref(INGRESS_STUB_ID)],
         &[ingress_stub_entry()],
         "single_node",
-        empty_runtime_swap(),
         &reg,
         &context,
     )
@@ -1921,8 +1855,8 @@ async fn an_http_wire_transport_starts_with_the_router_and_publishes_its_url() {
 #[tokio::test]
 async fn a_public_url_already_known_is_kept() {
     let stub = IngressStub::new();
-    let reg = registry_with_both_transports(stub);
-    let (context, public_url) = http_context(axum::Router::new(), true);
+    let reg = registry_with_ingress_stub(stub);
+    let (context, public_url) = http_context(axum::Router::new());
     public_url.store(Some(std::sync::Arc::new(
         "https://relay.example.test".into(),
     )));
@@ -1930,7 +1864,6 @@ async fn a_public_url_already_known_is_kept() {
         &[kind_ref(INGRESS_STUB_ID)],
         &[ingress_stub_entry()],
         "single_node",
-        empty_runtime_swap(),
         &reg,
         &context,
     )
@@ -1942,49 +1875,66 @@ async fn a_public_url_already_known_is_kept() {
     );
 }
 
-#[tokio::test]
-async fn legacy_wire_off_refuses_a_messages_transport_and_keeps_an_http_one() {
-    let stub = IngressStub::new();
-    let reg = registry_with_both_transports(stub);
-    let (context, _) = http_context(axum::Router::new(), false);
-    let refused = start_extra_transports(
-        &[kind_ref("dev.mcpg.builtin.transport.memory")],
-        &[memory_transport_entry()],
-        "single_node",
-        empty_runtime_swap(),
-        &reg,
-        &context,
-    )
-    .await;
-    let msg = format!("{:#}", refused.err().expect("messages wire refused"));
-    assert!(msg.contains("legacy_wire: false"), "{msg}");
-
-    let started = start_extra_transports(
-        &[kind_ref(INGRESS_STUB_ID)],
-        &[ingress_stub_entry()],
-        "single_node",
-        empty_runtime_swap(),
-        &reg,
-        &context,
-    )
-    .await
-    .unwrap();
-    assert_eq!(started.len(), 1);
-}
-
 /// The test-only `dev.test.transport.probe` cdylib, staged by a sandboxed
 /// runner. `None` under `cargo test`.
 fn http_transport_probe_cdylib() -> Option<std::path::PathBuf> {
     staged_test_file("MCPG_TEST_HTTP_TRANSPORT_CDYLIB")
 }
 
-/// A real `http`-wire cdylib, loaded through `plugins[]`, sends MCP traffic
-/// across the FFI into the gateway's own router: `initialize` answers with
-/// a session, `notifications/initialized` is accepted on it, the
-/// `tools/list` on that session streams back as SSE, and the health route
-/// answers too.
+/// One MCP request for the probe to send: a POST to `/mcp` with the
+/// `Mcp-Protocol-Version` and `Mcp-Method` headers and the `_meta`
+/// identity triple, plus `extra_headers`.
+fn probe_mcp_request(id: u64, method: &str, extra_headers: &[(&str, &str)]) -> serde_json::Value {
+    let version = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
+    let mut headers = vec![
+        serde_json::json!(["host", "probe.example.test"]),
+        serde_json::json!(["content-type", "application/json"]),
+        serde_json::json!(["accept", "application/json, text/event-stream"]),
+        serde_json::json!(["mcp-protocol-version", version]),
+        serde_json::json!(["mcp-method", method]),
+    ];
+    headers.extend(
+        extra_headers
+            .iter()
+            .map(|(name, value)| serde_json::json!([name, value])),
+    );
+    serde_json::json!({
+        "method": "POST",
+        "uri": "/mcp",
+        "headers": headers,
+        "body": serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": version,
+                    "io.modelcontextprotocol/clientInfo": {"name": "probe", "version": "1.0.0"},
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        })
+        .to_string(),
+    })
+}
+
+/// The JSON-RPC response in a probe answer: the body itself, or the `data:`
+/// frame of an event stream that carries an `id`.
+fn probe_rpc(answer: &serde_json::Value) -> serde_json::Value {
+    let body = answer["body"].as_str().unwrap_or_default();
+    std::iter::once(body)
+        .chain(body.lines().filter_map(|line| line.strip_prefix("data:")))
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(text.trim()).ok())
+        .find(|message| message.get("id").is_some())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// A real transport cdylib, loaded through `plugins[]`, sends MCP traffic
+/// across the FFI into the gateway's own router: `server/discover` and
+/// `tools/list` answer with the protocol version stamped, and the health
+/// route answers too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_native_http_wire_transport_serves_mcp_through_the_gateway_router() {
+async fn a_native_transport_serves_mcp_through_the_gateway_router() {
     let Some(so) = http_transport_probe_cdylib() else {
         eprintln!("skipped: this runner stages no http transport probe cdylib");
         return;
@@ -2002,52 +1952,11 @@ async fn a_native_http_wire_transport_serves_mcp_through_the_gateway_router() {
     let state = crate::app::build_from_config(config, Vec::new())
         .await
         .expect("the gateway builds with the probe loaded");
-    fn mcp_headers(extra: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
-        let mut headers = vec![
-            ("host", "probe.example.test"),
-            ("content-type", "application/json"),
-            ("accept", "application/json, text/event-stream"),
-        ];
-        headers.extend_from_slice(extra);
-        headers
-    }
     let probe_config = serde_json::json!({
         "report": report.display().to_string(),
         "requests": [
-            {
-                "method": "POST",
-                "uri": "/mcp",
-                "headers": mcp_headers(&[]),
-                "body": serde_json::json!({
-                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                    "params": {
-                        "protocolVersion": "2025-11-25",
-                        "capabilities": {},
-                        "clientInfo": {"name": "probe", "version": "1.0.0"}
-                    }
-                }).to_string(),
-            },
-            {
-                "method": "POST",
-                "uri": "/mcp",
-                "headers": mcp_headers(&[("mcp-protocol-version", "2025-11-25")]),
-                "body": serde_json::json!({
-                    "jsonrpc": "2.0", "method": "notifications/initialized"
-                }).to_string(),
-                "session_from": 0,
-            },
-            {
-                "method": "POST",
-                "uri": "/mcp",
-                "headers": mcp_headers(&[
-                    ("mcp-protocol-version", "2025-11-25"),
-                    ("x-mcpg-subject-id", "test-user"),
-                ]),
-                "body": serde_json::json!({
-                    "jsonrpc": "2.0", "id": 2, "method": "tools/list"
-                }).to_string(),
-                "session_from": 0,
-            },
+            probe_mcp_request(1, "server/discover", &[]),
+            probe_mcp_request(2, "tools/list", &[("x-mcpg-subject-id", "test-user")]),
             {"method": "GET", "uri": "/health"},
         ],
     });
@@ -2055,7 +1964,6 @@ async fn a_native_http_wire_transport_serves_mcp_through_the_gateway_router() {
     let context = ExtraTransportContext {
         http_router: Some(router),
         public_url: None,
-        legacy_wire: true,
     };
     let registry = state.runtime.load().plugin_registry_arc();
     let handles = start_extra_transports(
@@ -2065,12 +1973,11 @@ async fn a_native_http_wire_transport_serves_mcp_through_the_gateway_router() {
         }],
         &plugins,
         "single_node",
-        state.runtime.clone(),
         &registry,
         &context,
     )
     .await
-    .expect("the probe starts on the http wire");
+    .expect("the probe starts");
     assert_eq!(
         handles[0].listen_address().await.as_deref(),
         Some("https://probe.example.test")
@@ -2095,36 +2002,37 @@ async fn a_native_http_wire_transport_serves_mcp_through_the_gateway_router() {
             .map(|pair| pair[1].as_str().unwrap().to_owned())
     };
 
-    let initialize = &answers[0];
-    assert_eq!(initialize["status"], 200, "{initialize}");
-    assert!(
-        header(initialize, "mcp-session-id").is_some(),
-        "{initialize}"
-    );
-    assert!(
-        initialize["body"]
-            .as_str()
-            .unwrap()
-            .contains("\"serverInfo\""),
-        "{initialize}"
-    );
+    let version = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 
-    assert_eq!(answers[1]["status"], 202, "{}", answers[1]);
+    let discover = &answers[0];
+    assert_eq!(discover["status"], 200, "{discover}");
+    assert_eq!(
+        header(discover, "mcp-protocol-version").as_deref(),
+        Some(version),
+        "{discover}"
+    );
+    let discovered = probe_rpc(discover);
+    assert_eq!(discovered["id"], 1, "{discover}");
+    assert_eq!(
+        discovered["result"]["supportedVersions"],
+        serde_json::json!([version]),
+        "{discover}"
+    );
+    assert!(discovered["result"]["serverInfo"].is_object(), "{discover}");
 
-    let tools = &answers[2];
+    let tools = &answers[1];
     assert_eq!(tools["status"], 200, "{tools}");
     assert_eq!(
-        header(tools, "content-type").as_deref(),
-        Some("text/event-stream")
-    );
-    let events = tools["body"].as_str().unwrap();
-    assert!(
-        events.contains("event: message") && events.contains(r#""id":2,"result":{"tools":"#),
+        header(tools, "mcp-protocol-version").as_deref(),
+        Some(version),
         "{tools}"
     );
+    let listed = probe_rpc(tools);
+    assert_eq!(listed["id"], 2, "{tools}");
+    assert!(listed["result"]["tools"].is_array(), "{tools}");
     assert!(tools["error"].is_null(), "{tools}");
 
-    assert_eq!(answers[3]["status"], 200, "{}", answers[3]);
+    assert_eq!(answers[2]["status"], 200, "{}", answers[2]);
 }
 
 /// Boot a gateway whose config is `extra_yaml` plus the probe as a plugin
@@ -2156,7 +2064,6 @@ async fn run_probe(
             "/mcp",
         )),
         public_url: None,
-        legacy_wire: true,
     };
     let registry = state.runtime.load().plugin_registry_arc();
     let handles = start_extra_transports(
@@ -2169,12 +2076,11 @@ async fn run_probe(
         }],
         &plugins,
         "single_node",
-        state.runtime.clone(),
         &registry,
         &context,
     )
     .await
-    .expect("the probe starts on the http wire");
+    .expect("the probe starts");
     for _ in 0..400 {
         if let Ok(bytes) = std::fs::read(&report) {
             drop(handles);
@@ -2186,9 +2092,9 @@ async fn run_probe(
 }
 
 /// A gateway that admits only verified callers, with no token verifier at
-/// all: the transport's attested peer (as a tailnet member) opens a session
-/// and lists the catalog across the FFI, and an anonymous caller on the same
-/// transport gets the 401 challenge.
+/// all: the transport's attested peer (as a tailnet member) discovers the
+/// server and lists the catalog across the FFI, and an anonymous caller on
+/// the same transport gets the 401 challenge.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_transport_attested_peer_passes_require_authentication_and_an_anonymous_caller_does_not()
 {
@@ -2202,61 +2108,37 @@ async fn a_transport_attested_peer_passes_require_authentication_and_an_anonymou
         "subject_id": "alice@example.com",
         "issuer": "tailscale:example.com"
     });
-    let headers = serde_json::json!([
-        ["host", "probe.example.test"],
-        ["content-type", "application/json"],
-        ["accept", "application/json, text/event-stream"],
-        ["mcp-protocol-version", "2025-11-25"]
-    ]);
-    let initialize = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-11-25",
-            "capabilities": {},
-            "clientInfo": {"name": "tailnet-client", "version": "1.0.0"}
-        }
-    })
-    .to_string();
+    let attested = |mut request: serde_json::Value| {
+        request["peer"] = peer.clone();
+        request
+    };
     let answers = run_probe(
         &so,
         "governance:\n  access:\n    require_authentication: true\n",
         serde_json::json!([
-            {"method": "POST", "uri": "/mcp", "headers": headers, "body": initialize},
-            {"method": "POST", "uri": "/mcp", "headers": headers, "body": initialize, "peer": peer},
-            {
-                "method": "POST", "uri": "/mcp", "headers": headers, "session_from": 1, "peer": peer,
-                "body": serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}).to_string()
-            },
-            {
-                "method": "POST", "uri": "/mcp", "headers": headers, "session_from": 1, "peer": peer,
-                "body": serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).to_string()
-            },
+            probe_mcp_request(1, "server/discover", &[]),
+            attested(probe_mcp_request(1, "server/discover", &[])),
+            attested(probe_mcp_request(2, "tools/list", &[])),
         ]),
     )
     .await;
     assert_eq!(answers[0]["status"], 401, "anonymous: {}", answers[0]);
     assert_eq!(answers[1]["status"], 200, "attested: {}", answers[1]);
-    assert_eq!(answers[2]["status"], 202, "{}", answers[2]);
-    assert_eq!(answers[3]["status"], 200, "{}", answers[3]);
-    assert!(
-        answers[3]["body"]
-            .as_str()
-            .unwrap()
-            .contains(r#""id":2,"result":{"tools":"#),
-        "{}",
-        answers[3]
-    );
+    assert_eq!(probe_rpc(&answers[1])["id"], 1, "{}", answers[1]);
+    assert_eq!(answers[2]["status"], 200, "{}", answers[2]);
+    let listed = probe_rpc(&answers[2]);
+    assert_eq!(listed["id"], 2, "{}", answers[2]);
+    assert!(listed["result"]["tools"].is_array(), "{}", answers[2]);
 }
 
 #[tokio::test]
-async fn an_http_wire_transport_without_a_router_is_refused() {
+async fn a_transport_without_a_router_is_refused() {
     let stub = IngressStub::new();
-    let reg = registry_with_both_transports(stub);
+    let reg = registry_with_ingress_stub(stub);
     let refused = start_extra_transports(
         &[kind_ref(INGRESS_STUB_ID)],
         &[ingress_stub_entry()],
         "single_node",
-        empty_runtime_swap(),
         &reg,
         &ExtraTransportContext::default(),
     )
@@ -3004,7 +2886,7 @@ fn cross_check_cluster_provides_skips_table_for_plugin_class_kind() {
 }
 
 // ---------------------------------------------------------------------------
-// CC-2: live boot reachability probe. The vocabulary cross-check only proves
+// Live boot reachability probe. The vocabulary cross-check only proves
 // the role strings agree; this probe round-trips the advertised primitives so
 // a coordinator that can't actually serve them fails closed at boot instead
 // of silently de-clustering.
@@ -3156,8 +3038,8 @@ async fn probe_cluster_reachability_ok_for_bus_only_coordinator() {
 }
 
 // ---------------------------------------------------------------------------
-// CC-4 / CC-5: cluster-stable sub-key derivation. The requestState codec key
-// and the modern synthetic-session key both derive from the cluster-stable
+// Cluster-stable sub-key derivation. The requestState codec key and the
+// synthetic-session key both derive from the cluster-stable
 // secret (cluster.state_encryption_key_env) when not explicitly configured,
 // so every replica computes the same key without a second config knob.
 // ---------------------------------------------------------------------------
@@ -3165,7 +3047,7 @@ async fn probe_cluster_reachability_ok_for_bus_only_coordinator() {
 #[test]
 fn derive_cluster_subkey_is_deterministic() {
     // Same base + domain → same sub-key on every replica (the property that
-    // makes cross-replica modern resume decode).
+    // makes a cross-replica resume decode).
     let base = [9u8; 32];
     let a = derive_cluster_subkey(&base, b"mcpg:request-state-codec:v1");
     let b = derive_cluster_subkey(&base, b"mcpg:request-state-codec:v1");

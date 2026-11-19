@@ -805,7 +805,6 @@ async fn every_record_type_round_trips() {
             principal: "p".to_owned(),
             client_id: Some("c".to_owned()),
             session_id: Some("s".to_owned()),
-            notify: true,
             exp: 1_900_000_000,
         },
     )

@@ -37,12 +37,15 @@ pub fn main() -> anyhow::Result<()> {
         std::process::exit(crate::health_probe::run(&args[1..]));
     }
 
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_keep_alive(BLOCKING_THREAD_KEEP_ALIVE)
         .build()
-        .context("cannot build the async runtime")?
-        .block_on(run(args))
+        .context("cannot build the async runtime")?;
+    let outcome = runtime.block_on(run(args));
+    drop(runtime);
+    crate::observability::flush_os_streams();
+    outcome
 }
 
 /// How long an idle blocking-pool thread waits for work before it exits.

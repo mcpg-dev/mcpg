@@ -61,8 +61,9 @@ URLs are refused.
 
 ## Exposed resources (change watching)
 
-A `watch:` block turns a binding into something an MCP client can
-`resources/subscribe` to. The engine re-reads the binding, takes a
+A `watch:` block turns a binding into something an MCP client can watch:
+the client opens a `subscriptions/listen` stream whose
+`resourceSubscriptions` names the resource URI. The engine re-reads the binding, takes a
 SHA-256 of the result, and sends `notifications/resources/updated`
 **only when that hash moves**. An unchanged folder produces no traffic.
 

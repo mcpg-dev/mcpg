@@ -22,7 +22,7 @@ use super::{AdminConfig, ControlPlaneAttachConfig, ServerConfig};
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
     /// Listener configuration — bind address, transport mode
-    /// (HTTP / stdio / SSE), TLS, allowed origins, and per-request
+    /// (HTTP / stdio), TLS, allowed origins, and per-request
     /// timeouts. The block is mandatory in practice (the listener
     /// won't bind without `bind_address`) but defaults to a
     /// localhost dev-mode shape so out-of-the-box `mcpg` boots
@@ -97,8 +97,8 @@ pub struct GatewayConfig {
 /// trigger. Same semantics as SIGHUP and the admin endpoint:
 /// full `GatewayRuntime` rebuild via `ArcSwap`; session store
 /// preserved; credential cache rebuilt fresh; `list_changed`
-/// emitted per category for operational sessions on inventory
-/// delta.
+/// emitted per category to the open `subscriptions/listen`
+/// streams on inventory delta.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigWatchConfig {

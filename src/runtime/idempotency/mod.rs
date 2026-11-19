@@ -31,10 +31,10 @@ pub use store::{
     PeekOutcome, ReservationOutcome, noop_idempotency_store,
 };
 
-/// Reverse-DNS extension identifier advertised at `initialize` time.
+/// Reverse-DNS extension identifier `server/discover` advertises.
 ///
 /// Used both as the key under
-/// `result.capabilities.extensions[…]` in the initialize response
+/// `result.capabilities.extensions[…]` in the `server/discover` result
 /// and as the namespace for the request/response `_meta` keys
 /// emitted by this extension.
 pub const EXTENSION_ID: &str = "dev.mcpg/idempotency";
@@ -181,11 +181,10 @@ pub fn extract_request_key(meta: Option<&serde_json::Value>) -> KeyValidation {
 
 /// Build the JSON value the gateway emits under
 /// `result.capabilities.extensions[EXTENSION_ID]` in the
-/// `initialize` response. The values are the operator-tunable knobs
+/// `server/discover` result. The values are the operator-tunable knobs
 /// (TTLs, scope, supported methods), sourced from the runtime
-/// [`crate::config::IdempotencyConfig`]. This helper exists so the
-/// initialize handler can build the value declaratively from a
-/// config struct.
+/// [`crate::config::IdempotencyConfig`], so the advertisement is built
+/// declaratively from a config struct.
 pub fn capability_advertisement(
     default_ttl_seconds: u64,
     max_ttl_seconds: u64,
@@ -225,13 +224,9 @@ pub fn hash_request_body(
     hasher.update(tool_name.as_bytes());
     hasher.update(b"\x00");
     if let Some(args) = arguments {
-        // Serialize via serde_json::to_writer with a hasher
-        // adapter would avoid the temporary allocation; the
-        // straightforward `to_vec` is already fast enough for the
-        // dispatch path (one hash per call).
-        if let Ok(bytes) = serde_json::to_vec(args) {
-            hasher.update(&bytes);
-        }
+        // Encoding a `Value` cannot fail and the hasher's writer never
+        // errors, so the hasher sees exactly the bytes `to_vec` makes.
+        let _ = serde_json::to_writer(&mut hasher, args);
     }
     *hasher.finalize().as_bytes()
 }
@@ -392,6 +387,40 @@ mod tests {
         let c = hash_request_body("tools/call", "charge", Some(&json!({"amount": 200})));
         assert_eq!(a, b, "same input ⇒ same hash");
         assert_ne!(a, c, "different arguments ⇒ different hash");
+    }
+
+    /// Records written by any replica must keep matching, so the hash
+    /// stays BLAKE3 over `method \0 name \0` and the compact `to_vec`
+    /// encoding of the arguments.
+    #[test]
+    fn hash_request_body_hashes_the_compact_encoding() {
+        let reference = |args: Option<&serde_json::Value>| {
+            let mut bytes = b"tools/call\x00charge\x00".to_vec();
+            if let Some(args) = args {
+                bytes.extend(serde_json::to_vec(args).unwrap());
+            }
+            *blake3::hash(&bytes).as_bytes()
+        };
+        let cases = [
+            json!({}),
+            json!({"amount": 100, "currency": "EUR"}),
+            json!({"note": "quote \" backslash \\ newline \n tab \t nul \u{0} é 漢 🦀"}),
+            json!({"nested": {"list": [1, -2.5, 1e300, null, true, false], "empty": []}}),
+            json!({"pad": "x".repeat(70_000)}),
+            json!([1, "two", {"three": 3}]),
+            json!("bare string"),
+        ];
+        for args in &cases {
+            assert_eq!(
+                hash_request_body("tools/call", "charge", Some(args)),
+                reference(Some(args)),
+                "{args}"
+            );
+        }
+        assert_eq!(
+            hash_request_body("tools/call", "charge", None),
+            reference(None)
+        );
     }
 
     #[test]

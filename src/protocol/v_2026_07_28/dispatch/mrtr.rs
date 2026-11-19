@@ -1,4 +1,6 @@
-//! `mrtr` dispatch arms for MCP revision `2026-07-28`.
+//! MRTR resumption (SEP-2322): the retry of a request that answered
+//! `InputRequiredResult`, carrying `requestState` + `inputResponses` at
+//! the top level of params.
 
 use crate::protocol::shared::error::INVALID_PARAMS_CODE;
 use crate::protocol::shared::jsonrpc::{ProtocolHttpResponse, ProtocolResponse};
@@ -10,42 +12,26 @@ use crate::runtime::RequestContext;
 use crate::runtime::shared_services::SharedServices;
 use serde_json::Value;
 
-/// Extracted MRTR resumption signal from a request's `_meta`. None
-/// if the meta either is absent or lacks the resumption keys.
+/// The `requestState` + `inputResponses` of an MRTR retry.
 pub(crate) struct MrtrResumption {
     pub(crate) request_state: String,
     pub(crate) input_responses: Value,
 }
 
-pub(crate) fn extract_mrtr_resumption(meta: Option<&Value>) -> Option<MrtrResumption> {
-    use crate::protocol::v_2026_07_28::wire::mrtr::{
-        META_KEY_INPUT_RESPONSES, META_KEY_REQUEST_STATE,
-    };
-
-    let meta = meta?.as_object()?;
-    let request_state = meta.get(META_KEY_REQUEST_STATE)?.as_str()?.to_owned();
-    let input_responses = meta.get(META_KEY_INPUT_RESPONSES)?.clone();
-    Some(MrtrResumption {
-        request_state,
-        input_responses,
-    })
-}
-
-/// Companion to [`extract_mrtr_resumption`] for the spec-canonical
-/// top-level params placement (SEP-2322). Returns `Some` only when
-/// **both** `request_state` and `input_responses` are present —
-/// either alone is malformed and should fall through to the
-/// non-resumption path so the runtime returns a clear error.
-pub(crate) fn extract_mrtr_resumption_from_params(
-    request_state: Option<&str>,
-    input_responses: Option<&Value>,
-) -> Option<MrtrResumption> {
-    let request_state = request_state?.to_owned();
-    let input_responses = input_responses?.clone();
-    Some(MrtrResumption {
-        request_state,
-        input_responses,
-    })
+impl MrtrResumption {
+    /// The resumption a request's params carry: `Some` only when **both**
+    /// `requestState` and `inputResponses` are present. Either one alone
+    /// falls through to the ordinary path, which answers it as a new
+    /// request.
+    pub(crate) fn from_params(
+        request_state: Option<&str>,
+        input_responses: Option<&Value>,
+    ) -> Option<Self> {
+        Some(Self {
+            request_state: request_state?.to_owned(),
+            input_responses: input_responses?.clone(),
+        })
+    }
 }
 
 /// What the retry of a `tools/call` that offered the caller a link to
@@ -100,39 +86,23 @@ fn link_answer(input_responses: Option<&Value>) -> Result<LinkAnswer, &'static s
 /// attacker-controlled). An accepted link is waited for a short while; a
 /// declined one is not offered again; an unanswered one is offered again
 /// while it is pending; one that expired runs the call again as a new
-/// request would. `requestState` and `inputResponses` are read from
-/// params, else from `_meta`, as for any MRTR resumption.
+/// request would. `requestState` and `inputResponses` are the top-level
+/// params of the retry.
 pub(crate) async fn resume_connect_link(
     ctx: &RequestContext,
     runtime: &crate::runtime::GatewayRuntime,
     tool: &str,
     request_state: Option<&str>,
     input_responses: Option<&Value>,
-    meta: Option<&Value>,
 ) -> LinkResumption {
-    use crate::protocol::v_2026_07_28::wire::mrtr::{
-        META_KEY_INPUT_RESPONSES, META_KEY_REQUEST_STATE,
-    };
     use crate::runtime::authorization_server::connect::{
         LINK_REQUEST_STATE_PREFIX, LinkStateCheck,
     };
-    let meta = meta.and_then(Value::as_object);
-    let (request_state, input_responses) = match request_state {
-        Some(request_state) => (request_state, input_responses),
-        None => match meta
-            .and_then(|meta| meta.get(META_KEY_REQUEST_STATE))
-            .and_then(Value::as_str)
-        {
-            Some(request_state) => (
-                request_state,
-                meta.and_then(|meta| meta.get(META_KEY_INPUT_RESPONSES)),
-            ),
-            None => return LinkResumption::NotALink,
-        },
-    };
-    if !request_state.starts_with(LINK_REQUEST_STATE_PREFIX) {
+    let Some(request_state) =
+        request_state.filter(|state| state.starts_with(LINK_REQUEST_STATE_PREFIX))
+    else {
         return LinkResumption::NotALink;
-    }
+    };
     let refused = LinkResumption::Refused(
         "requestState does not name a link offered to this caller for this tool",
     );
@@ -166,34 +136,27 @@ pub(crate) async fn resume_connect_link(
     LinkResumption::Resumed
 }
 
-/// Translate an MRTR resumption (`_meta.requestState` +
-/// `_meta.inputResponses`) into the legacy `ServerRequestResponse`
-/// machinery so the pipeline picks up where it suspended.
+/// Resume the pipeline an MRTR `requestState` names with the client's
+/// `inputResponses`, so it picks up where it suspended, and answer under
+/// `request_id`, the id of the retry.
 ///
-/// Today this handles the **single-entry** case (one elicitation /
-/// sampling / roots input per suspension) — the shape the suspension
-/// path emits. Multi-entry MRTR (multiple simultaneous inputs from
-/// the spec's `inputRequests` map) is a follow-up: it needs a
-/// pipeline-engine refactor to consume an `InputResponses` map at
-/// once instead of one response at a time.
+/// The `requestState` must open under the codec for the calling principal
+/// (AEAD-bound to its owner), and the pipeline id it seals is the pipeline
+/// that resumes. One answer goes to `resume_single_input`, which requires
+/// its correlation token to be the request the pipeline awaits; the
+/// answers to a `gather` step's batch go to
+/// `handle_multi_input_resumption`, which records each and resumes once.
 pub(crate) async fn dispatch_mrtr_resumption(
     ctx: &RequestContext,
+    runtime: &crate::runtime::GatewayRuntime,
     services: &SharedServices,
     request_id: Value,
     mrtr: MrtrResumption,
 ) -> ProtocolHttpResponse {
     use crate::protocol::v_2026_07_28::wire::mrtr::{InputResponseValue, InputResponses};
 
-    let Some(runtime_handle) = services.runtime() else {
-        return handler_internal_error(Some(request_id), "gateway runtime is shutting down");
-    };
-    let runtime = runtime_handle.load();
-
-    // Validate the requestState blob is well-formed for this
-    // gateway's codec (key not rotated, ciphertext not tampered).
-    // The decoded payload (pipeline_id) is informational — the
-    // pending-server-request lookup keyed by correlation token
-    // recovers the pipeline id authoritatively.
+    // The blob must open for this gateway's codec (key not rotated,
+    // ciphertext not tampered); its payload is the pipeline id.
     let codec = &services.request_state_codec;
     // The blob is bound to the principal that suspended the pipeline;
     // decoding under a different principal fails AEAD verification.
@@ -216,8 +179,6 @@ pub(crate) async fn dispatch_mrtr_resumption(
         }
     };
 
-    // Parse the inputResponses map. Single-entry only for now;
-    // multi-entry MRTR is a follow-up.
     let responses = match InputResponses::from_value(&mrtr.input_responses) {
         Ok(r) => r,
         Err(error) => {
@@ -239,12 +200,9 @@ pub(crate) async fn dispatch_mrtr_resumption(
     }
 
     // SEP-2322 multi-entry MRTR — the client answered a `gather`
-    // step's batch in one `inputResponses` map. The `requestState`
-    // recovers the suspended pipeline directly (the per-token pending
-    // requests all point at it), so route to the multi-input resume
-    // path that records every answer and resumes once.
+    // step's batch in one `inputResponses` map. Route to the multi-input
+    // resume path that records every answer and resumes once.
     if responses.entries.len() > 1 {
-        let _ = request_id;
         let answers: std::collections::BTreeMap<String, Value> = responses
             .entries
             .into_iter()
@@ -263,7 +221,7 @@ pub(crate) async fn dispatch_mrtr_resumption(
             })
             .collect();
         let response = runtime
-            .handle_multi_input_resumption(ctx, &decoded_pipeline_id, answers)
+            .handle_multi_input_resumption(ctx, request_id, &decoded_pipeline_id, answers)
             .await;
         spend_request_state_after_resume(codec, &mrtr.request_state, &response).await;
         // A resume that ran the pipeline to completion returns a
@@ -289,17 +247,18 @@ pub(crate) async fn dispatch_mrtr_resumption(
         request_id = ctx.request_id.as_str(),
         correlation_token = %correlation_token,
         decoded_pipeline_id = %decoded_pipeline_id,
-        "MRTR resumption: delegating to legacy handle_server_request_response"
+        "MRTR resumption: resuming the suspended pipeline"
     );
 
-    // Drop the unused request_id binding; the resumption path mints
-    // its own response envelope using the original tools/call id
-    // recovered from the pipeline state.
-    let _ = request_id;
-
-    let response_id_value = Value::String(correlation_token);
     let response = runtime
-        .handle_server_request_response(ctx, response_id_value, result, error)
+        .resume_single_input(
+            ctx,
+            request_id,
+            &decoded_pipeline_id,
+            &correlation_token,
+            result,
+            error,
+        )
         .await;
     spend_request_state_after_resume(codec, &mrtr.request_state, &response).await;
     stamp_complete_result_type(response)
@@ -320,26 +279,67 @@ pub(crate) fn resume_did_not_commit(response: &ProtocolHttpResponse) -> bool {
     }
 }
 
-/// Spend the inline `requestState` blob (cross-replica single-use claim) AND
-/// clean up any handle-encoded state — but only once the resume actually
-/// committed. Deferring the claim past the resume means a recoverable
-/// downstream failure (pending-not-found / expired / transient KV error)
-/// leaves the blob reusable instead of wedging the suspension until pipeline
-/// timeout. Double-resume is already prevented by the pipeline's own
-/// `try_claim_pipeline` CAS, so the blob claim is purely the bearer-replay
-/// guard for an already-completed resume. Handle (`h.`) blobs are single-use
-/// by construction (the resume deletes the handle); `cleanup` removes any
-/// residual handle row regardless of outcome.
+/// Spend the `requestState` blob once the resume committed: claim an inline
+/// (`c.`) blob in the cross-replica single-use ledger and delete the row of
+/// a handle (`h.`) blob. A resume that committed nothing (pending-not-found,
+/// a foreign resumer, expired, a transient KV error) leaves the blob
+/// reusable, so neither a recoverable failure nor another principal that
+/// presents the blob can take the owner's resume away. Double-resume is
+/// already prevented by the pipeline's own `try_claim_pipeline` CAS, so the
+/// spend is the bearer-replay guard for an already-completed resume.
 pub(crate) async fn spend_request_state_after_resume(
     codec: &crate::protocol::v_2026_07_28::dispatch::request_state::RequestStateCodec,
     request_state: &str,
     response: &ProtocolHttpResponse,
 ) {
-    let _ = codec.cleanup(request_state).await;
     if resume_did_not_commit(response) {
         return;
     }
+    let _ = codec.cleanup(request_state).await;
     if let Err(error) = codec.enforce_single_use(request_state).await {
         tracing::debug!(error = %error, "MRTR requestState already spent post-resume");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_resumption_needs_both_request_state_and_input_responses() {
+        let answers = json!({ "e1": { "action": "accept" } });
+        let resumption =
+            MrtrResumption::from_params(Some("c.blob"), Some(&answers)).expect("resumption");
+        assert_eq!(resumption.request_state, "c.blob");
+        assert_eq!(resumption.input_responses, answers);
+
+        assert!(MrtrResumption::from_params(Some("c.blob"), None).is_none());
+        assert!(MrtrResumption::from_params(None, Some(&answers)).is_none());
+        assert!(MrtrResumption::from_params(None, None).is_none());
+    }
+
+    #[test]
+    fn link_answers_read_the_connect_input() {
+        use crate::runtime::authorization_server::connect::LINK_INPUT_KEY;
+        let answered = |value: Value| json!({ LINK_INPUT_KEY: value });
+        assert_eq!(link_answer(None), Ok(LinkAnswer::Unanswered));
+        assert_eq!(
+            link_answer(Some(&answered(json!({ "action": "accept" })))),
+            Ok(LinkAnswer::Accepted)
+        );
+        assert_eq!(
+            link_answer(Some(&answered(json!({ "action": "decline" })))),
+            Ok(LinkAnswer::Declined)
+        );
+        assert_eq!(
+            link_answer(Some(&answered(json!({ "action": "cancel" })))),
+            Ok(LinkAnswer::Declined)
+        );
+        assert_eq!(
+            link_answer(Some(&json!({ "other": { "action": "accept" } }))),
+            Ok(LinkAnswer::Unanswered)
+        );
+        assert!(link_answer(Some(&json!("not a map"))).is_err());
     }
 }

@@ -202,6 +202,18 @@ async fn serve(State(upstream): State<Upstream>, Json(body): Json<Value>) -> Res
         .into_response();
     }
     match method.as_str() {
+        "server/discover" => Json(json!({
+            "jsonrpc": "2.0", "id": id,
+            "result": {
+                "resultType": "complete",
+                "supportedVersions": [crate::protocol::SUPPORTED_PROTOCOL_VERSION],
+                "serverInfo": { "name": "upstream", "version": "1" },
+                "capabilities": { "events": { "listChanged": true } },
+                "ttlMs": 1,
+                "cacheScope": "public"
+            }
+        }))
+        .into_response(),
         "events/list" => {
             let types = upstream.types.lock().unwrap().clone();
             Json(json!({ "jsonrpc": "2.0", "id": id, "result": { "events": types } }))
@@ -392,7 +404,6 @@ mcp:
     - name: up
       upstream:
         url: "{url}"
-        protocol_version: "2026-07-28"
         upstream_safety: {{ allow_private_backends: true, allow_insecure_http: true }}
       import: {{ tools: false, events: true }}
       naming: {{ event_prefix: "up." }}

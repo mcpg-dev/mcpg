@@ -64,7 +64,7 @@ pub(crate) fn cross_check_cluster_provides(
                 max_payload_bytes = cap,
                 "cluster coordinator `bus` role has a declared per-message payload cap — \
                  bus messages above it fail at publish time; delivery-bus terminal \
-                 results typically exceed it (prefer a capless bus backend for legacy \
+                 results typically exceed it (prefer a capless bus backend for \
                  delivery/resume traffic)"
             );
         }
@@ -244,7 +244,7 @@ pub(crate) fn build_state_cipher(
 /// Cluster-stable 32-byte secret derived from `cluster.state_encryption_key_env`,
 /// or `None` when that env var is unset. This is the same key material
 /// `build_state_cipher` consumes (URL-safe base64, padded or unpadded);
-/// reading the raw bytes here lets the modern-resume key paths derive
+/// reading the raw bytes here lets the session and resume key paths derive
 /// domain-separated sub-keys that are IDENTICAL on every replica without an
 /// operator configuring a second secret. Returns an error only when the env
 /// var is named but unset/empty or the value is the wrong length — the same
@@ -284,16 +284,17 @@ pub(crate) fn cluster_state_key_bytes(
 
 /// Derive a domain-separated 32-byte sub-key from a cluster-stable base key
 /// via HMAC-SHA256. The `domain` string keeps each consumer's sub-key
-/// independent (the modern-session key space is disjoint from the
-/// requestState codec key space, etc.), so compromise/rotation reasoning is
-/// per-domain. Reuses the existing HMAC primitive — no new crypto.
+/// independent (the session key space is disjoint from the requestState
+/// codec key space, etc.), so compromise/rotation reasoning is per-domain.
+/// Reuses the existing HMAC primitive — no new crypto.
 pub(crate) fn derive_cluster_subkey(base: &[u8; 32], domain: &[u8]) -> [u8; 32] {
     hmac_sha256::HMAC::mac(domain, base)
 }
 
-/// Domain-separation label for the modern synthetic-session HMAC key derived
-/// from the cluster-stable secret. Kept disjoint from the requestState codec
-/// key space.
+/// Domain-separation label for the synthetic-session HMAC key derived from
+/// the cluster-stable secret. Kept disjoint from the requestState codec key
+/// space; the label is part of the derived key, so it stays fixed for the
+/// session ids to stay stable.
 pub(crate) const SYNTHETIC_SESSION_KEY_DOMAIN: &[u8] = b"mcpg:modern-session-key:v1";
 
 /// Wrap a resolved capability KV in the encrypting decorator when a

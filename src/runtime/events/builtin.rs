@@ -1,9 +1,9 @@
 //! Events the gateway raises itself, and the catalog-change notification.
 //!
 //! - `mcp.task.updated`: every status a task store writes. Only the
-//!   principal whose session owns the task receives it: the occurrence
-//!   names that principal as its audience, and the dispatcher delivers it
-//!   to no other subscription.
+//!   principal that owns the task receives it: the occurrence names that
+//!   principal as its audience, and the dispatcher delivers it to no
+//!   other subscription.
 //! - `approval.requested` / `approval.resolved`: a tool gate asking a
 //!   person to approve a call, and how that ended. Who may see them is the
 //!   operator's `event_name` rules and the type's `match`.
@@ -17,15 +17,14 @@ use serde_json::json;
 
 use super::engine::EventsCore;
 use crate::config::events::BuiltinEventSource;
-use crate::runtime::GatewayRuntime;
 use crate::runtime::approvals::ApprovalObserver;
 use crate::runtime::stores::session_store::SessionStore;
 use crate::runtime::task_store::{TaskObserver, TaskRecord};
+use crate::runtime::{GatewayRuntime, RequestIdentity};
 
 /// Raises `mcp.task.updated` for every task status written.
 struct TaskEvents {
     core: Weak<EventsCore>,
-    sessions: Arc<dyn SessionStore>,
 }
 
 impl TaskObserver for TaskEvents {
@@ -33,16 +32,13 @@ impl TaskObserver for TaskEvents {
         let Some(core) = self.core.upgrade() else {
             return;
         };
-        // A task of an anonymous session belongs to nobody who can
-        // subscribe, so it is not raised at all.
-        let Some(owner) = self
-            .sessions
-            .load_session(Some(&record.session_id), false)
-            .ok()
-            .and_then(|s| s.owner_principal.clone())
-        else {
+        // A task is owned by its caller's principal key. An anonymous
+        // caller's task is owned by a session id instead and belongs to
+        // nobody who can subscribe, so it is not raised at all.
+        if !RequestIdentity::is_principal_key(&record.session_id) {
             return;
-        };
+        }
+        let owner = record.session_id.clone();
         let status = serde_json::to_value(record.task.status)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))
@@ -129,7 +125,6 @@ impl ApprovalObserver for ApprovalEvents {
 pub fn observe_tasks(core: &Arc<EventsCore>, runtime: &GatewayRuntime) {
     runtime.task_store().set_observer(Arc::new(TaskEvents {
         core: Arc::downgrade(core),
-        sessions: Arc::clone(runtime.session_store()),
     }));
     runtime
         .approval_registry
@@ -138,26 +133,20 @@ pub fn observe_tasks(core: &Arc<EventsCore>, runtime: &GatewayRuntime) {
         }));
 }
 
-/// Tell every `2026-07-28` session that the event types changed, so a
+/// Tell every session that the event types changed, so a
 /// `subscriptions/listen` stream that asked for `events/listChanged` hears
 /// it.
 pub fn announce_list_changed(
     sessions: &Arc<dyn SessionStore>,
     bus: &Arc<dyn crate::runtime::buses::delivery_bus::DeliveryBus>,
 ) {
-    use crate::protocol::version::ProtocolVersion;
     let notification =
         crate::protocol::v_2026_07_28::extensions::events::wire::EventsListChangedParams::default()
             .to_notification();
     for session in sessions.list_sessions() {
-        if ProtocolVersion::parse(&session.protocol_version) != Some(ProtocolVersion::V_2026_07_28)
-        {
-            continue;
-        }
         let message = crate::runtime::pipeline_store::DeliveryMessage {
             kind: crate::runtime::pipeline_store::DeliveryKind::Notification,
             jsonrpc_message: notification.clone(),
-            delivery_id: String::new(),
         };
         let bus = Arc::clone(bus);
         let sid = session.session_id.clone();
