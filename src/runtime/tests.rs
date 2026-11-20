@@ -144,7 +144,9 @@ async fn send(
     let message = crate::protocol::Handler
         .parse(body)
         .expect("a well-formed message");
-    runtime.handle_protocol_message(&context, message).await
+    runtime
+        .handle_protocol_message(&Arc::new(context), message)
+        .await
 }
 
 /// The `result` of a JSON-RPC success.
@@ -214,7 +216,7 @@ async fn a_message_before_the_shared_services_are_installed_is_an_internal_error
         .expect("a well-formed message");
 
     let response = runtime
-        .handle_protocol_message(&request_context(anonymous()), message)
+        .handle_protocol_message(&Arc::new(request_context(anonymous())), message)
         .await;
 
     assert_eq!(response.http_status, 500);

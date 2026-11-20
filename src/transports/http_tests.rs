@@ -12518,3 +12518,91 @@ async fn a_listen_stream_asks_the_admission_for_each_resource() {
     assert_eq!(body["id"], 78);
     assert_eq!(admission_subscribers(&state), 0, "nothing is subscribed");
 }
+
+/// The sizes of the futures a `tools/call` runs through, outermost first.
+/// A future moves whole, so each poll chain that moves one copies all its
+/// bytes; `--nocapture` prints them.
+#[tokio::test]
+async fn the_tools_call_futures_are_measured() {
+    use std::mem::size_of_val;
+    let state = build_test_state();
+    let runtime = state.runtime.load_full();
+    let config = state.config.load_full();
+    let services = runtime
+        .shared_services
+        .load_full()
+        .expect("the test state installs the shared services");
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "mcpg.runtime.snapshot", "arguments": {} },
+    });
+    let ctx = Arc::new(crate::runtime::RequestContext::new(
+        crate::runtime::GatewayRequestId::new(),
+        None,
+        crate::runtime::RequestIdentity::Anonymous {
+            source: "test".to_owned(),
+        },
+        crate::runtime::TransportKind::Http,
+    ));
+    let headers = HeaderMap::new();
+    let wire_params = || -> crate::protocol::v_2026_07_28::wire::tools::ToolCallParams {
+        serde_json::from_value(body["params"].clone()).expect("tool call params")
+    };
+    let message = || {
+        crate::protocol::Handler
+            .parse(body.clone())
+            .expect("a tools/call")
+    };
+
+    let handler = mcp_handler(
+        axum::extract::State(state.clone()),
+        ConnectionExt(crate::transports::attested::ConnectionFacts::default()),
+        None,
+        axum::http::Method::POST,
+        axum::extract::OriginalUri("/mcp".parse().expect("uri")),
+        RequestHeaders(HeaderMap::new()),
+        Bytes::new(),
+    );
+    let transport_dispatch = dispatch(
+        &runtime,
+        &config,
+        body.clone(),
+        RequestContext::clone(&ctx),
+        Some(&headers),
+    );
+    let protocol_message = runtime.handle_protocol_message(&ctx, message());
+    let protocol_dispatch = crate::protocol::Handler.dispatch(&ctx, &runtime, message(), &services);
+    let tools_call_arm = crate::protocol::v_2026_07_28::dispatch::tools::dispatch_tools_call(
+        &ctx,
+        &runtime,
+        &services,
+        serde_json::json!(1),
+        wire_params(),
+    );
+    let tools_call = runtime.handle_tools_call(
+        serde_json::json!(1),
+        crate::protocol::ToolCallParams {
+            name: "mcpg.runtime.snapshot".to_owned(),
+            arguments: Some(serde_json::json!({})),
+            meta: None,
+        },
+        false,
+        &ctx,
+    );
+    let sizes = [
+        ("mcp_handler", size_of_val(&handler)),
+        ("transports::dispatch", size_of_val(&transport_dispatch)),
+        ("handle_protocol_message", size_of_val(&protocol_message)),
+        ("Handler::dispatch", size_of_val(&protocol_dispatch)),
+        ("dispatch_tools_call", size_of_val(&tools_call_arm)),
+        ("handle_tools_call", size_of_val(&tools_call)),
+        ("ProtocolMessage", size_of_val(&message())),
+        ("RequestContext", size_of_val(&*ctx)),
+    ];
+    for (name, size) in sizes {
+        println!("future size: {name} = {size} bytes");
+        assert!(size > 0, "{name}");
+    }
+}

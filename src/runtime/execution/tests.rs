@@ -46,7 +46,7 @@ fn sample_request() -> BackendInvocationRequest {
     let ctx = anonymous_context_in("session-1");
     let expr_ctx = ctx.to_expr_context("mcpg.runtime.snapshot", Some(&serde_json::json!({})));
     BackendInvocationRequest {
-        context: ctx,
+        context: std::sync::Arc::new(ctx),
         tool_name: "mcpg.runtime.snapshot".to_owned(),
         arguments: Some(serde_json::json!({})),
         expr_ctx,
@@ -87,10 +87,11 @@ fn sample_snapshot() -> RuntimeSnapshot {
 fn dispatcher_routes_runtime_snapshot_tool() {
     let dispatcher = ExecutionDispatcher::default();
     let mut request = sample_request();
-    request.context.identity = crate::runtime::RequestIdentity::HttpHeader {
-        subject_id: "user-1".to_owned(),
-        source: "x-mcpg-subject-id".to_owned(),
-    };
+    std::sync::Arc::make_mut(&mut request.context).identity =
+        crate::runtime::RequestIdentity::HttpHeader {
+            subject_id: "user-1".to_owned(),
+            source: "x-mcpg-subject-id".to_owned(),
+        };
     let result = dispatcher.dispatch_tool_call(
         BackendInvocationRoute::RuntimeSnapshot,
         &request,
@@ -121,10 +122,11 @@ fn dispatcher_routes_adapter_backed_request_echo_tool() {
     request.arguments = Some(serde_json::json!({
         "message": "hello"
     }));
-    request.context.identity = crate::runtime::RequestIdentity::HttpHeader {
-        subject_id: "user-1".to_owned(),
-        source: "x-mcpg-subject-id".to_owned(),
-    };
+    std::sync::Arc::make_mut(&mut request.context).identity =
+        crate::runtime::RequestIdentity::HttpHeader {
+            subject_id: "user-1".to_owned(),
+            source: "x-mcpg-subject-id".to_owned(),
+        };
 
     let result = dispatcher.dispatch_tool_call(
         BackendInvocationRoute::RequestEcho,

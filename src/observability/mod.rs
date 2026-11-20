@@ -18,9 +18,9 @@
 //! Metrics work the same way: there is no in-gateway Prometheus
 //! exporter. The [`metrics_bridge::PluginMetricsRecorder`] is the
 //! `metrics-rs` global recorder; every `counter!` / `gauge!` /
-//! `histogram!` call enqueues a `MetricPoint` onto a bounded
-//! channel that fans out to every operator-listed `MetricsSink`
-//! plugin. The canonical Prometheus plugin
+//! `histogram!` call aggregates into its series, and the bridge
+//! delivers one `MetricPoint` per series and flush to every
+//! operator-listed `MetricsSink` plugin. The canonical Prometheus plugin
 //! (`dev.mcpg.observability.prometheus`) accumulates events into
 //! its own in-memory registry and renders text-exposition v0.0.4
 //! through the `MetricsSink::render_text_exposition` slot —
@@ -45,6 +45,7 @@ pub const PROMETHEUS_PLUGIN_ID: &str = "dev.mcpg.observability.prometheus";
 pub const OTLP_PLUGIN_ID: &str = "dev.mcpg.observability.otlp";
 
 pub(crate) mod dispatch_guard;
+mod json_format;
 pub mod log_bridge;
 pub mod metrics_bridge;
 pub mod signal_router;
@@ -160,6 +161,9 @@ pub struct ObservabilityHandle {
     /// when metrics is disabled, the sinks list is empty, or the
     /// recorder slot was already claimed (test harness reentry).
     metrics_bridge: Option<metrics_bridge::MetricsBridgeHandle>,
+    /// Flushes the aggregated metrics to the sinks; `Some` once
+    /// `attach_metrics_bridge` started the forwarder.
+    metrics_flusher: Option<metrics_bridge::MetricsFlusher>,
     /// Shared `target_prefix → plugin_id` map used
     /// by all three bridges + the metrics recorder. Empty at
     /// init; gateway boot calls `populate_target_map` after
@@ -261,7 +265,22 @@ impl ObservabilityHandle {
         per_plugin_filters: std::sync::Arc<HashMap<String, signal_router::SignalFilter>>,
     ) {
         if let Some(handle) = self.metrics_bridge.take() {
-            handle.attach(runtime, per_plugin_filters);
+            self.metrics_flusher = handle.attach(runtime, per_plugin_filters);
+        }
+    }
+
+    /// Deliver the metrics aggregated since the last flush to the sinks.
+    /// `/metrics` calls it before it renders, so a scrape sees exact values.
+    pub async fn flush_metrics(&self) {
+        if let Some(flusher) = &self.metrics_flusher {
+            flusher.flush().await;
+        }
+    }
+
+    /// The final metrics flush at shutdown, while the sinks still run.
+    pub async fn close_metrics(&self) {
+        if let Some(flusher) = &self.metrics_flusher {
+            flusher.close().await;
         }
     }
 }
@@ -280,9 +299,8 @@ impl ObservabilityHandle {
 ///   sink (e.g. `dev.mcpg.observability.prometheus`), install
 ///   [`metrics_bridge::PluginMetricsRecorder`] as the metrics-rs
 ///   global recorder. Every gateway `counter!` / `gauge!` /
-///   `histogram!` enqueues a `MetricPoint` onto the bounded
-///   bridge channel; the forwarder task — attached once the
-///   runtime is up — drains it into
+///   `histogram!` aggregates into its series; the forwarder task —
+///   attached once the runtime is up — flushes the series into
 ///   `registry.emit_metric_event_filtered`. The Prometheus
 ///   plugin owns the in-memory registry that `/metrics`
 ///   renders from.
@@ -328,6 +346,7 @@ pub fn init(observability: &ObservabilityConfig) -> Result<ObservabilityHandle> 
             log_bridge: None,
             telemetry_bridge: None,
             metrics_bridge,
+            metrics_flusher: None,
             target_to_plugin_id,
             log_sink,
             log_gate: BridgeGate::default(),
@@ -343,6 +362,7 @@ pub fn init(observability: &ObservabilityConfig) -> Result<ObservabilityHandle> 
             log_bridge: None,
             telemetry_bridge: None,
             metrics_bridge,
+            metrics_flusher: None,
             target_to_plugin_id,
             log_sink,
             log_gate: BridgeGate::default(),
@@ -383,6 +403,7 @@ pub fn init(observability: &ObservabilityConfig) -> Result<ObservabilityHandle> 
         log_bridge: Some(log_bridge_handle),
         telemetry_bridge: Some(telemetry_bridge_handle),
         metrics_bridge,
+        metrics_flusher: None,
         target_to_plugin_id,
         log_sink,
         log_gate,
@@ -751,8 +772,7 @@ where
         SinkFormat::Json => fmt::layer()
             .json()
             .with_writer(writer)
-            .with_target(true)
-            .with_thread_names(true)
+            .event_format(json_format::JsonEvents::new())
             .boxed(),
     }
 }

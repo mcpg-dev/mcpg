@@ -248,7 +248,7 @@ impl GatewayRuntime {
             return;
         }
         info!(
-            request_id = %request_context.request_id,
+            request_id = request_context.request_id.as_str(),
             upstream_request_id = request_context.upstream_request_id.as_deref().unwrap_or(""),
             identity_kind = request_context.identity.label(),
             identity_trust = ?request_context.identity.trust_level(),
@@ -263,7 +263,7 @@ impl GatewayRuntime {
             return;
         }
         info!(
-            request_id = %request_context.request_id,
+            request_id = request_context.request_id.as_str(),
             upstream_request_id = request_context.upstream_request_id.as_deref().unwrap_or(""),
             identity_kind = request_context.identity.label(),
             identity_trust = ?request_context.identity.trust_level(),

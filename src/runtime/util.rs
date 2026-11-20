@@ -277,7 +277,7 @@ pub(crate) fn build_watch_resource_fetcher(
 
         let request_context = synthetic_watch_request_context();
         let execution_request = execution::BackendInvocationRequest {
-            context: request_context.clone(),
+            context: Arc::new(request_context.clone()),
             tool_name: profile.clone(),
             arguments: Some(args_value.clone()),
             expr_ctx: request_context.to_expr_context(&profile, Some(&args_value)),

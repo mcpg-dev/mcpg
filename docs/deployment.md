@@ -298,6 +298,15 @@ MCPG exposes three probe endpoints:
 
 The Helm chart configures all three probes with sensible defaults. The startup probe allows up to 60 seconds (12 attempts × 5s) for initial bootstrap.
 
+MCPG binds the MCP listener (`gateway.server.bind_address`) and the admin
+listener (`gateway.admin.bind_address`) before it starts any transport. If a
+bind fails (the port is in use, the bind is not permitted, or the TLS config
+does not load), MCPG logs an ERROR with the address and the cause, and exits
+with a non-zero status. MCPG also stops in the same way when the MCP or admin
+listener, or the tunnel transport, stops before a shutdown signal: it logs
+the ERROR, runs its normal shutdown, and exits with a non-zero status. A
+supervisor that restarts on failure then sees the failure.
+
 Outside Kubernetes, the image `HEALTHCHECK` runs `mcpg --health-check`. It
 maps a `0.0.0.0` or `[::]` bind to loopback and sends one `GET` to
 `health_path` with a 2 s timeout. It exits 0 on a 2xx and 1 otherwise, with

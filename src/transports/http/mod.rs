@@ -18,6 +18,7 @@ use axum::{
     routing::get,
     routing::post,
 };
+use futures::FutureExt as _;
 use serde::Serialize;
 use serde_json::Value;
 use std::convert::Infallible;
@@ -131,11 +132,49 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 const JSON_ACCEPT: &str = "application/json";
 const SSE_ACCEPT: &str = "text/event-stream";
 
-/// Start the HTTP(S) transport listener. Binds to the configured address,
-/// optionally with TLS, and serves until the shutdown signal fires.
-pub async fn serve(state: AppState, shutdown: tokio::sync::watch::Receiver<()>) -> Result<()> {
+/// The MCP listener: its socket, bound but not yet serving, and the TLS
+/// config it serves through when `gateway.server.tls` is set.
+pub struct HttpListener {
+    listener: tokio::net::TcpListener,
+    tls: Option<crate::transports::tls::RustlsConfig>,
+}
+
+impl HttpListener {
+    /// Bind `gateway.server.bind_address`, after the TLS server config
+    /// loads when TLS is configured. Fails when the address does not
+    /// resolve, is in use or is not permitted, or the TLS config does not
+    /// load.
+    pub async fn bind(config: &crate::config::AppConfig) -> Result<Self> {
+        let server = &config.gateway.server;
+        let tls = match &server.tls {
+            // A pre-built rustls ServerConfig carries the mTLS client
+            // verifier and the ALPN list, which axum-server's PEM loaders
+            // do not expose.
+            Some(tls) => Some(crate::transports::tls::RustlsConfig::from_config(
+                crate::transports::tls::build_server_config(tls)
+                    .map_err(|e| anyhow::anyhow!("failed to build TLS server config: {e}"))?,
+            )),
+            None => None,
+        };
+        let listener = tokio::net::TcpListener::bind(&server.bind_address).await?;
+        Ok(Self { listener, tls })
+    }
+
+    /// The address the listener holds.
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.listener.local_addr()
+    }
+}
+
+/// Serve the HTTP(S) transport on `listener` until the shutdown signal
+/// fires.
+pub async fn serve(
+    state: AppState,
+    listener: HttpListener,
+    shutdown: tokio::sync::watch::Receiver<()>,
+) -> Result<()> {
     let config = state.config.load();
-    let bind_address = config.gateway.server.bind_address.clone();
+    let bind_address = listener.local_addr()?;
     let health_path = config.gateway.server.health_path.clone();
     let mcp_path = config.gateway.server.mcp_path.clone();
     let tls_config = config.gateway.server.tls.clone();
@@ -143,25 +182,14 @@ pub async fn serve(state: AppState, shutdown: tokio::sync::watch::Receiver<()>) 
 
     let mut shutdown_rx = shutdown;
 
-    if let Some(tls) = tls_config {
-        use crate::transports::tls::{McpgTlsAcceptor, RustlsConfig, build_server_config};
+    if let (Some(rustls_config), Some(tls)) = (listener.tls, tls_config) {
+        use crate::transports::tls::McpgTlsAcceptor;
         use axum_server::tls_rustls::RustlsAcceptor;
-        // Build a custom rustls ServerConfig so we can wire mTLS
-        // (`WebPkiClientVerifier` against the operator's CA bundle)
-        // and ALPN (`h2` then `http/1.1`). axum-server's
-        // `RustlsConfig::from_pem_file` doesn't expose these, so
-        // we hand it a pre-built ServerConfig via `from_config`.
-        let server_config = build_server_config(&tls)
-            .map_err(|e| anyhow::anyhow!("failed to build TLS server config: {}", e))?;
-        let rustls_config = RustlsConfig::from_config(server_config);
         // McpgTlsAcceptor wraps the standard rustls acceptor and
         // stamps `TlsInfo` (peer cert chain + parsed leaf details)
         // onto every request via Extensions; the HTTP handler then
         // threads it into `RequestMetadata.tls`.
         let acceptor = McpgTlsAcceptor::new(RustlsAcceptor::new(rustls_config));
-        let addr: std::net::SocketAddr = bind_address
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid bind_address for TLS: {}", e))?;
         info!(
             bind_address = %bind_address,
             health_path = %health_path,
@@ -177,13 +205,13 @@ pub async fn serve(state: AppState, shutdown: tokio::sync::watch::Receiver<()>) 
             info!("https transport: graceful shutdown signal received");
             server_handle.graceful_shutdown(None);
         });
-        axum_server::bind(addr)
+        axum_server::Server::<std::net::SocketAddr>::from_listener(listener.listener)
             .acceptor(acceptor)
             .handle(handle)
             .serve(app.into_make_service())
             .await?;
     } else {
-        let listener = tokio::net::TcpListener::bind(&bind_address).await?;
+        let listener = listener.listener;
         info!(bind_address = %bind_address, health_path = %health_path, mcp_path = %mcp_path, "http transport listening");
         // Connect-info make-service so handlers can read the transport peer
         // (`ConnectInfo<SocketAddr>`) — the anonymous per-IP rate limiter's
@@ -492,11 +520,7 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
         ))
         // The request deadline. A tool call's awaited plugin call holds it,
         // and a request dropped once such a call began still finishes.
-        .layer(axum::middleware::from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                crate::transports::request_deadline::enforce(request_timeout, req, next)
-            },
-        ))
+        .layer(crate::transports::request_deadline::RequestDeadlineLayer::new(request_timeout))
         // Last-resort panic boundary: a panic in any handler becomes a
         // JSON-RPC 500 instead of resetting the connection / killing the
         // worker task. Placed inside TraceLayer so the synthesized 500 is
@@ -805,14 +829,20 @@ async fn mcp_handler(
             ctx,
             session_id,
             body,
-        } => subscriptions_listen_handler(state.clone(), ctx, session_id, body).await,
+        } => {
+            subscriptions_listen_handler(state.clone(), ctx, session_id, body)
+                .boxed()
+                .await
+        }
         DispatchOutcome::Stream {
             plan: StreamPlan::EventsStream,
             ctx,
             body,
             ..
         } => {
-            events_stream::events_stream_handler(state.clone(), ctx, body, client_accepts_sse).await
+            events_stream::events_stream_handler(state.clone(), ctx, body, client_accepts_sse)
+                .boxed()
+                .await
         }
         DispatchOutcome::Response {
             response,

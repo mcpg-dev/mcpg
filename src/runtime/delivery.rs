@@ -724,7 +724,7 @@ impl GatewayRuntime {
             return None;
         }
         let execution_request = execution::BackendInvocationRequest {
-            context: request_context.clone(),
+            context: Arc::new(request_context.clone()),
             tool_name: profile.clone(),
             arguments: params.arguments.clone(),
             expr_ctx: request_context.to_expr_context(profile, params.arguments.as_ref()),

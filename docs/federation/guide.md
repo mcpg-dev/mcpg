@@ -1132,6 +1132,18 @@ the client's own progress token. MCPG advertises no client capabilities to an
 upstream (except the MCP Apps extension when configured), and a
 server-to-client request an upstream sends is declined.
 
+### Cancellation
+When the client cancels a running federated `tools/call` with
+`notifications/cancelled` (or `tasks/cancel` for a task), MCPG stops waiting
+for the upstream. It sends the upstream `notifications/cancelled` with the
+upstream request id, over HTTP or on the stdio pipe. The client gets the
+same cancelled result as from a local backend: an `isError` tool result,
+counted in `mcpg_adapter_cancelled_in_flight_total{adapter="federation"}`.
+A call that is cancelled before it starts never reaches the upstream, and
+is counted in `mcpg_adapter_cancelled_on_entry_total`. A dropped HTTP
+request does not cancel a call that has started; local backends follow the
+same rule.
+
 ### Satellites & reload
 Dispatch uses one **satellite** (an upstream connection) per `(caller,
 federation)`, torn down after `session.idle_timeout_secs` idle. The

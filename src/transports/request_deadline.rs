@@ -13,6 +13,7 @@
 //! audit event, usage charge and session clean-up complete, and the quota
 //! permit and the plugin stay held until the call returns.
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,7 +23,6 @@ use std::time::Duration;
 
 use axum::extract::Request;
 use axum::http::StatusCode;
-use axum::middleware::Next;
 use axum::response::Response;
 
 tokio::task_local! {
@@ -139,24 +139,89 @@ where
     }
 }
 
-/// Middleware that answers `408` once `timeout` has passed, while no backend
-/// call is in flight.
-pub(crate) async fn enforce(timeout: Duration, request: Request, next: Next) -> Response {
-    let calls = BackendCalls::default();
-    let mut response = DetachOnDrop::new(calls.clone(), next.run(request));
-    let mut expired = std::pin::pin!(tokio::time::sleep(timeout));
-    std::future::poll_fn(|cx| {
-        if let Poll::Ready(response) = Pin::new(&mut response).poll(cx) {
+/// The layer that answers `408` once `timeout` has passed, while no backend
+/// call is in flight. Its service calls the inner service in `call`, so a
+/// request costs no clone of the inner service and no boxed middleware
+/// future.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RequestDeadlineLayer {
+    timeout: Duration,
+}
+
+impl RequestDeadlineLayer {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl<S> tower::Layer<S> for RequestDeadlineLayer {
+    type Service = RequestDeadline<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        RequestDeadline {
+            inner,
+            timeout: self.timeout,
+        }
+    }
+}
+
+/// The service of a [`RequestDeadlineLayer`].
+#[derive(Clone, Debug)]
+pub(crate) struct RequestDeadline<S> {
+    inner: S,
+    timeout: Duration,
+}
+
+impl<S> tower::Service<Request> for RequestDeadline<S>
+where
+    S: tower::Service<Request, Response = Response, Error = Infallible>,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = DeadlineFuture<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Infallible>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request) -> Self::Future {
+        DeadlineFuture {
+            response: DetachOnDrop::new(BackendCalls::default(), self.inner.call(request)),
+            expired: Box::pin(tokio::time::sleep(self.timeout)),
+        }
+    }
+}
+
+/// A request's response, or the empty `408` once its deadline passed while
+/// no backend call held it.
+pub(crate) struct DeadlineFuture<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    response: DetachOnDrop<F>,
+    expired: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl<F> Future for DeadlineFuture<F>
+where
+    F: Future<Output = Result<Response, Infallible>> + Send + 'static,
+{
+    type Output = Result<Response, Infallible>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if let Poll::Ready(response) = Pin::new(&mut this.response).poll(cx) {
             return Poll::Ready(response);
         }
         // Past the deadline a request with a call in flight is woken by its
         // own work, so the elapsed timer needs no waker.
-        if expired.as_mut().poll(cx).is_pending() || calls.in_flight() {
+        if this.expired.as_mut().poll(cx).is_pending() || this.response.calls.in_flight() {
             return Poll::Pending;
         }
-        Poll::Ready(timed_out())
-    })
-    .await
+        Poll::Ready(Ok(timed_out()))
+    }
 }
 
 fn timed_out() -> Response {
@@ -188,9 +253,7 @@ pub(crate) mod tests {
     }
 
     async fn call(app: Router) -> (StatusCode, String) {
-        let app = app.layer(axum::middleware::from_fn(|request, next| {
-            enforce(DEADLINE, request, next)
-        }));
+        let app = app.layer(RequestDeadlineLayer::new(DEADLINE));
         let response = app
             .oneshot(Request::get("/").body(Body::empty()).unwrap())
             .await
@@ -267,6 +330,54 @@ pub(crate) mod tests {
             assert!(!in_time, "the handler outlasts the request");
             assert_eq!(finish.await.is_ok(), begin_call, "begin_call: {begin_call}");
         }
+    }
+
+    /// Through the layer: a request dropped before its response finishes
+    /// its handler once a backend call began, and cancels it otherwise.
+    #[tokio::test]
+    async fn the_layer_detaches_a_dropped_request_only_once_a_backend_call_began() {
+        for begin_call in [false, true] {
+            let (finished, finish) = tokio::sync::oneshot::channel::<()>();
+            let finished = Arc::new(std::sync::Mutex::new(Some(finished)));
+            let app = Router::new()
+                .route(
+                    "/",
+                    get(move || {
+                        let finished = Arc::clone(&finished);
+                        async move {
+                            let _call = begin_call.then(begin_backend_call);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            if let Some(finished) = finished.lock().unwrap().take() {
+                                let _ = finished.send(());
+                            }
+                            "done"
+                        }
+                    }),
+                )
+                .layer(RequestDeadlineLayer::new(DEADLINE));
+            let request = app.oneshot(Request::get("/").body(Body::empty()).unwrap());
+            let in_time = tokio::time::timeout(Duration::from_millis(5), request)
+                .await
+                .is_ok();
+            assert!(!in_time, "the handler outlasts the request");
+            assert_eq!(finish.await.is_ok(), begin_call, "begin_call: {begin_call}");
+        }
+    }
+
+    /// The layer's service is ready when the inner service is.
+    #[tokio::test]
+    async fn the_layer_waits_for_the_inner_service() {
+        use tower::{Service, ServiceExt as _};
+        let mut service = tower::Layer::layer(
+            &RequestDeadlineLayer::new(DEADLINE),
+            tower::service_fn(|_: Request| async { Ok::<_, Infallible>(timed_out()) }),
+        );
+        let ready = service.ready().await.expect("an infallible service");
+        let response = ready
+            .call(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .expect("an infallible service");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
     #[test]

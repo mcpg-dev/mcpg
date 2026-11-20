@@ -18,7 +18,8 @@
 //!    method goes to its dispatch arm, which calls the runtime and shapes
 //!    the result (cache fields, `resultType`, MRTR `InputRequiredResult`).
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName};
+use futures::FutureExt as _;
 use serde_json::Value;
 
 use crate::protocol::shared::error::{HEADER_MISMATCH_CODE, ProtocolError};
@@ -51,6 +52,10 @@ use crate::protocol::v_2026_07_28::wire::{
 };
 use crate::runtime::shared_services::SharedServices;
 use crate::runtime::{GatewayRuntime, RequestContext};
+
+/// The routing headers as header names: a lookup by one skips parsing it.
+const PROTOCOL_VERSION_HEADER_NAME: HeaderName = HeaderName::from_static(PROTOCOL_VERSION_HEADER);
+const METHOD_HEADER_NAME: HeaderName = HeaderName::from_static(METHOD_HEADER);
 
 /// A request the transport answers with a long-lived stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +167,7 @@ impl Handler {
         // Either one alone is checked by `negotiate` before this runs.
         if let (Some(header_version), Some(body_version)) = (
             headers
-                .get(PROTOCOL_VERSION_HEADER)
+                .get(&PROTOCOL_VERSION_HEADER_NAME)
                 .and_then(|v| v.to_str().ok()),
             body.as_object()
                 .and_then(|obj| obj.get("params"))
@@ -193,7 +198,9 @@ impl Handler {
         // left undefined by the revision, so id-less bodies are not
         // subject to the header contract).
         let is_request = body_id.is_some();
-        let header_method = headers.get(METHOD_HEADER).and_then(|v| v.to_str().ok());
+        let header_method = headers
+            .get(&METHOD_HEADER_NAME)
+            .and_then(|v| v.to_str().ok());
         match header_method {
             None if is_request => {
                 return Err(header_mismatch(
@@ -262,7 +269,7 @@ impl Handler {
     /// Notifications return the `NotificationAccepted` envelope.
     pub async fn dispatch(
         &self,
-        ctx: &RequestContext,
+        ctx: &std::sync::Arc<RequestContext>,
         runtime: &GatewayRuntime,
         op: ProtocolMessage,
         services: &SharedServices,
@@ -301,6 +308,7 @@ impl Handler {
                 // carries no response.
                 runtime
                     .handle_request_cancellation(ctx, &cancelled_request_id, reason.as_deref())
+                    .boxed()
                     .await;
                 ProtocolHttpResponse {
                     http_status: 202,
@@ -316,7 +324,11 @@ impl Handler {
             ProtocolOperation::Capabilities(CapabilityOperation::ToolsList {
                 request_id,
                 params,
-            }) => dispatch_tools_list(ctx, runtime, request_id, params).await,
+            }) => {
+                dispatch_tools_list(ctx, runtime, request_id, params)
+                    .boxed()
+                    .await
+            }
             ProtocolOperation::Capabilities(CapabilityOperation::ToolsCall {
                 request_id,
                 params,
@@ -324,27 +336,51 @@ impl Handler {
             ProtocolOperation::Capabilities(CapabilityOperation::PromptsList {
                 request_id,
                 params,
-            }) => dispatch_prompts_list(ctx, runtime, request_id, params).await,
+            }) => {
+                dispatch_prompts_list(ctx, runtime, request_id, params)
+                    .boxed()
+                    .await
+            }
             ProtocolOperation::Capabilities(CapabilityOperation::PromptsGet {
                 request_id,
                 params,
-            }) => dispatch_prompts_get(ctx, runtime, services, request_id, params).await,
+            }) => {
+                dispatch_prompts_get(ctx, runtime, services, request_id, params)
+                    .boxed()
+                    .await
+            }
             ProtocolOperation::Capabilities(CapabilityOperation::ResourcesList {
                 request_id,
                 params,
-            }) => dispatch_resources_list(ctx, runtime, request_id, params).await,
+            }) => {
+                dispatch_resources_list(ctx, runtime, request_id, params)
+                    .boxed()
+                    .await
+            }
             ProtocolOperation::Capabilities(CapabilityOperation::ResourcesRead {
                 request_id,
                 params,
-            }) => dispatch_resources_read(ctx, runtime, request_id, params).await,
+            }) => {
+                dispatch_resources_read(ctx, runtime, request_id, params)
+                    .boxed()
+                    .await
+            }
             ProtocolOperation::Capabilities(CapabilityOperation::ResourcesTemplatesList {
                 request_id,
                 params,
-            }) => dispatch_resources_templates_list(ctx, runtime, request_id, params).await,
+            }) => {
+                dispatch_resources_templates_list(ctx, runtime, request_id, params)
+                    .boxed()
+                    .await
+            }
             ProtocolOperation::Capabilities(CapabilityOperation::Complete {
                 request_id,
                 params,
-            }) => dispatch_completion_complete(ctx, runtime, request_id, params).await,
+            }) => {
+                dispatch_completion_complete(ctx, runtime, request_id, params)
+                    .boxed()
+                    .await
+            }
             ProtocolOperation::Capabilities(CapabilityOperation::SubscriptionsListen {
                 request_id,
                 ..
@@ -366,13 +402,17 @@ impl Handler {
                 )
             }
             ProtocolOperation::TasksExtension(op) => {
-                dispatch_tasks_extension(ctx, runtime, services, op).await
+                dispatch_tasks_extension(ctx, runtime, services, op)
+                    .boxed()
+                    .await
             }
             ProtocolOperation::EventsExtension(op) => {
-                dispatch_events_extension(ctx, runtime, services, op).await
+                dispatch_events_extension(ctx, runtime, services, op)
+                    .boxed()
+                    .await
             }
             ProtocolOperation::SkillsExtension(op) => {
-                runtime.handle_skills_operation(op, ctx).await
+                runtime.handle_skills_operation(op, ctx).boxed().await
             }
         }
     }
@@ -1477,7 +1517,8 @@ mcp:
         services: &SharedServices,
     ) -> ProtocolHttpResponse {
         let runtime = crate::runtime::shared_services::test_runtime(&services.config_snapshot);
-        h.dispatch(ctx, &runtime, msg, services).await
+        h.dispatch(&Arc::new(ctx.clone()), &runtime, msg, services)
+            .await
     }
 
     fn make_test_request_context() -> RequestContext {

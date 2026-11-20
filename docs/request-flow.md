@@ -904,6 +904,7 @@ complete catalog.
 | Pipelines | `mcpg_pipeline_step_duration_seconds` | `step_id` |
 | Pipelines | `mcpg_pipeline_reaper_cleaned_total` | — |
 | Cancellation | `mcpg_cancellation_applied_total` / `_cancellations_broadcast_total` / `mcpg_tasks_cancelled_total` | — |
+| Cancellation | `mcpg_adapter_cancelled_on_entry_total` / `mcpg_adapter_cancelled_in_flight_total` | `adapter`, `profile` |
 | OAuth | `mcpg_oauth_token_refresh_total` / `_refresh_error_total` / `_cache_hit_total` | `provider` |
 | Security | `mcpg_dns_rebinding_blocked_total` | — |
 | Security | `mcpg_credential_header_stripped_total` | — |

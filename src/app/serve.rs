@@ -195,9 +195,58 @@ pub async fn run(state: AppState) -> Result<()> {
         None
     };
 
+    // Bind the MCP and admin listeners before any transport starts: a port
+    // in use, a denied bind or a TLS config that does not load refuses boot
+    // here, before a plugin transport opens an ingress and before anything
+    // can answer `/ready`.
+    let tunnel_cfg = config.gateway.server.tunnel.clone().filter(|t| t.enabled);
+    let http_listener = match (&tunnel_cfg, &config.gateway.server.transport) {
+        (None, TransportMode::Http) => Some(
+            http::HttpListener::bind(&config)
+                .await
+                .map_err(|e| listener_failed("mcp", &config.gateway.server.bind_address, e))?,
+        ),
+        _ => None,
+    };
+    let admin_listener = if config.gateway.admin.enabled {
+        // the admin API is the most privileged surface (terminate
+        // sessions, disable/drain plugins, reload config). Refuse to expose
+        // it on a public interface without authentication — this dangerous
+        // combo (auth.type=disabled or presence-only trusted_header on
+        // 0.0.0.0) must not boot silently.
+        {
+            let bind = config.gateway.admin.bind_address.as_str();
+            let public_bind =
+                bind.starts_with("0.0.0.0") || bind.starts_with("[::]") || bind.starts_with("::");
+            if public_bind && !config.gateway.admin.auth.is_authenticated() {
+                metrics::counter!(
+                    "mcpg_insecure_public_bind_total",
+                    "listener" => "admin",
+                )
+                .increment(1);
+                anyhow::bail!(
+                    "admin API is bound to a public interface ({bind}) with no authentication \
+                     (admin.auth.type=disabled or presence-only trusted_header). Bind admin to \
+                     127.0.0.1, or set admin.auth to static_bearer / trusted_header with \
+                     trusted_value_env."
+                );
+            }
+        }
+        let admin_addr = config.gateway.admin.bind_address.as_str();
+        let bound = match admin_addr.parse::<std::net::SocketAddr>() {
+            Ok(addr) => tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(anyhow::Error::from),
+            Err(e) => Err(anyhow::anyhow!("invalid gateway.admin.bind_address: {e}")),
+        };
+        Some(bound.map_err(|e| listener_failed("admin", admin_addr, e))?)
+    } else {
+        None
+    };
+
     // Start every plugin-supplied transport declared in
     // `gateway.server.transports[]` BEFORE the primary HTTP / stdio
-    // listener. Each entry's `kind:` resolves via
+    // listener serves. Each entry's `kind:` resolves via
     // `resolve_kind(SlotClass::Transport, ...)` (short alias or full plugin
     // id), and the transport hands whole requests to the gateway's own
     // router, which reads the live runtime, so reloads reach extra
@@ -228,7 +277,10 @@ pub async fn run(state: AppState) -> Result<()> {
         &state.runtime.load().plugin_registry_arc(),
         &extra_context,
     )
-    .await?;
+    .await
+    .inspect_err(|e| {
+        tracing::error!(error = %format!("{e:#}"), "an extra transport cannot start; the gateway stops");
+    })?;
 
     // Spawn transport
     let admin_shutdown_rx = shutdown_rx.clone();
@@ -236,60 +288,48 @@ pub async fn run(state: AppState) -> Result<()> {
     // shuts down as it would on SIGTERM.
     let (stdio_closed_tx, mut stdio_closed) = tokio::sync::oneshot::channel::<()>();
     let mut stdio_mode = false;
-    let transport_handle =
-        if let Some(tunnel_cfg) = config.gateway.server.tunnel.clone().filter(|t| t.enabled) {
-            // Tunnel mode: dial an MCPG-Cloud relay and answer
-            // tunnelled MCP traffic through the gateway's own router — no public
-            // TCP bind. This replaces the HTTP/stdio listener; a hot config reload
-            // is picked up on the next reconnect.
-            let state = state.clone();
-            let rx = shutdown_rx;
-            tokio::spawn(async move { crate::transports::tunnel::run(state, tunnel_cfg, rx).await })
-        } else {
-            match config.gateway.server.transport {
-                TransportMode::Http => {
-                    let state = state.clone();
-                    let rx = shutdown_rx;
-                    tokio::spawn(async move { http::serve(state, rx).await })
-                }
-                TransportMode::Stdio => {
-                    let state = state.clone();
-                    let rx = shutdown_rx;
-                    stdio_mode = true;
-                    tokio::spawn(async move {
-                        let served = stdio::serve(state, rx).await;
-                        let _ = stdio_closed_tx.send(());
-                        served
-                    })
-                }
-            }
-        };
+    let (transport_handle, transport_address) = if let Some(tunnel_cfg) = tunnel_cfg {
+        // Tunnel mode: dial an MCPG-Cloud relay and answer
+        // tunnelled MCP traffic through the gateway's own router — no public
+        // TCP bind. This replaces the HTTP/stdio listener; a hot config reload
+        // is picked up on the next reconnect.
+        let state = state.clone();
+        let rx = shutdown_rx;
+        let address = tunnel_cfg.relay_url.clone();
+        let handle =
+            tokio::spawn(
+                async move { crate::transports::tunnel::run(state, tunnel_cfg, rx).await },
+            );
+        (handle, address)
+    } else if let Some(listener) = http_listener {
+        let state = state.clone();
+        let rx = shutdown_rx;
+        let address = listener.local_addr().map_or_else(
+            |_| config.gateway.server.bind_address.clone(),
+            |a| a.to_string(),
+        );
+        let handle = tokio::spawn(async move { http::serve(state, listener, rx).await });
+        (handle, address)
+    } else {
+        let state = state.clone();
+        let rx = shutdown_rx;
+        stdio_mode = true;
+        let handle = tokio::spawn(async move {
+            let served = stdio::serve(state, rx).await;
+            let _ = stdio_closed_tx.send(());
+            served
+        });
+        (handle, "stdio".to_owned())
+    };
+    let mut mcp_task = ListenerTask {
+        name: "mcp",
+        address: transport_address,
+        task: Some(transport_handle),
+        watched: !stdio_mode,
+    };
 
-    // Conditionally start admin API on a separate listener
-    let admin_handle = if config.gateway.admin.enabled {
-        // the admin API is the most privileged surface (terminate
-        // sessions, disable/drain plugins, reload config). Refuse to expose
-        // it on a public interface without authentication — this dangerous
-        // combo (auth.type=disabled or presence-only trusted_header on
-        // 0.0.0.0) must not boot silently.
-        {
-            let bind = config.gateway.admin.bind_address.as_str();
-            let public_bind =
-                bind.starts_with("0.0.0.0") || bind.starts_with("[::]") || bind.starts_with("::");
-            if public_bind && !config.gateway.admin.auth.is_authenticated() {
-                metrics::counter!(
-                    "mcpg_insecure_public_bind_total",
-                    "listener" => "admin",
-                )
-                .increment(1);
-                anyhow::bail!(
-                    "admin API is bound to a public interface ({bind}) with no authentication \
-                     (admin.auth.type=disabled or presence-only trusted_header). Bind admin to \
-                     127.0.0.1, or set admin.auth to static_bearer / trusted_header with \
-                     trusted_value_env."
-                );
-            }
-        }
+    // Serve the admin API on its own listener.
+    let admin_handle = admin_listener.map(|listener| {
         let admin_service = crate::admin::AdminService::new(
             state.session_store.clone(),
             state.runtime.clone(),
@@ -298,28 +338,23 @@ pub async fn run(state: AppState) -> Result<()> {
             state.clone(),
         );
         let admin_router = crate::admin::admin_router(admin_service);
-        let admin_addr: std::net::SocketAddr = config
-            .gateway
-            .admin
-            .bind_address
-            .parse()
-            .expect("invalid gateway.admin.bind_address");
         let admin_shutdown = admin_shutdown_rx;
-        info!(bind = %admin_addr, "starting admin API");
-        Some(tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::bind(admin_addr)
-                .await
-                .expect("failed to bind admin listener");
+        info!(bind = %config.gateway.admin.bind_address, "starting admin API");
+        tokio::spawn(async move {
             axum::serve(listener, admin_router)
                 .with_graceful_shutdown(async move {
                     let mut rx = admin_shutdown;
                     let _ = rx.changed().await;
                 })
                 .await
-                .expect("admin server error");
-        }))
-    } else {
-        None
+                .context("admin server error")
+        })
+    });
+    let mut admin_task = ListenerTask {
+        name: "admin",
+        address: config.gateway.admin.bind_address.clone(),
+        task: admin_handle,
+        watched: true,
     };
 
     // Spawn the file-watch reload trigger (third reload
@@ -344,6 +379,10 @@ pub async fn run(state: AppState) -> Result<()> {
         state.runtime.load().plugin_registry_arc().loaded_plugins(),
     );
 
+    // A listener that stops before a shutdown signal stops the gateway: the
+    // normal shutdown runs, then `run` returns this error.
+    let mut listener_fault: Option<anyhow::Error> = None;
+
     // Wait for termination signal (loop to handle SIGHUP reloads)
     #[cfg(unix)]
     {
@@ -364,6 +403,10 @@ pub async fn run(state: AppState) -> Result<()> {
                 }
                 _ = &mut stdio_closed, if stdio_mode => {
                     info!("stdio client closed stdin");
+                    break;
+                }
+                fault = first_listener_end(&mut mcp_task, &mut admin_task) => {
+                    listener_fault = Some(fault);
                     break;
                 }
                 _ = sighup.recv() => {
@@ -415,6 +458,9 @@ pub async fn run(state: AppState) -> Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => info!("received SIGINT"),
             _ = &mut stdio_closed, if stdio_mode => info!("stdio client closed stdin"),
+            fault = first_listener_end(&mut mcp_task, &mut admin_task) => {
+                listener_fault = Some(fault);
+            }
         }
     }
 
@@ -431,16 +477,19 @@ pub async fn run(state: AppState) -> Result<()> {
     // Signal all subsystems to stop
     let _ = shutdown_tx.send(());
 
-    // Wait for transport to drain (with timeout)
-    let drain_result = tokio::time::timeout(shutdown_timeout, transport_handle).await;
-    match drain_result {
-        Ok(Ok(Ok(()))) => info!("transport drained cleanly"),
-        Ok(Ok(Err(e))) => warn!("transport error during shutdown: {}", e),
-        Ok(Err(e)) => warn!("transport task panicked: {}", e),
-        Err(_) => warn!(
-            timeout_secs = shutdown_timeout.as_secs(),
-            "shutdown timeout exceeded, forcing exit"
-        ),
+    // Wait for transport to drain (with timeout); a transport that already
+    // ended has nothing to drain.
+    if let Some(transport_handle) = mcp_task.task.take() {
+        let drain_result = tokio::time::timeout(shutdown_timeout, transport_handle).await;
+        match drain_result {
+            Ok(Ok(Ok(()))) => info!("transport drained cleanly"),
+            Ok(Ok(Err(e))) => warn!("transport error during shutdown: {}", e),
+            Ok(Err(e)) => warn!("transport task panicked: {}", e),
+            Err(_) => warn!(
+                timeout_secs = shutdown_timeout.as_secs(),
+                "shutdown timeout exceeded, forcing exit"
+            ),
+        }
     }
 
     // Close every plugin-supplied extra transport started from
@@ -506,6 +555,17 @@ pub async fn run(state: AppState) -> Result<()> {
         ),
     }
 
+    // Deliver the metrics of the last interval while the metrics sinks run.
+    if tokio::time::timeout(shutdown_timeout, state.observability.close_metrics())
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_secs = shutdown_timeout.as_secs(),
+            "final metrics flush exceeded shutdown timeout"
+        );
+    }
+
     // Drain plugin-owned background state (audit sinks, webhook buffers).
     // Each plugin gets a bounded budget so a misbehaving shutdown hook
     // cannot stall gateway teardown.
@@ -541,7 +601,7 @@ pub async fn run(state: AppState) -> Result<()> {
     }
 
     // Cancel the admin listener (drains after MCP so operators can observe drain)
-    if let Some(handle) = admin_handle {
+    if let Some(handle) = admin_task.task.take() {
         handle.abort();
         info!("admin API stopped");
     }
@@ -565,12 +625,64 @@ pub async fn run(state: AppState) -> Result<()> {
         info!("secrets-watch task stopped");
     }
 
-    // Flush metrics — `shutdown_all` above drains every plugin
-    // (including `MetricsSink` instances) with the per-plugin
-    // budget. No gateway-side recorder handle remains to flush.
-
     info!("shutdown complete");
-    Ok(())
+    match listener_fault {
+        Some(fault) => Err(fault),
+        None => Ok(()),
+    }
+}
+
+/// Log a listener that cannot serve at ERROR, with its address and the
+/// cause, and return the error that stops the gateway.
+fn listener_failed(listener: &str, address: &str, cause: anyhow::Error) -> anyhow::Error {
+    tracing::error!(
+        listener,
+        address,
+        error = %format!("{cause:#}"),
+        "listener cannot serve; the gateway stops"
+    );
+    cause.context(format!("the {listener} listener on {address} cannot serve"))
+}
+
+/// A listener task the gateway serves through. Its end before a shutdown
+/// signal means nothing serves on its address any more.
+struct ListenerTask {
+    name: &'static str,
+    address: String,
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
+    /// Whether an end before shutdown is a fault. The stdio transport ends
+    /// when its client closes stdin, which is a normal shutdown.
+    watched: bool,
+}
+
+impl ListenerTask {
+    /// Resolves when the watched task ends, with the error that stops the
+    /// gateway. Pending forever for an unwatched task or one already
+    /// ended, so a select loop can poll it on every turn.
+    async fn ended(&mut self) -> anyhow::Error {
+        if !self.watched {
+            return std::future::pending().await;
+        }
+        let Some(task) = self.task.as_mut() else {
+            return std::future::pending().await;
+        };
+        let outcome = task.await;
+        self.task = None;
+        let cause = match outcome {
+            Ok(Ok(())) => anyhow::anyhow!("the listener task ended"),
+            Ok(Err(e)) => e,
+            Err(e) => anyhow::anyhow!("the listener task failed: {e}"),
+        };
+        listener_failed(self.name, &self.address, cause)
+    }
+}
+
+/// The first of the MCP and admin listener tasks to end.
+async fn first_listener_end(mcp: &mut ListenerTask, admin: &mut ListenerTask) -> anyhow::Error {
+    tokio::select! {
+        fault = mcp.ended() => fault,
+        fault = admin.ended() => fault,
+    }
 }
 
 /// What transport plugins need from the gateway.

@@ -10,6 +10,7 @@ use crate::protocol::v_2026_07_28::dispatch::support::{
 };
 use crate::runtime::RequestContext;
 use crate::runtime::shared_services::SharedServices;
+use futures::FutureExt as _;
 use serde_json::Value;
 
 /// The `requestState` + `inputResponses` of an MRTR retry.
@@ -127,6 +128,7 @@ pub(crate) async fn resume_connect_link(
         (Ok(LinkAnswer::Accepted), Some(link)) => {
             let status = server
                 .await_link(&link, &principal, server.link_resume_wait())
+                .boxed()
                 .await;
             tracing::debug!(status = ?status, "the retry of a call that offered a link");
             ctx.connect_link.resume(link);

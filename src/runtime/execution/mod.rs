@@ -100,7 +100,9 @@ pub(crate) enum PipelineOutcome {
 /// Carries the caller identity, resolved arguments, expression context, and cancellation token.
 #[derive(Debug, Clone)]
 pub(crate) struct BackendInvocationRequest {
-    pub context: RequestContext,
+    /// Shared with the caller that owns the request, so a dispatch costs no
+    /// copy of the context.
+    pub context: Arc<RequestContext>,
     pub tool_name: String,
     pub arguments: Option<Value>,
     /// Expression context for resolving dynamic config fields at call time.
@@ -904,7 +906,7 @@ impl ExecutionDispatcher {
             current_step_index: 0,
             completed_steps: std::collections::BTreeMap::new(),
             original_args: request.arguments.clone().unwrap_or(Value::Null),
-            request_context: request.context.clone(),
+            request_context: RequestContext::clone(&request.context),
             created_at: chrono::Utc::now(),
             suspended_at: None,
             pipeline_timeout_ms: pipeline_config.pipeline_timeout_ms,
@@ -968,7 +970,7 @@ impl ExecutionDispatcher {
             .request_context
             .to_expr_context(&state.tool_name, Some(&state.original_args));
         let request = BackendInvocationRequest {
-            context: state.request_context.clone(),
+            context: Arc::new(state.request_context.clone()),
             tool_name: state.tool_name.clone(),
             arguments: Some(state.original_args.clone()),
             expr_ctx,
@@ -1107,7 +1109,10 @@ impl ExecutionDispatcher {
                     ref source,
                     ref upstream_name,
                 } => match self.federation_engine.load_full() {
-                    Some(engine) => {
+                    Some(engine) => 'federated: {
+                        if let Some(cancelled) = early_cancel_check(request, source, "federation") {
+                            break 'federated cancelled;
+                        }
                         let source = source.clone();
                         let upstream_name = upstream_name.clone();
                         let args = request.arguments.clone();
@@ -1124,25 +1129,30 @@ impl ExecutionDispatcher {
                         // upstream); bridge to the sync dispatch path the same
                         // way binding plugins do. Upstream server-requests
                         // (sampling/elicitation/roots) + progress are bridged
-                        // to the client.
+                        // to the client. The request's cancellation ends the
+                        // wait and is passed on to the upstream.
                         let outcome = tokio::task::block_in_place(|| {
-                            tokio::runtime::Handle::current().block_on(engine.call_tool(
-                                &source,
-                                &upstream_name,
-                                args.as_ref(),
-                                crate::runtime::federation::FederationCaller {
-                                    principal: principal.as_deref(),
-                                    session_id: session_id.as_deref(),
-                                    bearer: caller_bearer.as_deref(),
-                                    identity: Some(&caller_identity),
-                                    request_id: Some(&caller_request_id),
-                                    connect_link: Some(&connect_link),
-                                },
-                                progress_token.as_ref(),
-                            ))
+                            tokio::runtime::Handle::current().block_on(
+                                engine.call_tool_cancellable(
+                                    &source,
+                                    &upstream_name,
+                                    args.as_ref(),
+                                    crate::runtime::federation::FederationCaller {
+                                        principal: principal.as_deref(),
+                                        session_id: session_id.as_deref(),
+                                        bearer: caller_bearer.as_deref(),
+                                        identity: Some(&caller_identity),
+                                        request_id: Some(&caller_request_id),
+                                        connect_link: Some(&connect_link),
+                                    },
+                                    progress_token.as_ref(),
+                                    request.cancellation_token.as_ref(),
+                                ),
+                            )
                         });
                         match outcome {
-                            Ok(value) => federated_value_to_result(value),
+                            Ok(Some(value)) => federated_value_to_result(value),
+                            Ok(None) => cancelled_in_flight_result(&source, "federation"),
                             Err(UpstreamError::NotLinked { message }) => {
                                 not_linked_result(request, &message)
                             }
@@ -1294,6 +1304,13 @@ impl ExecutionDispatcher {
             }
             None => self.dispatch_tool_call(route, request, runtime_snapshot),
         }
+    }
+
+    /// Whether a dispatch of `route` reads the request's expression context:
+    /// a route the gateway runs itself does (command and network profiles,
+    /// pipelines); a plugin route does not.
+    pub(crate) fn reads_expr_context(&self, route: &BackendInvocationRoute) -> bool {
+        PluginRoute::of(route, &self.network_profiles).is_none()
     }
 
     /// [`Self::dispatch_tool_call`] for a plugin-backed route, with the same

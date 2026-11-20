@@ -252,7 +252,7 @@ impl GatewayRuntime {
         };
         let key = format!("realtime-{}:{}", op.as_str(), lease.id);
         let response = self
-            .handle_tools_call(json!(key), params, false, &ctx)
+            .handle_tools_call(json!(key), params, false, &std::sync::Arc::new(ctx))
             .await;
         let answer = match response.response {
             ProtocolResponse::JsonRpcSuccess(success)

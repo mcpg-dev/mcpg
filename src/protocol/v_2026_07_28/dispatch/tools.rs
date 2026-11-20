@@ -17,7 +17,9 @@ use crate::protocol::v_2026_07_28::wire::tools::{
 };
 use crate::runtime::shared_services::SharedServices;
 use crate::runtime::{GatewayRuntime, RequestContext};
+use futures::FutureExt as _;
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Dispatch `tools/list`.
 ///
@@ -120,7 +122,7 @@ pub(crate) const DEFAULT_TOOLS_LIST_TTL_MS: u64 = 60_000;
 /// MRTR's `InputRequiredResult`; the retry carries `requestState` +
 /// `inputResponses` at the top level of params (SEP-2322) and resumes it.
 pub(crate) async fn dispatch_tools_call(
-    ctx: &RequestContext,
+    ctx: &Arc<RequestContext>,
     runtime: &GatewayRuntime,
     services: &SharedServices,
     request_id: Value,
@@ -150,7 +152,9 @@ pub(crate) async fn dispatch_tools_call(
         params.request_state.as_deref(),
         params.input_responses.as_ref(),
     ) {
-        return dispatch_mrtr_resumption(ctx, runtime, services, request_id, resumption).await;
+        return dispatch_mrtr_resumption(ctx, runtime, services, request_id, resumption)
+            .boxed()
+            .await;
     }
 
     run_tools_call(ctx, runtime, request_id, params).await
@@ -159,7 +163,7 @@ pub(crate) async fn dispatch_tools_call(
 /// Run `tools/call` through the runtime and stamp `resultType:"complete"`
 /// on a result that names no other type.
 async fn run_tools_call(
-    ctx: &RequestContext,
+    ctx: &Arc<RequestContext>,
     runtime: &GatewayRuntime,
     request_id: Value,
     params: ToolCallParams,

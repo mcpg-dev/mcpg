@@ -286,7 +286,7 @@ impl GatewayRuntime {
             }),
             PromptRoute::Binding { ref profile } => {
                 let execution_request = execution::BackendInvocationRequest {
-                    context: request_context.clone(),
+                    context: Arc::new(request_context.clone()),
                     tool_name: profile.clone(),
                     arguments: params.arguments.clone(),
                     expr_ctx: request_context.to_expr_context(profile, params.arguments.as_ref()),
@@ -421,7 +421,7 @@ impl GatewayRuntime {
             ResourceRoute::Binding { ref profile } => {
                 let args = serde_json::json!({ "uri": params.uri });
                 let execution_request = execution::BackendInvocationRequest {
-                    context: request_context.clone(),
+                    context: Arc::new(request_context.clone()),
                     tool_name: profile.clone(),
                     arguments: Some(args.clone()),
                     expr_ctx: request_context.to_expr_context(profile, Some(&args)),
@@ -475,7 +475,7 @@ impl GatewayRuntime {
                 );
                 let args_value = serde_json::Value::Object(args);
                 let execution_request = execution::BackendInvocationRequest {
-                    context: request_context.clone(),
+                    context: Arc::new(request_context.clone()),
                     tool_name: profile.clone(),
                     arguments: Some(args_value.clone()),
                     expr_ctx: request_context.to_expr_context(profile, Some(&args_value)),

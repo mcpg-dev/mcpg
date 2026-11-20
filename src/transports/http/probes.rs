@@ -85,6 +85,7 @@ pub(crate) async fn metrics_handler(
     // Prometheus kind but the plugin failed to register or is
     // not currently serving traffic — surface that as a 503 so
     // operators notice instead of silently returning empty text.
+    state.observability.flush_metrics().await;
     let runtime = state.runtime.load();
     let body = runtime
         .plugin_registry()

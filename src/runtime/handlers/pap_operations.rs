@@ -1,3 +1,4 @@
+use futures::FutureExt as _;
 use serde_json::{Value, json};
 
 use super::super::*;
@@ -63,7 +64,11 @@ impl GatewayRuntime {
             })
         } else {
             let arguments = params.arguments.clone().unwrap_or_else(|| json!({}));
-            match operations.propose(&params.name, &arguments, caller).await {
+            match operations
+                .propose(&params.name, &arguments, caller)
+                .boxed()
+                .await
+            {
                 Ok(record) => {
                     metrics::counter!(
                         "mcpg_pap_operations_total",
@@ -80,6 +85,7 @@ impl GatewayRuntime {
                         },
                         &record,
                     )
+                    .boxed()
                     .await;
                     json!({
                         "content": [{
@@ -210,6 +216,7 @@ impl GatewayRuntime {
             arguments: Some(record.terms.clone()),
             meta: Some(Value::Object(meta)),
         };
+        let request_context = Arc::new(request_context);
         let response = self
             .handle_tools_call(json!(key), params, false, &request_context)
             .await;

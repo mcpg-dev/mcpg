@@ -1895,6 +1895,26 @@ pub(super) fn token_cancelled(token: Option<&tokio_util::sync::CancellationToken
     token.map(|t| t.is_cancelled()).unwrap_or(false)
 }
 
+/// The result of a backend call that its request's cancellation ended while
+/// it ran: the [`early_cancel_check`] result, counted as
+/// `mcpg_adapter_cancelled_in_flight_total`.
+pub(super) fn cancelled_in_flight_result(profile_name: &str, adapter_kind: &str) -> ToolCallResult {
+    metrics::counter!(
+        "mcpg_adapter_cancelled_in_flight_total",
+        "adapter" => adapter_kind.to_owned(),
+        "profile" => profile_name.to_owned(),
+    )
+    .increment(1);
+    ToolCallResult {
+        content: vec![ToolContent::text(format!(
+            "backend adapter '{adapter_kind}' aborted: request cancelled while the call ran"
+        ))],
+        structured_content: None,
+        is_error: true,
+        meta: None,
+    }
+}
+
 #[cfg(test)]
 mod elicitation_message_tests {
     use super::*;

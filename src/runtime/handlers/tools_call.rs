@@ -6,6 +6,7 @@ use crate::protocol::{
     JSONRPC_VERSION, JsonRpcErrorBody, JsonRpcSuccess, ProtocolHttpResponse, ProtocolResponse,
     ToolCallParams,
 };
+use futures::FutureExt as _;
 use serde_json::Value;
 
 impl GatewayRuntime {
@@ -16,9 +17,9 @@ impl GatewayRuntime {
     pub(crate) async fn handle_tools_call(
         &self,
         request_id: Value,
-        params: ToolCallParams,
+        mut params: ToolCallParams,
         materialize_as_task: bool,
-        request_context: &RequestContext,
+        request_context: &Arc<RequestContext>,
     ) -> ProtocolHttpResponse {
         // The realtime admission tool answers only the gateway's own calls;
         // to a caller it is an unknown tool.
@@ -56,8 +57,13 @@ impl GatewayRuntime {
                     );
                 }
 
-                let expr_ctx =
-                    request_context.to_expr_context(&params.name, params.arguments.as_ref());
+                // Only a route the gateway runs itself resolves expressions;
+                // a plugin route never reads the expression context.
+                let expr_ctx = if self.execution_dispatcher.reads_expr_context(&route) {
+                    request_context.to_expr_context(&params.name, params.arguments.as_ref())
+                } else {
+                    expr::ExprContext::default()
+                };
                 // progressToken MUST be a string or number per the
                 // Progress spec. Reject object/array/bool/null up front
                 // so a broken client cannot inject a structured token
@@ -245,6 +251,7 @@ impl GatewayRuntime {
                                         request_context,
                                         &request_id,
                                     )
+                                    .boxed()
                                     .await
                                 {
                                     Ok(()) => true,
@@ -304,6 +311,7 @@ impl GatewayRuntime {
                                         outcome,
                                         completed_at,
                                     )
+                                    .boxed()
                                     .await;
                             } else {
                                 return self
@@ -315,6 +323,7 @@ impl GatewayRuntime {
                                         outcome,
                                         completed_at,
                                     )
+                                    .boxed()
                                     .await;
                             }
                         }
@@ -333,6 +342,7 @@ impl GatewayRuntime {
                                         "method": idempotency_method,
                                     }),
                                 )
+                                .boxed()
                                 .await;
                             metrics::counter!(
                                 "mcpg_idempotency_in_flight_total",
@@ -363,6 +373,7 @@ impl GatewayRuntime {
                                         "method": idempotency_method,
                                     }),
                                 )
+                                .boxed()
                                 .await;
                             metrics::counter!(
                                 "mcpg_idempotency_conflict_total",
@@ -445,17 +456,6 @@ impl GatewayRuntime {
                         }
                         _ => None,
                     };
-                let execution_request = BackendInvocationRequest {
-                    context: request_context.clone(),
-                    tool_name: params.name.clone(),
-                    arguments: params.arguments.clone(),
-                    expr_ctx,
-                    progress_token,
-                    request_log_level,
-                    client_capabilities,
-                    cancellation_token: Some(cancel_token),
-                    idempotency_hint,
-                };
                 // Tool-call rate limiting runs in the tool-gate
                 // plugin chain: operators load `dev.mcpg.rate-limit`
                 // (or any other tool-gate plugin) via `plugins[]`.
@@ -594,7 +594,7 @@ impl GatewayRuntime {
                             &denial.audit_reason,
                         )
                         .with_upstream_request_id(request_context.upstream_request_id.clone());
-                        let _ = self.plugin_registry.emit_audit_event(&event).await;
+                        let _ = self.plugin_registry.emit_audit_event(&event).boxed().await;
                         // CP sample: pre-dispatch policy denial
                         // from the static built-in gate; capture
                         // request args on static-policy deny.
@@ -702,7 +702,7 @@ impl GatewayRuntime {
                         &reason,
                     )
                     .with_upstream_request_id(request_context.upstream_request_id.clone());
-                    let _ = self.plugin_registry.emit_audit_event(&event).await;
+                    let _ = self.plugin_registry.emit_audit_event(&event).boxed().await;
                     self.tool_call_recorder.record(cp_metrics::ToolCallSample {
                         plugin_id: cp_metrics::plugin_id_from_kind(&binding_type_label(&route)),
                         tool_name: params.name.clone(),
@@ -765,7 +765,7 @@ impl GatewayRuntime {
                         &reason,
                     )
                     .with_upstream_request_id(request_context.upstream_request_id.clone());
-                    let _ = self.plugin_registry.emit_audit_event(&event).await;
+                    let _ = self.plugin_registry.emit_audit_event(&event).boxed().await;
                     self.tool_call_recorder.record(cp_metrics::ToolCallSample {
                         plugin_id: cp_metrics::plugin_id_from_kind(&binding_type_label(&route)),
                         tool_name: params.name.clone(),
@@ -829,6 +829,7 @@ impl GatewayRuntime {
                                 &params.name,
                                 &warnings,
                             )
+                            .boxed()
                             .await;
                             permit
                         }
@@ -853,7 +854,7 @@ impl GatewayRuntime {
                                 &reason,
                             )
                             .with_upstream_request_id(request_context.upstream_request_id.clone());
-                            let _ = self.plugin_registry.emit_audit_event(&event).await;
+                            let _ = self.plugin_registry.emit_audit_event(&event).boxed().await;
                             return protocol_http_error(
                                             429,
                                             Some(request_id),
@@ -908,7 +909,7 @@ impl GatewayRuntime {
                                 .with_upstream_request_id(
                                     request_context.upstream_request_id.clone(),
                                 );
-                                let _ = self.plugin_registry.emit_audit_event(&event).await;
+                                let _ = self.plugin_registry.emit_audit_event(&event).boxed().await;
                                 warn!(
                                     error = %e,
                                     tool = %params.name,
@@ -1041,6 +1042,7 @@ impl GatewayRuntime {
                                     registry: &self.approval_registry,
                                     plugin_registry: &self.plugin_registry,
                                 })
+                                .boxed()
                                 .await;
                             match outcome {
                                 approvals::AwaitOutcome::Approved { .. } => None,
@@ -1097,6 +1099,7 @@ impl GatewayRuntime {
                             0,
                             &plugin_gate_meta,
                         )
+                        .boxed()
                         .await;
                 }
                 // tool input validation failures are
@@ -1143,9 +1146,23 @@ impl GatewayRuntime {
                             0,
                             &plugin_gate_meta,
                         )
+                        .boxed()
                         .await;
                 }
                 let backend = binding_type_label(&route);
+                // Every read of the caller's arguments above is done, so the
+                // request takes them over.
+                let execution_request = BackendInvocationRequest {
+                    context: Arc::clone(request_context),
+                    tool_name: params.name.clone(),
+                    arguments: params.arguments.take(),
+                    expr_ctx,
+                    progress_token,
+                    request_log_level,
+                    client_capabilities,
+                    cancellation_token: Some(cancel_token),
+                    idempotency_hint,
+                };
 
                 // Apply any pre-dispatch tool-gate argument rewrite
                 // (Allow.modified_arguments) before the transform chain,
@@ -1177,6 +1194,7 @@ impl GatewayRuntime {
                     let transformed = self
                         .plugin_registry
                         .apply_transforms_pre(&plugin_ctx, &current_args)
+                        .boxed()
                         .await;
                     if transformed != current_args {
                         args_mutated = true;
@@ -1230,6 +1248,7 @@ impl GatewayRuntime {
                             0,
                             &plugin_gate_meta,
                         )
+                        .boxed()
                         .await;
                 }
 
@@ -1318,6 +1337,7 @@ impl GatewayRuntime {
                                             "method": "tasks/create",
                                         }),
                                     )
+                                    .boxed()
                                     .await;
                                 metrics::counter!(
                                     "mcpg_idempotency_in_flight_total",
@@ -1350,6 +1370,7 @@ impl GatewayRuntime {
                                             outcome,
                                             completed_at,
                                         )
+                                        .boxed()
                                         .await;
                                 }
                             }
@@ -1368,6 +1389,7 @@ impl GatewayRuntime {
                                             "method": "tasks/create",
                                         }),
                                     )
+                                    .boxed()
                                     .await;
                                 metrics::counter!(
                                     "mcpg_idempotency_conflict_total",
@@ -1918,6 +1940,7 @@ impl GatewayRuntime {
                                         execution_ms,
                                         request_context.upstream_request_id.as_deref(),
                                     )
+                                    .boxed()
                                     .await
                                 {
                                     mcpg_plugin_protocol::GateDecision::Allow {
@@ -1998,6 +2021,7 @@ impl GatewayRuntime {
                                 };
                                 self.plugin_registry
                                     .apply_transforms_post(&plugin_ctx, &final_result_json)
+                                    .boxed()
                                     .await
                             } else {
                                 final_result_json
@@ -2053,6 +2077,7 @@ impl GatewayRuntime {
                                 server_request,
                                 &pipeline_id_str,
                             )
+                            .boxed()
                             .await
                         }
                         // SEP-2322 multi-entry MRTR — a `gather` step
@@ -2085,6 +2110,7 @@ impl GatewayRuntime {
                                 server_requests,
                                 &pipeline_id_str,
                             )
+                            .boxed()
                             .await
                         }
                     }
@@ -2147,6 +2173,7 @@ impl GatewayRuntime {
                                             .to_rfc3339(),
                                         }),
                                     )
+                                    .boxed()
                                     .await;
                                 metrics::counter!(
                                     "mcpg_idempotency_in_flight_total",
@@ -2188,6 +2215,7 @@ impl GatewayRuntime {
                                             outcome,
                                             completed_at,
                                         )
+                                        .boxed()
                                         .await;
                                 }
                             }
@@ -2205,6 +2233,7 @@ impl GatewayRuntime {
                                             "new_hash": hex::encode(request_hash),
                                         }),
                                     )
+                                    .boxed()
                                     .await;
                                 metrics::counter!(
                                     "mcpg_idempotency_conflict_total",
@@ -2254,6 +2283,7 @@ impl GatewayRuntime {
                     let mut result = if stream_eligible {
                         self.execution_dispatcher
                             .dispatch_tool_call_streaming(route, &execution_request, snapshot)
+                            .boxed()
                             .await
                     } else {
                         self.execution_dispatcher
@@ -2483,6 +2513,7 @@ impl GatewayRuntime {
                         };
                         self.plugin_registry
                             .apply_transforms_post(&plugin_ctx, &final_result_json)
+                            .boxed()
                             .await
                     } else {
                         final_result_json
@@ -2543,6 +2574,7 @@ impl GatewayRuntime {
                                         "cap": cp_metrics::PAYLOAD_CAPTURE_CAP_BYTES,
                                     }),
                                 )
+                                .boxed()
                                 .await;
                             metrics::counter!(
                                 "mcpg_idempotency_payload_truncated_total",
@@ -2616,6 +2648,7 @@ impl GatewayRuntime {
                                             "bytes": envelope_bytes.unwrap_or(0),
                                         }),
                                     )
+                                    .boxed()
                                     .await;
                                 metrics::counter!(
                                     "mcpg_idempotency_stream_completion_cached_total",
@@ -2649,7 +2682,7 @@ impl GatewayRuntime {
                 };
                 let event = mcpg_plugin_host::audit_events::tool_call_unknown_event(&audit_ctx)
                     .with_upstream_request_id(request_context.upstream_request_id.clone());
-                let _ = self.plugin_registry.emit_audit_event(&event).await;
+                let _ = self.plugin_registry.emit_audit_event(&event).boxed().await;
                 protocol_http_error(
                     200,
                     Some(request_id),

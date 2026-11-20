@@ -1357,6 +1357,45 @@ impl FederationEngine {
             .await
     }
 
+    /// [`Self::call_tool`] that `cancel` ends. A cancel before the call goes
+    /// out sends nothing; a cancel while it runs stops the wait and sends
+    /// the upstream `notifications/cancelled` with the upstream request id.
+    /// `Ok(None)` is a cancelled call. With no `cancel`, the call runs to
+    /// its end.
+    pub async fn call_tool_cancellable(
+        &self,
+        source: &str,
+        upstream_name: &str,
+        args: Option<&Value>,
+        caller: FederationCaller<'_>,
+        progress_token: Option<&Value>,
+        cancel: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<Option<Value>, UpstreamError> {
+        let Some(cancel) = cancel else {
+            return self
+                .call_tool(source, upstream_name, args, caller, progress_token)
+                .await
+                .map(Some);
+        };
+        if cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let satellite = self.get_or_connect_satellite(source, caller).await?;
+        let input_schema = self.upstream_input_schema(source, upstream_name);
+        satellite
+            .call_tool_cancellable(
+                upstream_name,
+                args,
+                &ToolCallOptions {
+                    input_schema: input_schema.as_ref(),
+                    progress_token,
+                    ..ToolCallOptions::default()
+                },
+                Box::pin(cancel.cancelled()),
+            )
+            .await
+    }
+
     /// The declared `inputSchema` of a federated tool, looked up from the
     /// last successful import of its owning federation (keyed by `source`
     /// → `upstream_name`). `None` when the federation/tool is unknown
@@ -1995,6 +2034,10 @@ fn impersonation_identity(
 #[cfg(test)]
 #[path = "engine_idp_tests.rs"]
 mod idp_tests;
+
+#[cfg(test)]
+#[path = "engine_cancel_tests.rs"]
+mod cancel_tests;
 
 #[cfg(test)]
 mod tests {

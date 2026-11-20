@@ -12,7 +12,7 @@
 //! message that names none is served as `2026-07-28`: the process speaks
 //! one revision, and its frames carry no headers.
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName};
 use serde_json::Value;
 
 use crate::protocol::shared::PROTOCOL_VERSION_HEADER;
@@ -20,6 +20,10 @@ use crate::protocol::shared::error::{INVALID_REQUEST_CODE, UNSUPPORTED_PROTOCOL_
 use crate::protocol::shared::messages::TransportRejection;
 use crate::protocol::v_2026_07_28::wire::SUPPORTED_PROTOCOL_VERSION;
 use crate::protocol::v_2026_07_28::wire::meta::META_KEY_PROTOCOL_VERSION;
+
+/// [`PROTOCOL_VERSION_HEADER`] as a header name: a lookup by it skips
+/// parsing the name.
+const PROTOCOL_VERSION_HEADER_NAME: HeaderName = HeaderName::from_static(PROTOCOL_VERSION_HEADER);
 
 /// Why a request's protocol version is refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +43,7 @@ pub fn negotiate(
     headers: Option<&HeaderMap>,
     body: &Value,
 ) -> Result<(), ProtocolNegotiationError> {
-    if let Some(raw) = headers.and_then(|headers| headers.get(PROTOCOL_VERSION_HEADER)) {
+    if let Some(raw) = headers.and_then(|headers| headers.get(&PROTOCOL_VERSION_HEADER_NAME)) {
         let header = raw
             .to_str()
             .map_err(|_| ProtocolNegotiationError::InvalidHeader)?;

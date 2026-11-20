@@ -841,7 +841,7 @@ impl GatewayRuntime {
     /// incomplete).
     pub async fn handle_protocol_message(
         &self,
-        context: &RequestContext,
+        context: &Arc<RequestContext>,
         message: ProtocolMessage,
     ) -> ProtocolHttpResponse {
         let start = std::time::Instant::now();
@@ -866,7 +866,7 @@ impl GatewayRuntime {
     /// shared services; a `-32603` envelope while they are not installed.
     async fn dispatch_protocol_message(
         &self,
-        context: &RequestContext,
+        context: &Arc<RequestContext>,
         message: ProtocolMessage,
     ) -> ProtocolHttpResponse {
         let Some(services) = self.shared_services.load_full() else {

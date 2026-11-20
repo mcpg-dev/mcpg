@@ -8,6 +8,8 @@
 //! transport only frames the outcome: HTTP as JSON or SSE, stdio as JSON
 //! lines.
 
+use std::sync::Arc;
+
 use axum::http::HeaderMap;
 use serde_json::Value;
 
@@ -97,7 +99,7 @@ pub(crate) async fn dispatch(
     }
     let ctx = with_request_meta(ctx, &body);
     let ctx = match runtime.ensure_session(ctx) {
-        SessionOutcome::Ready(ctx) => ctx,
+        SessionOutcome::Ready(ctx) => Arc::new(ctx),
         SessionOutcome::CapacityExhausted => {
             return DispatchOutcome::Rejected(capacity_exhausted(body_id));
         }
@@ -129,7 +131,7 @@ pub(crate) async fn dispatch(
         let session_id = session_id.to_owned();
         return DispatchOutcome::Stream {
             plan,
-            ctx,
+            ctx: Arc::unwrap_or_clone(ctx),
             session_id,
             body,
         };
@@ -179,7 +181,9 @@ pub(crate) async fn dispatch(
     DispatchOutcome::Response {
         response,
         notifications,
-        ctx,
+        // A copy only when a task the request started still holds the
+        // context.
+        ctx: Arc::unwrap_or_clone(ctx),
     }
 }
 
