@@ -49,7 +49,8 @@ fn scripted(script: Vec<u16>) -> crate::runtime::events::test_support::Reply {
 }
 
 #[tokio::test]
-async fn each_event_goes_in_one_signed_post_whose_id_is_the_event_id() {
+async fn each_event_goes_in_one_signed_post_with_a_message_id_of_its_own() {
+    use crate::protocol::v_2026_07_28::extensions::events::wire::is_valid_webhook_id;
     let h = WebhookHarness::start("", ORDERS_TYPE).await;
     let subscription = subscribe(&h, json!({ "region": "eu" })).await;
     h.fire("o-1", "eu").await;
@@ -64,12 +65,17 @@ async fn each_event_goes_in_one_signed_post_whose_id_is_the_event_id() {
         "the match drops other regions"
     );
     let verifier = Verifier::new(vec![WhsecSecret::parse(&whsec(1)).unwrap()]).unwrap();
+    let mut message_ids = std::collections::HashSet::new();
     for request in &events {
         let body = request.json();
-        assert_eq!(
-            request.header("webhook-id"),
-            body["eventId"].as_str().map(str::to_owned)
+        let message_id = request.header("webhook-id").unwrap();
+        assert!(message_id.starts_with("msg_"), "{message_id}");
+        assert!(is_valid_webhook_id(&message_id), "{message_id}");
+        assert!(
+            !message_id.contains(body["eventId"].as_str().unwrap()),
+            "the webhook-id is not derived from the event id: {message_id}"
         );
+        assert!(message_ids.insert(message_id), "one id per message");
         assert_eq!(
             request.header("x-mcp-subscription-id").as_deref(),
             Some(subscription.id.as_str())
@@ -103,6 +109,9 @@ async fn a_failed_delivery_is_retried_with_the_same_id_and_a_fresh_signature() {
     h.core.dispatch_settle().await;
     let events = h.receiver.events();
     assert_eq!(event_ids(&events), ["o-1", "o-1", "o-1"]);
+    let message_ids: std::collections::HashSet<_> =
+        events.iter().map(|r| r.header("webhook-id")).collect();
+    assert_eq!(message_ids.len(), 1, "every retry keeps the webhook-id");
     let signatures: std::collections::HashSet<_> = events
         .iter()
         .map(|r| (r.header("webhook-timestamp"), r.header("webhook-signature")))
@@ -150,14 +159,14 @@ async fn gone_and_too_large_are_never_retried() {
 }
 
 #[tokio::test]
-async fn an_event_id_no_attempt_can_sign_is_abandoned_at_once_and_suspends_nothing() {
+async fn an_event_id_that_is_no_header_value_is_delivered_all_the_same() {
     let h = WebhookHarness::start(
         "      webhook: { retry: { window_ms: 1800 }, suspension: { min_attempts: 1, failure_rate: 0.01 } }",
         ORDERS_TYPE,
     )
     .await;
     let subscription = subscribe(&h, json!({})).await;
-    // A log row whose id holds a `.`, as a build that kept such ids wrote it.
+    // A log row whose id holds a `.`, which no `webhook-id` may carry.
     let lease = (*h.core.owner_lease().borrow()).expect("the owner");
     let ty = Arc::clone(h.core.catalog().get("orders.created").unwrap());
     h.core
@@ -180,10 +189,12 @@ async fn an_event_id_no_attempt_can_sign_is_abandoned_at_once_and_suspends_nothi
         .unwrap();
     h.fire("o-2", "eu").await;
     h.deliver().await;
-    assert_eq!(
-        event_ids(&h.receiver.events()),
-        ["o-2"],
-        "the dotted id is never sent, and the next event still is"
+    let events = h.receiver.events();
+    assert_eq!(event_ids(&events), ["orders.eu-1", "o-2"]);
+    assert!(
+        events
+            .iter()
+            .all(|r| !r.header("webhook-id").unwrap().contains('.'))
     );
     let state = h
         .core
@@ -373,7 +384,7 @@ async fn a_breaking_schema_change_ends_delivery_and_the_refresh_says_why() {
     let terminated = &h.receiver.envelopes("terminated")[0];
     assert_eq!(
         terminated.json()["error"]["code"],
-        -32014,
+        -32026,
         "{}",
         terminated.json()
     );
@@ -384,7 +395,7 @@ async fn a_breaking_schema_change_ends_delivery_and_the_refresh_says_why() {
         .subscribe_webhook(&alice(), h.params("/hook", json!({}), 1))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32014);
+    assert_eq!(error.code(), -32026);
     assert_eq!(error.data().unwrap()["reason"], "schema_changed");
     // Re-listed, the client subscribes afresh on the new schema.
     subscribe(&h, json!({})).await;
@@ -411,7 +422,7 @@ async fn an_additive_schema_change_keeps_delivering() {
 
 #[tokio::test]
 async fn a_terminated_envelope_carries_the_configured_numbering() {
-    let h = WebhookHarness::start("      error_codes: sep_3415", ORDERS_TYPE).await;
+    let h = WebhookHarness::start("      error_codes: draft", ORDERS_TYPE).await;
     subscribe(&h, json!({})).await;
     let other = ORDERS_TYPE
         .replace("orders.created", "invoices.created")
@@ -426,7 +437,7 @@ async fn a_terminated_envelope_carries_the_configured_numbering() {
         .await
     );
     let terminated = &h.receiver.envelopes("terminated")[0];
-    assert_eq!(terminated.json()["error"]["code"], -32023);
+    assert_eq!(terminated.json()["error"]["code"], -32011);
     assert_eq!(terminated.json()["error"]["data"]["kind"], "event");
 }
 
@@ -449,7 +460,7 @@ async fn a_removed_type_ends_delivery_and_the_refresh_finds_no_event() {
     let terminated = &h.receiver.envelopes("terminated")[0];
     assert_eq!(
         terminated.json()["error"]["code"],
-        -32011,
+        -32023,
         "{}",
         terminated.json()
     );
@@ -459,7 +470,7 @@ async fn a_removed_type_ends_delivery_and_the_refresh_finds_no_event() {
         .subscribe_webhook(&alice(), h.params("/hook", json!({}), 1))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32011);
+    assert_eq!(error.code(), -32023);
     assert_eq!(error.data().unwrap()["kind"], "event");
 
     // The type comes back: the subscriber starts over, not refused.
@@ -521,7 +532,7 @@ async fn an_end_in_the_log_ends_the_subscriptions_of_its_arguments_after_what_ca
         terminated[0].header("x-mcp-subscription-id").as_deref(),
         Some(eu.as_str())
     );
-    assert_eq!(terminated[0].json()["error"]["code"], -32012);
+    assert_eq!(terminated[0].json()["error"]["code"], -32024);
     assert_eq!(
         terminated[0].json()["error"]["data"]["reason"],
         "upstream_forbidden"
@@ -651,7 +662,7 @@ mcp:
         "nothing after the denial"
     );
     let terminated = &h.receiver.envelopes("terminated")[0];
-    assert_eq!(terminated.json()["error"]["code"], -32012);
+    assert_eq!(terminated.json()["error"]["code"], -32024);
     assert!(
         terminated
             .header("webhook-id")
@@ -665,7 +676,7 @@ mcp:
         .subscribe_webhook(&alice(), h.params("/hook", json!({}), 1))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32011);
+    assert_eq!(error.code(), -32023);
 }
 
 #[tokio::test]

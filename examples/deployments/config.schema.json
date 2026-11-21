@@ -3040,13 +3040,13 @@
       "description": "The numbering of the MCP Events error codes on the wire.",
       "oneOf": [
         {
-          "const": "draft",
-          "description": "`-32011` to `-32015`.",
+          "const": "spec",
+          "description": "The specification's codes, `-32023` to `-32027`.",
           "type": "string"
         },
         {
-          "const": "sep_3415",
-          "description": "`-32023` to `-32027`.",
+          "const": "draft",
+          "description": "`-32011` to `-32015`, for a client that still expects them.",
           "type": "string"
         }
       ]
@@ -3363,7 +3363,7 @@
       "oneOf": [
         {
           "const": "capability",
-          "description": "The top-level `capabilities.events` object.",
+          "description": "A top-level `capabilities.events` object, beside the extensions entry.",
           "type": "string"
         },
         {
@@ -3395,10 +3395,9 @@
       "properties": {
         "advertise": {
           "default": [
-            "capability",
             "extension"
           ],
-          "description": "Where `server/discover` advertises the extension. The drafts disagree on the location, so both are on by default: `capability` is the top-level `capabilities.events` object (read by ChatGPT), `extension` is the `capabilities.extensions[\"io.modelcontextprotocol/events\"]` entry. Must name at least one location when `enabled` is `true`.",
+          "description": "Where `server/discover` advertises the extension. `extension` (default, and always required) is the `capabilities.extensions[\"io.modelcontextprotocol/events\"]` entry the specification defines. `capability` adds a top-level `capabilities.events` object with the same settings, for a client that reads only that location (the ChatGPT profile).",
           "items": {
             "$ref": "#/definitions/EventsAdvertiseLocation"
           },
@@ -3436,8 +3435,8 @@
               "$ref": "#/definitions/EventErrorCodes"
             }
           ],
-          "default": "draft",
-          "description": "How the extension's error codes are numbered. `draft` (default) answers `-32011` to `-32015`, the numbers the ChatGPT profile documents; `sep_3415` answers `-32023` to `-32027`, the numbers the upstream sketch assigns. The documentation names the `draft` numbers."
+          "default": "spec",
+          "description": "How the extension's error codes are numbered. `spec` (default) answers the specification's codes: `-32023` NotFound, `-32024` Forbidden, `-32025` ResourceExhausted, `-32026` Unsupported and `-32027` CallbackEndpointError. `draft` answers `-32011` to `-32015` in the same order, the codes the ChatGPT profile documents. `HeaderMismatch` is `-32020` under both."
         },
         "inbound_profiles": {
           "description": "Signing profiles of inbound senders beyond the built-in ones (`standard_webhooks`, `github`, `stripe`, `slack`). A route names one in `source.inbound.verify.profile`.",
@@ -3495,8 +3494,10 @@
           ],
           "default": {
             "enabled": false,
-            "heartbeat_interval_ms": 20000,
+            "heartbeat_interval_ms": 30000,
+            "max_heartbeat_interval_ms": 50000,
             "max_streams_per_principal": 16,
+            "min_heartbeat_interval_ms": 1000,
             "require_trust": "verified"
           },
           "description": "Push delivery (`events/stream`)."
@@ -3537,7 +3538,7 @@
             }
           ],
           "default": "ok",
-          "description": "The answer to `events/unsubscribe` for a subscription that does not exist. `ok` (default) answers `{}`, as an idempotent unsubscribe; `not_found` answers `-32011` with `data.kind: \"subscription\"`."
+          "description": "The answer to `events/unsubscribe` for a subscription that does not exist. `ok` (default) answers `{}`, as an idempotent unsubscribe; `not_found` answers `NotFound` (`-32023`) with `data.kind: \"subscription\"`."
         },
         "webhook": {
           "allOf": [
@@ -3676,8 +3677,15 @@
           "type": "boolean"
         },
         "heartbeat_interval_ms": {
-          "default": 20000,
-          "description": "Interval of heartbeat frames, in milliseconds, from 1 000 to 30 000. Default 20 000. A client that hears nothing for twice this treats the stream as dead and reconnects with its cursor.",
+          "default": 30000,
+          "description": "The heartbeat interval granted to a stream whose client suggests none, in milliseconds. Default 30 000. Every `notifications/events/active` carries the grant as `heartbeatMs`, and a heartbeat goes out whenever that long passes with no other message on the stream.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_heartbeat_interval_ms": {
+          "default": 50000,
+          "description": "The longest heartbeat interval granted, in milliseconds; a longer suggestion is lowered to it. Default 50 000, under the 60 s idle timeout common to load balancers. Keep it below the idle timeout of every proxy in front of the gateway.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -3685,6 +3693,13 @@
         "max_streams_per_principal": {
           "default": 16,
           "description": "Streams one principal may hold open across the cluster. Default 16. These do not count against the server-push stream cap of a session.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "min_heartbeat_interval_ms": {
+          "default": 1000,
+          "description": "The shortest heartbeat interval granted, in milliseconds; a shorter suggestion is raised to it. Default 1 000.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -3730,6 +3745,13 @@
             "deny_hosts": []
           },
           "description": "The outbound client that reaches callback URLs."
+        },
+        "egress_ip_ranges": {
+          "description": "The address ranges deliveries leave from, as CIDR strings, published on the Server Card for receivers that allowlist source addresses. Empty (default): none is published.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         },
         "enabled": {
           "default": true,
@@ -3787,6 +3809,13 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "signing_keys": {
+          "description": "Ed25519 keys that give each delivery and challenge a second signature beside its HMAC (Standard Webhooks `v1a,`), so a receiver can tell which server sent it. The first key signs; every key is published on the Server Card, so a rotation lists the new key first and keeps the old one until receivers have the new one. Empty (default): deliveries carry the HMAC signature only.",
+          "items": {
+            "$ref": "#/definitions/WebhookSigningKeyConfig"
+          },
+          "type": "array"
         },
         "suspension": {
           "allOf": [
@@ -5639,7 +5668,6 @@
             "delivery": {},
             "events": {
               "advertise": [
-                "capability",
                 "extension"
               ],
               "allow_ephemeral_subscriptions": false,
@@ -5648,7 +5676,7 @@
               },
               "delivery_paused": false,
               "enabled": false,
-              "error_codes": "draft",
+              "error_codes": "spec",
               "log": {
                 "inbox_max_rows": 10000,
                 "inbox_ttl_ms": 86400000
@@ -5665,8 +5693,10 @@
               },
               "push": {
                 "enabled": false,
-                "heartbeat_interval_ms": 20000,
+                "heartbeat_interval_ms": 30000,
+                "max_heartbeat_interval_ms": 50000,
                 "max_streams_per_principal": 16,
+                "min_heartbeat_interval_ms": 1000,
                 "require_trust": "verified"
               },
               "reauthorize_interval_ms": 300000,
@@ -5891,7 +5921,6 @@
           ],
           "default": {
             "advertise": [
-              "capability",
               "extension"
             ],
             "allow_ephemeral_subscriptions": false,
@@ -5900,7 +5929,7 @@
             },
             "delivery_paused": false,
             "enabled": false,
-            "error_codes": "draft",
+            "error_codes": "spec",
             "log": {
               "inbox_max_rows": 10000,
               "inbox_ttl_ms": 86400000
@@ -5917,8 +5946,10 @@
             },
             "push": {
               "enabled": false,
-              "heartbeat_interval_ms": 20000,
+              "heartbeat_interval_ms": 30000,
+              "max_heartbeat_interval_ms": 50000,
               "max_streams_per_principal": 16,
+              "min_heartbeat_interval_ms": 1000,
               "require_trust": "verified"
             },
             "reauthorize_interval_ms": 300000,
@@ -7503,7 +7534,7 @@
     },
     "RealtimeAdmissionConfig": {
       "additionalProperties": false,
-      "description": "`mcp.realtime.admission`.\n\nThe gateway calls `tool` as the caller, through the whole tool-call path (policy, gates, the backend), with these arguments:\n\n- `op`: `admit` (a caller opens realtime delivery), `renew` (it still holds it) or `release` (it let go; best effort). - `lease_id`: one id per held delivery, the same in all three calls and on every replica. - `kind`: `events` or `resource`. - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or `subscribe` for a resource. - `event`: `{name, arguments}` for events; `resource`: `{uri}` for a resource. - `client`: `{name, version}` of the MCP client, when it named itself.\n\nThe tool answers with an object that has a boolean `allow`. With `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten the renew interval. With `allow: false`, `error: {code, message, data}` reaches the caller: a numeric `code` is the JSON-RPC error code and `data` (or `details`) its data; any other `code` gives `-32013` with the whole `error` object as data.\n\nThe tool is internal: `tools/list` does not show it and a caller's own `tools/call` of it is refused.",
+      "description": "`mcp.realtime.admission`.\n\nThe gateway calls `tool` as the caller, through the whole tool-call path (policy, gates, the backend), with these arguments:\n\n- `op`: `admit` (a caller opens realtime delivery), `renew` (it still holds it) or `release` (it let go; best effort). - `lease_id`: one id per held delivery, the same in all three calls and on every replica. - `kind`: `events` or `resource`. - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or `subscribe` for a resource. - `event`: `{name, arguments}` for events; `resource`: `{uri}` for a resource. - `client`: `{name, version}` of the MCP client, when it named itself.\n\nThe tool answers with an object that has a boolean `allow`. With `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten the renew interval. With `allow: false`, `error: {code, message, data}` reaches the caller: a numeric `code` is the JSON-RPC error code and `data` (or `details`) its data; any other `code` gives `-32025` (ResourceExhausted) with the whole `error` object as data.\n\nThe tool is internal: `tools/list` does not show it and a caller's own `tools/call` of it is refused.",
       "properties": {
         "on_error": {
           "allOf": [
@@ -9735,7 +9766,7 @@
         },
         {
           "const": "not_found",
-          "description": "`-32011` with `data.kind: \"subscription\"`.",
+          "description": "`NotFound` with `data.kind: \"subscription\"`.",
           "type": "string"
         }
       ]
@@ -10303,7 +10334,7 @@
     },
     "WebhookLimitsConfig": {
       "additionalProperties": false,
-      "description": "`events.webhook.limits:` — subscription and delivery limits. A subscribe past a subscription limit answers `-32013` naming the limit.",
+      "description": "`events.webhook.limits:` — subscription and delivery limits. A subscribe past a subscription limit answers `ResourceExhausted` naming the limit.",
       "properties": {
         "per_host_concurrency": {
           "default": 8,
@@ -10374,6 +10405,27 @@
           "type": "integer"
         }
       },
+      "type": "object"
+    },
+    "WebhookSigningKeyConfig": {
+      "additionalProperties": false,
+      "description": "One key of `events.webhook.signing_keys`.",
+      "properties": {
+        "kid": {
+          "description": "Key identifier, published with the public key. Defaults to the RFC 7638 thumbprint of the key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "private_key": {
+          "description": "The Ed25519 private key in PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`, as `openssl genpkey -algorithm ed25519` writes it). Supply via `${secret.NAME}` or `${env.X}`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "private_key"
+      ],
       "type": "object"
     },
     "WebhookSuspensionConfig": {
@@ -10844,7 +10896,6 @@
           "delivery": {},
           "events": {
             "advertise": [
-              "capability",
               "extension"
             ],
             "allow_ephemeral_subscriptions": false,
@@ -10853,7 +10904,7 @@
             },
             "delivery_paused": false,
             "enabled": false,
-            "error_codes": "draft",
+            "error_codes": "spec",
             "log": {
               "inbox_max_rows": 10000,
               "inbox_ttl_ms": 86400000
@@ -10870,8 +10921,10 @@
             },
             "push": {
               "enabled": false,
-              "heartbeat_interval_ms": 20000,
+              "heartbeat_interval_ms": 30000,
+              "max_heartbeat_interval_ms": 50000,
               "max_streams_per_principal": 16,
+              "min_heartbeat_interval_ms": 1000,
               "require_trust": "verified"
             },
             "reauthorize_interval_ms": 300000,

@@ -36,6 +36,7 @@ pub mod dispatcher;
 pub mod engine;
 mod federated;
 pub mod handler;
+pub mod identity;
 pub mod inbound;
 pub mod index;
 pub mod keys;

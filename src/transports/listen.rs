@@ -206,6 +206,22 @@ pub(crate) async fn open_listen(
             None,
         ))
     })?;
+    if params
+        .subscriptions
+        .iter()
+        .any(|target| matches!(target, SubscriptionTarget::TasksStatus { .. }))
+        && !crate::protocol::v_2026_07_28::dispatch::tasks::client_declared_tasks_extension(ctx)
+    {
+        use crate::protocol::v_2026_07_28::extensions::tasks::wire::{
+            TASKS_CAPABILITY_REQUIRED_MESSAGE, required_capabilities_data,
+        };
+        return Err(ListenRefusal::Error(ProtocolError::application(
+            Some(request_id),
+            crate::protocol::MISSING_REQUIRED_CLIENT_CAPABILITY_CODE,
+            TASKS_CAPABILITY_REQUIRED_MESSAGE,
+            Some(required_capabilities_data()),
+        )));
+    }
 
     let runtime = state.runtime.load_full();
     let row = if ctx.session_ephemeral {

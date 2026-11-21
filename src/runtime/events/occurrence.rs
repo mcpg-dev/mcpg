@@ -1,9 +1,9 @@
 //! The gateway builds every occurrence; nothing a source sends is passed
 //! through as is.
 //!
-//! The event id becomes the `webhook-id` header of a delivery, so it is
-//! limited to a header-safe alphabet without `.`; an id outside it is
-//! replaced by a hash.
+//! The event id is limited to a short alphabet without `.`; an id outside
+//! it is replaced by a hash of it, so one upstream id always maps to the
+//! same event id.
 //! The time is normalized to RFC 3339 UTC. `data` goes through the type's
 //! operator transform, must match the payload schema, has credential-shaped
 //! values redacted, and must fit the size cap. An occurrence that fails a
@@ -42,7 +42,7 @@ pub struct RawOccurrence {
 /// An occurrence as the log keeps it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoredOccurrence {
-    /// Stable id: the `webhook-id` of every delivery of this occurrence.
+    /// Stable id of the event, the same on every path that reports it.
     pub event_id: String,
     /// RFC 3339 UTC time the event happened.
     pub timestamp: String,
@@ -89,9 +89,9 @@ impl ShapeError {
     }
 }
 
-/// Whether `id` may be used as an event id as it is: header-safe, free of
-/// the `.` Standard Webhooks forbids in a `webhook-id`, and not in the
-/// `msg_` space a receiver tells control envelopes apart by.
+/// Whether `id` may be used as an event id as it is: short, of letters,
+/// digits, `_`, `:` and `-` only, and outside the `msg_` space of the
+/// gateway's own `webhook-id`s.
 pub fn is_header_safe_event_id(id: &str) -> bool {
     use crate::protocol::v_2026_07_28::extensions::events::wire::CONTROL_WEBHOOK_ID_PREFIX;
     !id.is_empty()

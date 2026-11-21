@@ -38,6 +38,7 @@ use tokio::sync::{Notify, watch};
 use super::catalog::{EventCatalog, EventType, FederatedEvents, SourceSpec};
 use super::delivery::{EgressFactory, egress_policy};
 use super::dispatcher::{DISPATCH_TICK, Dispatcher};
+use super::identity::ServerIdentity;
 use super::inbound::{Handshake, InboundRejection, extract_event_id, extract_timestamp};
 use super::index::SubscriptionIndex;
 use super::keys::EventsKeys;
@@ -197,6 +198,7 @@ pub struct PreparedEvents {
     stores: Option<Arc<EventsStores>>,
     catalog: Arc<EventCatalog>,
     egress: Option<Arc<SafeEgress>>,
+    identity: Option<Arc<ServerIdentity>>,
     /// The imports of the runtime the config comes with, from the value
     /// `catalog` holds.
     imports: Option<watch::Receiver<FederatedEvents>>,
@@ -308,6 +310,8 @@ pub struct EventsCore {
     stopped: AtomicBool,
     egress: ArcSwapOption<SafeEgress>,
     egress_factory: parking_lot::RwLock<Option<EgressFactory>>,
+    /// The keys that sign deliveries beside their HMAC, when configured.
+    identity: ArcSwapOption<ServerIdentity>,
     verifying_hosts: Arc<InFlightHosts>,
     dispatcher: tokio::sync::Mutex<Dispatcher>,
     /// Subscriptions whose record changed since the dispatcher read it.
@@ -393,6 +397,7 @@ impl EventsCore {
             stopped: AtomicBool::new(false),
             egress: ArcSwapOption::empty(),
             egress_factory: parking_lot::RwLock::new(None),
+            identity: ArcSwapOption::empty(),
             verifying_hosts: Arc::default(),
             dispatcher: tokio::sync::Mutex::new(Dispatcher::default()),
             stale: parking_lot::Mutex::new(HashSet::new()),
@@ -451,6 +456,11 @@ impl EventsCore {
         self.egress.load_full()
     }
 
+    /// The keys that sign deliveries beside their HMAC, when configured.
+    pub fn identity(&self) -> Option<Arc<ServerIdentity>> {
+        self.identity.load_full()
+    }
+
     pub(crate) fn verifying_hosts(&self) -> &Arc<InFlightHosts> {
         &self.verifying_hosts
     }
@@ -506,7 +516,7 @@ impl EventsCore {
     }
 
     /// Admit a new reader of `ty` under the plan's reader cap, or refuse it
-    /// with `-32013 {limit: "plan.event_subscriptions"}`. The cap counts
+    /// with `ResourceExhausted {limit: "plan.event_subscriptions"}`. The cap counts
     /// every live reader on this gateway, webhook subscriptions, poll leases
     /// and open streams, and the upstream subscriptions held for imported
     /// types. A reader of an imported type whose demand no upstream
@@ -741,6 +751,7 @@ impl EventsCore {
                 stores: self.stores.load_full(),
                 catalog: Arc::new(EventCatalog::empty()),
                 egress: None,
+                identity: None,
                 imports: None,
                 imports_pending: false,
                 public_address: PublicAddress::of(config),
@@ -764,6 +775,7 @@ impl EventsCore {
         } else {
             None
         };
+        let identity = ServerIdentity::from_config(&events.webhook)?.map(Arc::new);
         let current = self.stores.load_full();
         let keys = match EventsKeys::from_config(config)? {
             Some(keys) => Arc::new(keys),
@@ -801,6 +813,7 @@ impl EventsCore {
             stores: Some(stores),
             catalog: Arc::new(catalog),
             egress,
+            identity,
             imports: Some(imports),
             imports_pending: imported.pending,
             public_address,
@@ -855,6 +868,7 @@ impl EventsCore {
             self.catalog.store(served);
             self.stores.store(prepared.stores);
             self.egress.store(prepared.egress);
+            self.identity.store(prepared.identity);
             self.imports_pending
                 .store(prepared.imports_pending, Ordering::SeqCst);
             self.public_address.store(Arc::new(prepared.public_address));

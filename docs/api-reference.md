@@ -85,6 +85,14 @@ Every request carries its client context in `params._meta`:
 `server/discover` requires the first three keys. Other methods require them
 when `gateway.server.enforce_request_meta` is `true`.
 
+The gateway reads the client's extensions from
+`clientCapabilities.extensions` on each request, and from nowhere else. An
+extension's settings object may carry a `revision` string. No `revision`
+means the extension's initial revision, which is the revision the gateway
+implements for the Tasks, Skills and Events extensions. An extension declared
+with any `revision` is not enabled for that request. The gateway's own
+declarations in `server/discover` carry no `revision`.
+
 ---
 
 ## A minimal client
@@ -265,7 +273,12 @@ only when the request's `clientCapabilities` support it.
 client that declared the `io.modelcontextprotocol/tasks` extension, answers
 `resultType: "task"` with a `taskId`, `ttlMs` and `pollIntervalMs`. The client
 polls `tasks/get`, answers input with `tasks/update`, and cancels with
-`tasks/cancel`.
+`tasks/cancel`. The gateway declares the extension as
+`"io.modelcontextprotocol/tasks": {}`. A `tasks/get`, `tasks/update` or
+`tasks/cancel` request, or a `subscriptions/listen` request for `taskIds`, that
+does not declare the extension gets HTTP 400 with error `-32021` (Missing
+Required Client Capability) and
+`data.requiredCapabilities.extensions["io.modelcontextprotocol/tasks"]`.
 
 ### List Prompts / Get Prompt
 

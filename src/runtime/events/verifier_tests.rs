@@ -24,6 +24,7 @@ async fn run(receiver: &Receiver) -> Result<(), DeliveryErrorCategory> {
         &url,
         "sub_abc",
         &secret,
+        None,
         Duration::from_secs(2),
         now_s(),
     )
@@ -127,6 +128,7 @@ async fn an_unreachable_endpoint_reads_as_refused() {
         &url,
         "sub_abc",
         &secret,
+        None,
         Duration::from_secs(2),
         now_s(),
     )

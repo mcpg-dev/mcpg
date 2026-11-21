@@ -331,7 +331,7 @@ async fn poll_is_refused_off_its_mode_trust_or_lease_cap() {
         .poll_events(&ctx(verified("alice")), params("orders.created", None))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32014, "poll off is an unsupported mode");
+    assert_eq!(error.code(), -32026, "poll off is an unsupported mode");
 
     let dir = tempfile::tempdir().unwrap();
     let state = boot(&yaml(
@@ -348,19 +348,19 @@ async fn poll_is_refused_off_its_mode_trust_or_lease_cap() {
         .poll_events(&ctx(header), params("orders.created", None))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32012);
+    assert_eq!(error.code(), -32024);
 
     let error = core
         .poll_events(&ctx(verified("alice")), params("hooks.only", None))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32014, "a type that does not offer poll");
+    assert_eq!(error.code(), -32026, "a type that does not offer poll");
 
     let error = core
         .poll_events(&ctx(verified("alice")), params("nope", None))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32011);
+    assert_eq!(error.code(), -32023);
 
     core.poll_events(&ctx(verified("alice")), params("orders.created", None))
         .await
@@ -373,7 +373,7 @@ async fn poll_is_refused_off_its_mode_trust_or_lease_cap() {
         .poll_events(&ctx(verified("alice")), params("orders.shipped", None))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32013);
+    assert_eq!(error.code(), -32025);
     assert_eq!(error.data().unwrap()["limit"], "poll_leases");
 }
 

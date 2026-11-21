@@ -655,6 +655,7 @@ async fn core_on(
             stores: Some(Arc::new(stores)),
             catalog: Arc::new(catalog),
             egress: None,
+            identity: None,
             imports: None,
             imports_pending: false,
             public_address: PublicAddress::default(),

@@ -46,10 +46,15 @@ const IMPORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_IMPORTED_EVENT_TYPES: usize = 1_000;
 
 /// Whether `capabilities`, as an upstream advertised them, include MCP
-/// Events; `None` when the upstream showed none.
+/// Events at a revision this build implements; `None` when the upstream
+/// showed none.
 fn advertises_events(capabilities: Option<&Value>) -> Option<bool> {
-    use mcpg_mcp_wire::v_2026_07_28::extensions::events::wire::EventsCapability;
-    capabilities.map(|capabilities| EventsCapability::advertised_in(capabilities).is_some())
+    use mcpg_mcp_wire::shared::extension_revision::revision_is_supported_in;
+    use mcpg_mcp_wire::v_2026_07_28::extensions::events::wire::{EXTENSION_ID, EventsCapability};
+    capabilities.map(|capabilities| {
+        EventsCapability::advertised_in(capabilities).is_some()
+            && revision_is_supported_in(capabilities, EXTENSION_ID)
+    })
 }
 
 /// Every event type `upstream` lists. An upstream that does not serve MCP
@@ -963,8 +968,7 @@ impl FederationEngine {
         fed: &FederationConfig,
         caller: FederationCaller<'_>,
     ) -> Result<Option<String>, UpstreamError> {
-        self.bearer_for_auth(&fed.name, &fed.upstream.auth, caller)
-            .await
+        self.bearer_for_auth(fed, &fed.upstream.auth, caller).await
     }
 
     /// Bearer credential for the sessions that have no caller: import,
@@ -977,7 +981,7 @@ impl FederationEngine {
     ) -> Result<Option<String>, UpstreamError> {
         match fed.upstream.auth.import.as_deref() {
             Some(import) if import.mode.authenticates_without_caller() => {
-                self.bearer_for_auth(&fed.name, import, FederationCaller::default())
+                self.bearer_for_auth(fed, import, FederationCaller::default())
                     .await
             }
             Some(_) => Err(UpstreamError::Connect(
@@ -990,8 +994,9 @@ impl FederationEngine {
     /// Bearer credential one `auth` block yields. `service_token` uses
     /// the static token; `pass_through` forwards the inbound caller's
     /// bearer; `oauth_client_credentials` mints a machine token via the
-    /// credential-issuer subsystem (cached + auto-refreshed);
-    /// `oauth_impersonation` exchanges the caller's bearer for an upstream
+    /// credential-issuer subsystem (cached + auto-refreshed), for the
+    /// upstream's canonical URI as RFC 8707 `resource` unless
+    /// `credential_config` names one; `oauth_impersonation` exchanges the caller's bearer for an upstream
     /// token via the same subsystem (the caller bearer is the RFC 8693
     /// subject token), or, per `subject_token`, the caller's stored IdP
     /// sign-in. The two caller-derived modes yield no bearer when there
@@ -999,10 +1004,11 @@ impl FederationEngine {
     /// unless the stored sign-in is exchanged instead; `none` => no auth.
     async fn bearer_for_auth(
         &self,
-        federation: &str,
+        fed: &FederationConfig,
         auth: &AuthConfig,
         caller: FederationCaller<'_>,
     ) -> Result<Option<String>, UpstreamError> {
+        let federation = fed.name.as_str();
         match auth.mode {
             AuthMode::ServiceToken => Ok(auth.token.clone()),
             AuthMode::PassThrough => {
@@ -1010,7 +1016,11 @@ impl FederationEngine {
                 Ok(caller.bearer.map(str::to_owned))
             }
             AuthMode::OauthClientCredentials => self
-                .resolve_oauth_credential(auth, machine_identity())
+                .resolve_oauth_credential(
+                    auth,
+                    machine_identity(),
+                    canonical_resource(&fed.upstream.url).as_deref(),
+                )
                 .await
                 .map(Some),
             AuthMode::OauthImpersonation => {
@@ -1027,6 +1037,7 @@ impl FederationEngine {
                         .resolve_oauth_credential(
                             auth,
                             impersonation_identity(caller.identity, bearer),
+                            None,
                         )
                         .await
                         .map(Some),
@@ -1112,7 +1123,7 @@ impl FederationEngine {
             IdpSubjectToken::Linked(token) => {
                 let identity = idp_sessions::vault_identity(identity, &token);
                 match self
-                    .issue_oauth_credential(auth, &issuer, target, identity)
+                    .issue_oauth_credential(auth, &issuer, target, identity, None)
                     .await
                 {
                     Ok(bearer) => {
@@ -1266,13 +1277,16 @@ impl FederationEngine {
     /// `(plugin_id, target)`) or the per-caller identity carrying the subject
     /// token for `oauth_impersonation` (token exchange, cached per caller).
     /// Secrets / subject tokens stay inside the issuer plugin.
+    /// `default_resource` is the per-call `resource` when
+    /// `auth.credential_config` names none.
     async fn resolve_oauth_credential(
         &self,
         auth: &AuthConfig,
         identity: PluginIdentity,
+        default_resource: Option<&str>,
     ) -> Result<String, UpstreamError> {
         let (issuer, target) = self.oauth_issuer(auth)?;
-        self.issue_oauth_credential(auth, &issuer, target, identity)
+        self.issue_oauth_credential(auth, &issuer, target, identity, default_resource)
             .await
             .map_err(IssueFailure::into_upstream)
     }
@@ -1315,11 +1329,12 @@ impl FederationEngine {
         issuer: &Arc<dyn CredentialIssuer>,
         target: &str,
         identity: PluginIdentity,
+        default_resource: Option<&str>,
     ) -> Result<String, IssueFailure> {
         let creds = self.credentials.as_ref().ok_or(IssueFailure::NotWired)?;
         // Per-call issuer config from the federation (registry OAuth
         // discovery / operator overrides for template issuers).
-        let call_config = auth.credential_config.clone().unwrap_or(Value::Null);
+        let call_config = call_config(auth.credential_config.as_ref(), default_resource);
         let issued = creds
             .cache
             .get_or_issue(issuer, &identity, target, &call_config)
@@ -1938,6 +1953,49 @@ fn trust_from_config(level: crate::config::policy::TrustLevelConfig) -> RequestT
     }
 }
 
+/// The canonical URI of an `http(s)` upstream, its RFC 8707 resource
+/// identifier: lower-case scheme and host, no default port, no user
+/// information, query or fragment, and no trailing `/` on an empty path.
+/// `None` for any other scheme, such as `tunnel://`.
+fn canonical_resource(upstream_url: &str) -> Option<String> {
+    let mut url = url::Url::parse(upstream_url).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return None;
+    }
+    url.set_fragment(None);
+    url.set_query(None);
+    url.set_username("").ok()?;
+    url.set_password(None).ok()?;
+    let canonical = url.as_str();
+    Some(if url.path() == "/" {
+        canonical.trim_end_matches('/').to_owned()
+    } else {
+        canonical.to_owned()
+    })
+}
+
+/// The per-call issuer config: `configured`, with `default_resource` as
+/// its `resource` when it names none.
+fn call_config(configured: Option<&Value>, default_resource: Option<&str>) -> Value {
+    let mut config = configured.cloned().unwrap_or(Value::Null);
+    let Some(resource) = default_resource else {
+        return config;
+    };
+    if config.is_null() {
+        config = json!({});
+    }
+    if let Value::Object(ref mut map) = config {
+        let named = map
+            .get("resource")
+            .and_then(Value::as_str)
+            .is_some_and(|r| !r.is_empty());
+        if !named {
+            map.insert("resource".to_owned(), json!(resource));
+        }
+    }
+    config
+}
+
 /// Fixed machine identity for `oauth_client_credentials` issuance. The grant
 /// authenticates MCPG-as-itself (identity-independent), so a constant
 /// identity lets the credential cache share one token per `(plugin_id,
@@ -2048,6 +2106,30 @@ mod tests {
     use axum::routing::post;
     use axum::{Router, http::StatusCode};
     use serde_json::Value;
+
+    #[test]
+    fn an_upstream_events_extension_at_an_unknown_revision_is_not_used() {
+        let events = "io.modelcontextprotocol/events";
+        assert_eq!(advertises_events(None), None);
+        assert_eq!(advertises_events(Some(&json!({}))), Some(false));
+        assert_eq!(
+            advertises_events(Some(&json!({ "extensions": { events: {} } }))),
+            Some(true)
+        );
+        assert_eq!(
+            advertises_events(Some(
+                &json!({ "extensions": { events: { "revision": "2" } } })
+            )),
+            Some(false)
+        );
+        assert_eq!(
+            advertises_events(Some(&json!({
+                "events": {},
+                "extensions": { events: { "revision": "2" } }
+            }))),
+            Some(false)
+        );
+    }
 
     /// The `server/discover` result of a mock upstream that serves MCP
     /// 2026-07-28 and advertises `capabilities`.
@@ -2949,6 +3031,165 @@ import: {{ resources: true }}
                 .unwrap()
                 .contains("auth=Bearer tok-for-https://aud.example"),
             "expected the issuer to receive credential_config, got {result:?}"
+        );
+    }
+
+    /// Stub issuer that mints `res-<resource>` from the per-call
+    /// `resource`, or `res-none` without one.
+    struct ResourceEchoIssuer {
+        manifest: mcpg_plugin_protocol::manifest::PluginManifest,
+    }
+
+    #[async_trait::async_trait]
+    impl mcpg_plugin_protocol::credential::CredentialIssuer for ResourceEchoIssuer {
+        fn manifest(&self) -> &mcpg_plugin_protocol::manifest::PluginManifest {
+            &self.manifest
+        }
+        async fn issue(
+            &self,
+            _identity: &PluginIdentity,
+            _target: &str,
+            config: &Value,
+        ) -> Result<
+            mcpg_plugin_protocol::credential::IssuedCredential,
+            mcpg_plugin_protocol::credential::CredentialError,
+        > {
+            let resource = config
+                .get("resource")
+                .and_then(Value::as_str)
+                .unwrap_or("none");
+            Ok(
+                mcpg_plugin_protocol::credential::IssuedCredential::from_value(
+                    format!("res-{resource}"),
+                    60,
+                ),
+            )
+        }
+    }
+
+    /// The bearer a client-credentials federation on `url` presents, with
+    /// `credential_config` as its per-call issuer config.
+    async fn client_credentials_bearer(url: &str, credential_config: Option<Value>) -> String {
+        use mcpg_plugin_protocol::manifest::{PluginClass, PluginManifest};
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_credential_issuer(
+                Arc::new(ResourceEchoIssuer {
+                    manifest: PluginManifest {
+                        id: "stub.resource".into(),
+                        version: "0.0.1".into(),
+                        name: "stub".into(),
+                        plugin_class: PluginClass::CredentialIssuer,
+                        protocol_version: "1.0".into(),
+                        license: None,
+                        required_capabilities: vec![],
+                        tags: vec![],
+                        provides: vec![],
+                        provides_schemes: vec![],
+                        module_path_prefix: "stub".into(),
+                        backend_profile: None,
+                    },
+                }),
+                mcpg_plugin_protocol::PluginTier::Native,
+            )
+            .expect("register issuer");
+        let cache = Arc::new(CredentialCacheKind::Local(Arc::new(
+            mcpg_plugin_host::credential_cache::CredentialCache::default(),
+        )));
+        let mut fed = fed_config(url);
+        fed.upstream.auth.mode = crate::config::AuthMode::OauthClientCredentials;
+        fed.upstream.auth.credential = Some("cred://stub.resource/notion".into());
+        fed.upstream.auth.credential_config = credential_config;
+        let cap = CapabilityRegistry::default();
+        let engine =
+            FederationEngine::new(vec![fed], cap.federated_overlay(), empty_policy(), "via-1")
+                .with_credentials(Arc::new(registry), cache);
+        let result = engine
+            .call_tool("notion", "search", None, caller(Some("sess-1"), None), None)
+            .await
+            .expect("call_tool");
+        result["content"][0]["text"]
+            .as_str()
+            .expect("echoed text")
+            .to_owned()
+    }
+
+    /// RFC 8707: a client-credentials token is requested for the upstream's
+    /// canonical URI unless the per-call config names another resource.
+    #[tokio::test]
+    async fn client_credentials_request_the_upstream_as_resource() {
+        let url = spawn_mock().await;
+        let canonical = canonical_resource(&url).expect("an http upstream");
+        let text = client_credentials_bearer(&url, None).await;
+        assert!(
+            text.contains(&format!("auth=Bearer res-{canonical}")),
+            "expected the upstream as resource, got {text}"
+        );
+
+        let text = client_credentials_bearer(
+            &url,
+            Some(json!({ "audience": "https://aud.example", "resource": "https://named.example/mcp" })),
+        )
+        .await;
+        assert!(
+            text.contains("auth=Bearer res-https://named.example/mcp"),
+            "a named resource wins, got {text}"
+        );
+    }
+
+    #[test]
+    fn canonical_resource_is_the_rfc_8707_form_of_the_upstream() {
+        for (upstream, canonical) in [
+            (
+                "https://MCP.Example.com/mcp",
+                Some("https://mcp.example.com/mcp"),
+            ),
+            (
+                "https://mcp.example.com:443/mcp/",
+                Some("https://mcp.example.com/mcp/"),
+            ),
+            ("https://mcp.example.com", Some("https://mcp.example.com")),
+            ("https://mcp.example.com/", Some("https://mcp.example.com")),
+            (
+                "https://user:pw@mcp.example.com/mcp?key=secret#frag",
+                Some("https://mcp.example.com/mcp"),
+            ),
+            (
+                "http://127.0.0.1:8080/mcp",
+                Some("http://127.0.0.1:8080/mcp"),
+            ),
+            ("tunnel://crm/mcp", None),
+            ("not a url", None),
+        ] {
+            assert_eq!(
+                canonical_resource(upstream).as_deref(),
+                canonical,
+                "{upstream}"
+            );
+        }
+    }
+
+    #[test]
+    fn call_config_adds_the_default_resource_only_when_none_is_named() {
+        let default = Some("https://up.example/mcp");
+        assert_eq!(call_config(None, None), Value::Null);
+        assert_eq!(
+            call_config(None, default),
+            json!({ "resource": "https://up.example/mcp" })
+        );
+        assert_eq!(
+            call_config(Some(&json!({ "audience": "a" })), default),
+            json!({ "audience": "a", "resource": "https://up.example/mcp" })
+        );
+        assert_eq!(
+            call_config(Some(&json!({ "resource": "" })), default),
+            json!({ "resource": "https://up.example/mcp" })
+        );
+        let named = json!({ "resource": "https://named.example/mcp" });
+        assert_eq!(call_config(Some(&named), default), named);
+        assert_eq!(
+            call_config(Some(&json!({ "audience": "a" })), None),
+            json!({ "audience": "a" })
         );
     }
 

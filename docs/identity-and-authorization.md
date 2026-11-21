@@ -248,7 +248,7 @@ warning, because it governs nothing.
 | Decision point | Layers | On deny |
 |---|---|---|
 | `events/list` | built-in gate (visibility) | the type is not listed |
-| `event.subscribe.pre` (subscribe and every refresh) | policy engine chain, built-in gate, tool_gate chain (an approval is awaited) | `-32012 {reason}`; a quota or rate limit answers `-32013` |
+| `event.subscribe.pre` (subscribe and every refresh) | policy engine chain, built-in gate, tool_gate chain (an approval is awaited) | `-32024 {reason}` (Forbidden); a quota or rate limit answers `-32025` (ResourceExhausted) |
 | `events/unsubscribe` | built-in gate (visibility) | `{}`, so no existence leaks |
 | `event.recheck` (every `mcp.configurations.events.reauthorize_interval_ms`, and after each reload) | policy engine chain and built-in gate, from the identity stored at subscribe; never the tool_gate chain, whose gates have side effects | delivery stops, the receiver gets `terminated`, the next refresh is refused |
 | `event.deliver.post` (each payload, per subscriber) | tool_gate post-dispatch chain | the payload is not sent; the receiver gets a `gap` |

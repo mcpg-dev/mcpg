@@ -3,7 +3,9 @@
 //! in `capabilities_list.rs`, beside every other resource read.
 
 use super::super::*;
-use crate::protocol::shared::caching::{CacheScope, DEFAULT_LIST_TTL_MS, RESULT_TYPE_COMPLETE};
+use crate::protocol::shared::caching::{
+    CacheScope, DEFAULT_LIST_TTL_MS, DEFAULT_READ_TTL_MS, RESULT_TYPE_COMPLETE,
+};
 use crate::protocol::shared::skills::{
     GetSkillResult, ListSkillsResult, ReadDirectoryResult, SkillsOperation, capability_value,
 };
@@ -134,6 +136,9 @@ impl GatewayRuntime {
                         &GetSkillResult {
                             result_type,
                             skill: skill.entry.clone(),
+                            ttl_ms: DEFAULT_READ_TTL_MS,
+                            // Visible per caller, like `resources/read`.
+                            cache_scope: CacheScope::Private,
                         },
                     ),
                     None => skills_error(
@@ -191,6 +196,9 @@ impl GatewayRuntime {
                         result_type,
                         resources: page,
                         next_cursor,
+                        ttl_ms: DEFAULT_LIST_TTL_MS,
+                        // Filtered per caller, like `resources/list`.
+                        cache_scope: CacheScope::Private,
                     },
                 )
             }

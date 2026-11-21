@@ -2,9 +2,11 @@
 //! log to its callback, on the replica that holds the subscription's shard.
 //! The shards are fenced locks the replicas share out (`DISPATCH_SHARDS`).
 //!
-//! Each event goes in its own signed POST whose `webhook-id` is the event
-//! id, the same on every retry, with a fresh timestamp and signature per
-//! attempt. A `2xx` acknowledges it; `410` and `413` give it up at once; any
+//! Each event goes in its own signed POST whose `webhook-id`,
+//! `msg_<keyed hash>`, names that event on that subscription: the same on
+//! every retry, never derived from the event id. Each attempt gets a fresh
+//! timestamp and signature. A `2xx` acknowledges it; `410` and `413` give
+//! it up at once, leaving the subscription as it is; any
 //! other answer is retried with backoff until the attempts or the retry
 //! window run out, and then given up. The watermark (`ack_seq`) only moves
 //! over events that are acknowledged, given up, or not for this
@@ -85,8 +87,9 @@ fn now_ms() -> u64 {
 pub struct Outcome {
     id: String,
     seq: u64,
-    /// The `webhook-id` of the attempt: the event id for an event.
-    webhook_id: String,
+    /// What the audit names the delivery by: the event id for an event,
+    /// the `webhook-id` for a control envelope.
+    event_id: String,
     host: String,
     category: Option<DeliveryErrorCategory>,
     status: Option<u16>,
@@ -369,6 +372,30 @@ fn recheck_context(record: &SubscriptionRecord) -> RequestContext {
         record.identity.clone(),
         TransportKind::Http,
     )
+}
+
+/// The `webhook-id` of the delivery of the event at `seq` to `record`: a
+/// keyed hash of the subscription and the event's place in the log. It is
+/// the same on every retry and on every owner, so a receiver can drop a
+/// repeat; it differs per subscription, and carries nothing of the event
+/// id, which comes from the upstream and is shared by every subscription
+/// the event matches.
+fn event_webhook_id(
+    core: &EventsCore,
+    record: &SubscriptionRecord,
+    epoch: u64,
+    seq: u64,
+) -> String {
+    let random = core
+        .stores()
+        .map(|s| {
+            s.keys.key_hash(
+                "event-delivery",
+                format!("{}:{epoch}:{seq}", record.id).as_bytes(),
+            )
+        })
+        .unwrap_or_else(|| random_token(CONTROL_ID_BYTES));
+    crate::protocol::v_2026_07_28::extensions::events::wire::event_webhook_id(&random)
 }
 
 /// The `webhook-id` of the gap envelope at `seq`: the same on every retry
@@ -1009,14 +1036,14 @@ impl EventsCore {
             // attempt fails as a refused connection.
             dispatcher.host_in_flight.insert(host.clone(), host_used);
             for (seq, outgoing) in started {
-                let (webhook_id, control) = match &outgoing {
+                let (event_id, control) = match &outgoing {
                     Outgoing::Event(occurrence) => (occurrence.event_id.clone(), false),
                     Outgoing::Gap => (String::new(), true),
                 };
                 dispatcher.tasks.spawn(std::future::ready(Outcome {
                     id: id.to_owned(),
                     seq,
-                    webhook_id,
+                    event_id,
                     host: host.clone(),
                     category: Some(DeliveryErrorCategory::ConnectionRefused),
                     status: None,
@@ -1064,7 +1091,7 @@ impl EventsCore {
                 }
                 continue;
             };
-            let (webhook_id, body, control) = match &outgoing {
+            let (webhook_id, event_id, body, control) = match &outgoing {
                 Outgoing::Event(occurrence) => {
                     // The cursor never passes an event still awaiting delivery.
                     let cursor_seq = if sub.state.ack_seq.saturating_add(1) >= seq {
@@ -1086,6 +1113,7 @@ impl EventsCore {
                         meta: None,
                     };
                     (
+                        event_webhook_id(self, &sub.record, sub.state.epoch, seq),
                         occurrence.event_id.clone(),
                         serde_json::to_vec(&body),
                         false,
@@ -1093,8 +1121,10 @@ impl EventsCore {
                 }
                 Outgoing::Gap => {
                     let cursor = self.cursor_for(ty, sub, seq);
+                    let webhook_id = gap_webhook_id(self, &sub.record, sub.state.epoch, seq);
                     (
-                        gap_webhook_id(self, &sub.record, sub.state.epoch, seq),
+                        webhook_id.clone(),
+                        webhook_id,
                         serde_json::to_vec(&ControlEnvelope::Gap { cursor }),
                         true,
                     )
@@ -1116,6 +1146,7 @@ impl EventsCore {
             let id = id.to_owned();
             let host = host.clone();
             let builtin = ty.is_builtin();
+            let identity = self.identity();
             metrics::counter!("mcpg_events_attempts_total", "event" => ty.name.clone())
                 .increment(1);
             dispatcher.tasks.spawn(async move {
@@ -1128,13 +1159,14 @@ impl EventsCore {
                     secrets: &keys,
                     webhook_id: &webhook_id,
                     body: Bytes::from(body),
+                    identity: identity.as_deref(),
                 }
                 .send(now_ms() / 1_000)
                 .await;
                 Outcome {
                     id,
                     seq,
-                    webhook_id,
+                    event_id,
                     host,
                     category: attempt.category(),
                     status: attempt.status(),
@@ -1184,6 +1216,7 @@ impl EventsCore {
         let id = record.id.clone();
         let webhook_id = webhook_id.to_owned();
         let kind = envelope.kind();
+        let identity = self.identity();
         tokio::spawn(async move {
             let keys: Vec<&WhsecSecret> = secrets.iter().take(1).collect();
             let attempt = SignedPost {
@@ -1193,6 +1226,7 @@ impl EventsCore {
                 secrets: &keys,
                 webhook_id: &webhook_id,
                 body: Bytes::from(body),
+                identity: identity.as_deref(),
             }
             .send(now_ms() / 1_000)
             .await;
@@ -1265,7 +1299,7 @@ impl EventsCore {
             Some(_) if outcome.unsignable => {
                 tracing::warn!(
                     event = %name,
-                    "event id is no valid webhook-id; the event is abandoned"
+                    "the delivery's webhook-id could not be signed; the event is abandoned"
                 );
                 abandoned = Some(UNSIGNABLE_ID);
             }
@@ -1345,7 +1379,7 @@ impl EventsCore {
             tracing::info!(event = %name, "event subscription suspended after repeated delivery failures");
         }
         let record = sub.record.clone();
-        let event_id = outcome.webhook_id.clone();
+        let event_id = outcome.event_id.clone();
         if suspend {
             self.checkpoint_one(dispatcher, &outcome.id, now).await;
         }

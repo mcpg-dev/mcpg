@@ -140,12 +140,13 @@ pub fn is_allowlisted(config: &WebhookVerificationConfig, host: &str) -> bool {
 }
 
 /// Send one challenge to `url` for subscription `subscription_id`, signed
-/// with `secret`.
+/// with `secret`, and with `identity` beside it when configured.
 pub async fn challenge(
     egress: &SafeEgress,
     url: &CallbackUrl,
     subscription_id: &str,
     secret: &WhsecSecret,
+    identity: Option<&super::identity::ServerIdentity>,
     timeout: Duration,
     now_s: u64,
 ) -> Result<(), DeliveryErrorCategory> {
@@ -162,6 +163,7 @@ pub async fn challenge(
         secrets: &[secret],
         webhook_id: &webhook_id,
         body: Bytes::from(body),
+        identity,
     };
     let attempt = match tokio::time::timeout(timeout, post.send(now_s)).await {
         Ok(attempt) => attempt,

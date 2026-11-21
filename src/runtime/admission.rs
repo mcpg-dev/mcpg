@@ -16,8 +16,10 @@ use crate::runtime::{
     GatewayRequestId, GatewayRuntime, RequestContext, RequestIdentity, TransportKind,
 };
 
-/// The JSON-RPC code of a denial whose error names no numeric code.
-pub const DEFAULT_DENIAL_CODE: i32 = -32013;
+/// The JSON-RPC code of a denial whose error names no numeric code:
+/// `ResourceExhausted`.
+pub const DEFAULT_DENIAL_CODE: i32 =
+    crate::protocol::v_2026_07_28::extensions::events::errors::RESOURCE_EXHAUSTED_CODE;
 
 /// What an admission call asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,11 +492,11 @@ mod tests {
     #[test]
     fn a_denial_with_a_numeric_code_passes_through_with_data_or_details() {
         let denial = decide(
-            &json!({"allow": false, "error": {"code": -32013, "message": "limit", "data": {"limit": "realtime", "max": 1}}}),
+            &json!({"allow": false, "error": {"code": -32025, "message": "limit", "data": {"limit": "realtime", "max": 1}}}),
             MINUTE,
         )
         .unwrap_err();
-        assert_eq!(denial.code, -32013);
+        assert_eq!(denial.code, -32025);
         assert_eq!(denial.message, "limit");
         assert_eq!(denial.data, Some(json!({"limit": "realtime", "max": 1})));
         let details = decide(

@@ -1069,7 +1069,7 @@ governance:
 #           value: "${cred://env/MY_API_KEY}"   # single value (or `parts: {…}` for multi-part)
 #           ttl_seconds: 3600
 #           authorize: any               # any | {roles:[…]} | {groups:[…]} | {subjects:[…]}
-#   # - id: dev.mcpg.credential.oauth-client-credentials  # …oauth_client_credentials.so | providers{token_url, client_id, client_secret (cred://), scopes[], refresh_buffer_ms=60000}
+#   # - id: dev.mcpg.credential.oauth-client-credentials  # …oauth_client_credentials.so | providers{token_url, client_id, client_secret (cred://), scopes[], resource?, refresh_buffer_ms=60000}
 #   # - id: dev.mcpg.credential.vault-dynamic-db          # …vault_dynamic_db.so | url, auth{token|approle}, db_mount=database, targets{vault_role, identity_mapping, max_cache_ttl_ms}
 #
 #   # ────────────── SECRET PROVIDER (class: secret_provider) ──────────────

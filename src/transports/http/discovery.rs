@@ -463,6 +463,123 @@ pub(crate) fn served_registry_entry(
     }))
 }
 
+/// The `$schema` of a Server Card.
+pub(crate) const SERVER_CARD_SCHEMA: &str =
+    "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json";
+/// The media type a Server Card is served as.
+pub(crate) const SERVER_CARD_MEDIA_TYPE: &str = "application/mcp-server-card+json";
+/// The path of the Server Card under the MCP endpoint.
+pub(crate) const SERVER_CARD_SUFFIX: &str = "/server-card";
+
+/// The public URL of the MCP endpoint: `mcp.registry.url`, else
+/// `governance.access.resource_metadata.resource`, else
+/// `gateway.server.canonical_url` with the MCP path.
+fn public_mcp_url(config: &crate::config::AppConfig) -> Option<String> {
+    config
+        .mcp
+        .registry
+        .url
+        .clone()
+        .or_else(|| {
+            config
+                .governance
+                .access
+                .resource_metadata
+                .as_ref()
+                .map(|rm| rm.resource.clone())
+        })
+        .or_else(|| {
+            config.gateway.server.canonical_url.as_ref().map(|base| {
+                format!(
+                    "{}{}",
+                    base.trim_end_matches('/'),
+                    config.gateway.server.mcp_path
+                )
+            })
+        })
+}
+
+/// This gateway's Server Card: one `streamable-http` remote, the MCP
+/// endpoint, whose `extensionsInfo` carries `extensions_info`. `None` when
+/// no public URL of the endpoint is known.
+pub(crate) fn server_card(
+    config: &crate::config::AppConfig,
+    extensions_info: serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let url = public_mcp_url(config)?;
+    let served = &config.mcp.registry;
+    let name = if served.name.contains('/') {
+        served.name.clone()
+    } else {
+        "dev.mcpg/gateway".to_owned()
+    };
+    let description = served
+        .description
+        .clone()
+        .filter(|d| !d.is_empty() && d.chars().count() <= 100)
+        .unwrap_or_else(|| "MCP gateway".to_owned());
+    let mut remote = serde_json::json!({
+        "type": "streamable-http",
+        "url": url,
+        "supportedProtocolVersions": [crate::protocol::SUPPORTED_PROTOCOL_VERSION],
+    });
+    if !extensions_info.is_empty() {
+        remote["extensionsInfo"] = serde_json::Value::Object(extensions_info);
+    }
+    Some(serde_json::json!({
+        "$schema": SERVER_CARD_SCHEMA,
+        "name": name,
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": description,
+        "remotes": [remote],
+    }))
+}
+
+/// `GET {mcp_path}/server-card`: this gateway's Server Card. While MCP
+/// Events delivers webhooks, the events entry of `extensionsInfo` carries
+/// the keys that sign them and the ranges they leave from, when set. A
+/// receiver trusts those only from the origin it connects to for MCP, so
+/// the card is served there, never redirected. `404` while no public URL
+/// of the MCP endpoint is known.
+pub(crate) async fn server_card_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Response {
+    let config = state.config.load();
+    let runtime = state.runtime.load_full();
+    let events = runtime.events_config();
+    let mut extensions_info = serde_json::Map::new();
+    if events.enabled && events.webhook.enabled {
+        let identity = runtime
+            .shared_services
+            .load_full()
+            .and_then(|services| services.events_core.get().cloned())
+            .and_then(|core| core.identity());
+        if let Some(info) =
+            crate::runtime::events::identity::webhooks_info(&events.webhook, identity.as_deref())
+        {
+            extensions_info.insert(
+                crate::protocol::v_2026_07_28::extensions::events::wire::EXTENSION_ID.to_owned(),
+                info,
+            );
+        }
+    }
+    match server_card(&config, extensions_info) {
+        Some(card) => (
+            [
+                (axum::http::header::CONTENT_TYPE, SERVER_CARD_MEDIA_TYPE),
+                (axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            ],
+            Json(card),
+        )
+            .into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no public URL of the MCP endpoint is configured" })),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /v0.1/servers` — the standard registry list envelope with this
 /// gateway as the single entry.
 pub(crate) async fn served_registry_list_handler(

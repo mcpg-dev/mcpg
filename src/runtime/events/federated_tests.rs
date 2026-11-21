@@ -197,7 +197,7 @@ async fn serve(State(upstream): State<Upstream>, Json(body): Json<Value>) -> Res
             .push((method, region, cursor));
         return Json(json!({
             "jsonrpc": "2.0", "id": id,
-            "error": { "code": -32012, "message": "forbidden", "data": { "reason": "not_shared" } }
+            "error": { "code": -32024, "message": "forbidden", "data": { "reason": "not_shared" } }
         }))
         .into_response();
     }
@@ -208,7 +208,9 @@ async fn serve(State(upstream): State<Upstream>, Json(body): Json<Value>) -> Res
                 "resultType": "complete",
                 "supportedVersions": [crate::protocol::SUPPORTED_PROTOCOL_VERSION],
                 "serverInfo": { "name": "upstream", "version": "1" },
-                "capabilities": { "events": { "listChanged": true } },
+                "capabilities": {
+                    "extensions": { "io.modelcontextprotocol/events": { "listChanged": true } }
+                },
                 "ttlMs": 1,
                 "cacheScope": "public"
             }
@@ -319,6 +321,7 @@ fn stream(upstream: Upstream, id: Value, region: Option<String>, after: usize) -
     let active = StreamFrame::Active {
         cursor: Some(after.to_string()),
         truncated: false,
+        heartbeat_ms: Some(30_000),
     }
     .to_notification(&id);
     let start = (
@@ -648,7 +651,7 @@ async fn an_upstream_that_ends_a_subscription_ends_the_ones_it_served() {
             Ok(result) => panic!("the poll never ended: {result:?}; {}", upstream.seen()),
         }
     };
-    assert_eq!(error.code(), -32012);
+    assert_eq!(error.code(), -32024);
     assert_eq!(
         error.data().unwrap()["reason"],
         "upstream_forbidden",
@@ -831,19 +834,19 @@ async fn an_upstream_subscription_resumes_from_its_own_position() {
 #[test]
 fn upstream_errors_end_restart_or_retry_the_read() {
     let schema_changed = UpstreamError::JsonRpc {
-        code: -32014,
-        message: "inputSchema changed".to_owned(),
-        data: Some(json!({ "feature": "inputSchema", "reason": "schema_changed" })),
-    };
-    assert!(matches!(Ended::of(schema_changed), Ended::SchemaChanged));
-    let renumbered = UpstreamError::JsonRpc {
         code: -32026,
         message: "inputSchema changed".to_owned(),
         data: Some(json!({ "feature": "inputSchema", "reason": "schema_changed" })),
     };
+    assert!(matches!(Ended::of(schema_changed), Ended::SchemaChanged));
+    let draft = UpstreamError::JsonRpc {
+        code: -32014,
+        message: "inputSchema changed".to_owned(),
+        data: Some(json!({ "feature": "inputSchema", "reason": "schema_changed" })),
+    };
     assert!(
-        matches!(Ended::of(renumbered), Ended::SchemaChanged),
-        "either numbering"
+        matches!(Ended::of(draft), Ended::Refused(_)),
+        "only the specification's codes are read"
     );
     let rpc = |code: i64| UpstreamError::JsonRpc {
         code,
@@ -851,7 +854,7 @@ fn upstream_errors_end_restart_or_retry_the_read() {
         data: None,
     };
     assert!(matches!(
-        Ended::of(rpc(-32012)),
+        Ended::of(rpc(-32024)),
         Ended::Terminated(EndReason::Forbidden)
     ));
     assert!(matches!(
@@ -863,7 +866,7 @@ fn upstream_errors_end_restart_or_retry_the_read() {
         Ended::Terminated(EndReason::ArgumentsRefused)
     ));
     assert!(
-        matches!(Ended::of(rpc(-32013)), Ended::Refused(_)),
+        matches!(Ended::of(rpc(-32025)), Ended::Refused(_)),
         "a limit passes"
     );
     assert!(matches!(
@@ -882,7 +885,7 @@ fn upstream_errors_end_restart_or_retry_the_read() {
         }),
     };
     assert!(matches!(
-        Ended::of(with_status(403, -32012, None)),
+        Ended::of(with_status(403, -32024, None)),
         Ended::Terminated(EndReason::Forbidden)
     ));
     assert!(matches!(
@@ -892,7 +895,7 @@ fn upstream_errors_end_restart_or_retry_the_read() {
     assert!(matches!(
         Ended::of(with_status(
             400,
-            -32014,
+            -32026,
             Some(json!({ "feature": "inputSchema", "reason": "schema_changed" }))
         )),
         Ended::SchemaChanged
@@ -911,7 +914,7 @@ fn upstream_errors_end_restart_or_retry_the_read() {
         matches!(
             Ended::of(with_status(
                 429,
-                -32013,
+                -32025,
                 Some(json!({ "limit": "plan.rps_per_gateway", "max": 5 }))
             )),
             Ended::Failed(_)
@@ -1176,7 +1179,7 @@ async fn an_upstream_delivery_is_checked_before_it_is_taken() {
     // The upstream ends the subscription for good: its readers end there.
     let terminated = ControlEnvelope::Terminated {
         error: crate::protocol::shared::jsonrpc::JsonRpcErrorBody {
-            code: -32012,
+            code: -32024,
             message: "forbidden".to_owned(),
             data: None,
         },
@@ -1202,7 +1205,7 @@ async fn an_upstream_delivery_is_checked_before_it_is_taken() {
             Ok(result) => panic!("the poll never ended: {result:?}; {}", upstream.seen()),
         }
     };
-    assert_eq!(error.code(), -32012);
+    assert_eq!(error.code(), -32024);
     drop(state);
 }
 

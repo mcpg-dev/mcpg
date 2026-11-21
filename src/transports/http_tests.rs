@@ -72,9 +72,10 @@ fn mcp_post_with(headers: &[(&str, &str)], mut body: Value) -> Request<Body> {
         );
     if let Some(method) = method.as_deref() {
         request = request.header(METHOD_HEADER, method);
-        if let Some(name) =
-            name_source_field(method).and_then(|field| body.get("params")?.get(field)?.as_str())
-        {
+        let field = name_source_field(method).or_else(|| {
+            crate::protocol::v_2026_07_28::extensions::events::wire::name_header_field(method)
+        });
+        if let Some(name) = field.and_then(|field| body.get("params")?.get(field)?.as_str()) {
             request = request.header(NAME_HEADER, encode_header_value(name));
         }
         let params = body
@@ -9620,11 +9621,53 @@ async fn subscriptions_listen_returns_sse_with_confirmation_event() {
         serde_json::json!({ "toolsListChanged": true })
     );
     assert_eq!(data_payloads[1]["id"], 401);
-    assert_eq!(data_payloads[1]["result"]["resultType"], "complete");
     assert_eq!(
-        data_payloads[1]["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
-        401
+        data_payloads[1]["result"],
+        serde_json::json!({
+            "resultType": "complete",
+            "_meta": { "io.modelcontextprotocol/subscriptionId": 401 }
+        })
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listening_for_task_status_needs_the_tasks_extension() {
+    let app = router(build_test_state(), "/health", "/mcp");
+    let listen = |id: u64, capabilities: Value| {
+        mcp_post(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "subscriptions/listen",
+            "params": {
+                "notifications": { "taskIds": ["t-1"] },
+                "_meta": { "io.modelcontextprotocol/clientCapabilities": capabilities }
+            }
+        }))
+    };
+
+    let refused = app
+        .clone()
+        .oneshot(listen(403, serde_json::json!({})))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(refused.into_body(), 4 * 1024).await.unwrap()).unwrap();
+    assert_eq!(body["id"], 403);
+    assert_eq!(body["error"]["code"], -32021, "{body}");
+    assert_eq!(
+        body["error"]["data"]["requiredCapabilities"]["extensions"]["io.modelcontextprotocol/tasks"],
+        serde_json::json!({})
+    );
+
+    let opened = app
+        .oneshot(listen(
+            404,
+            serde_json::json!({ "extensions": { "io.modelcontextprotocol/tasks": {} } }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), StatusCode::OK);
 }
 
 /// A client never chooses its session: a session id or a resume cursor in
@@ -10202,7 +10245,7 @@ async fn an_mrtr_answer_under_meta_is_refused() {
 
 /// `_meta` block that carries the request triple AND declares the
 /// SEP-2663 tasks extension, so a `tasks/*` request reaches the dispatch
-/// arm instead of the extension-gate `-32601`.
+/// arm instead of the extension-gate `-32021`.
 fn tasks_meta_with_extension() -> Value {
     serde_json::json!({
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -10214,26 +10257,75 @@ fn tasks_meta_with_extension() -> Value {
 }
 
 #[tokio::test]
-async fn tasks_extension_get_without_declaration_is_method_not_found() {
-    // SEP-2663: a server MUST NOT surface tasks to a client that did
-    // not declare the `io.modelcontextprotocol/tasks` extension. The
-    // bare `tasks/*` methods appear not-to-exist (`-32601`) for such
-    // a client.
+async fn tasks_methods_without_the_declaration_need_the_client_capability() {
+    // A client that does not declare `io.modelcontextprotocol/tasks` on
+    // the request gets `-32021` (HTTP 400) naming the extension.
+    let state = build_test_state();
+    let app = router(state, "/health", "/mcp");
+
+    for (id, method) in [
+        (501, "tasks/get"),
+        (502, "tasks/cancel"),
+        (505, "tasks/update"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(mcp_post(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": { "taskId": "t-1", "inputResponses": {} }
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 4 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["error"]["code"], -32021, "{method}: {body}");
+        assert_eq!(
+            body["error"]["data"],
+            serde_json::json!({
+                "requiredCapabilities": {
+                    "extensions": { "io.modelcontextprotocol/tasks": {} }
+                }
+            }),
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tasks_declared_at_an_unknown_revision_are_not_enabled() {
     let state = build_test_state();
     let app = router(state, "/health", "/mcp");
 
     let response = app
-        .oneshot(mcp_post(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 501,
-            "method": "tasks/get",
-            "params": { "taskId": "t-1" }
-        })))
+        .oneshot(mcp_post_with(
+            &[(SUBJECT_ID_HEADER, "user-1")],
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 506,
+                "method": "tasks/get",
+                "params": {
+                    "taskId": "no-such-task",
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientInfo": { "name": "t", "version": "0" },
+                        "io.modelcontextprotocol/clientCapabilities": {
+                            "extensions": {
+                                "io.modelcontextprotocol/tasks": { "revision": "2" }
+                            }
+                        }
+                    }
+                }
+            }),
+        ))
         .await
         .unwrap();
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 4 * 1024).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], -32601);
+    assert_eq!(body["error"]["code"], -32021, "{body}");
 }
 
 #[tokio::test]
@@ -11997,7 +12089,7 @@ async fn tools_call_past_the_monthly_quota_waits_until_the_reset() {
 }
 
 /// `events/*` share the licence's per-gateway request ceiling with
-/// `tools/call`: past it the answer is `-32013 {limit:
+/// `tools/call`: past it the answer is `-32025 {limit:
 /// "plan.rps_per_gateway"}` on 429, with `Retry-After` and no transport
 /// marker left in the body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -12040,7 +12132,7 @@ async fn events_past_the_request_ceiling_get_429_with_retry_after() {
     assert_eq!(response.headers()["retry-after"], "1");
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], -32013, "{body}");
+    assert_eq!(body["error"]["code"], -32025, "{body}");
     assert_eq!(body["error"]["data"]["limit"], "plan.rps_per_gateway");
     assert_eq!(body["error"]["data"]["max"], 1);
     assert!(
@@ -12051,8 +12143,8 @@ async fn events_past_the_request_ceiling_get_429_with_retry_after() {
     );
 }
 
-/// Served end to end over HTTP: discover advertises both locations, and
-/// `events/*` reach the installed core.
+/// Served end to end over HTTP: discover advertises the extensions entry
+/// only, and `events/*` reach the installed core.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn events_are_discoverable_and_served_over_http() {
     let app = router(build_events_state(true), "/health", "/mcp");
@@ -12061,11 +12153,7 @@ async fn events_are_discoverable_and_served_over_http() {
         user_post(&app, "server/discover", 1, serde_json::json!({}), &[]).await;
     assert_eq!(status, StatusCode::OK, "{discover}");
     let caps = &discover["result"]["capabilities"];
-    assert_eq!(
-        caps["events"],
-        serde_json::json!({"listChanged": true}),
-        "{caps}"
-    );
+    assert!(caps.get("events").is_none(), "{caps}");
     assert_eq!(
         caps["extensions"]["io.modelcontextprotocol/events"],
         serde_json::json!({"listChanged": true}),
@@ -12214,7 +12302,7 @@ async fn events_malformed_params_are_400_without_the_secret() {
 }
 
 /// A malformed `Idempotency-Key` on an `events/*` request answers with
-/// the idempotency extension's own code, apart from the events `-32013`
+/// the idempotency extension's own code, apart from the events `-32025`
 /// ResourceExhausted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn malformed_idempotency_key_on_events_is_not_an_events_code() {
@@ -12441,7 +12529,7 @@ async fn a_refused_listen_carries_the_error_of_the_admission_tool() {
         crate::config::realtime::AdmissionOnError::Deny,
     );
     let answer = admission_refusal(&state).await;
-    assert_eq!(answer["error"]["code"], -32013, "{answer}");
+    assert_eq!(answer["error"]["code"], -32025, "{answer}");
     assert_eq!(
         answer["error"]["message"],
         "the free plan has one realtime consumer"
@@ -12513,7 +12601,7 @@ async fn a_listen_stream_asks_the_admission_for_each_resource() {
     let response = admission_listen(&state).await;
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], -32013, "{body}");
+    assert_eq!(body["error"]["code"], -32025, "{body}");
     assert_eq!(body["error"]["message"], "one consumer only");
     assert_eq!(body["id"], 78);
     assert_eq!(admission_subscribers(&state), 0, "nothing is subscribed");

@@ -78,6 +78,7 @@ fn params(name: &str, cursor: Option<String>) -> StreamEventsParams {
         arguments: Map::new(),
         cursor,
         max_age_ms: None,
+        heartbeat_ms: None,
         meta: None,
     }
 }
@@ -220,7 +221,7 @@ async fn the_cap_refuses_one_stream_too_many_and_a_closed_stream_frees_its_slot(
     let first = open(&core, "orders.created", None).await.unwrap();
     let _second = open(&core, "orders.created", None).await.unwrap();
     let error = open(&core, "orders.created", None).await.unwrap_err();
-    assert_eq!(error.code(), -32013);
+    assert_eq!(error.code(), -32025);
     assert_eq!(error.data().unwrap()["limit"], "streams");
 
     drop(first);
@@ -263,7 +264,7 @@ async fn an_end_in_the_log_terminates_the_stream_after_the_events_before_it() {
     assert_eq!(event["params"]["data"]["n"], 1);
     let terminated = next_non_heartbeat(&mut frames).await;
     assert_eq!(terminated["method"], "notifications/events/terminated");
-    assert_eq!(terminated["params"]["error"]["code"], -32011);
+    assert_eq!(terminated["params"]["error"]["code"], -32023);
     let result = next(&mut frames).await;
     assert_eq!(result["id"], 7, "nothing past the end: {result}");
 }
@@ -282,7 +283,7 @@ async fn a_removed_type_terminates_the_stream_with_a_final_result() {
         .unwrap();
     let terminated = next_non_heartbeat(&mut frames).await;
     assert_eq!(terminated["method"], "notifications/events/terminated");
-    assert_eq!(terminated["params"]["error"]["code"], -32011);
+    assert_eq!(terminated["params"]["error"]["code"], -32023);
     assert_eq!(terminated["params"]["error"]["data"]["kind"], "event");
     let result = next(&mut frames).await;
     assert_eq!(result["id"], 7);
@@ -306,7 +307,7 @@ async fn a_stream_is_refused_off_its_mode_or_trust() {
     let error = open(&core_of(&off), "orders.created", None)
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32014);
+    assert_eq!(error.code(), -32026);
 
     let dir = tempfile::tempdir().unwrap();
     let both = format!("{ORDERS}\n{HOOKS_ONLY}");
@@ -320,9 +321,9 @@ async fn a_stream_is_refused_off_its_mode_or_trust() {
         .open_stream(&ctx(header), params("orders.created", None), json!(1))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32012);
+    assert_eq!(error.code(), -32024);
     let error = open(&core, "hooks.only", None).await.unwrap_err();
-    assert_eq!(error.code(), -32014);
+    assert_eq!(error.code(), -32026);
     let error = open(&core, "nope", None).await.unwrap_err();
-    assert_eq!(error.code(), -32011);
+    assert_eq!(error.code(), -32023);
 }

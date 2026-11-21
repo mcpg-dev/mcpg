@@ -310,7 +310,7 @@ impl EventsCore {
     }
 
     /// `POST …/events/subscriptions/{id}/terminate`: stop delivery for
-    /// good; the client's next refresh answers `-32012`.
+    /// good; the client's next refresh answers `Forbidden`.
     pub async fn admin_terminate(&self, id: &str) -> Result<(), AdminError> {
         let now = now_ms();
         let record = self

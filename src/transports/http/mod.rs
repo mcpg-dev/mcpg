@@ -82,7 +82,7 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for RequestHeaders {
 }
 
 mod cors;
-mod discovery;
+pub(crate) mod discovery;
 mod events_stream;
 mod events_webhooks;
 mod identity;
@@ -247,6 +247,16 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
             get(mcp_405_handler)
                 .post(mcp_handler)
                 .delete(mcp_405_handler),
+        )
+        // The Server Card, at the location the Server Card specification
+        // reserves under the MCP endpoint.
+        .route(
+            &format!(
+                "{}{}",
+                mcp_path.trim_end_matches('/'),
+                discovery::SERVER_CARD_SUFFIX
+            ),
+            get(discovery::server_card_handler),
         );
 
     // Kept for the canonical-host exemption list below: the metrics endpoint is
@@ -1018,6 +1028,15 @@ async fn subscriptions_listen_handler(
     let request_id = request_context.request_id.clone();
     let listen = match open_listen(&state, &request_context, &session_id, &body).await {
         Ok(listen) => listen,
+        Err(ListenRefusal::Error(error))
+            if error.code() == crate::protocol::MISSING_REQUIRED_CLIENT_CAPABILITY_CODE =>
+        {
+            return map_protocol_error_with_status(
+                error,
+                axum::http::StatusCode::BAD_REQUEST,
+                &request_id,
+            );
+        }
         Err(ListenRefusal::Error(error)) => {
             return map_protocol_error_response(error, &request_id);
         }

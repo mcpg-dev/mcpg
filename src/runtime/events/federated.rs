@@ -564,7 +564,14 @@ impl UpstreamSubscription {
         .await
     }
 
-    /// Read one `events/stream` until it ends.
+    /// Tell `upstream` the type's `inputSchema` as imported, so its
+    /// requests carry the `Mcp-Param-{Name}` headers the schema calls for.
+    fn remember_schema(&self, upstream: &dyn McpUpstream) {
+        upstream.remember_event_input_schema(&self.upstream_name, &self.ty.input_schema);
+    }
+
+    /// Read one `events/stream` until it ends: the upstream closes it, or
+    /// the client sees it silent for three granted heartbeats.
     async fn stream(&mut self, upstream: &dyn McpUpstream, cancel: &CancellationToken) -> Ended {
         let resumed = self.cursor.is_some();
         let params = StreamEventsParams {
@@ -572,6 +579,7 @@ impl UpstreamSubscription {
             arguments: self.arguments.clone(),
             cursor: self.cursor.clone(),
             max_age_ms: None,
+            heartbeat_ms: None,
             meta: None,
         };
         let mut stream = match upstream.open_event_stream(&params).await {
@@ -587,7 +595,9 @@ impl UpstreamSubscription {
                 return Ended::Closed;
             };
             let queued = match StreamFrame::from_notification(&message) {
-                Some(StreamFrame::Active { cursor, truncated }) => {
+                Some(StreamFrame::Active {
+                    cursor, truncated, ..
+                }) => {
                     if truncated && resumed && !self.gap(GapReason::UpstreamTruncated).await {
                         return Ended::Cancelled;
                     }
@@ -681,7 +691,8 @@ impl UpstreamSubscription {
         );
         // The upstream challenges the callback while it subscribes, so the
         // route has to be there first.
-        let route = UpstreamRoute::new(&self.federation, &self.ty.name, self.scope.clone());
+        let mut route = UpstreamRoute::new(&self.federation, &self.ty.name, self.scope.clone());
+        route.signing_keys = published_keys(upstream).await;
         if let Err(error) = stores.routes.put(&self.id, &route, None).await {
             return Ended::Failed(error.to_string());
         }
@@ -761,6 +772,7 @@ impl UpstreamSubscription {
         let identity = self.subscriber.as_ref().map(|s| &s.identity);
         match connect(ctx, &self.federation, identity).await {
             Ok(upstream) => {
+                self.remember_schema(upstream.as_ref());
                 let params = UnsubscribeEventsParams {
                     name: self.upstream_name.clone(),
                     arguments: self.arguments.clone(),
@@ -802,9 +814,33 @@ async fn connect(
         .map_err(Ended::of)
 }
 
+/// The Ed25519 keys `upstream`'s Server Card publishes for its webhook
+/// deliveries: read only from the card on the MCP endpoint's own origin,
+/// for the remote that is that endpoint. `None` when it publishes none.
+async fn published_keys(upstream: &dyn McpUpstream) -> Option<Vec<jsonwebtoken::jwk::Jwk>> {
+    let url = upstream.endpoint_url()?.to_owned();
+    match upstream.server_card().await {
+        Ok(Some(card)) => super::identity::published_signing_keys(&card, &url),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(error = %error, "the upstream's Server Card could not be read; its deliveries are checked by HMAC only");
+            None
+        }
+    }
+}
+
+/// A wait drawn evenly from zero to `cap`, so that the subscriptions an
+/// upstream restart ends do not all come back at the same moment.
+pub(super) fn full_jitter(cap: Duration) -> Duration {
+    use chacha20poly1305::aead::Generate as _;
+    let cap_ms = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX);
+    let draw = u64::from_le_bytes(<[u8; 8]>::generate());
+    Duration::from_millis(draw % cap_ms.saturating_add(1))
+}
+
 /// Run one upstream subscription until `cancel`, reconnecting after each
-/// end. With `retire` cancelled as it stops, the webhook subscription it
-/// made upstream ends too.
+/// end with a fully jittered wait. With `retire` cancelled as it stops, the
+/// webhook subscription it made upstream ends too.
 async fn read(
     mut subscription: UpstreamSubscription,
     ctx: SourceContext,
@@ -822,6 +858,7 @@ async fn read(
         let identity = subscription.subscriber.as_ref().map(|s| s.identity.clone());
         let ended = match connect(&ctx, &federation, identity.as_ref()).await {
             Ok(upstream) => {
+                subscription.remember_schema(upstream.as_ref());
                 let ended = match mode {
                     UpstreamMode::Webhook => {
                         subscription.webhook(&ctx, upstream.as_ref(), &cancel).await
@@ -838,13 +875,13 @@ async fn read(
             Ended::Cancelled => break,
             Ended::Closed => {
                 backoff = MIN_BACKOFF;
-                MIN_BACKOFF
+                full_jitter(MIN_BACKOFF)
             }
             Ended::Failed(reason) => {
                 tracing::warn!(event = %name, federation = %federation, reason = %reason, "upstream event read failed; retrying");
                 metrics::counter!("mcpg_events_upstream_failures_total", "event" => name.clone(), "reason" => "failed")
                     .increment(1);
-                let wait = backoff;
+                let wait = full_jitter(backoff);
                 backoff = (backoff * 2).min(MAX_BACKOFF);
                 wait
             }
@@ -881,7 +918,7 @@ async fn read(
                 if !subscription.gap(GapReason::UpstreamTruncated).await {
                     break;
                 }
-                MIN_BACKOFF
+                full_jitter(MIN_BACKOFF)
             }
         };
         tokio::select! {

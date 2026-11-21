@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::config::EventsConfig;
 use crate::protocol::shared::error::{
-    INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE, METHOD_NOT_FOUND_CODE,
+    HEADER_MISMATCH_CODE, INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE, METHOD_NOT_FOUND_CODE,
 };
 use crate::protocol::shared::jsonrpc::{ProtocolHttpResponse, ProtocolResponse};
 use crate::protocol::v_2026_07_28::dispatch::support::serialize_jsonrpc_success;
@@ -180,7 +180,7 @@ fn render<T: serde::Serialize>(
 }
 
 /// The answer to an `events/*` request past the licence's per-gateway
-/// request ceiling: `-32013 {limit: "plan.rps_per_gateway", max}` on HTTP
+/// request ceiling: `ResourceExhausted {limit: "plan.rps_per_gateway", max}` on HTTP
 /// 429, with `Retry-After: 1`.
 pub(crate) fn plan_rps_refusal(
     id: Option<Value>,
@@ -200,7 +200,8 @@ pub(crate) fn plan_rps_refusal(
 
 /// HTTP status of an `events/*` error.
 ///
-/// A malformed request is the client's (`400`). A denial is `403`, which
+/// A malformed request is the client's (`400`), and so is a routing header
+/// that disagrees with the body (`HeaderMismatch`). A denial is `403`, which
 /// keeps the step-up path: a missing-scope marker in `data` becomes an
 /// `insufficient_scope` challenge on the way out. A store or coordinator
 /// fault is `503`, retryable, because the request left nothing behind. A
@@ -209,7 +210,7 @@ pub(crate) fn plan_rps_refusal(
 /// on `200`.
 pub(crate) fn events_error_http_status(code: i32) -> u16 {
     match code {
-        INVALID_PARAMS_CODE => 400,
+        INVALID_PARAMS_CODE | HEADER_MISMATCH_CODE => 400,
         FORBIDDEN_CODE => 403,
         INTERNAL_ERROR_CODE => 503,
         METHOD_NOT_FOUND_CODE => 404,
@@ -555,7 +556,7 @@ mod tests {
         let response = dispatch(&context(TransportKind::Http), &services, poll).await;
         assert_eq!(response.http_status, 200);
         let (code, data, _) = error_body(&response);
-        assert_eq!(code, -32014);
+        assert_eq!(code, -32026);
         assert_eq!(
             data,
             Some(json!({ "feature": "deliveryMode", "value": "poll" }))
@@ -573,19 +574,24 @@ mod tests {
             (
                 EventsError::forbidden(ForbiddenReason::Unauthenticated),
                 403,
-                -32012,
+                -32024,
             ),
-            (EventsError::not_found(NotFoundKind::Event), 200, -32011),
+            (EventsError::not_found(NotFoundKind::Event), 200, -32023),
             (
                 EventsError::resource_exhausted("subscriptions", Some(100)),
                 200,
                 RESOURCE_EXHAUSTED_CODE,
             ),
-            (EventsError::unsupported_delivery_mode("push"), 200, -32014),
+            (EventsError::unsupported_delivery_mode("push"), 200, -32026),
             (
                 EventsError::callback_endpoint(DeliveryErrorCategory::Timeout),
                 200,
-                -32015,
+                -32027,
+            ),
+            (
+                EventsError::header_mismatch("Mcp-Param-region"),
+                400,
+                -32020,
             ),
             (EventsError::internal("store unavailable"), 503, -32603),
         ];
@@ -608,24 +614,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_sep_3415_numbering_moves_only_the_events_codes() {
+    async fn the_draft_numbering_moves_only_the_events_codes() {
         let cases = [
-            (EventsError::not_found(NotFoundKind::Event), 200, -32023),
+            (EventsError::not_found(NotFoundKind::Event), 200, -32011),
             (
                 EventsError::forbidden(ForbiddenReason::Unauthenticated),
                 403,
-                -32024,
+                -32012,
             ),
             (
                 EventsError::resource_exhausted("subscriptions", Some(100)),
                 200,
-                -32025,
+                -32013,
             ),
-            (EventsError::unsupported_delivery_mode("push"), 200, -32026),
+            (EventsError::unsupported_delivery_mode("push"), 200, -32014),
             (
                 EventsError::callback_endpoint(DeliveryErrorCategory::Timeout),
                 200,
-                -32027,
+                -32015,
+            ),
+            (
+                EventsError::header_mismatch("Mcp-Param-region"),
+                400,
+                -32020,
             ),
             (EventsError::invalid_params("bad url"), 400, -32602),
             (EventsError::internal("store unavailable"), 503, -32603),
@@ -634,7 +645,7 @@ mod tests {
             let mut config = AppConfig::default();
             config.mcp.configurations.events.enabled = true;
             config.mcp.configurations.events.error_codes =
-                crate::config::events::EventErrorCodes::Sep3415;
+                crate::config::events::EventErrorCodes::Draft;
             let services = SharedServices::for_tests(Arc::new(config));
             install(
                 &services,

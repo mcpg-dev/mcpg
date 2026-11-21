@@ -75,7 +75,7 @@ async fn a_subscribe_verifies_the_callback_then_grants_a_deterministic_subscript
 }
 
 #[tokio::test]
-async fn a_failed_challenge_answers_32015_and_stores_nothing() {
+async fn a_failed_challenge_answers_32027_and_stores_nothing() {
     let h = WebhookHarness::start("", ORDERS_TYPE).await;
     h.receiver.set_reply(Arc::new(|_| (200, b"{}".to_vec())));
     let error = h
@@ -83,7 +83,7 @@ async fn a_failed_challenge_answers_32015_and_stores_nothing() {
         .subscribe_webhook(&alice(), h.params("/hook", json!({}), 1))
         .await
         .expect_err("refused");
-    assert_eq!(error.code(), -32015);
+    assert_eq!(error.code(), -32027);
     assert!(matches!(
         EventsErrorData::parse(error.code(), error.data()),
         Some(EventsErrorData::CallbackEndpoint(data))
@@ -146,7 +146,7 @@ async fn subscribe_refuses_bad_input_before_any_request() {
         .subscribe_webhook(&alice(), params)
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32011);
+    assert_eq!(error.code(), -32023);
 
     let mut deep = json!("leaf");
     for _ in 0..10 {
@@ -183,13 +183,13 @@ async fn subscribe_and_unsubscribe_need_a_verified_principal_by_default() {
             .subscribe_webhook(ctx, h.params("/hook", json!({}), 1))
             .await
             .unwrap_err();
-        assert_eq!(error.code(), -32012);
+        assert_eq!(error.code(), -32024);
         let error = h
             .core
             .unsubscribe_webhook(ctx, unsubscribe(&h, "/hook", json!({})))
             .await
             .unwrap_err();
-        assert_eq!(error.code(), -32012);
+        assert_eq!(error.code(), -32024);
     }
     assert!(h.receiver.requests().is_empty());
 }
@@ -274,7 +274,7 @@ async fn unsubscribe_of_an_unknown_key_can_answer_not_found() {
         .unsubscribe_webhook(&alice(), unsubscribe(&h, "/hook", json!({})))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32011);
+    assert_eq!(error.code(), -32023);
     assert_eq!(error.data().unwrap()["kind"], "subscription");
 }
 
@@ -295,7 +295,7 @@ async fn limits_are_checked_before_the_challenge() {
         .subscribe_webhook(&alice(), h.params("/b", json!({}), 1))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32013);
+    assert_eq!(error.code(), -32025);
     assert_eq!(error.data().unwrap()["limit"], "subscriptions");
     assert_eq!(h.receiver.requests().len(), before);
     // A refresh of the subscription held is not a new one.
@@ -365,7 +365,7 @@ async fn an_event_rule_governs_subscribe_with_cel_over_the_arguments() {
         .subscribe_webhook(&alice(), h.params("/hook", json!({ "region": "us" }), 1))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32012);
+    assert_eq!(error.code(), -32024);
     assert_eq!(error.data().unwrap()["reason"], "policy");
 }
 
@@ -414,11 +414,11 @@ fn gate_denials_map_to_events_codes() {
     let denial = |code: i32, data: Option<Value>| {
         crate::runtime::util::protocol_http_error(403, None, code, "denied", data)
     };
-    assert_eq!(gate_error(denial(-32003, None)).code(), -32012);
-    assert_eq!(gate_error(denial(-32022, None)).code(), -32012);
-    assert_eq!(gate_error(denial(-33000, None)).code(), -32012);
-    assert_eq!(gate_error(denial(-33001, None)).code(), -32013);
-    assert_eq!(gate_error(denial(-32029, None)).code(), -32013);
+    assert_eq!(gate_error(denial(-32003, None)).code(), -32024);
+    assert_eq!(gate_error(denial(-32022, None)).code(), -32024);
+    assert_eq!(gate_error(denial(-33000, None)).code(), -32024);
+    assert_eq!(gate_error(denial(-33001, None)).code(), -32025);
+    assert_eq!(gate_error(denial(-32029, None)).code(), -32025);
     // The policy gate marks a missing scope under the transport's key; the
     // events error keeps it there, so the transport still mints the
     // `insufficient_scope` challenge.
@@ -474,5 +474,5 @@ async fn a_receiver_document_stands_in_for_the_challenge() {
         .subscribe_webhook(&alice(), h.params("/elsewhere", json!({}), 1))
         .await
         .unwrap_err();
-    assert_eq!(error.code(), -32015);
+    assert_eq!(error.code(), -32027);
 }

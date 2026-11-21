@@ -5,7 +5,9 @@
 //! The events owner makes the upstream subscription and writes its route
 //! first, because the upstream challenges the callback while it subscribes.
 //! Any replica takes a delivery: it checks the Standard Webhooks signature
-//! with the secret every replica derives for the route, and hands the
+//! with the secret every replica derives for the route, and, when the
+//! upstream's Server Card publishes signing keys, its `v1a,` signature
+//! against them; then it hands the
 //! occurrence, or the gap or end an envelope reports, to the owner through
 //! the type's inbox. The answer is 2xx only once that write is durable; the
 //! log deduplicates a delivery repeated by its event id.
@@ -61,6 +63,11 @@ pub struct UpstreamRoute {
     /// `upstream_error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<String>,
+    /// The Ed25519 keys the upstream's Server Card publishes for webhook
+    /// deliveries. With them, a delivery needs a `v1a,` signature one of
+    /// them verifies, beside its HMAC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_keys: Option<Vec<jsonwebtoken::jwk::Jwk>>,
 }
 
 impl UpstreamRoute {
@@ -72,8 +79,27 @@ impl UpstreamRoute {
             scope,
             abandoned: false,
             ended: None,
+            signing_keys: None,
         }
     }
+}
+
+/// Whether a delivery that passed its HMAC check also carries the server
+/// identity `route` asks for: without published keys, nothing more; with
+/// them, a `v1a,` signature one of them verifies.
+fn has_route_identity(route: &UpstreamRoute, headers: &axum::http::HeaderMap, body: &[u8]) -> bool {
+    let Some(keys) = &route.signing_keys else {
+        return true;
+    };
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let (Some(id), Some(timestamp), Some(signature)) = (
+        header(mcpg_standard_webhooks::HEADER_ID),
+        header(mcpg_standard_webhooks::HEADER_TIMESTAMP).and_then(|t| t.parse::<u64>().ok()),
+        header(mcpg_standard_webhooks::HEADER_SIGNATURE),
+    ) else {
+        return false;
+    };
+    super::identity::verify_asymmetric(keys, id, timestamp, body, signature)
 }
 
 /// The routes of the upstream webhook subscriptions, in the subscription
@@ -183,7 +209,7 @@ impl EventsCore {
             verifier
                 .verify_headers(headers, body, now_ms() / 1_000)
                 .is_ok()
-        });
+        }) && has_route_identity(&route, headers, body);
         if !verified {
             metrics::counter!("mcpg_events_upstream_deliveries_total", "outcome" => "unauthorized")
                 .increment(1);

@@ -498,7 +498,8 @@ enables, whatever modes the upstream offers.
   answers `200` once that is durable: `503` for an unknown id, `410` for a
   stopped one, `401` for a bad signature, the echo for a verification
   challenge. An upstream `gap` envelope writes a gap marker; a `terminated`
-  one with `-32012`, `-32011` or `-32602` writes an end row (below), any
+  one with `-32024` (Forbidden), `-32023` (NotFound) or `-32602` writes an
+  end row (below), any
   other marks the route so the owner subscribes again later. The owner
   refreshes the subscription at 80% of its grant and unsubscribes when its
   demand ends, not when ownership moves to another replica.
@@ -516,8 +517,8 @@ enables, whatever modes the upstream offers.
   upstream cursor (slot `{id}` of the type's resume position, kept seven
   days). An upstream `truncated`, a schema change upstream, or a restart
   with no cursor writes a gap marker for its readers only.
-- **Ends when the upstream ends it.** An upstream `-32012`, `-32011` or
-  `-32602` (on the stream's `terminated` frame or as the answer to a poll or
+- **Ends when the upstream ends it.** An upstream `-32024` (Forbidden),
+  `-32023` (NotFound) or `-32602` (on the stream's `terminated` frame or as the answer to a poll or
   a stream request) writes an end row for those arguments: webhook
   subscriptions end once every row before it is done (deleted, not
   tombstoned, so a refresh subscribes anew), a poll from before it gets the

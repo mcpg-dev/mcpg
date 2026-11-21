@@ -6,8 +6,10 @@
 //! 2. [`Handler::validate_transport_headers`] — the SEP-2243 header
 //!    contract: `Mcp-Method` is required and must equal the body method;
 //!    `Mcp-Name` is required (and body-validated) for `tools/call` /
-//!    `prompts/get` / `resources/read`; recognized `Mcp-Param-{Name}`
-//!    headers are body-validated. Header values use the `=?base64?…?=`
+//!    `prompts/get` / `resources/read` and for the `events/*` methods that
+//!    name an event type; recognized `Mcp-Param-{Name}` headers are
+//!    body-validated (on `events/*` by the events core, against the event
+//!    type's annotations). Header values use the `=?base64?…?=`
 //!    sentinel for non-ASCII. Methods MCP `2026-07-28` does not define
 //!    answer HTTP 404 + `-32601` here.
 //! 3. [`Handler::long_lived_stream_plan`] — a `subscriptions/listen` or
@@ -48,7 +50,7 @@ use crate::protocol::v_2026_07_28::wire::request_meta::{
 use crate::protocol::v_2026_07_28::wire::routing::map_client_message_to_operation;
 use crate::protocol::v_2026_07_28::wire::{
     METHOD_HEADER, PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION, header_mismatch,
-    name_source_field, validate_name_header, validate_param_headers,
+    name_source_field, param_headers, validate_name_header, validate_param_headers,
 };
 use crate::runtime::shared_services::SharedServices;
 use crate::runtime::{GatewayRuntime, RequestContext};
@@ -116,9 +118,11 @@ impl Handler {
     /// - `Mcp-Method` is REQUIRED on every request and MUST
     ///   equal the body `method`.
     /// - `Mcp-Name` is REQUIRED for `tools/call` / `prompts/get`
-    ///   (mirrors `params.name`) and `resources/read` (mirrors
-    ///   `params.uri`), and MUST equal the body value after sentinel
-    ///   decode.
+    ///   (mirrors `params.name`), `resources/read` (mirrors
+    ///   `params.uri`) and `events/poll` / `events/stream` /
+    ///   `events/subscribe` / `events/unsubscribe` (mirrors
+    ///   `params.name`, the event name), and MUST equal the body value
+    ///   after sentinel decode.
     /// - Any recognized `Mcp-Param-{Name}` header MUST equal the body
     ///   value at `params.arguments.{name}` after sentinel decode.
     ///
@@ -228,26 +232,38 @@ impl Handler {
             // `params.uri` for `resources/read`. The header value may
             // be `=?base64?…?=`-wrapped and is decoded before
             // comparison.
-            if let Some(source_field) = name_source_field(body_method) {
-                validate_name_header(headers, body, source_field, body_id.clone())?;
-            } else if let Some(source_field) =
-                crate::protocol::v_2026_07_28::extensions::events::wire::optional_name_header_field(
+            let events_name_field =
+                crate::protocol::v_2026_07_28::extensions::events::wire::name_header_field(
                     body_method,
-                )
-                && headers.contains_key(crate::protocol::v_2026_07_28::wire::NAME_HEADER)
+                );
+            // An events request whose body names no event is invalid params,
+            // which the events dispatch answers; there is nothing to mirror.
+            let events_names_one = events_name_field.is_some_and(|field| {
+                body.get("params")
+                    .and_then(|p| p.get(field))
+                    .is_some_and(Value::is_string)
+            });
+            if let Some(source_field) =
+                name_source_field(body_method).or(events_name_field.filter(|_| events_names_one))
             {
-                // Events methods take `Mcp-Name` optionally: a client may
-                // send it, and then it must agree with the body.
                 validate_name_header(headers, body, source_field, body_id.clone())?;
             }
 
-            // SEP-2243 `x-mcp-header` param→header promotion. Any
-            // recognized `Mcp-Param-{Name}` header MUST, after sentinel
-            // decode, match the value carried at the corresponding
-            // `params.arguments.{name}` position in the body. The
-            // gateway routes/executes on the body, so a header that
-            // disagrees with the body is a routing-vs-execution split.
-            validate_param_headers(headers, body, body_id.clone())?;
+            if events_name_field.is_some() {
+                // The annotations of the event type decide which
+                // `Mcp-Param-{Name}` headers an events request needs; the
+                // events core checks them against its catalog. Here only
+                // their shape is checked.
+                param_headers(headers, body_id.clone())?;
+            } else {
+                // SEP-2243 `x-mcp-header` param→header promotion. Any
+                // recognized `Mcp-Param-{Name}` header MUST, after sentinel
+                // decode, match the value carried at the corresponding
+                // `params.arguments.{name}` position in the body. The
+                // gateway routes/executes on the body, so a header that
+                // disagrees with the body is a routing-vs-execution split.
+                validate_param_headers(headers, body, body_id.clone())?;
+            }
         }
         Ok(())
     }
@@ -985,24 +1001,68 @@ mod tests {
         })
     }
 
-    /// `Mcp-Name` is optional on `events/*`: absent is fine, present must
-    /// agree with `params.name`.
+    /// `Mcp-Name` is required on the four `events/*` methods that name an
+    /// event type, and must agree with `params.name`.
     #[test]
-    fn events_mcp_name_is_optional_but_checked_when_sent() {
+    fn events_mcp_name_is_required_and_checked() {
+        let h = Handler::new();
+        for method in [
+            "events/subscribe",
+            "events/unsubscribe",
+            "events/poll",
+            "events/stream",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(METHOD_HEADER, method.parse().unwrap());
+            let mut body = events_subscribe_body("orders.created");
+            body["method"] = serde_json::json!(method);
+            let err = h.validate_transport_headers(&headers, &body).unwrap_err();
+            assert_eq!((err.status, err.error_code), (400, -32020), "{method}");
+            assert!(err.message.contains("Mcp-Name"), "{method}");
+
+            headers.insert(NAME_HEADER, "orders.created".parse().unwrap());
+            assert!(
+                h.validate_transport_headers(&headers, &body).is_ok(),
+                "{method}"
+            );
+
+            headers.insert(NAME_HEADER, "orders.deleted".parse().unwrap());
+            let err = h.validate_transport_headers(&headers, &body).unwrap_err();
+            assert_eq!((err.status, err.error_code), (400, -32020), "{method}");
+        }
+    }
+
+    /// A non-ASCII event name travels in the Base64 sentinel.
+    #[test]
+    fn events_mcp_name_decodes_the_sentinel() {
         let h = Handler::new();
         let mut headers = HeaderMap::new();
         headers.insert(METHOD_HEADER, "events/subscribe".parse().unwrap());
+        headers.insert(
+            NAME_HEADER,
+            crate::protocol::v_2026_07_28::wire::encode_header_value("bestellung.erstellt.ü")
+                .parse()
+                .unwrap(),
+        );
+        let body = events_subscribe_body("bestellung.erstellt.ü");
+        assert!(h.validate_transport_headers(&headers, &body).is_ok());
+    }
+
+    /// On `events/*` an `Mcp-Param-*` header is checked for shape here and
+    /// against the event type by the events core, so a header that names
+    /// no argument passes this step.
+    #[test]
+    fn events_param_headers_are_checked_for_shape_only() {
+        let h = Handler::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(METHOD_HEADER, "events/subscribe".parse().unwrap());
+        headers.insert(NAME_HEADER, "orders.created".parse().unwrap());
+        headers.insert("mcp-param-region", "eu".parse().unwrap());
         let body = events_subscribe_body("orders.created");
         assert!(h.validate_transport_headers(&headers, &body).is_ok());
-
-        headers.insert(NAME_HEADER, "orders.created".parse().unwrap());
-        assert!(h.validate_transport_headers(&headers, &body).is_ok());
-
-        headers.insert(NAME_HEADER, "orders.deleted".parse().unwrap());
+        headers.insert("mcp-param-region", "=?base64?!!?=".parse().unwrap());
         let err = h.validate_transport_headers(&headers, &body).unwrap_err();
-        assert_eq!(err.status, 400);
-        assert_eq!(err.error_code, -32020);
-        assert!(err.message.contains("Mcp-Name"));
+        assert_eq!((err.status, err.error_code), (400, -32020));
     }
 
     /// `events/list` names no type, so an `Mcp-Name` on it is ignored like
@@ -1192,17 +1252,9 @@ mcp:
                 let ext = success.result["capabilities"]["extensions"]
                     .as_object()
                     .expect("extensions map");
-                assert!(ext.contains_key("io.modelcontextprotocol/tasks"));
-                let methods = ext["io.modelcontextprotocol/tasks"]["methods"]
-                    .as_array()
-                    .expect("methods array");
-                // SEP-2663: three bare methods (get/update/cancel); a task
-                // is created by `tools/call`.
-                assert_eq!(methods.len(), 3);
-                let method_strs: Vec<&str> = methods.iter().filter_map(Value::as_str).collect();
-                assert!(method_strs.contains(&"tasks/get"));
-                assert!(method_strs.contains(&"tasks/update"));
-                assert!(method_strs.contains(&"tasks/cancel"));
+                // The extension defines no settings, and this build
+                // implements its initial revision, so it sends none.
+                assert_eq!(ext["io.modelcontextprotocol/tasks"], serde_json::json!({}));
             }
             other => panic!("expected JsonRpcSuccess for server/discover, got {other:?}"),
         }

@@ -114,6 +114,26 @@ fn jwt_claims(bearer: &str) -> Option<BearerClaims> {
     serde_json::from_slice(&raw).ok()
 }
 
+/// Check the request's `Mcp-Param-{Name}` headers against the
+/// `x-mcp-header` annotations of the type's input schema: `HeaderMismatch`
+/// when one it calls for is missing or disagrees with `arguments`. A
+/// request without routing headers (an internal one) is not checked.
+pub fn check_param_headers(
+    ctx: &RequestContext,
+    ty: &EventType,
+    arguments: &Map<String, Value>,
+) -> Result<(), EventsError> {
+    let Some(headers) = ctx.param_headers.as_deref() else {
+        return Ok(());
+    };
+    crate::protocol::v_2026_07_28::wire::validate_annotated_param_headers(
+        &ty.input_schema,
+        &Value::Object(arguments.clone()),
+        headers,
+    )
+    .map_err(EventsError::header_mismatch)
+}
+
 /// Check subscription `arguments` against the size and depth bounds and the
 /// type's input schema. The message never quotes the arguments.
 pub fn check_arguments(ty: &EventType, arguments: &Map<String, Value>) -> Result<(), EventsError> {
@@ -160,7 +180,7 @@ fn webhook_admission_lease(
     }
 }
 
-/// The `-32012` (or `-32013`) a denial of the policy gate becomes on an
+/// The `Forbidden` (or `ResourceExhausted`) a denial of the policy gate becomes on an
 /// `events/*` method. The reason is a fixed category, never the rule.
 pub(crate) fn gate_error(response: crate::protocol::ProtocolHttpResponse) -> EventsError {
     let (code, data) = match response.response {
@@ -227,7 +247,7 @@ enum Existing {
 }
 
 impl EventsCore {
-    /// The event type `name` offers webhook delivery to `ctx`; `-32011` when
+    /// The event type `name` offers webhook delivery to `ctx`; `NotFound` when
     /// the caller may not see it.
     fn webhook_type(
         &self,
@@ -237,7 +257,7 @@ impl EventsCore {
         self.offered_type(ctx, name, DeliveryMode::Webhook)
     }
 
-    /// The event type `name` offers `mode` to `ctx`; `-32011` when the
+    /// The event type `name` offers `mode` to `ctx`; `NotFound` when the
     /// caller may not see it.
     pub(crate) fn offered_type(
         &self,
@@ -292,6 +312,7 @@ impl EventsCore {
         let signing = params.delivery.secret.signing_secret();
         let principal_key = subscriber_key(&ctx.identity, config.webhook.require_trust)?;
         let ty = self.webhook_type(ctx, &params.name)?;
+        check_param_headers(ctx, &ty, &params.arguments)?;
         check_arguments(&ty, &params.arguments)?;
 
         let arguments = Value::Object(params.arguments.clone());
@@ -714,7 +735,17 @@ impl EventsCore {
         let outcome = if documented {
             Ok(())
         } else {
-            challenge(&egress, url, id, signing, timeout, now / 1_000).await
+            let identity = self.identity();
+            challenge(
+                &egress,
+                url,
+                id,
+                signing,
+                identity.as_deref(),
+                timeout,
+                now / 1_000,
+            )
+            .await
         };
         let label = match outcome {
             Ok(()) if documented => "documented",
@@ -775,6 +806,11 @@ impl EventsCore {
             PolicyRoute::event(None),
         ) {
             return Ok(UnsubscribeEventsResult::default());
+        }
+        // A type the catalog no longer has calls for no header.
+        let catalog = self.catalog();
+        if let Some(ty) = catalog.get(&params.name) {
+            check_param_headers(ctx, ty, &params.arguments)?;
         }
         let Some(stores) = self.stores() else {
             return unknown(NotFoundKind::Subscription);

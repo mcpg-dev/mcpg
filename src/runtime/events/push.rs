@@ -10,11 +10,18 @@
 //! the read poll uses.
 //!
 //! Frames, in order: `active` with the start position (`truncated` when
-//! the cursor could not be honoured); then an `event` per occurrence, and
-//! `active {truncated: true}` where events may be missing; a `heartbeat`
-//! every `push.heartbeat_interval_ms` with the position read up to; an `error` when
-//! a read fails. When the gateway ends the stream it sends `terminated`
-//! if the subscription ended, then the empty `StreamEventsResult`.
+//! the cursor could not be honoured) and the granted heartbeat interval;
+//! then an `event` per occurrence, and `active {truncated: true}` where
+//! events may be missing; a `heartbeat` with the position read up to
+//! whenever the granted interval passes with no other frame; an `error`
+//! when a read fails. When the gateway ends the stream it sends
+//! `terminated` if the subscription ended, then the empty
+//! `StreamEventsResult`.
+//!
+//! The grant is the client's `heartbeatMs` within
+//! `push.{min,max}_heartbeat_interval_ms`, or
+//! `push.heartbeat_interval_ms` without one, and every `active` frame
+//! repeats it.
 //!
 //! A stream holds a lease (`ev:push:p:…`) for the per-principal cap and
 //! demand for its type's source, both renewed every half heartbeat and
@@ -35,7 +42,9 @@ use super::handler::policy_key;
 use super::log::{HEAD_TOPIC_PREFIX, ResumePoint};
 use super::poll::{PresenceRow, ReadItem, Reader, read_occurrences, resume_point};
 use super::subscriptions::{CredentialSnapshot, TerminationReason};
-use super::webhook::{check_arguments, credential_snapshot, gate_error, subscriber_key};
+use super::webhook::{
+    check_arguments, check_param_headers, credential_snapshot, gate_error, subscriber_key,
+};
 use crate::config::events::EventReplay;
 use crate::protocol::v_2026_07_28::extensions::events::errors::{
     CodeNumbering, EventsError, ForbiddenReason,
@@ -153,7 +162,11 @@ struct Stream {
     request_id: Value,
     stream_id: String,
     numbering: CodeNumbering,
+    /// The granted heartbeat interval.
     heartbeat: Duration,
+    /// When the stream last sent a frame; a heartbeat is due one interval
+    /// after it.
+    last_sent: tokio::time::Instant,
     reauthorize: Duration,
     epoch: u64,
     after: u64,
@@ -181,6 +194,7 @@ impl EventsCore {
         }
         let principal_key = subscriber_key(&ctx.identity, push.require_trust)?;
         let ty = self.offered_type(ctx, &params.name, DeliveryMode::Push)?;
+        check_param_headers(ctx, &ty, &params.arguments)?;
         check_arguments(&ty, &params.arguments)?;
         let arguments = Value::Object(params.arguments.clone());
         let runtime = self
@@ -243,7 +257,8 @@ impl EventsCore {
                 }
             }
         };
-        let heartbeat = Duration::from_millis(push.heartbeat_interval_ms);
+        let heartbeat_ms = push.granted_heartbeat_ms(params.heartbeat_ms);
+        let heartbeat = Duration::from_millis(heartbeat_ms);
         let stream_id = uuid::Uuid::now_v7().to_string();
         let opened_ms = now_ms();
         let client_info = ctx.client();
@@ -303,15 +318,8 @@ impl EventsCore {
             }
             return Err(store_fault(error));
         }
-        self.note_lease_demand(
-            &stores,
-            &ty,
-            &holder,
-            now_ms(),
-            push.heartbeat_interval_ms,
-            heartbeat * 2,
-        )
-        .await;
+        self.note_lease_demand(&stores, &ty, &holder, now_ms(), heartbeat_ms, heartbeat * 2)
+            .await;
 
         let (tx, rx) = mpsc::channel(FRAME_BUFFER);
         let head = self.head_watch(&stores, &ty.source_key);
@@ -334,6 +342,7 @@ impl EventsCore {
             stream_id: stream_id.clone(),
             numbering: config.error_codes.numbering(),
             heartbeat,
+            last_sent: tokio::time::Instant::now(),
             reauthorize: Duration::from_millis(config.reauthorize_interval_ms),
             epoch: start.epoch,
             after: start.after_seq,
@@ -433,18 +442,15 @@ impl Stream {
     }
 
     async fn serve(&mut self, head: &HeadWatch, truncated: bool) -> Close {
-        if !self
-            .send(StreamFrame::Active {
-                cursor: self.cursor(self.after),
-                truncated,
-            })
-            .await
-        {
+        let active = StreamFrame::Active {
+            cursor: self.cursor(self.after),
+            truncated,
+            heartbeat_ms: Some(self.heartbeat_ms()),
+        };
+        if !self.send(active).await {
             return Close::Client;
         }
         let mut head_rx = head.rx.clone();
-        let mut beat =
-            tokio::time::interval_at(tokio::time::Instant::now() + self.heartbeat, self.heartbeat);
         let renew_every = self.heartbeat / 2;
         let mut renew =
             tokio::time::interval_at(tokio::time::Instant::now() + renew_every, renew_every);
@@ -466,8 +472,9 @@ impl Stream {
                     }
                     read_now = true;
                 }
-                _ = beat.tick() => {
-                    if !self.send(StreamFrame::Heartbeat { cursor: self.cursor(self.after) }).await {
+                () = tokio::time::sleep_until(self.last_sent + self.heartbeat) => {
+                    let beat = StreamFrame::Heartbeat { cursor: self.cursor(self.after) };
+                    if !self.send(beat).await {
                         return Close::Client;
                     }
                 }
@@ -527,6 +534,7 @@ impl Stream {
                     ReadItem::Gap { after } => StreamFrame::Active {
                         cursor: self.cursor_in(read.epoch, after),
                         truncated: true,
+                        heartbeat_ms: Some(self.heartbeat_ms()),
                     },
                     ReadItem::Ended(reason) => {
                         return Some(Close::Terminated(TerminationReason::Upstream(reason)));
@@ -708,12 +716,20 @@ impl Stream {
         })
     }
 
+    /// The granted heartbeat interval in milliseconds.
+    fn heartbeat_ms(&self) -> u64 {
+        u64::try_from(self.heartbeat.as_millis()).unwrap_or(u64::MAX)
+    }
+
     /// Send `frame`; `false` once the client is gone.
-    async fn send(&self, frame: StreamFrame) -> bool {
-        self.tx
+    async fn send(&mut self, frame: StreamFrame) -> bool {
+        let sent = self
+            .tx
             .send(frame.to_notification(&self.request_id))
             .await
-            .is_ok()
+            .is_ok();
+        self.last_sent = tokio::time::Instant::now();
+        sent
     }
 }
 

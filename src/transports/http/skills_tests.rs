@@ -495,6 +495,94 @@ async fn discover_declares_the_extension_and_results_are_stamped() {
     );
 }
 
+/// The Skills extension schema, as published (see `testdata/ext-skills`).
+const SKILLS_SCHEMA: &str = include_str!("testdata/ext-skills/schema.json");
+
+/// Validate `instance` against the `$defs` entry `definition` of the
+/// Skills extension schema.
+fn assert_conforms(definition: &str, instance: &Value) {
+    let mut schema: Value = serde_json::from_str(SKILLS_SCHEMA).expect("the schema parses");
+    assert!(
+        schema["$defs"].get(definition).is_some(),
+        "the schema defines {definition}"
+    );
+    schema["$ref"] = Value::String(format!("#/$defs/{definition}"));
+    let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
+    let errors: Vec<String> = validator
+        .iter_errors(instance)
+        .map(|error| format!("{}: {error}", error.instance_path))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{definition} does not conform: {errors:?}\n{instance}"
+    );
+}
+
+#[tokio::test]
+async fn every_skills_answer_conforms_to_the_extension_schema() {
+    let dir = skills_folder();
+    let app = router(
+        skills_state(dir.path(), ToolAccessPolicyConfig::default(), 1),
+        "/health",
+        "/mcp",
+    );
+
+    let first = call(&app, 2, "skills/list", serde_json::json!({})).await;
+    assert_conforms("ListSkillsResultResponse", &first);
+    let cursor = first["result"]["nextCursor"]
+        .as_str()
+        .expect("a page of one has a next page");
+    let second = call(
+        &app,
+        3,
+        "skills/list",
+        serde_json::json!({ "cursor": cursor }),
+    )
+    .await;
+    assert_conforms("ListSkillsResultResponse", &second);
+
+    for (id, uri) in [
+        (4, "skill://macos/computer-use/SKILL.md"),
+        (5, "skill://macos/mouse/SKILL.md"),
+    ] {
+        let got = call(&app, id, "skills/get", serde_json::json!({ "uri": uri })).await;
+        assert_conforms("GetSkillResultResponse", &got);
+    }
+
+    for (id, uri) in [
+        (6, "skill://macos"),
+        (7, "skill://macos/computer-use"),
+        (8, "skill://macos/computer-use/references"),
+    ] {
+        let listed = call(
+            &app,
+            id,
+            "resources/directory/read",
+            serde_json::json!({ "uri": uri }),
+        )
+        .await;
+        assert_conforms("ReadResourceDirectoryResultResponse", &listed);
+    }
+
+    let read = call(
+        &app,
+        9,
+        "resources/read",
+        serde_json::json!({ "uri": "skill://macos/mouse/SKILL.md" }),
+    )
+    .await;
+    assert_conforms("ReadResourceResultResponse", &read);
+
+    let refused = call(
+        &app,
+        10,
+        "skills/get",
+        serde_json::json!({ "uri": "skill://macos/nothing/SKILL.md" }),
+    )
+    .await;
+    assert_conforms("JSONRPCErrorResponse", &refused);
+}
+
 #[tokio::test]
 async fn skills_methods_answer_404_while_no_skills_are_served() {
     let app = router(build_test_state(), "/health", "/mcp");

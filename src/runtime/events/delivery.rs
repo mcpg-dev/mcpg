@@ -22,6 +22,7 @@ use mcpg_safe_egress::{
 };
 use mcpg_standard_webhooks::{SignError, WhsecSecret};
 
+use super::identity::ServerIdentity;
 use crate::config::events::WebhookEgressConfig;
 use crate::protocol::v_2026_07_28::extensions::events::wire::{
     DeliveryErrorCategory, SUBSCRIPTION_ID_HEADER,
@@ -146,9 +147,12 @@ pub struct SignedPost<'a> {
     pub subscription_id: &'a str,
     /// The current secret first; the previous one during a rotation.
     pub secrets: &'a [&'a WhsecSecret],
-    /// `webhook-id`: the event id, or `msg_<type>_<random>`.
+    /// `webhook-id`: `msg_<random>` for an event, `msg_<type>_<random>` for
+    /// a control envelope.
     pub webhook_id: &'a str,
     pub body: Bytes,
+    /// The keys that add a `v1a,` signature beside the HMAC ones.
+    pub identity: Option<&'a ServerIdentity>,
 }
 
 impl SignedPost<'_> {
@@ -167,6 +171,16 @@ impl SignedPost<'_> {
         };
         if signed.insert_into(&mut headers).is_err() {
             return Attempt::Unsignable;
+        }
+        if let Some(asymmetric) = self
+            .identity
+            .and_then(|identity| identity.sign(self.webhook_id, now_s, &self.body))
+            && let Ok(value) = HeaderValue::from_str(&format!("{} {asymmetric}", signed.signature))
+        {
+            headers.insert(
+                HeaderName::from_static(mcpg_standard_webhooks::HEADER_SIGNATURE),
+                value,
+            );
         }
         headers.insert(
             header::CONTENT_TYPE,
@@ -220,6 +234,7 @@ mod tests {
             secrets: &[&secret],
             webhook_id: "orders.created-1",
             body: Bytes::from_static(b"{}"),
+            identity: None,
         };
         assert!(matches!(dotted.send(1).await, Attempt::Unsignable));
         let keyless = SignedPost {
@@ -229,6 +244,7 @@ mod tests {
             secrets: &[],
             webhook_id: "evt_1",
             body: Bytes::from_static(b"{}"),
+            identity: None,
         };
         assert!(matches!(keyless.send(1).await, Attempt::NotSent));
     }

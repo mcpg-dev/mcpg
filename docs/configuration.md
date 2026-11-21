@@ -1262,9 +1262,9 @@ The numbering of the MCP Events error codes on the wire.
 
 **Variants:**
 
-- **`draft`** — `-32011` to `-32015`.
+- **`spec`** — The specification's codes, `-32023` to `-32027`.
 
-- **`sep_3415`** — `-32023` to `-32027`.
+- **`draft`** — `-32011` to `-32015`, for a client that still expects them.
 
 ### `EventLogConfig`
 
@@ -1369,7 +1369,7 @@ A place in the `server/discover` capabilities where MCP Events is advertised.
 
 **Variants:**
 
-- **`capability`** — The top-level `capabilities.events` object.
+- **`capability`** — A top-level `capabilities.events` object, beside the extensions entry.
 
 - **`extension`** — The `capabilities.extensions["io.modelcontextprotocol/events"]` entry.
 
@@ -1389,12 +1389,12 @@ Off by default. With `enabled: false` the `events/*` methods answer `-32601` and
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
-| `advertise` | array&lt;[`EventsAdvertiseLocation`](#eventsadvertiselocation)&gt; | (see type) | Where `server/discover` advertises the extension. The drafts disagree on the location, so both are on by default: `capability` is the top-level `capabilities.events` object (read by ChatGPT), `extension` is the `capabilities.extensions["io.modelcontextprotocol/events"]` entry. Must name at least one location when `enabled` is `true`. |
+| `advertise` | array&lt;[`EventsAdvertiseLocation`](#eventsadvertiselocation)&gt; | (see type) | Where `server/discover` advertises the extension. `extension` (default, and always required) is the `capabilities.extensions["io.modelcontextprotocol/events"]` entry the specification defines. `capability` adds a top-level `capabilities.events` object with the same settings, for a client that reads only that location (the ChatGPT profile). |
 | `allow_ephemeral_subscriptions` | boolean | `false` | Accept webhook subscriptions on a store that loses them on a restart. Every grant is then capped at `webhook.ttl.min_ms`, so a client refreshes before a restart can matter for long. Default `false`. |
 | `audit` | [`EventsAuditConfig`](#eventsauditconfig) | (see type) | Audit of event delivery. |
 | `delivery_paused` | boolean | `false` | Hold every delivery, in every mode, while keeping every subscription and every event within retention: webhook deliveries wait, a poll answers no events and the cursor it was given, and a stream sends heartbeats only. Subscribe and refresh still answer, with `deliveryStatus.active: false` and `lastError: "paused"`. Delivery resumes from each position when this is cleared. Default `false`. |
 | `enabled` | boolean | `false` | Serve the `events/*` methods of every delivery mode enabled below, and advertise the extension. Default `false`. |
-| `error_codes` | [`EventErrorCodes`](#eventerrorcodes) | `"draft"` | How the extension's error codes are numbered. `draft` (default) answers `-32011` to `-32015`, the numbers the ChatGPT profile documents; `sep_3415` answers `-32023` to `-32027`, the numbers the upstream sketch assigns. The documentation names the `draft` numbers. |
+| `error_codes` | [`EventErrorCodes`](#eventerrorcodes) | `"spec"` | How the extension's error codes are numbered. `spec` (default) answers the specification's codes: `-32023` NotFound, `-32024` Forbidden, `-32025` ResourceExhausted, `-32026` Unsupported and `-32027` CallbackEndpointError. `draft` answers `-32011` to `-32015` in the same order, the codes the ChatGPT profile documents. `HeaderMismatch` is `-32020` under both. |
 | `inbound_profiles` | array&lt;[`InboundProfileConfig`](#inboundprofileconfig)&gt; |  | Signing profiles of inbound senders beyond the built-in ones (`standard_webhooks`, `github`, `stripe`, `slack`). A route names one in `source.inbound.verify.profile`. |
 | `log` | [`EventLogConfig`](#eventlogconfig) | (see type) | Event log limits. |
 | `log_store` | [`StoreOverrideConfig`](#storeoverrideconfig) (optional) |  | Store of the event log (store role `event-log`). Omitted, the cluster coordinator's store is used. The retention byte budgets of every event type must fit this store (see `mcp.capabilities.events[].retention.max_bytes`). |
@@ -1403,7 +1403,7 @@ Off by default. With `enabled: false` the `events/*` methods answer `-32601` and
 | `reauthorize_interval_ms` | integer | `300000` | How often the authorization of a long-lived grant is checked again from its stored identity: each webhook subscription and each open stream. In milliseconds; default 300 000 (5 minutes). |
 | `sources` | [`EventSourcesConfig`](#eventsourcesconfig) | (see type) | Lifecycle of event sources. |
 | `store` | [`StoreOverrideConfig`](#storeoverrideconfig) (optional) |  | Store of the webhook subscription records (store role `event-subscription`). Omitted, the cluster coordinator's store is used, which is in memory on a single node. Webhook delivery refuses a store that does not survive a restart unless `allow_ephemeral_subscriptions` is set; a single node keeps subscriptions with `{kind: file, dir: …}`. |
-| `unsubscribe_unknown` | [`UnsubscribeUnknown`](#unsubscribeunknown) | `"ok"` | The answer to `events/unsubscribe` for a subscription that does not exist. `ok` (default) answers `{}`, as an idempotent unsubscribe; `not_found` answers `-32011` with `data.kind: "subscription"`. |
+| `unsubscribe_unknown` | [`UnsubscribeUnknown`](#unsubscribeunknown) | `"ok"` | The answer to `events/unsubscribe` for a subscription that does not exist. `ok` (default) answers `{}`, as an idempotent unsubscribe; `not_found` answers `NotFound` (`-32023`) with `data.kind: "subscription"`. |
 | `webhook` | [`EventsWebhookConfig`](#eventswebhookconfig) | (see type) | Webhook delivery (`events/subscribe`). |
 
 ### `EventsPollConfig`
@@ -1428,8 +1428,10 @@ Off by default. With `enabled: false` the `events/*` methods answer `-32601` and
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `false` | Serve `events/stream`, and offer `push` on every type whose `delivery` lists it. Default `false`. |
-| `heartbeat_interval_ms` | integer | `20000` | Interval of heartbeat frames, in milliseconds, from 1 000 to 30 000. Default 20 000. A client that hears nothing for twice this treats the stream as dead and reconnects with its cursor. |
+| `heartbeat_interval_ms` | integer | `30000` | The heartbeat interval granted to a stream whose client suggests none, in milliseconds. Default 30 000. Every `notifications/events/active` carries the grant as `heartbeatMs`, and a heartbeat goes out whenever that long passes with no other message on the stream. |
+| `max_heartbeat_interval_ms` | integer | `50000` | The longest heartbeat interval granted, in milliseconds; a longer suggestion is lowered to it. Default 50 000, under the 60 s idle timeout common to load balancers. Keep it below the idle timeout of every proxy in front of the gateway. |
 | `max_streams_per_principal` | integer | `16` | Streams one principal may hold open across the cluster. Default 16. These do not count against the server-push stream cap of a session. |
+| `min_heartbeat_interval_ms` | integer | `1000` | The shortest heartbeat interval granted, in milliseconds; a shorter suggestion is raised to it. Default 1 000. |
 | `require_trust` | [`SubscriberTrust`](#subscribertrust) | `"verified"` | The lowest caller trust that may open a stream. `verified` (default) requires a cryptographically verified principal; `header_asserted` also admits a principal named by a request header. |
 
 ### `EventsWebhookConfig`
@@ -1440,12 +1442,14 @@ Off by default. With `enabled: false` the `events/*` methods answer `-32601` and
 | --- | --- | --- | --- |
 | `control_envelopes` | array&lt;[`ControlEnvelopeKind`](#controlenvelopekind)&gt; | (see type) | The control envelopes sent besides events. Default both `gap` and `terminated`; a `verification` envelope is always sent. |
 | `egress` | [`WebhookEgressConfig`](#webhookegressconfig) | (see type) | The outbound client that reaches callback URLs. |
+| `egress_ip_ranges` | array&lt;string&gt; |  | The address ranges deliveries leave from, as CIDR strings, published on the Server Card for receivers that allowlist source addresses. Empty (default): none is published. |
 | `enabled` | boolean | `true` | Accept `events/subscribe` and deliver to callback URLs. Default `true`. Requires a store that survives a restart (or `allow_ephemeral_subscriptions`) and a key that every replica shares: `cluster.state_encryption_key_env` or `mcp.configurations.sessions.synthetic_session_key`. |
 | `limits` | [`WebhookLimitsConfig`](#webhooklimitsconfig) | (see type) | Subscription and delivery limits. |
 | `max_payload_bytes` | integer | `245760` | Largest serialized occurrence, in bytes; a larger occurrence is not delivered. At most 245 760 (the default), so the whole request body stays within 262 144 bytes. |
 | `require_trust` | [`SubscriberTrust`](#subscribertrust) | `"verified"` | The lowest caller trust that may subscribe. `verified` (default) requires a cryptographically verified principal; `header_asserted` also admits a principal named by a request header and is for self-hosted deployments that trust their front proxy. |
 | `retry` | [`WebhookRetryConfig`](#webhookretryconfig) | (see type) | Retries of one delivery. |
 | `secret_rotation_grace_ms` | integer | `600000` | How long the previous secret keeps signing after a subscribe replaces it, in milliseconds. Default 600 000 (10 minutes). |
+| `signing_keys` | array&lt;[`WebhookSigningKeyConfig`](#webhooksigningkeyconfig)&gt; |  | Ed25519 keys that give each delivery and challenge a second signature beside its HMAC (Standard Webhooks `v1a,`), so a receiver can tell which server sent it. The first key signs; every key is published on the Server Card, so a rotation lists the new key first and keeps the old one until receivers have the new one. Empty (default): deliveries carry the HMAC signature only. |
 | `suspension` | [`WebhookSuspensionConfig`](#webhooksuspensionconfig) | (see type) | When failing deliveries suspend a subscription. |
 | `ttl` | [`WebhookTtlConfig`](#webhookttlconfig) | (see type) | Lifetime of a subscription grant. |
 | `verification` | [`WebhookVerificationConfig`](#webhookverificationconfig) | (see type) | Proof that a callback endpoint wants the deliveries. |
@@ -2367,7 +2371,7 @@ The gateway calls `tool` as the caller, through the whole tool-call path (policy
 
 - `op`: `admit` (a caller opens realtime delivery), `renew` (it still holds it) or `release` (it let go; best effort). - `lease_id`: one id per held delivery, the same in all three calls and on every replica. - `kind`: `events` or `resource`. - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or `subscribe` for a resource. - `event`: `{name, arguments}` for events; `resource`: `{uri}` for a resource. - `client`: `{name, version}` of the MCP client, when it named itself.
 
-The tool answers with an object that has a boolean `allow`. With `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten the renew interval. With `allow: false`, `error: {code, message, data}` reaches the caller: a numeric `code` is the JSON-RPC error code and `data` (or `details`) its data; any other `code` gives `-32013` with the whole `error` object as data.
+The tool answers with an object that has a boolean `allow`. With `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten the renew interval. With `allow: false`, `error: {code, message, data}` reaches the caller: a numeric `code` is the JSON-RPC error code and `data` (or `details`) its data; any other `code` gives `-32025` (ResourceExhausted) with the whole `error` object as data.
 
 The tool is internal: `tools/list` does not show it and a caller's own `tools/call` of it is refused.
 
@@ -3130,7 +3134,7 @@ The answer to an `events/unsubscribe` naming no live subscription.
 
 - **`ok`** — `{}`, the same answer as for a subscription that existed.
 
-- **`not_found`** — `-32011` with `data.kind: "subscription"`.
+- **`not_found`** — `NotFound` with `data.kind: "subscription"`.
 
 ### `UpstreamConfig`
 
@@ -3294,7 +3298,7 @@ A proof of intent a callback endpoint may give.
 
 ### `WebhookLimitsConfig`
 
-`events.webhook.limits:` — subscription and delivery limits. A subscribe past a subscription limit answers `-32013` naming the limit.
+`events.webhook.limits:` — subscription and delivery limits. A subscribe past a subscription limit answers `ResourceExhausted` naming the limit.
 
 | Field | Type | Default | Summary |
 | --- | --- | --- | --- |
@@ -3314,6 +3318,15 @@ A proof of intent a callback endpoint may give.
 | `honor_retry_after` | boolean | `true` | Wait as long as a `Retry-After` answer asks, inside the window. Default `true`. |
 | `max_attempts` | integer | `5` | Attempts per delivery, the first included. Default 5. |
 | `window_ms` | integer | `900000` | Time after the first attempt within which retries happen, in milliseconds. Default 900 000 (15 minutes). On a gateway a control plane manages, the plan's retry window is the most it can be. |
+
+### `WebhookSigningKeyConfig`
+
+One key of `events.webhook.signing_keys`.
+
+| Field | Type | Default | Summary |
+| --- | --- | --- | --- |
+| `kid` | string (optional) |  | Key identifier, published with the public key. Defaults to the RFC 7638 thumbprint of the key. |
+| `private_key` | string |  | The Ed25519 private key in PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`, as `openssl genpkey -algorithm ed25519` writes it). Supply via `${secret.NAME}` or `${env.X}`. |
 
 ### `WebhookSuspensionConfig`
 

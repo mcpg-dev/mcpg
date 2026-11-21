@@ -10,35 +10,33 @@ use crate::protocol::v_2026_07_28::dispatch::support::{
     handler_internal_error, serialize_jsonrpc_success,
 };
 use crate::protocol::v_2026_07_28::extensions::tasks::wire::{
-    Task as WireTask, TaskStatus as WireTaskStatus,
+    TASKS_CAPABILITY_REQUIRED_MESSAGE, Task as WireTask, TaskStatus as WireTaskStatus,
+    required_capabilities_data,
 };
 use crate::runtime::shared_services::SharedServices;
 use crate::runtime::{GatewayRuntime, RequestContext};
 use serde_json::Value;
 
-/// True when the per-request client capabilities declared the
-/// `io.modelcontextprotocol/tasks` extension (SEP-2663). A server
-/// MUST NOT surface tasks to a client that did not declare it — both
-/// the `tasks/*` methods and the `tools/call` → `resultType:"task"`
-/// materialization gate on this.
+/// True when the per-request client capabilities declare the
+/// `io.modelcontextprotocol/tasks` extension at a revision this build
+/// implements. A server MUST NOT surface tasks to a client that did not
+/// declare it — both the `tasks/*` methods and the `tools/call` →
+/// `resultType:"task"` materialization gate on this.
 pub(crate) fn client_declared_tasks_extension(ctx: &RequestContext) -> bool {
-    ctx.request_capabilities
-        .as_ref()
-        .and_then(|caps| caps.extensions.as_ref())
-        .map(|ext| {
-            ext.contains_key(
-                crate::protocol::v_2026_07_28::extensions::tasks::wire::EXTENSION_NAMESPACE,
-            )
-        })
-        .unwrap_or(false)
+    ctx.request_capabilities.as_ref().is_some_and(|caps| {
+        caps.supported_extension(
+            crate::protocol::v_2026_07_28::extensions::tasks::wire::EXTENSION_NAMESPACE,
+        )
+        .is_some()
+    })
 }
 
 /// Dispatch one of the three bare SEP-2663 tasks methods
 /// (`tasks/get` / `tasks/update` / `tasks/cancel`).
 ///
 /// Gated on the per-request extension declaration: a client that did
-/// not declare `io.modelcontextprotocol/tasks` gets `-32601` (the
-/// methods do not exist for it). Task authorization binds to the
+/// not declare `io.modelcontextprotocol/tasks` gets `-32021`. Task
+/// authorization binds to the
 /// request **principal** (`RequestContext::task_owner_key`) so a task
 /// minted on one cluster replica is pollable from another.
 ///
@@ -55,19 +53,16 @@ pub(crate) async fn dispatch_tasks_extension(
     use crate::protocol::v_2026_07_28::extensions::tasks::wire::{CancelTaskResult, GetTaskResult};
     use crate::protocol::v_2026_07_28::wire::operations::TasksExtensionOperation;
 
-    // SEP-2663: never surface tasks to a client that did not declare
-    // the extension. The methods MUST appear not-to-exist (`-32601`).
     if !client_declared_tasks_extension(ctx) {
-        let request_id = op.request_id_owned();
         return ProtocolHttpResponse {
-            http_status: 404,
+            http_status: 400,
             response: ProtocolResponse::JsonRpcError(JsonRpcError {
                 jsonrpc: JSONRPC_VERSION,
-                id: request_id,
+                id: op.request_id_owned(),
                 error: JsonRpcErrorBody {
-                    code: -32601,
-                    message: "tasks extension not declared by client".to_owned(),
-                    data: None,
+                    code: crate::protocol::MISSING_REQUIRED_CLIENT_CAPABILITY_CODE,
+                    message: TASKS_CAPABILITY_REQUIRED_MESSAGE.to_owned(),
+                    data: Some(required_capabilities_data()),
                 },
             }),
         };

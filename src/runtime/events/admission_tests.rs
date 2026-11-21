@@ -47,6 +47,7 @@ fn stream_params() -> StreamEventsParams {
         arguments: Map::new(),
         cursor: None,
         max_age_ms: None,
+        heartbeat_ms: None,
         meta: None,
     }
 }
@@ -100,7 +101,7 @@ async fn a_stream_is_admitted_then_ends_when_a_renewal_is_refused() {
         "{terminated}"
     );
     let error = &terminated["params"]["error"];
-    assert_eq!(error["code"], -32013, "{terminated}");
+    assert_eq!(error["code"], -32025, "{terminated}");
     assert_eq!(error["message"], "one realtime consumer on this plan");
     assert_eq!(error["data"]["code"], "realtime_limit");
     assert_eq!(error["data"]["details"]["limit"], 1);
@@ -110,7 +111,7 @@ async fn a_stream_is_admitted_then_ends_when_a_renewal_is_refused() {
         .open_stream(&alice(), stream_params(), json!(8))
         .await
         .expect_err("refused at the open");
-    assert_eq!(refused.code(), -32013);
+    assert_eq!(refused.code(), -32025);
     assert_eq!(refused.message(), "one realtime consumer on this plan");
 }
 
@@ -123,7 +124,7 @@ async fn a_poll_lease_is_admitted_on_its_first_poll_and_renewed_on_later_ones() 
         .poll_events(&alice(), poll_params())
         .await
         .expect_err("refused");
-    assert_eq!(refused.code(), -32013);
+    assert_eq!(refused.code(), -32025);
     assert_eq!(refused.data().unwrap()["details"]["limit"], 1);
 
     admit_with(&h, ALLOW).await;
@@ -143,7 +144,7 @@ async fn a_poll_lease_is_admitted_on_its_first_poll_and_renewed_on_later_ones() 
         .poll_events(&alice(), poll_params())
         .await
         .expect_err("the renewal is refused");
-    assert_eq!(refused.code(), -32013);
+    assert_eq!(refused.code(), -32025);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -155,7 +156,7 @@ async fn a_webhook_subscription_asks_the_admission_before_the_callback() {
         .subscribe_webhook(&alice(), h.params("/hook", json!({}), 1))
         .await
         .expect_err("refused");
-    assert_eq!(refused.code(), -32013);
+    assert_eq!(refused.code(), -32025);
     assert_eq!(refused.message(), "one realtime consumer on this plan");
     assert!(
         h.receiver.requests().is_empty(),

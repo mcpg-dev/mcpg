@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use super::store_override::StoreOverrideConfig;
 use super::watch::WatchStrategyConfig;
-use crate::protocol::v_2026_07_28::extensions::events::wire::MAX_STREAM_HEARTBEAT_MS;
+use crate::protocol::v_2026_07_28::extensions::events::wire::DEFAULT_HEARTBEAT_MS;
 
 /// Longest event-type name.
 pub const MAX_EVENT_NAME_CHARS: usize = 128;
@@ -56,25 +56,26 @@ pub struct EventsConfig {
     /// and advertise the extension. Default `false`.
     pub enabled: bool,
 
-    /// Where `server/discover` advertises the extension. The drafts
-    /// disagree on the location, so both are on by default:
-    /// `capability` is the top-level `capabilities.events` object (read
-    /// by ChatGPT), `extension` is the
-    /// `capabilities.extensions["io.modelcontextprotocol/events"]` entry.
-    /// Must name at least one location when `enabled` is `true`.
+    /// Where `server/discover` advertises the extension. `extension`
+    /// (default, and always required) is the
+    /// `capabilities.extensions["io.modelcontextprotocol/events"]` entry
+    /// the specification defines. `capability` adds a top-level
+    /// `capabilities.events` object with the same settings, for a client
+    /// that reads only that location (the ChatGPT profile).
     pub advertise: Vec<EventsAdvertiseLocation>,
 
     /// The answer to `events/unsubscribe` for a subscription that does
     /// not exist. `ok` (default) answers `{}`, as an idempotent
-    /// unsubscribe; `not_found` answers `-32011` with
+    /// unsubscribe; `not_found` answers `NotFound` (`-32023`) with
     /// `data.kind: "subscription"`.
     pub unsubscribe_unknown: UnsubscribeUnknown,
 
-    /// How the extension's error codes are numbered. `draft` (default)
-    /// answers `-32011` to `-32015`, the numbers the ChatGPT profile
-    /// documents; `sep_3415` answers `-32023` to `-32027`, the numbers the
-    /// upstream sketch assigns. The documentation names the `draft`
-    /// numbers.
+    /// How the extension's error codes are numbered. `spec` (default)
+    /// answers the specification's codes: `-32023` NotFound, `-32024`
+    /// Forbidden, `-32025` ResourceExhausted, `-32026` Unsupported and
+    /// `-32027` CallbackEndpointError. `draft` answers `-32011` to
+    /// `-32015` in the same order, the codes the ChatGPT profile
+    /// documents. `HeaderMismatch` is `-32020` under both.
     pub error_codes: EventErrorCodes,
 
     /// Store of the webhook subscription records (store role
@@ -143,7 +144,8 @@ pub struct EventsConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EventsAdvertiseLocation {
-    /// The top-level `capabilities.events` object.
+    /// A top-level `capabilities.events` object, beside the extensions
+    /// entry.
     Capability,
     /// The `capabilities.extensions["io.modelcontextprotocol/events"]`
     /// entry.
@@ -159,7 +161,7 @@ pub enum UnsubscribeUnknown {
     /// `{}`, the same answer as for a subscription that existed.
     #[default]
     Ok,
-    /// `-32011` with `data.kind: "subscription"`.
+    /// `NotFound` with `data.kind: "subscription"`.
     NotFound,
 }
 
@@ -169,12 +171,11 @@ pub enum UnsubscribeUnknown {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum EventErrorCodes {
-    /// `-32011` to `-32015`.
+    /// The specification's codes, `-32023` to `-32027`.
     #[default]
+    Spec,
+    /// `-32011` to `-32015`, for a client that still expects them.
     Draft,
-    /// `-32023` to `-32027`.
-    #[serde(rename = "sep_3415")]
-    Sep3415,
 }
 
 impl EventErrorCodes {
@@ -184,8 +185,8 @@ impl EventErrorCodes {
     ) -> mcpg_mcp_wire::v_2026_07_28::extensions::events::errors::CodeNumbering {
         use mcpg_mcp_wire::v_2026_07_28::extensions::events::errors::CodeNumbering;
         match self {
+            Self::Spec => CodeNumbering::Spec,
             Self::Draft => CodeNumbering::Draft,
-            Self::Sep3415 => CodeNumbering::Sep3415,
         }
     }
 }
@@ -290,6 +291,58 @@ pub struct EventsWebhookConfig {
     /// The control envelopes sent besides events. Default both `gap` and
     /// `terminated`; a `verification` envelope is always sent.
     pub control_envelopes: Vec<ControlEnvelopeKind>,
+    /// Ed25519 keys that give each delivery and challenge a second
+    /// signature beside its HMAC (Standard Webhooks `v1a,`), so a receiver
+    /// can tell which server sent it. The first key signs; every key is
+    /// published on the Server Card, so a rotation lists the new key
+    /// first and keeps the old one until receivers have the new one.
+    /// Empty (default): deliveries carry the HMAC signature only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub signing_keys: Vec<WebhookSigningKeyConfig>,
+    /// The address ranges deliveries leave from, as CIDR strings,
+    /// published on the Server Card for receivers that allowlist source
+    /// addresses. Empty (default): none is published.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub egress_ip_ranges: Vec<String>,
+}
+
+/// One key of `events.webhook.signing_keys`.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookSigningKeyConfig {
+    /// Key identifier, published with the public key. Defaults to the
+    /// RFC 7638 thumbprint of the key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kid: Option<String>,
+    /// The Ed25519 private key in PKCS#8 PEM (`-----BEGIN PRIVATE
+    /// KEY-----`, as `openssl genpkey -algorithm ed25519` writes it).
+    /// Supply via `${secret.NAME}` or `${env.X}`.
+    pub private_key: String,
+}
+
+impl std::fmt::Debug for WebhookSigningKeyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebhookSigningKeyConfig")
+            .field("kid", &self.kid)
+            .field("private_key", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Whether `range` is a CIDR string: an IP address, `/`, and a prefix
+/// length the address family allows.
+fn is_cidr(range: &str) -> bool {
+    let Some((address, prefix)) = range.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => prefix <= 32,
+        Ok(std::net::IpAddr::V6(_)) => prefix <= 128,
+        Err(_) => false,
+    }
 }
 
 impl Default for EventsWebhookConfig {
@@ -306,6 +359,8 @@ impl Default for EventsWebhookConfig {
             max_payload_bytes: MAX_PAYLOAD_BYTES_CEILING,
             secret_rotation_grace_ms: 600_000,
             control_envelopes: vec![ControlEnvelopeKind::Gap, ControlEnvelopeKind::Terminated],
+            signing_keys: Vec::new(),
+            egress_ip_ranges: Vec::new(),
         }
     }
 }
@@ -368,7 +423,8 @@ impl Default for WebhookTtlConfig {
 }
 
 /// `events.webhook.limits:` — subscription and delivery limits. A
-/// subscribe past a subscription limit answers `-32013` naming the limit.
+/// subscribe past a subscription limit answers `ResourceExhausted` naming
+/// the limit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct WebhookLimitsConfig {
@@ -623,10 +679,20 @@ pub struct EventsPushConfig {
     /// `header_asserted` also admits a principal named by a request
     /// header.
     pub require_trust: SubscriberTrust,
-    /// Interval of heartbeat frames, in milliseconds, from 1 000 to
-    /// 30 000. Default 20 000. A client that hears nothing for twice this
-    /// treats the stream as dead and reconnects with its cursor.
+    /// The heartbeat interval granted to a stream whose client suggests
+    /// none, in milliseconds. Default 30 000. Every
+    /// `notifications/events/active` carries the grant as `heartbeatMs`,
+    /// and a heartbeat goes out whenever that long passes with no other
+    /// message on the stream.
     pub heartbeat_interval_ms: u64,
+    /// The shortest heartbeat interval granted, in milliseconds; a shorter
+    /// suggestion is raised to it. Default 1 000.
+    pub min_heartbeat_interval_ms: u64,
+    /// The longest heartbeat interval granted, in milliseconds; a longer
+    /// suggestion is lowered to it. Default 50 000, under the 60 s idle
+    /// timeout common to load balancers. Keep it below the idle timeout of
+    /// every proxy in front of the gateway.
+    pub max_heartbeat_interval_ms: u64,
     /// Streams one principal may hold open across the cluster. Default 16.
     /// These do not count against the server-push stream cap of a session.
     pub max_streams_per_principal: u64,
@@ -637,7 +703,9 @@ impl Default for EventsPushConfig {
         Self {
             enabled: false,
             require_trust: SubscriberTrust::Verified,
-            heartbeat_interval_ms: 20_000,
+            heartbeat_interval_ms: DEFAULT_HEARTBEAT_MS,
+            min_heartbeat_interval_ms: 1_000,
+            max_heartbeat_interval_ms: 50_000,
             max_streams_per_principal: 16,
         }
     }
@@ -645,10 +713,19 @@ impl Default for EventsPushConfig {
 
 impl EventsPushConfig {
     fn validate(&self) -> Result<()> {
-        if !(1_000..=MAX_STREAM_HEARTBEAT_MS).contains(&self.heartbeat_interval_ms) {
+        positive(
+            "push.min_heartbeat_interval_ms",
+            self.min_heartbeat_interval_ms,
+        )?;
+        if !(self.min_heartbeat_interval_ms..=self.max_heartbeat_interval_ms)
+            .contains(&self.heartbeat_interval_ms)
+        {
             bail!(
-                "push.heartbeat_interval_ms must be from 1000 to {MAX_STREAM_HEARTBEAT_MS}; the \
-                 extension asks for a data frame at least every 30 seconds"
+                "push: min_heartbeat_interval_ms ({}) <= heartbeat_interval_ms ({}) <= \
+                 max_heartbeat_interval_ms ({}) must hold",
+                self.min_heartbeat_interval_ms,
+                self.heartbeat_interval_ms,
+                self.max_heartbeat_interval_ms
             );
         }
         positive(
@@ -656,16 +733,25 @@ impl EventsPushConfig {
             self.max_streams_per_principal,
         )
     }
+
+    /// The heartbeat interval granted to a client that suggests
+    /// `suggested`, in milliseconds: the suggestion within the bounds, or
+    /// the default without one.
+    pub fn granted_heartbeat_ms(&self, suggested: Option<u64>) -> u64 {
+        suggested.map_or(self.heartbeat_interval_ms, |ms| {
+            ms.clamp(
+                self.min_heartbeat_interval_ms,
+                self.max_heartbeat_interval_ms,
+            )
+        })
+    }
 }
 
 impl Default for EventsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            advertise: vec![
-                EventsAdvertiseLocation::Capability,
-                EventsAdvertiseLocation::Extension,
-            ],
+            advertise: vec![EventsAdvertiseLocation::Extension],
             unsubscribe_unknown: UnsubscribeUnknown::default(),
             error_codes: EventErrorCodes::default(),
             store: None,
@@ -687,10 +773,10 @@ impl Default for EventsConfig {
 impl EventsConfig {
     /// Checks that need nothing but this block.
     pub(crate) fn validate(&self) -> Result<()> {
-        if self.enabled && self.advertise.is_empty() {
+        if self.enabled && !self.advertise.contains(&EventsAdvertiseLocation::Extension) {
             bail!(
-                "advertise must name `capability`, `extension` or both while events are \
-                 enabled; a client cannot discover an extension advertised nowhere"
+                "advertise must name `extension`: the capabilities.extensions entry is where a \
+                 client discovers the extension; `capability` only adds a top-level copy"
             );
         }
         if let Some(store) = &self.store {
@@ -753,7 +839,7 @@ impl EventsConfig {
 
     /// Whether the extensions-map entry is advertised.
     pub fn advertises_extension(&self) -> bool {
-        self.enabled && self.advertise.contains(&EventsAdvertiseLocation::Extension)
+        self.enabled
     }
 
     /// The delivery modes this config serves, in wire order.
@@ -801,6 +887,12 @@ impl EventsPollConfig {
 
 impl EventsWebhookConfig {
     fn validate(&self) -> Result<()> {
+        for (index, range) in self.egress_ip_ranges.iter().enumerate() {
+            if !is_cidr(range) {
+                bail!("webhook.egress_ip_ranges[{index}] `{range}` is not a CIDR range");
+            }
+        }
+        crate::runtime::events::identity::ServerIdentity::from_config(self)?;
         let ttl = &self.ttl;
         positive("webhook.ttl.min_ms", ttl.min_ms)?;
         if !(ttl.min_ms <= ttl.default_ms && ttl.default_ms <= ttl.max_ms) {
@@ -1853,6 +1945,13 @@ fn validate_event_type(
         }
     }
     compile_checked(&input_schema, &format!("{at}.input_schema"))?;
+    // A client drops a type whose annotations break the transport's rules,
+    // so such a type could never be subscribed to.
+    if let Some(violation) =
+        crate::protocol::v_2026_07_28::wire::x_mcp_header_violation(&input_schema)
+    {
+        bail!("{at}.input_schema: {violation}");
+    }
     let payload_validator = compile_checked(&payload_schema, &format!("{at}.payload_schema"))?;
     if let Some(expr) = &ty.match_expr {
         cel::Program::compile(expr)

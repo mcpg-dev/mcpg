@@ -66,8 +66,8 @@ pub const MIN_RENEW_INTERVAL_MS: u64 = 1_000;
 /// `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten
 /// the renew interval. With `allow: false`, `error: {code, message, data}`
 /// reaches the caller: a numeric `code` is the JSON-RPC error code and
-/// `data` (or `details`) its data; any other `code` gives `-32013` with the
-/// whole `error` object as data.
+/// `data` (or `details`) its data; any other `code` gives `-32025`
+/// (ResourceExhausted) with the whole `error` object as data.
 ///
 /// The tool is internal: `tools/list` does not show it and a caller's own
 /// `tools/call` of it is refused.

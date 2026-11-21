@@ -84,6 +84,17 @@ pub(crate) async fn dispatch(
     {
         return DispatchOutcome::Rejected(rejection);
     }
+    if let Some(headers) = headers
+        && body
+            .get("method")
+            .and_then(Value::as_str)
+            .and_then(crate::protocol::v_2026_07_28::extensions::events::wire::name_header_field)
+            .is_some()
+    {
+        let params =
+            crate::protocol::v_2026_07_28::wire::param_headers(headers, None).unwrap_or_default();
+        ctx.param_headers = Some(Arc::new(params));
+    }
     if config.gateway.server.enforce_request_meta
         && let Some(rejection) =
             crate::protocol::v_2026_07_28::wire::enforce_request_meta_triple(&body)

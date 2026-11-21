@@ -50,18 +50,13 @@ fn one_type(body: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn off_by_default_with_both_locations() {
+fn off_by_default_with_the_extensions_entry_only() {
     let config = EventsConfig::default();
     assert!(!config.enabled);
     assert!(!config.advertises_capability());
     assert!(!config.advertises_extension());
-    assert_eq!(
-        config.advertise,
-        vec![
-            EventsAdvertiseLocation::Capability,
-            EventsAdvertiseLocation::Extension
-        ]
-    );
+    assert_eq!(config.advertise, vec![EventsAdvertiseLocation::Extension]);
+    assert_eq!(config.error_codes, EventErrorCodes::Spec);
     config.validate().unwrap();
 
     let parsed: EventsConfig = serde_yaml::from_str("{}").unwrap();
@@ -115,31 +110,39 @@ fn defaults_follow_the_delivery_profile() {
 
 #[test]
 fn enabled_advertises_where_configured() {
-    let both: EventsConfig = serde_yaml::from_str("enabled: true").unwrap();
+    let default: EventsConfig = serde_yaml::from_str("enabled: true").unwrap();
+    default.validate().unwrap();
+    assert!(!default.advertises_capability());
+    assert!(default.advertises_extension());
+
+    let both: EventsConfig =
+        serde_yaml::from_str("enabled: true\nadvertise: [capability, extension]").unwrap();
     both.validate().unwrap();
     assert!(both.advertises_capability());
     assert!(both.advertises_extension());
-
-    let extension_only: EventsConfig =
-        serde_yaml::from_str("enabled: true\nadvertise: [extension]").unwrap();
-    extension_only.validate().unwrap();
-    assert!(!extension_only.advertises_capability());
-    assert!(extension_only.advertises_extension());
-
-    let capability_only: EventsConfig =
-        serde_yaml::from_str("enabled: true\nadvertise: [capability]").unwrap();
-    assert!(capability_only.advertises_capability());
-    assert!(!capability_only.advertises_extension());
 }
 
+/// The extensions entry is where a client looks, so it is never left out.
 #[test]
-fn enabled_with_nowhere_to_advertise_is_refused() {
-    let nowhere: EventsConfig = serde_yaml::from_str("enabled: true\nadvertise: []").unwrap();
-    let error = nowhere.validate().unwrap_err().to_string();
-    assert!(error.contains("advertise"), "{error}");
+fn enabled_without_the_extensions_entry_is_refused() {
+    for advertise in ["[]", "[capability]"] {
+        let config: EventsConfig =
+            serde_yaml::from_str(&format!("enabled: true\nadvertise: {advertise}")).unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("extension"), "{advertise}: {error}");
+    }
 
     let disabled: EventsConfig = serde_yaml::from_str("advertise: []").unwrap();
     disabled.validate().unwrap();
+}
+
+#[test]
+fn error_codes_are_spec_or_draft() {
+    let draft: EventsConfig = serde_yaml::from_str("error_codes: draft").unwrap();
+    assert_eq!(draft.error_codes, EventErrorCodes::Draft);
+    let spec: EventsConfig = serde_yaml::from_str("error_codes: spec").unwrap();
+    assert_eq!(spec.error_codes, EventErrorCodes::Spec);
+    assert!(serde_yaml::from_str::<EventsConfig>("error_codes: sep_3415").is_err());
 }
 
 #[test]
@@ -175,9 +178,9 @@ fn unknown_fields_and_locations_are_refused() {
 fn the_documented_configuration_block_parses_and_validates() {
     let block = r#"
 enabled: true
-advertise: [capability, extension]
+advertise: [extension]
 unsubscribe_unknown: ok
-error_codes: draft
+error_codes: spec
 store: { kind: file, dir: /var/lib/mcpg/events }
 log_store: { kind: file, dir: /var/lib/mcpg/events-log }
 allow_ephemeral_subscriptions: false
@@ -199,7 +202,7 @@ webhook:
   secret_rotation_grace_ms: 600000
   control_envelopes: [gap, terminated]
 poll: { enabled: false, require_trust: verified, next_poll_ms: 5000, min_next_poll_ms: 1000, max_events: 100, max_events_cap: 1000, lease_multiplier: 3, max_leases_per_principal: 100 }
-push: { enabled: false, require_trust: verified, heartbeat_interval_ms: 20000, max_streams_per_principal: 16 }
+push: { enabled: false, require_trust: verified, heartbeat_interval_ms: 30000, min_heartbeat_interval_ms: 1000, max_heartbeat_interval_ms: 50000, max_streams_per_principal: 16 }
 "#;
     let parsed: EventsConfig = serde_yaml::from_str(block).unwrap();
     parsed.validate().unwrap();
@@ -217,14 +220,27 @@ fn push_bounds_are_checked() {
     let parsed: EventsConfig = serde_yaml::from_str("push: { enabled: true }").unwrap();
     parsed.validate().unwrap();
     assert_eq!(parsed.push.require_trust, SubscriberTrust::Verified);
+    let long: EventsConfig = serde_yaml::from_str(
+        "push: { heartbeat_interval_ms: 90000, max_heartbeat_interval_ms: 90000 }",
+    )
+    .unwrap();
+    long.validate().unwrap();
     for (block, needle) in [
         (
             "push: { heartbeat_interval_ms: 999 }",
             "heartbeat_interval_ms",
         ),
         (
-            "push: { heartbeat_interval_ms: 30001 }",
+            "push: { heartbeat_interval_ms: 50001 }",
             "heartbeat_interval_ms",
+        ),
+        (
+            "push: { min_heartbeat_interval_ms: 0 }",
+            "min_heartbeat_interval_ms",
+        ),
+        (
+            "push: { min_heartbeat_interval_ms: 40000, max_heartbeat_interval_ms: 20000 }",
+            "max_heartbeat_interval_ms",
         ),
         (
             "push: { max_streams_per_principal: 0 }",
@@ -235,6 +251,29 @@ fn push_bounds_are_checked() {
         let error = parsed.validate().unwrap_err().to_string();
         assert!(error.contains(needle), "{block}: {error}");
     }
+}
+
+#[test]
+fn the_heartbeat_grant_clamps_a_suggestion_to_the_bounds() {
+    let push = EventsPushConfig::default();
+    assert_eq!(push.granted_heartbeat_ms(None), 30_000);
+    assert_eq!(push.granted_heartbeat_ms(Some(15_000)), 15_000);
+    assert_eq!(push.granted_heartbeat_ms(Some(10)), 1_000);
+    assert_eq!(push.granted_heartbeat_ms(Some(600_000)), 50_000);
+}
+
+/// An `x-mcp-header` annotation that breaks the transport's rules makes
+/// the type unusable to every client, so the config refuses it.
+#[test]
+fn an_invalid_x_mcp_header_annotation_is_refused() {
+    let error = refused(&one_type(&format!(
+        r#"        delivery: [webhook]
+        input_schema:
+          type: object
+          properties:
+            ratio: {{ type: number, x-mcp-header: Ratio }}{HMAC_SOURCE}"#
+    )));
+    assert!(error.contains("x-mcp-header"), "{error}");
 }
 
 #[test]

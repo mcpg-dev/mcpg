@@ -228,6 +228,7 @@ async fn builtin_events_read_by_poll_or_stream_are_not_billed() {
                 arguments: serde_json::Map::new(),
                 cursor: None,
                 max_age_ms: None,
+                heartbeat_ms: None,
                 meta: None,
             },
             json!(1),

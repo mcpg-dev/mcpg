@@ -24,10 +24,7 @@ pub(crate) fn build_discover_result(
     runtime: &GatewayRuntime,
     transport: &TransportKind,
 ) -> DiscoverResult {
-    use crate::protocol::v_2026_07_28::extensions::tasks::wire::{
-        EXTENSION_NAMESPACE as TASKS_EXTENSION_NAMESPACE, METHOD_CANCEL_TASK, METHOD_GET_TASK,
-        METHOD_UPDATE_TASK,
-    };
+    use crate::protocol::v_2026_07_28::extensions::tasks::wire::EXTENSION_NAMESPACE as TASKS_EXTENSION_NAMESPACE;
 
     // Gate each capability on whether the operator actually wired
     // anything that surfaces it. SEP-2575's
@@ -59,17 +56,9 @@ pub(crate) fn build_discover_result(
     // `"required"` / `"optional"`). Any tool declaring it
     // means the tasks extension is reachable on this gateway.
     let tasks_enabled = caps.tools.iter().any(|t| t.task_support.is_some());
+    // The extension defines no settings: an empty object declares it.
     if tasks_enabled {
-        extensions.insert(
-            TASKS_EXTENSION_NAMESPACE.to_owned(),
-            serde_json::json!({
-                "methods": [
-                    METHOD_GET_TASK,
-                    METHOD_UPDATE_TASK,
-                    METHOD_CANCEL_TASK,
-                ],
-            }),
-        );
+        extensions.insert(TASKS_EXTENSION_NAMESPACE.to_owned(), serde_json::json!({}));
     }
 
     // SEP-1865 MCP Apps — advertised when
@@ -112,7 +101,8 @@ pub(crate) fn build_discover_result(
         );
     }
 
-    // MCP Events, in each location the operator chose. Config and the
+    // MCP Events: the extensions entry, and the top-level copy when the
+    // operator asks for it. Config and the
     // installed core decide it, never the caller, because this result is
     // publicly cacheable.
     let events_config = runtime.events_config();
@@ -320,10 +310,15 @@ mod events_advertisement_tests {
         ]
     }
 
+    /// By default the extensions entry alone advertises events, with no
+    /// `revision` and no other setting than `listChanged`.
     #[test]
-    fn enabled_events_are_advertised_in_both_locations() {
-        let caps = capabilities(&services(true, both(), true), TransportKind::Http);
-        assert_eq!(caps["events"], json!({"listChanged": true}));
+    fn enabled_events_are_advertised_in_the_extensions_entry() {
+        let caps = capabilities(
+            &services(true, vec![EventsAdvertiseLocation::Extension], true),
+            TransportKind::Http,
+        );
+        assert!(caps.get("events").is_none(), "{caps}");
         assert_eq!(
             caps["extensions"]["io.modelcontextprotocol/events"],
             json!({"listChanged": true})
@@ -331,21 +326,11 @@ mod events_advertisement_tests {
     }
 
     #[test]
-    fn each_location_is_switchable() {
-        let capability_only = capabilities(
-            &services(true, vec![EventsAdvertiseLocation::Capability], true),
-            TransportKind::Http,
-        );
-        assert_eq!(capability_only["events"], json!({"listChanged": true}));
-        assert!(capability_only.get("extensions").is_none());
-
-        let extension_only = capabilities(
-            &services(true, vec![EventsAdvertiseLocation::Extension], true),
-            TransportKind::Http,
-        );
-        assert!(extension_only.get("events").is_none());
+    fn the_top_level_copy_is_opt_in() {
+        let caps = capabilities(&services(true, both(), true), TransportKind::Http);
+        assert_eq!(caps["events"], json!({"listChanged": true}));
         assert_eq!(
-            extension_only["extensions"]["io.modelcontextprotocol/events"],
+            caps["extensions"]["io.modelcontextprotocol/events"],
             json!({"listChanged": true})
         );
     }

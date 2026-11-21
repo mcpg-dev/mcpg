@@ -379,6 +379,12 @@ pub struct RequestContext {
     /// `_meta["io.modelcontextprotocol/clientInfo"]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<mcpg_plugin_protocol::ClientInfo>,
+    /// The `Mcp-Param-{Name}` headers of an `events/*` request over HTTP,
+    /// as lower-case name after the prefix and raw value, for the events
+    /// core to check against the event type's `x-mcp-header`
+    /// annotations. `None` where no routing headers exist.
+    #[serde(skip)]
+    pub(crate) param_headers: Option<Arc<Vec<(String, String)>>>,
 }
 
 impl RequestContext {
@@ -407,6 +413,7 @@ impl RequestContext {
             realtime_admission: false,
             client_ip: None,
             client: None,
+            param_headers: None,
         }
     }
 

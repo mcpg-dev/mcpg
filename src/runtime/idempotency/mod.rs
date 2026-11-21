@@ -10,9 +10,10 @@
 //!   reserved for a future per-binding "key required" policy and not
 //!   emitted yet). They sit in the application `-33xxx` band, clear of
 //!   the implementation-defined server range that MCP extensions draw
-//!   from: the Events extension's `-32011` and `-32013` mean NotFound and
-//!   ResourceExhausted, and the `Idempotency-Key` header lift answers on
-//!   every POST, `events/*` included.
+//!   from: the Events extension's codes (`-32023`..`-32027`, or
+//!   `-32011`..`-32015` under its draft numbering) sit there, and the
+//!   `Idempotency-Key` header lift answers on every POST, `events/*`
+//!   included.
 //! - Format validation for the request-side key
 //!   ([`validate_request_key`]): ASCII, ≤255 chars, non-empty after
 //!   trim. Rejection surfaces as `IdempotencyKeyMalformed`.

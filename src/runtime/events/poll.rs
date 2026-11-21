@@ -41,7 +41,7 @@ use super::handler::policy_key;
 use super::keys::EventsKeys;
 use super::log::{LogEntry, ResumePoint, RowBody};
 use super::subscriptions::{HintOp, SUBSCRIPTION_TOPIC, StoreError, SubscriptionHint};
-use super::webhook::{check_arguments, gate_error, subscriber_key};
+use super::webhook::{check_arguments, check_param_headers, gate_error, subscriber_key};
 use crate::config::events::EventReplay;
 use crate::protocol::v_2026_07_28::extensions::events::errors::{
     EventsError, FEATURE_INPUT_SCHEMA,
@@ -627,6 +627,7 @@ impl EventsCore {
         }
         let principal_key = subscriber_key(&ctx.identity, poll.require_trust)?;
         let ty = self.offered_type(ctx, &params.name, DeliveryMode::Poll)?;
+        check_param_headers(ctx, &ty, &params.arguments)?;
         check_arguments(&ty, &params.arguments)?;
         let arguments = Value::Object(params.arguments.clone());
         let runtime = self
@@ -956,7 +957,7 @@ impl EventsCore {
 }
 
 /// Where a reader with `cursor` starts in the log of `ty`, a type with
-/// replay; `-32014 schema_changed` for a cursor of an older schema epoch.
+/// replay; `Unsupported` with `reason: "schema_changed"` for a cursor of an older schema epoch.
 pub(crate) async fn resume_point(
     stores: &EventsStores,
     ty: &EventType,

@@ -48,6 +48,7 @@ fn stream(region_name: &str) -> StreamEventsParams {
         arguments: region(region_name),
         cursor: None,
         max_age_ms: None,
+        heartbeat_ms: None,
         meta: None,
     }
 }
@@ -167,6 +168,7 @@ async fn a_stream_open_counts_against_the_request_ceiling() {
             .header("accept", "application/json, text/event-stream")
             .header("mcp-protocol-version", "2026-07-28")
             .header("mcp-method", "events/stream")
+            .header("mcp-name", "orders.created")
             .body(Body::from(
                 json!({
                     "jsonrpc": "2.0",

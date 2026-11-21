@@ -113,6 +113,10 @@ mcp:
   configurations:
     events:
       enabled: true
+      # ChatGPT reads the top-level `capabilities.events` and the draft
+      # error codes (-32011..-32015); the extensions entry stays as well.
+      advertise: [capability, extension]
+      error_codes: draft
       store: { kind: file, dir: "/var/lib/mcpg/events/subscriptions" }
       log_store: { kind: file, dir: "/var/lib/mcpg/events/log" }
       # One audit record per delivery request, for the test capture.
