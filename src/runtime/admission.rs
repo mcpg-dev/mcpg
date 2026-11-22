@@ -165,6 +165,12 @@ impl RealtimeAdmission {
         self.paced.lock().remove(lease_id);
     }
 
+    /// The caller-paced leases this replica holds a grant for.
+    #[cfg(test)]
+    pub(crate) fn paced_ids(&self) -> std::collections::BTreeSet<String> {
+        self.paced.lock().keys().cloned().collect()
+    }
+
     /// The internal tool the admission calls.
     pub fn tool(&self) -> &str {
         &self.config.tool

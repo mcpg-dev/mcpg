@@ -227,18 +227,28 @@ impl LeaseStore {
         Self { kv, bus, keys }
     }
 
-    /// The id of the lease of `principal_key` on `name` with `arguments`.
+    /// The id of the lease of `principal_key` on `name` with `arguments`,
+    /// held by the MCP client that names itself `client` (its
+    /// `clientInfo.name`). Each client of one principal holds a lease of
+    /// its own; a caller that names no client has one lease per principal,
+    /// event and arguments. The client's version is not part of the id, so
+    /// a client upgrade keeps its lease.
     pub fn lease_id(
         &self,
         principal_key: &str,
         name: &str,
         arguments: &Map<String, Value>,
+        client: Option<&str>,
     ) -> String {
-        let input = Value::Array(vec![
+        let mut parts = vec![
             Value::String(principal_key.to_owned()),
             Value::String(name.to_owned()),
             Value::Object(arguments.clone()),
-        ]);
+        ];
+        if let Some(client) = client {
+            parts.push(Value::String(client.to_owned()));
+        }
+        let input = Value::Array(parts);
         self.keys.key_hash(
             "poll-lease",
             &mcpg_mcp_wire::shared::canonical::canonical_value_bytes(&input),
@@ -654,9 +664,13 @@ impl EventsCore {
         let lease_ms = poll.next_poll_ms.saturating_mul(poll.lease_multiplier);
         let ttl = Duration::from_millis(lease_ms.max(1_000));
         let scope = CursorScope::new(&ty.source_key, &arguments);
-        let id = stores
-            .leases
-            .lease_id(&principal_key, &ty.name, &params.arguments);
+        let client = ctx.client();
+        let id = stores.leases.lease_id(
+            &principal_key,
+            &ty.name,
+            &params.arguments,
+            client.as_ref().map(|c| c.name.as_str()),
+        );
         let holder = LeaseHolder {
             principal_key: &principal_key,
             identity: &ctx.identity,
@@ -682,7 +696,7 @@ impl EventsCore {
             .realtime_admit_paced(
                 lease.is_some(),
                 &ctx.identity,
-                ctx.client().as_ref(),
+                client.as_ref(),
                 &crate::runtime::admission::AdmissionLease {
                     id: id.to_string(),
                     delivery: "poll",

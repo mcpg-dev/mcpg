@@ -499,25 +499,37 @@ fn public_mcp_url(config: &crate::config::AppConfig) -> Option<String> {
         })
 }
 
+/// Longest `title` and `description` a Server Card takes, in characters.
+const SERVER_CARD_TEXT_MAX: usize = 100;
+
+/// `text` when a Server Card takes it as a `title` or `description`.
+fn card_text(text: Option<&str>) -> Option<String> {
+    text.filter(|t| !t.is_empty() && t.chars().count() <= SERVER_CARD_TEXT_MAX)
+        .map(str::to_owned)
+}
+
 /// This gateway's Server Card: one `streamable-http` remote, the MCP
-/// endpoint, whose `extensionsInfo` carries `extensions_info`. `None` when
-/// no public URL of the endpoint is known.
+/// endpoint, whose `extensionsInfo` carries `extensions_info`. `version`
+/// is the `serverInfo.version` of `server/discover`; `title` is
+/// `mcp.server_info.title` when set. `None` when no public URL of the
+/// endpoint is known.
 pub(crate) fn server_card(
     config: &crate::config::AppConfig,
     extensions_info: serde_json::Map<String, serde_json::Value>,
 ) -> Option<serde_json::Value> {
     let url = public_mcp_url(config)?;
     let served = &config.mcp.registry;
+    let identity = &config.mcp.server_info;
     let name = if served.name.contains('/') {
         served.name.clone()
     } else {
         "dev.mcpg/gateway".to_owned()
     };
-    let description = served
-        .description
-        .clone()
-        .filter(|d| !d.is_empty() && d.chars().count() <= 100)
-        .unwrap_or_else(|| "MCP gateway".to_owned());
+    let description = match served.description.as_deref() {
+        Some(description) => card_text(Some(description)),
+        None => card_text(identity.description.as_deref()),
+    }
+    .unwrap_or_else(|| "MCP gateway".to_owned());
     let mut remote = serde_json::json!({
         "type": "streamable-http",
         "url": url,
@@ -526,13 +538,17 @@ pub(crate) fn server_card(
     if !extensions_info.is_empty() {
         remote["extensionsInfo"] = serde_json::Value::Object(extensions_info);
     }
-    Some(serde_json::json!({
+    let mut card = serde_json::json!({
         "$schema": SERVER_CARD_SCHEMA,
         "name": name,
         "version": env!("CARGO_PKG_VERSION"),
         "description": description,
         "remotes": [remote],
-    }))
+    });
+    if let Some(title) = card_text(identity.title.as_deref()) {
+        card["title"] = serde_json::json!(title);
+    }
+    Some(card)
 }
 
 /// `GET {mcp_path}/server-card`: this gateway's Server Card. While MCP

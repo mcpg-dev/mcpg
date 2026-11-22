@@ -84,7 +84,9 @@ pub struct McpConfig {
 
     /// How the server presents itself to clients: `serverInfo` in
     /// `server/discover`. Every field is optional; an unset field keeps
-    /// MCPG's own value. `version` is always the gateway's.
+    /// MCPG's own value. `version` is always the gateway's. The Server Card
+    /// takes `title`, and `description` when `mcp.registry.description` is
+    /// unset, if they are 1 to 100 characters.
     #[serde(default)]
     pub server_info: McpServerInfoConfig,
 

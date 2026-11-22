@@ -160,6 +160,50 @@ fn the_server_card_publishes_the_keys_under_its_remote() {
     );
 }
 
+/// The card presents the server as `server/discover` does: its version,
+/// the configured title, and the configured description when the registry
+/// sets none.
+#[test]
+fn the_server_card_carries_the_configured_server_identity() {
+    use crate::transports::http::discovery::server_card;
+    let mut config = crate::config::AppConfig::default();
+    config.gateway.server.canonical_url = Some("https://gw.example".to_owned());
+    let card = server_card(&config, serde_json::Map::new()).unwrap();
+    assert_eq!(card["name"], "dev.mcpg/gateway");
+    assert_eq!(card["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(card["description"], "MCP gateway");
+    assert!(card.get("title").is_none(), "no title unless one is set");
+
+    config.mcp.server_info.title = Some("Acme Docs".to_owned());
+    config.mcp.server_info.description = Some("Search the Acme docs.".to_owned());
+    let card = server_card(&config, serde_json::Map::new()).unwrap();
+    assert_eq!(card["title"], "Acme Docs");
+    assert_eq!(card["description"], "Search the Acme docs.");
+    assert_eq!(card["version"], env!("CARGO_PKG_VERSION"));
+
+    // The registry's name and description come first.
+    config.mcp.registry.name = "com.acme/docs".to_owned();
+    config.mcp.registry.description = Some("Acme docs over MCP.".to_owned());
+    let card = server_card(&config, serde_json::Map::new()).unwrap();
+    assert_eq!(card["name"], "com.acme/docs");
+    assert_eq!(card["description"], "Acme docs over MCP.");
+    config.mcp.registry.description = Some("x".repeat(101));
+    let card = server_card(&config, serde_json::Map::new()).unwrap();
+    assert_eq!(card["description"], "MCP gateway");
+
+    // Text the card schema does not take (empty, over 100 characters) is
+    // left out.
+    config.mcp.registry.description = None;
+    config.mcp.server_info.title = Some("t".repeat(101));
+    config.mcp.server_info.description = Some(String::new());
+    let card = server_card(&config, serde_json::Map::new()).unwrap();
+    assert!(card.get("title").is_none());
+    assert_eq!(card["description"], "MCP gateway");
+    config.mcp.server_info.title = Some("é".repeat(100));
+    let card = server_card(&config, serde_json::Map::new()).unwrap();
+    assert_eq!(card["title"], "é".repeat(100), "the limit is in characters");
+}
+
 #[test]
 fn unusable_or_duplicate_keys_are_refused() {
     let mut config = webhook_config(&[(None, 1)], &[]);

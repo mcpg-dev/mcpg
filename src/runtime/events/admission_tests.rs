@@ -147,6 +147,61 @@ async fn a_poll_lease_is_admitted_on_its_first_poll_and_renewed_on_later_ones() 
     assert_eq!(refused.code(), -32025);
 }
 
+fn alice_as(client: &str) -> RequestContext {
+    let mut ctx = alice();
+    ctx.client = Some(mcpg_plugin_protocol::ClientInfo {
+        name: client.to_owned(),
+        version: Some("1.0.0".to_owned()),
+    });
+    ctx
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_client_of_one_principal_is_admitted_to_a_poll_lease_of_its_own() {
+    let h = WebhookHarness::start(MODES, ORDERS_TYPE).await;
+    admit_with(&h, ALLOW).await;
+    let admission = h
+        .state
+        .runtime
+        .load()
+        .realtime_admission
+        .clone()
+        .expect("an admission is installed");
+    h.core
+        .poll_events(&alice_as("client-a"), poll_params())
+        .await
+        .expect("client-a is admitted");
+    // Inside client-a's grant a poll of client-a asks nothing; client-b's
+    // first poll is an `admit` of a lease of its own, which the grants
+    // table records under its own id.
+    h.core
+        .poll_events(&alice_as("client-a"), poll_params())
+        .await
+        .expect("client-a keeps its lease");
+    h.core
+        .poll_events(&alice_as("client-b"), poll_params())
+        .await
+        .expect("client-b is admitted");
+
+    let stores = h.core.stores().unwrap();
+    let principal = verified_identity("alice")
+        .synthetic_principal_key()
+        .unwrap();
+    let ids: std::collections::BTreeSet<String> = ["client-a", "client-b"]
+        .into_iter()
+        .map(|client| {
+            stores
+                .leases
+                .lease_id(&principal, "orders.created", &Map::new(), Some(client))
+        })
+        .collect();
+    assert_eq!(ids.len(), 2, "two lease ids");
+    assert_eq!(admission.paced_ids(), ids, "one grant per client");
+    for id in &ids {
+        assert!(stores.leases.get(id).await.unwrap().is_some());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_webhook_subscription_asks_the_admission_before_the_callback() {
     let h = WebhookHarness::start(MODES, ORDERS_TYPE).await;

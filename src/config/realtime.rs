@@ -54,7 +54,8 @@ pub const MIN_RENEW_INTERVAL_MS: u64 = 1_000;
 /// - `op`: `admit` (a caller opens realtime delivery), `renew` (it still
 ///   holds it) or `release` (it let go; best effort).
 /// - `lease_id`: one id per held delivery, the same in all three calls and
-///   on every replica.
+///   on every replica. A poll lease is one per principal, event, arguments
+///   and MCP client name, so two clients of one principal hold two leases.
 /// - `kind`: `events` or `resource`.
 /// - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or
 ///   `subscribe` for a resource.

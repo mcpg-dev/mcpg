@@ -5843,7 +5843,7 @@
             }
           ],
           "default": {},
-          "description": "How the server presents itself to clients: `serverInfo` in `server/discover`. Every field is optional; an unset field keeps MCPG's own value. `version` is always the gateway's."
+          "description": "How the server presents itself to clients: `serverInfo` in `server/discover`. Every field is optional; an unset field keeps MCPG's own value. `version` is always the gateway's. The Server Card takes `title`, and `description` when `mcp.registry.description` is unset, if they are 1 to 100 characters."
         },
         "skills": {
           "allOf": [
@@ -7534,7 +7534,7 @@
     },
     "RealtimeAdmissionConfig": {
       "additionalProperties": false,
-      "description": "`mcp.realtime.admission`.\n\nThe gateway calls `tool` as the caller, through the whole tool-call path (policy, gates, the backend), with these arguments:\n\n- `op`: `admit` (a caller opens realtime delivery), `renew` (it still holds it) or `release` (it let go; best effort). - `lease_id`: one id per held delivery, the same in all three calls and on every replica. - `kind`: `events` or `resource`. - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or `subscribe` for a resource. - `event`: `{name, arguments}` for events; `resource`: `{uri}` for a resource. - `client`: `{name, version}` of the MCP client, when it named itself.\n\nThe tool answers with an object that has a boolean `allow`. With `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten the renew interval. With `allow: false`, `error: {code, message, data}` reaches the caller: a numeric `code` is the JSON-RPC error code and `data` (or `details`) its data; any other `code` gives `-32025` (ResourceExhausted) with the whole `error` object as data.\n\nThe tool is internal: `tools/list` does not show it and a caller's own `tools/call` of it is refused.",
+      "description": "`mcp.realtime.admission`.\n\nThe gateway calls `tool` as the caller, through the whole tool-call path (policy, gates, the backend), with these arguments:\n\n- `op`: `admit` (a caller opens realtime delivery), `renew` (it still holds it) or `release` (it let go; best effort). - `lease_id`: one id per held delivery, the same in all three calls and on every replica. A poll lease is one per principal, event, arguments and MCP client name, so two clients of one principal hold two leases. - `kind`: `events` or `resource`. - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or `subscribe` for a resource. - `event`: `{name, arguments}` for events; `resource`: `{uri}` for a resource. - `client`: `{name, version}` of the MCP client, when it named itself.\n\nThe tool answers with an object that has a boolean `allow`. With `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten the renew interval. With `allow: false`, `error: {code, message, data}` reaches the caller: a numeric `code` is the JSON-RPC error code and `data` (or `details`) its data; any other `code` gives `-32025` (ResourceExhausted) with the whole `error` object as data.\n\nThe tool is internal: `tools/list` does not show it and a caller's own `tools/call` of it is refused.",
       "properties": {
         "on_error": {
           "allOf": [

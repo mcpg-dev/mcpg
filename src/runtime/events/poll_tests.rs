@@ -239,7 +239,9 @@ async fn max_events_pages_with_has_more_and_an_immediate_poll_reads_on() {
     let stores = core.stores().unwrap();
     let ty = Arc::clone(core.catalog().get("orders.created").unwrap());
     let principal = verified("alice").synthetic_principal_key().unwrap();
-    let id = stores.leases.lease_id(&principal, &ty.name, &Map::new());
+    let id = stores
+        .leases
+        .lease_id(&principal, &ty.name, &Map::new(), None);
     let mut lease = stores.leases.get(&id).await.unwrap().unwrap();
     lease.last_read_ms = 0;
     stores
@@ -375,6 +377,105 @@ async fn poll_is_refused_off_its_mode_trust_or_lease_cap() {
         .unwrap_err();
     assert_eq!(error.code(), -32025);
     assert_eq!(error.data().unwrap()["limit"], "poll_leases");
+}
+
+fn as_client(identity: RequestIdentity, name: &str, version: &str) -> RequestContext {
+    let mut ctx = ctx(identity);
+    ctx.client = Some(mcpg_plugin_protocol::ClientInfo {
+        name: name.to_owned(),
+        version: Some(version.to_owned()),
+    });
+    ctx
+}
+
+#[test]
+fn the_lease_id_is_per_client_name_and_stable_without_one() {
+    let leases = LeaseStore::new(
+        Arc::new(crate::builtins::cluster_primitives::MemoryKv::new()),
+        None,
+        crate::runtime::events::test_support::keys(),
+    );
+    let arguments = Map::new();
+    let none = leases.lease_id("p", "orders.created", &arguments, None);
+    assert_eq!(
+        none,
+        leases.lease_id("p", "orders.created", &arguments, None),
+        "a caller without client info keeps one id"
+    );
+    let a = leases.lease_id("p", "orders.created", &arguments, Some("client-a"));
+    let b = leases.lease_id("p", "orders.created", &arguments, Some("client-b"));
+    assert_ne!(a, b, "two clients of one principal hold two leases");
+    assert_ne!(a, none);
+    assert_ne!(b, none);
+    assert_eq!(
+        a,
+        leases.lease_id("p", "orders.created", &arguments, Some("client-a"))
+    );
+    assert_ne!(
+        a,
+        leases.lease_id("q", "orders.created", &arguments, Some("client-a")),
+        "the principal stays in the id"
+    );
+}
+
+#[tokio::test]
+async fn two_clients_of_one_principal_hold_two_leases_under_one_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = boot(&yaml(
+        dir.path(),
+        "{ enabled: true, min_next_poll_ms: 1, max_leases_per_principal: 2 }",
+    ))
+    .await;
+    let core = core_of(&state);
+    core.poll_events(
+        &as_client(verified("alice"), "client-a", "1.0.0"),
+        params("orders.created", None),
+    )
+    .await
+    .unwrap();
+    // A new version of the same client keeps its lease.
+    core.poll_events(
+        &as_client(verified("alice"), "client-a", "1.1.0"),
+        params("orders.created", None),
+    )
+    .await
+    .unwrap();
+    core.poll_events(
+        &as_client(verified("alice"), "client-b", "1.0.0"),
+        params("orders.created", None),
+    )
+    .await
+    .unwrap();
+
+    let stores = core.stores().unwrap();
+    let principal = verified("alice").synthetic_principal_key().unwrap();
+    let lease = |client: &str| {
+        stores
+            .leases
+            .lease_id(&principal, "orders.created", &Map::new(), Some(client))
+    };
+    for client in ["client-a", "client-b"] {
+        let held = stores.leases.get(&lease(client)).await.unwrap();
+        assert!(held.is_some(), "{client} holds a lease");
+    }
+    assert_eq!(stores.leases.count_of(&principal, 10).await.unwrap(), 2);
+
+    // The cap counts the principal's leases over all its clients.
+    let error = core
+        .poll_events(
+            &as_client(verified("alice"), "client-c", "1.0.0"),
+            params("orders.created", None),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), -32025);
+    assert_eq!(error.data().unwrap()["limit"], "poll_leases");
+    core.poll_events(
+        &as_client(verified("bob"), "client-c", "1.0.0"),
+        params("orders.created", None),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
