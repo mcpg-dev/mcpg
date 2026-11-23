@@ -33,8 +33,8 @@ use super::{
 };
 use crate::config::interactive_login::{login_key_algorithm, normalize_pem};
 use crate::config::{
-    AuthorizationServerConfig, LoginAssertionAudience, LoginClientAuth, TrustedIdpConfig,
-    TrustedIdpLoginConfig,
+    AuthorizationServerConfig, ClientMetadataDocumentConfig, LoginAssertionAudience,
+    LoginClientAuth, McpServerInfoConfig, TrustedIdpConfig, TrustedIdpLoginConfig,
 };
 
 /// Lifetime of a client assertion the gateway signs. It is a bearer
@@ -381,9 +381,15 @@ fn is_error_code(code: &str) -> bool {
 pub struct LoginCredential {
     client_id: String,
     method: CredentialMethod,
+    /// The public key of `private_key`, as the metadata document publishes
+    /// it; `None` for a pre-registered client or without a key.
+    public_jwk: Option<jsonwebtoken::jwk::Jwk>,
 }
 
 enum CredentialMethod {
+    /// A public client: the metadata document declares
+    /// `token_endpoint_auth_method: none`, and PKCE alone binds the code.
+    None,
     SecretBasic(SecretString),
     SecretPost(SecretString),
     PrivateKeyJwt(AssertionSigner),
@@ -410,7 +416,7 @@ impl std::fmt::Debug for LoginCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoginCredential")
             .field("client_id", &self.client_id)
-            .field("method", &self.method().as_str())
+            .field("method", &self.token_endpoint_auth_method())
             .finish_non_exhaustive()
     }
 }
@@ -425,9 +431,41 @@ impl LoginCredential {
     /// The credential `login` configures. Errors name settings, never
     /// their values.
     pub fn from_config(login: &TrustedIdpLoginConfig) -> Result<Self> {
-        let method = login.effective_client_auth().ok_or_else(|| {
-            anyhow!("needs a credential: client_secret, or private_key for private_key_jwt")
-        })?;
+        let client_id = login
+            .client_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("needs a client_id"))?;
+        Self::for_client(login, client_id, false)
+    }
+
+    /// The credential of `login` for `client_id`. With `metadata_document`
+    /// the client id is the URL of the gateway's Client ID Metadata
+    /// Document: no credential makes a public client, and a private key's
+    /// public half is kept for the document.
+    pub fn for_client(
+        login: &TrustedIdpLoginConfig,
+        client_id: &str,
+        metadata_document: bool,
+    ) -> Result<Self> {
+        if metadata_document && login.client_secret.is_some() {
+            return Err(anyhow!(
+                "client_secret needs a pre-registered client_id; a metadata document cannot \
+                 carry a shared secret"
+            ));
+        }
+        let Some(method) = login.effective_client_auth() else {
+            if metadata_document {
+                return Ok(Self {
+                    client_id: client_id.to_owned(),
+                    method: CredentialMethod::None,
+                    public_jwk: None,
+                });
+            }
+            return Err(anyhow!(
+                "needs a credential: client_secret, or private_key for private_key_jwt"
+            ));
+        };
+        let mut public_jwk = None;
         let secret = || {
             login
                 .client_secret
@@ -449,6 +487,17 @@ impl LoginCredential {
                 let key = alg
                     .encoding_key(normalize_pem(pem).as_bytes())
                     .map_err(|_| anyhow!("private_key is not a usable {} key", alg.as_str()))?;
+                if metadata_document {
+                    let mut jwk = jsonwebtoken::jwk::Jwk::from_encoding_key(&key, alg.algorithm())
+                        .map_err(|_| {
+                            anyhow!(
+                                "private_key has no public key the metadata document can publish"
+                            )
+                        })?;
+                    jwk.common.key_id = login.key_id.clone();
+                    jwk.common.public_key_use = Some(jsonwebtoken::jwk::PublicKeyUse::Signature);
+                    public_jwk = Some(jwk);
+                }
                 CredentialMethod::PrivateKeyJwt(AssertionSigner {
                     alg: alg.algorithm(),
                     key,
@@ -458,8 +507,9 @@ impl LoginCredential {
             }
         };
         Ok(Self {
-            client_id: login.client_id.clone(),
+            client_id: client_id.to_owned(),
             method,
+            public_jwk,
         })
     }
 
@@ -467,11 +517,26 @@ impl LoginCredential {
         &self.client_id
     }
 
-    pub fn method(&self) -> LoginClientAuth {
+    /// The configured method; `None` for a public client.
+    pub fn method(&self) -> Option<LoginClientAuth> {
         match self.method {
-            CredentialMethod::SecretBasic(_) => LoginClientAuth::ClientSecretBasic,
-            CredentialMethod::SecretPost(_) => LoginClientAuth::ClientSecretPost,
-            CredentialMethod::PrivateKeyJwt(_) => LoginClientAuth::PrivateKeyJwt,
+            CredentialMethod::None => None,
+            CredentialMethod::SecretBasic(_) => Some(LoginClientAuth::ClientSecretBasic),
+            CredentialMethod::SecretPost(_) => Some(LoginClientAuth::ClientSecretPost),
+            CredentialMethod::PrivateKeyJwt(_) => Some(LoginClientAuth::PrivateKeyJwt),
+        }
+    }
+
+    /// The RFC 7591 `token_endpoint_auth_method` of this credential.
+    pub fn token_endpoint_auth_method(&self) -> &'static str {
+        self.method().map_or("none", LoginClientAuth::as_str)
+    }
+
+    /// The JWS algorithm of the client assertion, for `private_key_jwt`.
+    fn signing_alg(&self) -> Option<Algorithm> {
+        match self.method {
+            CredentialMethod::PrivateKeyJwt(ref signer) => Some(signer.alg),
+            _ => None,
         }
     }
 
@@ -487,6 +552,10 @@ impl LoginCredential {
     ) -> Result<ClientAuthentication, UpstreamError> {
         let client_id = || SecretString::new(self.client_id.clone());
         Ok(match self.method {
+            CredentialMethod::None => ClientAuthentication {
+                form: vec![("client_id", client_id())],
+                authorization: None,
+            },
             CredentialMethod::SecretBasic(ref secret) => {
                 let pair = Zeroizing::new(format!(
                     "{}:{}",
@@ -586,6 +655,10 @@ pub struct IdpMetadata {
     /// RFC 9207 §3: the IdP puts `iss` in every authorization response, so
     /// a response without it is refused.
     pub authorization_response_iss_parameter_supported: bool,
+    /// The IdP resolves a client id that is the URL of a Client ID
+    /// Metadata Document (`client_id_metadata_document_supported`). Always
+    /// `false` when every endpoint is configured: nothing is discovered.
+    pub client_id_metadata_document_supported: bool,
 }
 
 impl IdpMetadata {
@@ -649,16 +722,23 @@ impl IdpMetadata {
             endpoint("token_endpoint", &login.token_endpoint)?,
         )?;
         let revocation_endpoint = endpoint("revocation_endpoint", &login.revocation_endpoint)?;
-        let authorization_response_iss_parameter_supported = discovered.is_some_and(|(_, doc)| {
-            doc.get("authorization_response_iss_parameter_supported")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        });
+        let advertises = |key: &str| {
+            discovered.is_some_and(|(_, doc)| {
+                doc.get(key)
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+        };
         Ok(Self {
             authorization_endpoint,
             token_endpoint,
             revocation_endpoint,
-            authorization_response_iss_parameter_supported,
+            authorization_response_iss_parameter_supported: advertises(
+                "authorization_response_iss_parameter_supported",
+            ),
+            client_id_metadata_document_supported: advertises(
+                "client_id_metadata_document_supported",
+            ),
         })
     }
 }
@@ -779,6 +859,7 @@ impl MetadataCache {
                         token_endpoint = %metadata.token_endpoint,
                         revocation_endpoint = metadata.revocation_endpoint.as_deref().unwrap_or("none"),
                         iss_parameter_supported = metadata.authorization_response_iss_parameter_supported,
+                        client_id_metadata_document_supported = metadata.client_id_metadata_document_supported,
                         "login IdP endpoints discovered"
                     );
                 }
@@ -826,6 +907,9 @@ pub(super) struct LoginClient {
     credential: LoginCredential,
     /// `{authorization_server.issuer}/oauth/callback`.
     redirect_uri: String,
+    /// The gateway's Client ID Metadata Document settings while its URL is
+    /// the client id; `None` for a pre-registered client.
+    metadata_document: Option<ClientMetadataDocumentConfig>,
     /// Every endpoint configured: nothing is discovered.
     configured: Option<Arc<IdpMetadata>>,
     /// Shared with the client a reload replaces when the IdP entry is
@@ -854,7 +938,30 @@ impl LoginClient {
         server: &AuthorizationServerConfig,
     ) -> Result<Self> {
         let at = format!("trusted_idps[`{}`].login", idp.issuer);
-        let credential = LoginCredential::from_config(login).map_err(|e| anyhow!("{at}: {e}"))?;
+        let (client_id, metadata_document) = match (
+            &login.client_id,
+            server.client_metadata_document_url(),
+        ) {
+            (Some(client_id), _) => (client_id.clone(), None),
+            (None, Some(url)) => (
+                url,
+                Some(
+                    server
+                        .interactive_settings()
+                        .client_metadata_document
+                        .clone(),
+                ),
+            ),
+            (None, None) => {
+                return Err(anyhow!(
+                    "{at}.client_id is required: the gateway has no Client ID Metadata Document \
+                     (it needs an https:// issuer and interactive.client_metadata_document enabled)"
+                ));
+            }
+        };
+        let credential =
+            LoginCredential::for_client(login, &client_id, metadata_document.is_some())
+                .map_err(|e| anyhow!("{at}: {e}"))?;
         for (key, url) in [
             ("authorization_endpoint", &login.authorization_endpoint),
             ("token_endpoint", &login.token_endpoint),
@@ -875,6 +982,7 @@ impl LoginClient {
             config: login.clone(),
             credential,
             redirect_uri: server.login_callback_url(),
+            metadata_document,
             configured,
             discovered: Arc::default(),
         })
@@ -1017,9 +1125,70 @@ impl<'a> LoginIdp<'a> {
         &self.client.config
     }
 
-    /// The gateway's client id at the IdP.
+    /// The gateway's client id at the IdP: the pre-registered
+    /// `login.client_id`, else the URL of its Client ID Metadata Document.
     pub fn client_id(&self) -> &'a str {
-        &self.client.config.client_id
+        self.client.credential.client_id()
+    }
+
+    /// Whether the client id is the URL of the gateway's Client ID
+    /// Metadata Document.
+    pub fn uses_metadata_document(&self) -> bool {
+        self.client.metadata_document.is_some()
+    }
+
+    /// The client id an authorization request at the IdP of `metadata`
+    /// carries, in the order of MCP client registration: the
+    /// pre-registered client, else the metadata document URL while the IdP
+    /// advertises `client_id_metadata_document_supported`. The gateway
+    /// registers no client dynamically, so an IdP without either is
+    /// refused.
+    pub fn client_id_at(&self, metadata: &IdpMetadata) -> Result<&'a str, UpstreamError> {
+        if self.uses_metadata_document() && !metadata.client_id_metadata_document_supported {
+            return Err(UpstreamError::Misconfigured(
+                "the IdP does not advertise client_id_metadata_document_supported, so it cannot \
+                 resolve the gateway's Client ID Metadata Document; register the gateway at the \
+                 IdP and set trusted_idps[].login.client_id"
+                    .to_owned(),
+            ));
+        }
+        Ok(self.client_id())
+    }
+
+    /// The gateway's Client ID Metadata Document while its URL is the
+    /// client id: that URL as `client_id`, the one redirect URI the
+    /// authorization request sends, the authorization code and refresh
+    /// grants, and the token endpoint authentication of the credential,
+    /// with the public key inline for `private_key_jwt`. `client_name`
+    /// and `client_uri` fall back to `server_info`. `None` for a
+    /// pre-registered client.
+    pub fn client_metadata_document(
+        &self,
+        server_info: &McpServerInfoConfig,
+    ) -> Option<serde_json::Value> {
+        let settings = self.client.metadata_document.as_ref()?;
+        let credential = &self.client.credential;
+        let mut document = serde_json::json!({
+            "client_id": credential.client_id(),
+            "client_name": settings.effective_client_name(server_info),
+            "redirect_uris": [self.redirect_uri()],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": credential.token_endpoint_auth_method(),
+        });
+        if let Some(uri) = settings.effective_client_uri(server_info) {
+            document["client_uri"] = serde_json::json!(uri);
+        }
+        if let Some(ref uri) = settings.logo_uri {
+            document["logo_uri"] = serde_json::json!(uri);
+        }
+        if let Some(ref jwk) = credential.public_jwk {
+            document["jwks"] = serde_json::json!({ "keys": [jwk] });
+        }
+        if let Some(alg) = credential.signing_alg() {
+            document["token_endpoint_auth_signing_alg"] = serde_json::json!(alg);
+        }
+        Some(document)
     }
 
     /// The redirect URI registered at the IdP:
@@ -1064,6 +1233,7 @@ impl<'a> LoginIdp<'a> {
         request: &IdpAuthorizationRequest<'_>,
     ) -> Result<String, UpstreamError> {
         let config = self.config();
+        let client_id = self.client_id_at(metadata)?;
         let mut url = url::Url::parse(&metadata.authorization_endpoint).map_err(|e| {
             UpstreamError::Misconfigured(format!("the authorization endpoint is not a URL: {e}"))
         })?;
@@ -1071,7 +1241,7 @@ impl<'a> LoginIdp<'a> {
             let mut query = url.query_pairs_mut();
             query
                 .append_pair("response_type", "code")
-                .append_pair("client_id", &config.client_id)
+                .append_pair("client_id", client_id)
                 .append_pair("redirect_uri", self.redirect_uri())
                 .append_pair("scope", &config.scopes.join(" "))
                 .append_pair("state", request.state)

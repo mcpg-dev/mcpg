@@ -152,6 +152,16 @@ pub(crate) async fn dispatch_tools_call(
         params.request_state.as_deref(),
         params.input_responses.as_ref(),
     ) {
+        // A retry is the original `tools/call` again, so its headers must
+        // mirror its arguments as on the first call.
+        if let Some(refused) = runtime.tools_call_param_header_mismatch(
+            &request_id,
+            &params.name,
+            params.arguments.as_ref(),
+            ctx,
+        ) {
+            return refused;
+        }
         return dispatch_mrtr_resumption(ctx, runtime, services, request_id, resumption)
             .boxed()
             .await;

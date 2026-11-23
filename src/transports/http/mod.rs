@@ -394,6 +394,10 @@ pub fn router(state: AppState, health_path: &str, mcp_path: &str) -> Router {
             get(oauth_jwks_handler),
         )
         .route(
+            crate::config::interactive_login::CLIENT_METADATA_DOCUMENT_PATH,
+            get(discovery::oauth_client_metadata_document_handler),
+        )
+        .route(
             crate::runtime::authorization_server::revocation::REVOCATION_PATH,
             post(oauth_revoke_handler),
         )

@@ -228,17 +228,19 @@ impl LeaseStore {
     }
 
     /// The id of the lease of `principal_key` on `name` with `arguments`,
-    /// held by the MCP client that names itself `client` (its
-    /// `clientInfo.name`). Each client of one principal holds a lease of
-    /// its own; a caller that names no client has one lease per principal,
-    /// event and arguments. The client's version is not part of the id, so
-    /// a client upgrade keeps its lease.
+    /// held by the MCP client `client` names (its `clientInfo.name` and
+    /// `clientInfo.title`). Each client of one principal holds a lease of
+    /// its own, and so does each instance of one client that tells itself
+    /// apart by its title; a caller that names no client has one lease per
+    /// principal, event and arguments. A client without a title keys on its
+    /// name alone, and the client's version is not part of the id, so a
+    /// client upgrade keeps its lease.
     pub fn lease_id(
         &self,
         principal_key: &str,
         name: &str,
         arguments: &Map<String, Value>,
-        client: Option<&str>,
+        client: Option<&mcpg_plugin_protocol::ClientInfo>,
     ) -> String {
         let mut parts = vec![
             Value::String(principal_key.to_owned()),
@@ -246,7 +248,10 @@ impl LeaseStore {
             Value::Object(arguments.clone()),
         ];
         if let Some(client) = client {
-            parts.push(Value::String(client.to_owned()));
+            parts.push(Value::String(client.name.clone()));
+            if let Some(title) = &client.title {
+                parts.push(Value::String(title.clone()));
+            }
         }
         let input = Value::Array(parts);
         self.keys.key_hash(
@@ -665,12 +670,10 @@ impl EventsCore {
         let ttl = Duration::from_millis(lease_ms.max(1_000));
         let scope = CursorScope::new(&ty.source_key, &arguments);
         let client = ctx.client();
-        let id = stores.leases.lease_id(
-            &principal_key,
-            &ty.name,
-            &params.arguments,
-            client.as_ref().map(|c| c.name.as_str()),
-        );
+        let id =
+            stores
+                .leases
+                .lease_id(&principal_key, &ty.name, &params.arguments, client.as_ref());
         let holder = LeaseHolder {
             principal_key: &principal_key,
             identity: &ctx.identity,

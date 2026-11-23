@@ -359,6 +359,28 @@ pub struct ServedRegistryConfig {
     pub url: Option<String>,
 }
 
+/// The Server Card `name` when `mcp.registry.name` is not one the card
+/// takes.
+pub(crate) const DEFAULT_SERVER_CARD_NAME: &str = "dev.mcpg/gateway";
+
+/// Whether a Server Card takes `name`: 3 to 200 characters matching
+/// `^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$`, a namespace and a server name
+/// around exactly one `/`.
+pub(crate) fn is_server_card_name(name: &str) -> bool {
+    let Some((namespace, server)) = name.split_once('/') else {
+        return false;
+    };
+    (3..=200).contains(&name.len())
+        && !namespace.is_empty()
+        && !server.is_empty()
+        && namespace
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && server
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
 impl ServedRegistryConfig {
     pub(crate) fn validate(&self) -> Result<()> {
         if !self.enabled {

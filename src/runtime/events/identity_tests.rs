@@ -204,6 +204,46 @@ fn the_server_card_carries_the_configured_server_identity() {
     assert_eq!(card["title"], "é".repeat(100), "the limit is in characters");
 }
 
+/// The card takes `mcp.registry.name` only when the Server Card schema
+/// does: 3 to 200 characters of `^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$`. Any
+/// other name gives the default.
+#[test]
+fn the_server_card_name_follows_the_card_schema() {
+    use crate::transports::http::discovery::server_card;
+    let mut config = crate::config::AppConfig::default();
+    config.gateway.server.canonical_url = Some("https://gw.example".to_owned());
+    let longest = format!("{}/{}", "a".repeat(100), "b".repeat(99));
+    for name in [
+        "a/b",
+        "com.acme/docs",
+        "io-acme.dev/my_server.v2",
+        "A-1/z",
+        longest.as_str(),
+    ] {
+        config.mcp.registry.name = name.to_owned();
+        let card = server_card(&config, serde_json::Map::new()).unwrap();
+        assert_eq!(card["name"], name, "{name}");
+    }
+    let too_long = format!("{}/{}", "a".repeat(100), "b".repeat(100));
+    for name in [
+        "",
+        "/",
+        "a/",
+        "/b",
+        "ab",
+        "com.acme/docs/v2",
+        "com acme/docs",
+        "com_acme/docs",
+        "com.acme/do cs",
+        "com.acme/döcs",
+        too_long.as_str(),
+    ] {
+        config.mcp.registry.name = name.to_owned();
+        let card = server_card(&config, serde_json::Map::new()).unwrap();
+        assert_eq!(card["name"], "dev.mcpg/gateway", "{name:?}");
+    }
+}
+
 #[test]
 fn unusable_or_duplicate_keys_are_refused() {
     let mut config = webhook_config(&[(None, 1)], &[]);

@@ -520,10 +520,10 @@ pub(crate) fn server_card(
     let url = public_mcp_url(config)?;
     let served = &config.mcp.registry;
     let identity = &config.mcp.server_info;
-    let name = if served.name.contains('/') {
+    let name = if crate::config::registry::is_server_card_name(&served.name) {
         served.name.clone()
     } else {
-        "dev.mcpg/gateway".to_owned()
+        crate::config::registry::DEFAULT_SERVER_CARD_NAME.to_owned()
     };
     let description = match served.description.as_deref() {
         Some(description) => card_text(Some(description)),
@@ -754,6 +754,38 @@ pub(crate) async fn oauth_jwks_handler(
         Json(jwks.clone()),
     )
         .into_response()
+}
+
+/// `GET /oauth/client-metadata.json` — the gateway's own Client ID Metadata
+/// Document, whose URL is its client id at a login IdP without a
+/// pre-registered `login.client_id`. The IdP fetches it from this origin
+/// and compares its `client_id` with the URL exactly, so it is served
+/// here, never redirected. Public metadata, cached for five minutes. `404`
+/// while the document is not the client id in use: no authorization
+/// server, no login IdP, a pre-registered client, the document disabled,
+/// or an issuer that is not `https://`.
+pub(crate) async fn oauth_client_metadata_document_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Response {
+    let config = state.config.load();
+    let runtime = state.runtime.load();
+    let document = runtime
+        .ema_authorization_server()
+        .and_then(|server| server.login_idp())
+        .and_then(|login| login.client_metadata_document(&config.mcp.server_info));
+    match document {
+        Some(document) => (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "public, max-age=300")],
+            Json(document),
+        )
+            .into_response(),
+        None => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no client metadata document is published" })),
+        )
+            .into_response(),
+    }
 }
 
 /// `POST /oauth/token` — ID-JAG redemption and, with a login IdP, the

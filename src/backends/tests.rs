@@ -1911,6 +1911,87 @@ fn input_schema_falls_back_to_operator_when_plugin_returns_none() {
     assert_eq!(schema["properties"]["id"]["type"], "integer");
 }
 
+/// The `Mcp-Param-{Name}` check of a `tools/call` reads the schema the
+/// registry publishes: the operator overlay merged on the plugin-derived
+/// schema for a native tool, the imported schema for a federated one.
+#[test]
+fn tool_param_headers_follow_the_published_schema() {
+    let plugin_reg = registry_with_fake_sql(Some((
+        "orders.lookup",
+        serde_json::json!({
+            "type": "object",
+            "properties": { "tenant": { "type": "string" }, "id": { "type": "integer" } }
+        }),
+    )));
+    let mut binding = sql_binding("orders.lookup");
+    binding.input_schema = Some(serde_json::json!({
+        "properties": { "tenant": { "x-mcp-header": "Tenant" } }
+    }));
+    let reg = CapabilityRegistry::new(
+        false,
+        DebugToolBackends::default(),
+        DebugToolExposure::default(),
+        &[binding],
+        &[],
+        &[],
+        &[],
+        Some(&plugin_reg),
+    );
+    reg.federated_overlay()
+        .store(std::sync::Arc::new(FederatedCatalog::from_parts(
+            vec![crate::backends::federation::FederatedTool {
+                descriptor: ToolDescriptor {
+                    name: "upstream.count".to_owned(),
+                    title: None,
+                    description: String::new(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "limit": { "type": "integer", "x-mcp-header": "Limit" } }
+                    }),
+                    output_schema: None,
+                    annotations: None,
+                    execution: None,
+                    icons: None,
+                    meta: None,
+                },
+                route: BackendInvocationRoute::Federated {
+                    source: "upstream".to_owned(),
+                    upstream_name: "count".to_owned(),
+                },
+            }],
+            vec![],
+            vec![],
+            vec![],
+        )));
+    let h = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+    let native = serde_json::json!({ "tenant": "acme", "id": 7 });
+    let check = |name: &str, args: &serde_json::Value, pairs: &[(&str, &str)]| {
+        reg.check_tool_param_headers(name, args, &h(pairs))
+    };
+
+    assert!(check("orders.lookup", &native, &[("tenant", "acme")]).is_ok());
+    // A header for an argument no annotation names is not checked.
+    assert!(check("orders.lookup", &native, &[("tenant", "acme"), ("id", "8")]).is_ok());
+    let missing = check("orders.lookup", &native, &[]).unwrap_err();
+    assert!(missing.contains("Mcp-Param-tenant"), "{missing}");
+    assert!(check("orders.lookup", &native, &[("tenant", "other")]).is_err());
+    // No value for the annotated argument: no header expected.
+    assert!(check("orders.lookup", &serde_json::json!({ "id": 7 }), &[]).is_ok());
+
+    let federated = serde_json::json!({ "limit": 10 });
+    assert!(check("upstream.count", &federated, &[("limit", "10")]).is_ok());
+    assert!(check("upstream.count", &federated, &[]).is_err());
+    assert!(check("upstream.count", &federated, &[("limit", "11")]).is_err());
+
+    // An unknown tool is left to the caller's unknown-tool answer.
+    assert!(check("nope", &federated, &[]).is_ok());
+}
+
 fn resource_template_binding_with_completions(
     name: &str,
     uri_template: &str,

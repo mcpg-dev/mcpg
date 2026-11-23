@@ -466,6 +466,10 @@ async fn a_busy_or_full_route_asks_the_sender_to_retry() {
       - name: small
         source: { inbound: { source_id: small, allow_unsigned: true } }"#;
     let state = boot(&yaml(dir.path(), "      log: { inbox_max_rows: 1 }", types)).await;
+    let core = core_of(&state);
+    // A stopped core holds no owner lease, so its owner loop drains nothing
+    // and the first row stays in the inbox; the route still takes events.
+    core.stop().await;
     let unsigned = |id: &str| {
         Request::builder()
             .method("POST")
@@ -477,6 +481,13 @@ async fn a_busy_or_full_route_asks_the_sender_to_retry() {
         post(&state, unsigned("limited")).await.status(),
         StatusCode::ACCEPTED
     );
+    // A bucket stamped an hour ahead refills nothing before the next POST,
+    // however slow the host is.
+    let catalog = core.catalog();
+    let (_, route) = catalog.by_source_id("limited")[0];
+    let _ = route
+        .rate
+        .take_at(std::time::Instant::now() + Duration::from_secs(3600));
     let limited = post(&state, unsigned("limited")).await;
     assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(limited.headers().contains_key("retry-after"));

@@ -364,9 +364,9 @@ mcp:
             redeem_token_url: https://as.crm.acme.example/oauth2/token
 ```
 
-Note: the host credential cache keys on `(identity, plugin, target)` —
-after a re-discovery changes the metadata, already-cached tokens serve
-until their TTL expires.
+Note: the host credential cache keys on `(identity, plugin, target,
+per-call config)`, so a re-discovery that changes the metadata gets a
+fresh token on the next call.
 
 #### Clustered deployments and incremental crawls
 
@@ -711,6 +711,12 @@ mcp:
 ```
 
 The same token is shared across all callers (the grant is identity-independent).
+The host credential cache and the plugin keep one token per `resource`, so
+two federations that share a provider get tokens for their own upstreams.
+A provider can authenticate with `client_auth: private_key_jwt` and a
+`private_key` in place of a `client_secret`: each token request then carries
+a fresh signed RFC 7523 client assertion. See the plugin's README for the
+settings.
 
 ### `oauth_impersonation` — on-behalf-of the caller
 MCPG exchanges the **caller's** inbound bearer for an upstream token (RFC 8693

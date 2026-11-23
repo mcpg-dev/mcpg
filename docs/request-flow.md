@@ -127,8 +127,10 @@ HTTP POST /mcp
 │   └─ anything but "2026-07-28", or neither → 400, -32022
 │
 ├─ 7. Dispatch (transports/dispatch.rs, shared with stdio)
-│   ├─ Handler::validate_transport_headers — Mcp-Method / Mcp-Name /
-│   │  Mcp-Param-* against the body (-32020)
+│   ├─ Handler::validate_transport_headers — Mcp-Method / Mcp-Name
+│   │  against the body, Mcp-Param-* shape (-32020); on tools/call and
+│   │  events/* the runtime checks Mcp-Param-* against the x-mcp-header
+│   │  annotations of the tool's or event type's inputSchema
 │   ├─ _meta client info and capabilities → RequestContext
 │   ├─ runtime.ensure_session(ctx) → the caller's session row
 │   │  (503 when the principal's row cap is reached)

@@ -88,8 +88,13 @@ pub(crate) async fn dispatch(
         && body
             .get("method")
             .and_then(Value::as_str)
-            .and_then(crate::protocol::v_2026_07_28::extensions::events::wire::name_header_field)
-            .is_some()
+            .is_some_and(|method| {
+                method == "tools/call"
+                    || crate::protocol::v_2026_07_28::extensions::events::wire::name_header_field(
+                        method,
+                    )
+                    .is_some()
+            })
     {
         let params =
             crate::protocol::v_2026_07_28::wire::param_headers(headers, None).unwrap_or_default();
@@ -293,6 +298,7 @@ fn request_client(meta: &Value) -> Option<mcpg_plugin_protocol::ClientInfo> {
     };
     Some(mcpg_plugin_protocol::ClientInfo {
         name: clean(info.get("name")?)?,
+        title: info.get("title").and_then(clean),
         version: info.get("version").and_then(clean),
     })
 }
@@ -328,14 +334,24 @@ mod tests {
     fn the_request_client_is_cleaned_and_bounded() {
         let long = "x".repeat(MAX_CLIENT_FIELD_CHARS + 10);
         let meta = json!({
-            META_KEY_CLIENT_INFO: { "name": " host\u{7}app ", "version": long },
+            META_KEY_CLIENT_INFO: {
+                "name": " host\u{7}app ",
+                "title": " replica\u{7}-1 ",
+                "version": long,
+            },
         });
         let client = request_client(&meta).expect("named client");
         assert_eq!(client.name, "hostapp");
+        assert_eq!(client.title.as_deref(), Some("replica-1"));
         assert_eq!(
             client.version.map(|v| v.chars().count()),
             Some(MAX_CLIENT_FIELD_CHARS)
         );
+        let untitled = request_client(&json!({
+            META_KEY_CLIENT_INFO: { "name": "hostapp", "title": "  " },
+        }))
+        .expect("named client");
+        assert!(untitled.title.is_none());
     }
 
     #[test]

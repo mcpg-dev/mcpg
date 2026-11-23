@@ -509,6 +509,7 @@ async fn discovery_reads_the_login_endpoints_once() {
                 token_endpoint: format!("{uri}/token"),
                 revocation_endpoint: Some(format!("{uri}/revoke")),
                 authorization_response_iss_parameter_supported: true,
+                client_id_metadata_document_supported: false,
             }
         );
     }
@@ -706,6 +707,7 @@ async fn stale_endpoints_serve_through_a_discovery_outage() {
         token_endpoint: "https://idp.test/token".to_owned(),
         revocation_endpoint: None,
         authorization_response_iss_parameter_supported: false,
+        client_id_metadata_document_supported: false,
     });
     let client = server.idps[0].login.as_ref().unwrap();
     *client.discovered.cached.write().await = Some(CachedMetadata {
@@ -778,6 +780,7 @@ async fn the_authorization_url_carries_the_transaction_and_the_configuration() {
         token_endpoint: "https://idp.test/token".to_owned(),
         revocation_endpoint: None,
         authorization_response_iss_parameter_supported: false,
+        client_id_metadata_document_supported: false,
     };
     let url = login(&server)
         .authorization_url(
@@ -1087,7 +1090,7 @@ fn credentials_never_reach_debug_output() {
     }))
     .unwrap();
     let credential = LoginCredential::from_config(&jwt).unwrap();
-    assert_eq!(credential.method(), LoginClientAuth::PrivateKeyJwt);
+    assert_eq!(credential.method(), Some(LoginClientAuth::PrivateKeyJwt));
     let auth = credential
         .authenticate("https://idp.test/token", IDP_ISSUER)
         .unwrap();
@@ -1339,4 +1342,315 @@ async fn a_private_address_is_refused_before_any_request() {
     .await
     .map(|response| response.status.as_u16());
     assert_eq!(answered.ok(), Some(200));
+}
+
+// ── the gateway's Client ID Metadata Document ────────────────────────
+
+const DOCUMENT_URL: &str = "https://gw.test/oauth/client-metadata.json";
+
+/// A login block without a pre-registered client: no `client_id` and no
+/// secret, with `login` over that.
+fn unregistered(login: Value) -> Value {
+    merged(json!({ "client_id": null, "client_secret": null }), login)
+}
+
+fn metadata_supporting(supported: bool) -> IdpMetadata {
+    IdpMetadata {
+        authorization_endpoint: "https://idp.test/authorize".to_owned(),
+        token_endpoint: "https://idp.test/token".to_owned(),
+        revocation_endpoint: None,
+        authorization_response_iss_parameter_supported: false,
+        client_id_metadata_document_supported: supported,
+    }
+}
+
+fn some_request() -> IdpAuthorizationRequest<'static> {
+    IdpAuthorizationRequest {
+        state: "s",
+        nonce: NONCE,
+        code_challenge: "c",
+        prompt: None,
+        login_hint: None,
+    }
+}
+
+fn query_value(url: &str, name: &str) -> Option<String> {
+    url::Url::parse(url)
+        .unwrap()
+        .query_pairs()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
+fn server_info(title: Option<&str>, name: Option<&str>) -> McpServerInfoConfig {
+    McpServerInfoConfig {
+        name: name.map(str::to_owned),
+        title: title.map(str::to_owned),
+        description: None,
+        icons: None,
+        website_url: Some("https://www.example.com/about".to_owned()),
+    }
+}
+
+#[test]
+fn a_public_client_document_names_the_gateway_and_its_callback() {
+    let server = build(&config(IDP_ISSUER, unregistered(json!({})), json!({})));
+    let login = login(&server);
+    assert!(login.uses_metadata_document());
+    assert_eq!(login.client_id(), DOCUMENT_URL);
+    let document = login
+        .client_metadata_document(&server_info(Some("Acme MCP"), Some("com.acme.mcp")))
+        .expect("the document is published");
+    assert_eq!(
+        document,
+        json!({
+            "client_id": DOCUMENT_URL,
+            "client_name": "Acme MCP",
+            "client_uri": "https://www.example.com/about",
+            "redirect_uris": [CALLBACK],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        })
+    );
+    let named = login
+        .client_metadata_document(&server_info(None, Some("com.acme.mcp")))
+        .unwrap();
+    assert_eq!(named["client_name"], "com.acme.mcp");
+    let unnamed = login
+        .client_metadata_document(&McpServerInfoConfig::default())
+        .unwrap();
+    assert_eq!(unnamed["client_name"], "MCPG gateway");
+    assert!(unnamed.get("client_uri").is_none());
+}
+
+#[test]
+fn configured_document_fields_override_the_server_identity() {
+    let mut config = config(IDP_ISSUER, unregistered(json!({})), json!({}));
+    config.interactive = Some(
+        serde_json::from_value(json!({
+            "client_metadata_document": {
+                "client_name": "Acme sign-in",
+                "client_uri": "https://acme.example",
+                "logo_uri": "https://acme.example/logo.png",
+            },
+        }))
+        .unwrap(),
+    );
+    let server = build(&config);
+    let document = login(&server)
+        .client_metadata_document(&server_info(Some("Acme MCP"), None))
+        .unwrap();
+    assert_eq!(document["client_name"], "Acme sign-in");
+    assert_eq!(document["client_uri"], "https://acme.example");
+    assert_eq!(document["logo_uri"], "https://acme.example/logo.png");
+}
+
+/// With a private key the document declares `private_key_jwt` and carries
+/// the public half of the key inline, never the private one; an assertion
+/// the gateway signs verifies against it.
+#[test]
+fn a_keyed_document_publishes_the_public_key_only() {
+    let server = build(&config(
+        IDP_ISSUER,
+        unregistered(json!({ "private_key": IDP_PRIVATE_PEM, "key_id": "gw-1" })),
+        json!({}),
+    ));
+    let login = login(&server);
+    let document = login
+        .client_metadata_document(&McpServerInfoConfig::default())
+        .unwrap();
+    assert_eq!(document["token_endpoint_auth_method"], "private_key_jwt");
+    assert_eq!(document["token_endpoint_auth_signing_alg"], "RS256");
+    let keys = document["jwks"]["keys"].as_array().expect("inline jwks");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["kty"], "RSA");
+    assert_eq!(keys[0]["kid"], "gw-1");
+    for private in ["d", "p", "q", "dp", "dq", "qi"] {
+        assert!(keys[0].get(private).is_none(), "{private} leaked");
+    }
+    assert!(document.get("jwks_uri").is_none());
+
+    let auth = login
+        .client
+        .credential
+        .authenticate("https://idp.test/token", IDP_ISSUER)
+        .unwrap();
+    let assertion = auth
+        .form
+        .iter()
+        .find(|(name, _)| *name == "client_assertion")
+        .unwrap()
+        .1
+        .expose()
+        .to_owned();
+    let published: JwkSet = serde_json::from_value(document["jwks"].clone()).unwrap();
+    let key = DecodingKey::from_jwk(&published.keys[0]).unwrap();
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&["https://idp.test/token"]);
+    validation.set_issuer(&[DOCUMENT_URL]);
+    let claims = jsonwebtoken::decode::<Value>(&assertion, &key, &validation)
+        .expect("the assertion verifies with the published key")
+        .claims;
+    assert_eq!(claims["sub"], DOCUMENT_URL);
+}
+
+#[test]
+fn a_pre_registered_client_publishes_no_document() {
+    let server = build(&config(IDP_ISSUER, json!({}), json!({})));
+    let login = login(&server);
+    assert!(!login.uses_metadata_document());
+    assert_eq!(login.client_id(), LOGIN_CLIENT_ID);
+    assert!(
+        login
+            .client_metadata_document(&McpServerInfoConfig::default())
+            .is_none()
+    );
+}
+
+/// The client id order: a pre-registered client whatever the IdP
+/// advertises; else the document URL while the IdP advertises
+/// `client_id_metadata_document_supported`; else no authorization request.
+#[test]
+fn the_authorization_request_chooses_the_client_id_in_registration_order() {
+    let pre_registered = build(&config(IDP_ISSUER, json!({}), json!({})));
+    for supported in [true, false] {
+        let url = login(&pre_registered)
+            .authorization_url(&metadata_supporting(supported), &some_request())
+            .unwrap();
+        assert_eq!(
+            query_value(&url, "client_id").as_deref(),
+            Some(LOGIN_CLIENT_ID)
+        );
+    }
+
+    let document = build(&config(IDP_ISSUER, unregistered(json!({})), json!({})));
+    let url = login(&document)
+        .authorization_url(&metadata_supporting(true), &some_request())
+        .unwrap();
+    assert_eq!(
+        query_value(&url, "client_id").as_deref(),
+        Some(DOCUMENT_URL)
+    );
+
+    match login(&document).authorization_url(&metadata_supporting(false), &some_request()) {
+        Err(UpstreamError::Misconfigured(reason)) => assert!(
+            reason.contains("client_id_metadata_document_supported")
+                && reason.contains("login.client_id"),
+            "{reason}"
+        ),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// The redirect URI and the client id of the authorization request are the
+/// ones the document lists, as the IdP checks (CIMD §4).
+#[test]
+fn the_authorization_request_agrees_with_the_document() {
+    for login_config in [
+        unregistered(json!({})),
+        unregistered(json!({ "private_key": IDP_PRIVATE_PEM })),
+    ] {
+        let server = build(&config(IDP_ISSUER, login_config, json!({})));
+        let login = login(&server);
+        let document = login
+            .client_metadata_document(&McpServerInfoConfig::default())
+            .unwrap();
+        let url = login
+            .authorization_url(&metadata_supporting(true), &some_request())
+            .unwrap();
+        assert_eq!(
+            query_value(&url, "client_id").as_deref(),
+            document["client_id"].as_str()
+        );
+        let redirect_uri = query_value(&url, "redirect_uri").unwrap();
+        let listed: Vec<&str> = document["redirect_uris"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(listed.contains(&redirect_uri.as_str()), "{listed:?}");
+        assert_eq!(
+            query_value(&url, "response_type").as_deref(),
+            document["response_types"][0].as_str()
+        );
+    }
+}
+
+#[tokio::test]
+async fn discovery_reads_whether_the_idp_resolves_metadata_documents() {
+    let idp = MockServer::start().await;
+    serve_discovery(
+        &idp,
+        discovery_document(
+            &idp,
+            json!({ "client_id_metadata_document_supported": true }),
+        ),
+        1,
+    )
+    .await;
+    let server = build(&config(&idp.uri(), unregistered(json!({})), json!({})));
+    let metadata = login(&server).metadata().await.expect("discovered");
+    assert!(metadata.client_id_metadata_document_supported);
+    let url = login(&server)
+        .authorization_url(&metadata, &some_request())
+        .unwrap();
+    assert_eq!(
+        query_value(&url, "client_id").as_deref(),
+        Some(DOCUMENT_URL)
+    );
+}
+
+/// A public client redeems its code with `client_id` in the form and no
+/// credential at all.
+#[tokio::test]
+async fn a_public_client_redeems_a_code_with_its_document_url() {
+    let idp = token_endpoint_answering(token_response(json!({}))).await;
+    let server = endpoint_server(&idp, unregistered(json!({})));
+    login(&server)
+        .exchange_code("idp-code-1", "verifier-0123456789")
+        .await
+        .expect("redeemed");
+    let request = the_only_request(&idp).await;
+    assert!(request.headers.get("authorization").is_none());
+    let form = form_of(&request.body);
+    assert_eq!(field(&form, "client_id"), Some(DOCUMENT_URL));
+    assert_eq!(field(&form, "redirect_uri"), Some(CALLBACK));
+    assert_eq!(field(&form, "client_secret"), None);
+    assert_eq!(field(&form, "client_assertion"), None);
+}
+
+#[test]
+fn without_a_document_an_unregistered_login_is_refused() {
+    let mut disabled = config(IDP_ISSUER, unregistered(json!({})), json!({}));
+    disabled.interactive = Some(
+        serde_json::from_value(json!({ "client_metadata_document": { "enabled": false } }))
+            .unwrap(),
+    );
+    let mut plain_http = config(IDP_ISSUER, unregistered(json!({})), json!({}));
+    plain_http.issuer = "http://127.0.0.1:8787".to_owned();
+    for config in [disabled, plain_http] {
+        assert!(config.client_metadata_document_url().is_none());
+        let err = build_refused(&config);
+        assert!(err.contains("client_id is required"), "{err}");
+    }
+
+    let err = build_refused(&config(
+        IDP_ISSUER,
+        merged(
+            unregistered(json!({})),
+            json!({ "client_secret": LOGIN_SECRET }),
+        ),
+        json!({}),
+    ));
+    assert!(err.contains("pre-registered client_id"), "{err}");
+    assert!(!err.contains(LOGIN_SECRET), "{err}");
+}
+
+fn build_refused(config: &AuthorizationServerConfig) -> String {
+    match AuthorizationServer::from_config(config, None, ReplayLedger::in_process()) {
+        Ok(_) => panic!("the server must be refused"),
+        Err(err) => format!("{err:#}"),
+    }
 }

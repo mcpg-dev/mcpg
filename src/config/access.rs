@@ -1201,7 +1201,7 @@ impl AuthorizationServerConfig {
         if let Some(ref interactive) = self.interactive {
             interactive.validate(&format!("{prefix}.interactive"))?;
         }
-        Ok(())
+        self.validate_login_client_id(prefix)
     }
 
     /// Every `client_roles` key names a client that can authenticate, and

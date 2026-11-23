@@ -55,7 +55,8 @@ pub const MIN_RENEW_INTERVAL_MS: u64 = 1_000;
 ///   holds it) or `release` (it let go; best effort).
 /// - `lease_id`: one id per held delivery, the same in all three calls and
 ///   on every replica. A poll lease is one per principal, event, arguments
-///   and MCP client name, so two clients of one principal hold two leases.
+///   and MCP client name and title, so two clients of one principal hold
+///   two leases, and so do two instances of one client with two titles.
 /// - `kind`: `events` or `resource`.
 /// - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or
 ///   `subscribe` for a resource.

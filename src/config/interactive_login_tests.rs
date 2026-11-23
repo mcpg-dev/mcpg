@@ -1598,3 +1598,135 @@ fn config_check_names_the_callback_scopes_store_and_key() {
     assert!(interactive_login_summary(&ema).is_empty());
     assert!(interactive_login_summary(&AppConfig::default()).is_empty());
 }
+
+// ── the gateway's Client ID Metadata Document ────────────────────────
+
+const DOCUMENT_URL: &str = "https://mcp.example.com/oauth/client-metadata.json";
+
+/// [`base`] with no pre-registered login client and no secret.
+fn unregistered() -> AppConfig {
+    let mut config = base();
+    let login = login(&mut config);
+    login.client_id = None;
+    login.client_secret = None;
+    config
+}
+
+#[test]
+fn a_pre_registered_client_keeps_its_id_and_publishes_no_document() {
+    let mut config = base();
+    let authz = authz(&mut config);
+    assert_eq!(authz.login_client_id().as_deref(), Some("0oa1agent"));
+    assert_eq!(authz.client_metadata_document_url(), None);
+    assert!(
+        authz
+            .interactive_settings()
+            .client_metadata_document
+            .enabled
+    );
+}
+
+#[test]
+fn without_client_id_the_document_url_is_the_client_id() {
+    let mut config = unregistered();
+    config
+        .validate()
+        .expect("a metadata document client validates");
+    let authz = authz(&mut config);
+    assert_eq!(
+        authz.client_metadata_document_url().as_deref(),
+        Some(DOCUMENT_URL)
+    );
+    assert_eq!(authz.login_client_id().as_deref(), Some(DOCUMENT_URL));
+
+    let mut keyed = unregistered();
+    login(&mut keyed).private_key = Some(RSA_PEM.to_owned());
+    login(&mut keyed).key_id = Some("gw-1".to_owned());
+    keyed.validate().expect("private_key_jwt with the document");
+
+    let text = interactive_login_summary(&config).join("\n");
+    assert!(
+        text.contains(&format!("(Client ID Metadata Document `{DOCUMENT_URL}`)")),
+        "{text}"
+    );
+    assert!(
+        text.contains("client_id_metadata_document_supported"),
+        "{text}"
+    );
+}
+
+#[test]
+fn without_client_id_a_document_must_be_usable() {
+    let mut disabled = unregistered();
+    interactive(&mut disabled).client_metadata_document.enabled = false;
+    let err = refused(&disabled);
+    assert!(
+        err.contains("client_metadata_document is disabled"),
+        "{err}"
+    );
+
+    let mut loopback = unregistered();
+    authz(&mut loopback).issuer = "http://127.0.0.1:8787".to_owned();
+    assert_eq!(authz(&mut loopback).client_metadata_document_url(), None);
+    let err = refused(&loopback);
+    assert!(err.contains("must be https"), "{err}");
+
+    let mut configured = unregistered();
+    let login_block = login(&mut configured);
+    login_block.authorization_endpoint = Some("https://acme.okta.com/authorize".to_owned());
+    login_block.token_endpoint = Some("https://acme.okta.com/token".to_owned());
+    login_block.revocation_endpoint = Some("https://acme.okta.com/revoke".to_owned());
+    let err = refused(&configured);
+    assert!(err.contains("every IdP endpoint is configured"), "{err}");
+
+    let mut secret = unregistered();
+    login(&mut secret).client_secret = Some("login-client-secret-0123".to_owned());
+    let err = refused(&secret);
+    assert!(err.contains("pre-registered client_id"), "{err}");
+    assert!(!err.contains("login-client-secret-0123"), "{err}");
+
+    let mut stray = unregistered();
+    login(&mut stray).key_id = Some("gw-1".to_owned());
+    let err = refused(&stray);
+    assert!(err.contains("apply only with private_key"), "{err}");
+}
+
+#[test]
+fn document_fields_are_checked() {
+    for (field, value, expected) in [
+        (
+            "client_uri",
+            "http://acme.example",
+            "client_uri must be an https://",
+        ),
+        (
+            "logo_uri",
+            "https://u:p@acme.example/l.png",
+            "logo_uri must be an https://",
+        ),
+    ] {
+        let mut config = unregistered();
+        let document = &mut interactive(&mut config).client_metadata_document;
+        match field {
+            "client_uri" => document.client_uri = Some(value.to_owned()),
+            _ => document.logo_uri = Some(value.to_owned()),
+        }
+        let err = refused(&config);
+        assert!(err.contains(expected), "{field}: {err}");
+    }
+    let mut long_name = unregistered();
+    interactive(&mut long_name)
+        .client_metadata_document
+        .client_name = Some("x".repeat(81));
+    assert!(refused(&long_name).contains("client_name"));
+}
+
+#[test]
+fn a_public_document_client_draws_a_warning() {
+    let found = warnings(&unregistered());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("public client"), "{}", found[0]);
+    let mut keyed = unregistered();
+    login(&mut keyed).private_key = Some(RSA_PEM.to_owned());
+    assert_eq!(warnings(&keyed), Vec::<String>::new());
+}

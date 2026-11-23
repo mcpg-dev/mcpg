@@ -528,6 +528,200 @@ async fn runtime_handles_tool_call_protocol_request() {
     assert_eq!(result["structuredContent"]["service"], "mcpg");
 }
 
+/// [`send`] with the `Mcp-Param-{Name}` headers an HTTP request carries.
+async fn send_with_param_headers(
+    gateway: &Arc<arc_swap::ArcSwap<GatewayRuntime>>,
+    identity: RequestIdentity,
+    body: Value,
+    param_headers: &[(&str, &str)],
+) -> ProtocolHttpResponse {
+    let runtime = gateway.load_full();
+    let mut context = match runtime.ensure_session(request_context(identity)) {
+        SessionOutcome::Ready(context) => context,
+        SessionOutcome::CapacityExhausted => panic!("the session store has room"),
+    };
+    context.param_headers = Some(Arc::new(
+        param_headers
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect(),
+    ));
+    let message = crate::protocol::Handler
+        .parse(body)
+        .expect("a well-formed message");
+    runtime
+        .handle_protocol_message(&Arc::new(context), message)
+        .await
+}
+
+/// A runtime that serves the federated tool `upstream.query`, whose
+/// `region` argument carries `x-mcp-header: Region`.
+fn runtime_with_annotated_federated_tool() -> GatewayRuntime {
+    let runtime = test_runtime();
+    let tool = crate::backends::federation::FederatedTool {
+        descriptor: crate::backends::ToolDescriptor {
+            name: "upstream.query".to_owned(),
+            title: None,
+            description: "query".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "region": { "type": "string", "x-mcp-header": "Region" },
+                    "query": { "type": "string" }
+                }
+            }),
+            output_schema: None,
+            annotations: None,
+            execution: None,
+            icons: None,
+            meta: None,
+        },
+        route: crate::backends::BackendInvocationRoute::Federated {
+            source: "upstream".to_owned(),
+            upstream_name: "query".to_owned(),
+        },
+    };
+    let catalog = crate::backends::federation::FederatedCatalog::from_parts(
+        vec![tool],
+        vec![],
+        vec![],
+        vec![],
+    );
+    runtime
+        .capability_registry
+        .federated_overlay()
+        .store(Arc::new(catalog));
+    runtime
+        .pre_dispatch_policy
+        .federated_policy_handle()
+        .store(Arc::new(policy::FederatedToolPolicies::from_federations([
+            policy::FederationGovernance {
+                federation: "upstream".to_owned(),
+                minimum_trust: RequestTrustLevel::HeaderAsserted,
+                cel_allow_if: None,
+                required_scopes: Vec::new(),
+            },
+        ])));
+    runtime
+}
+
+/// `tools/call` checks `Mcp-Param-{Name}` against the `x-mcp-header`
+/// annotations of the called tool's published `inputSchema`: a missing or
+/// disagreeing header is `HeaderMismatch` on HTTP 400.
+#[tokio::test]
+async fn tools_call_param_headers_follow_the_tool_schema() {
+    let gateway = serve(runtime_with_annotated_federated_tool());
+    let arguments = serde_json::json!({ "region": "us-west1", "query": "q" });
+
+    for headers in [&[][..], &[("region", "eu-west1")][..]] {
+        let response = send_with_param_headers(
+            &gateway,
+            header_asserted("user-1"),
+            tools_call(1, "upstream.query", arguments.clone()),
+            headers,
+        )
+        .await;
+        assert_eq!(response.http_status, 400, "{headers:?}");
+        assert_eq!(error_code(&response), -32020, "{headers:?}");
+    }
+
+    // A matching header, and one for an argument no annotation names, pass
+    // the check; the call then fails at the absent upstream.
+    for headers in [
+        &[("region", "us-west1")][..],
+        &[("region", "us-west1"), ("query", "other")][..],
+    ] {
+        let response = send_with_param_headers(
+            &gateway,
+            header_asserted("user-1"),
+            tools_call(2, "upstream.query", arguments.clone()),
+            headers,
+        )
+        .await;
+        assert_ne!(response.http_status, 400, "{headers:?}");
+        if let ProtocolResponse::JsonRpcError(error) = &response.response {
+            assert_ne!(error.error.code, -32020, "{headers:?}");
+        }
+    }
+}
+
+/// The retry of a suspended call (`requestState` + `inputResponses`) is
+/// the original `tools/call` again: its headers get the same check before
+/// the state is opened.
+#[tokio::test]
+async fn a_resumed_tools_call_gets_the_param_header_check() {
+    let gateway = serve(runtime_with_annotated_federated_tool());
+    let retry = |id: u64| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "upstream.query",
+                "arguments": { "region": "us-west1" },
+                "inputResponses": { "ask": { "action": "accept", "content": {} } },
+                "requestState": "not-a-state",
+            },
+        })
+    };
+    for headers in [&[][..], &[("region", "eu-west1")][..]] {
+        let response =
+            send_with_param_headers(&gateway, header_asserted("user-1"), retry(6), headers).await;
+        assert_eq!(response.http_status, 400, "{headers:?}");
+        assert_eq!(error_code(&response), -32020, "{headers:?}");
+    }
+    // Matching headers reach the state check, which refuses the blob.
+    let response = send_with_param_headers(
+        &gateway,
+        header_asserted("user-1"),
+        retry(7),
+        &[("region", "us-west1")],
+    )
+    .await;
+    assert_ne!(error_code(&response), -32020);
+}
+
+/// A header on a tool without annotations is not required to match, and a
+/// call to a hidden or unknown tool keeps its own answer.
+#[tokio::test]
+async fn tools_call_param_headers_do_not_reveal_hidden_or_unknown_tools() {
+    let gateway = serve(runtime_with_annotated_federated_tool());
+
+    let result = success_result(
+        send_with_param_headers(
+            &gateway,
+            header_asserted("user-1"),
+            tools_call(
+                3,
+                "mcpg.request.echo",
+                serde_json::json!({ "message": "hello" }),
+            ),
+            &[("message", "other")],
+        )
+        .await,
+    );
+    assert_eq!(result["structuredContent"]["arguments"]["message"], "hello");
+
+    let hidden = send_with_param_headers(
+        &gateway,
+        anonymous(),
+        tools_call(4, "upstream.query", serde_json::json!({ "region": "us" })),
+        &[],
+    )
+    .await;
+    assert_eq!(hidden.http_status, 403);
+    assert_eq!(error_code(&hidden), -32003);
+
+    let unknown = send_with_param_headers(
+        &gateway,
+        header_asserted("user-1"),
+        tools_call(5, "nope", serde_json::json!({ "region": "us" })),
+        &[("region", "eu")],
+    )
+    .await;
+    assert_eq!(error_code(&unknown), -32602);
+}
+
 #[test]
 fn verified_identity_has_correct_trust_level_and_fields() {
     let identity = RequestIdentity::Verified {
@@ -1742,6 +1936,7 @@ fn derived_session_ids_keep_their_bytes() {
         let mut context = request_context(verified("alice"));
         context.client = client.map(|name| mcpg_plugin_protocol::ClientInfo {
             name: name.to_owned(),
+            title: None,
             version: None,
         });
         match runtime.ensure_session(context) {

@@ -249,11 +249,11 @@ impl Handler {
                 validate_name_header(headers, body, source_field, body_id.clone())?;
             }
 
-            if events_name_field.is_some() {
-                // The annotations of the event type decide which
-                // `Mcp-Param-{Name}` headers an events request needs; the
-                // events core checks them against its catalog. Here only
-                // their shape is checked.
+            if events_name_field.is_some() || body_method == "tools/call" {
+                // The `x-mcp-header` annotations of the tool's or event
+                // type's `inputSchema` decide which `Mcp-Param-{Name}`
+                // headers the request needs; the runtime checks them
+                // against its catalog. Here only their shape is checked.
                 param_headers(headers, body_id.clone())?;
             } else {
                 // SEP-2243 `x-mcp-header` param→header promotion. Any
@@ -1119,16 +1119,21 @@ mod tests {
         assert!(h.validate_transport_headers(&headers, &body).is_ok());
     }
 
+    /// On `tools/call` an `Mcp-Param-*` header is checked for shape here and
+    /// against the tool's `inputSchema` by the runtime, so a header whose
+    /// name is no argument's passes this step.
     #[test]
-    fn validate_param_header_rejects_mismatch() {
+    fn tools_call_param_headers_are_checked_for_shape_only() {
         let h = Handler::new();
         let mut headers = HeaderMap::new();
         headers.insert(METHOD_HEADER, "tools/call".parse().unwrap());
         headers.insert(NAME_HEADER, "execute_sql".parse().unwrap());
         headers.insert("mcp-param-region", "eu-west1".parse().unwrap());
         let body = tools_call_body("execute_sql");
+        assert!(h.validate_transport_headers(&headers, &body).is_ok());
+        headers.insert("mcp-param-region", "=?base64?!!?=".parse().unwrap());
         let err = h.validate_transport_headers(&headers, &body).unwrap_err();
-        assert_eq!(err.error_code, -32020);
+        assert_eq!((err.status, err.error_code), (400, -32020));
         assert!(err.message.contains("Mcp-Param-region"));
     }
 

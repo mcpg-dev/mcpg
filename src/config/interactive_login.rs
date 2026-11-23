@@ -46,19 +46,31 @@ use super::federation::AuthConfig;
 #[serde(deny_unknown_fields)]
 pub struct TrustedIdpLoginConfig {
     /// The client identifier the IdP issued to the gateway (1–255
-    /// characters).
-    pub client_id: String,
+    /// characters): a pre-registered client, which the gateway always
+    /// prefers. Unset, the gateway's client id is the URL of its own Client
+    /// ID Metadata Document (`interactive.client_metadata_document`),
+    /// `{authorization_server.issuer}/oauth/client-metadata.json`, and a
+    /// sign-in proceeds only while the IdP's discovery document advertises
+    /// `client_id_metadata_document_supported: true`. That needs an
+    /// `https://` issuer, the document enabled and at least one endpoint
+    /// left to discovery.
+    #[serde(default)]
+    pub client_id: Option<String>,
     /// How the gateway authenticates at the IdP token endpoint:
     /// `client_secret_basic`, `client_secret_post` or `private_key_jwt`.
     /// Defaults to `private_key_jwt` when `private_key` is set and to
-    /// `client_secret_basic` when `client_secret` is set. The gateway is
-    /// always a confidential client here, so a stolen IdP refresh token
-    /// is useless without this credential.
+    /// `client_secret_basic` when `client_secret` is set. A pre-registered
+    /// client is always confidential, so a stolen IdP refresh token is
+    /// useless without this credential. Without `client_id` only
+    /// `private_key_jwt` applies (the document publishes the public key);
+    /// with no `private_key` there the gateway is a public client
+    /// (`token_endpoint_auth_method: none`) that relies on PKCE alone.
     #[serde(default)]
     pub client_auth: Option<LoginClientAuth>,
     /// Shared secret for the two secret methods, at least 16 bytes.
     /// Supply via `${secret.NAME}` or `${env.X}`. Set this or
-    /// `private_key`, not both.
+    /// `private_key`, not both. Needs `client_id`: a metadata document
+    /// cannot carry a shared secret.
     #[serde(default)]
     pub client_secret: Option<String>,
     /// `private_key_jwt`: the PEM private key the client assertion is
@@ -394,10 +406,10 @@ impl TrustedIdpLoginConfig {
     /// Every rule a login block must satisfy on its own, at `at`
     /// (`…trusted_idps[`{issuer}`].login`).
     pub(crate) fn validate(&self, at: &str, idp: &TrustedIdpConfig) -> Result<()> {
-        let client_id = self.client_id.as_str();
-        if client_id.trim().is_empty()
-            || client_id.chars().count() > MAX_LOGIN_CLIENT_ID_CHARS
-            || client_id.chars().any(char::is_control)
+        if let Some(ref client_id) = self.client_id
+            && (client_id.trim().is_empty()
+                || client_id.chars().count() > MAX_LOGIN_CLIENT_ID_CHARS
+                || client_id.chars().any(char::is_control))
         {
             bail!("{at}.client_id must be 1 to {MAX_LOGIN_CLIENT_ID_CHARS} printable characters");
         }
@@ -467,7 +479,33 @@ impl TrustedIdpLoginConfig {
                  at the IdP with exactly one credential"
             );
         }
-        if self.client_secret.is_none() && self.private_key.is_none() {
+        if self.client_id.is_none() {
+            if self.client_secret.is_some()
+                || matches!(
+                    self.client_auth,
+                    Some(LoginClientAuth::ClientSecretBasic | LoginClientAuth::ClientSecretPost)
+                )
+            {
+                bail!(
+                    "{at}: a client secret needs a pre-registered client_id; without one the \
+                     gateway signs in with its Client ID Metadata Document, which authenticates \
+                     with private_key (private_key_jwt) or not at all"
+                );
+            }
+            if self.private_key.is_none() {
+                if self.client_auth.is_some()
+                    || self.key_id.is_some()
+                    || self.signing_alg.is_some()
+                    || self.assertion_audience.is_some()
+                {
+                    bail!(
+                        "{at}: client_auth, key_id, signing_alg and assertion_audience apply \
+                         only with private_key"
+                    );
+                }
+                return Ok(());
+            }
+        } else if self.client_secret.is_none() && self.private_key.is_none() {
             bail!(
                 "{at} needs a credential: client_secret, or private_key for private_key_jwt. The \
                  gateway is a confidential client at the IdP, so a stored IdP refresh token is \
@@ -599,6 +637,11 @@ pub struct InteractiveLoginConfig {
     /// RFC 7591 dynamic client registration at `POST /oauth/register`.
     #[serde(default)]
     pub dynamic_client_registration: DynamicClientRegistrationConfig,
+    /// The gateway's own Client ID Metadata Document, which identifies it
+    /// as an OAuth client at a login IdP that has no pre-registered
+    /// `trusted_idps[].login.client_id`.
+    #[serde(default)]
+    pub client_metadata_document: ClientMetadataDocumentConfig,
     /// Where grants, refresh tokens and stored IdP sign-ins live. Unset:
     /// the cluster coordinator's key-value store when
     /// `cluster.kind` is not `single_node`; on a single node, a file store
@@ -635,6 +678,7 @@ impl Default for InteractiveLoginConfig {
             refresh_tokens: RefreshTokensConfig::default(),
             idp_sessions: IdpSessionsConfig::default(),
             dynamic_client_registration: DynamicClientRegistrationConfig::default(),
+            client_metadata_document: ClientMetadataDocumentConfig::default(),
             store: None,
             state_keys: Vec::new(),
         }
@@ -889,6 +933,113 @@ impl std::fmt::Debug for DynamicClientRegistrationConfig {
             )
             .finish()
     }
+}
+
+/// Path of the gateway's own Client ID Metadata Document under the issuer.
+pub const CLIENT_METADATA_DOCUMENT_PATH: &str = "/oauth/client-metadata.json";
+
+/// The gateway's own OAuth Client ID Metadata Document
+/// (`interactive.client_metadata_document`,
+/// `draft-ietf-oauth-client-id-metadata-document`), served at
+/// `GET /oauth/client-metadata.json` on the issuer's origin. Its URL is the
+/// gateway's client id at a login IdP that has no `login.client_id`: the
+/// IdP fetches the document and reads the client's name, redirect URI and
+/// authentication method from it. The document lists the one redirect URI
+/// the gateway sends, `{issuer}/oauth/callback`; `token_endpoint_auth_method`
+/// is `private_key_jwt` with the public key of `login.private_key` inline
+/// as `jwks`, else `none`. It is served only while it is the client id in
+/// use (else 404). A pre-registered `login.client_id` always wins, so
+/// enabling this changes no configuration that has one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClientMetadataDocumentConfig {
+    /// Serve the document and sign in with its URL as the client id when
+    /// `login.client_id` is unset. Off, `login.client_id` is required.
+    #[serde(default = "super::default_true")]
+    pub enabled: bool,
+    /// `client_name`, shown by the IdP on its sign-in and consent pages
+    /// (1–80 characters). Defaults to `mcp.server_info.title`, else
+    /// `mcp.server_info.name`, else `MCPG gateway`.
+    #[serde(default)]
+    pub client_name: Option<String>,
+    /// `client_uri`, an `https://` page about the gateway. Defaults to
+    /// `mcp.server_info.website_url` when that is `https://`.
+    #[serde(default)]
+    pub client_uri: Option<String>,
+    /// `logo_uri`, an `https://` image the IdP may show.
+    #[serde(default)]
+    pub logo_uri: Option<String>,
+}
+
+impl Default for ClientMetadataDocumentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            client_name: None,
+            client_uri: None,
+            logo_uri: None,
+        }
+    }
+}
+
+/// `client_name` when nothing else names the gateway.
+pub const DEFAULT_CLIENT_NAME: &str = "MCPG gateway";
+
+impl ClientMetadataDocumentConfig {
+    fn validate(&self, prefix: &str) -> Result<()> {
+        let at = format!("{prefix}.client_metadata_document");
+        if let Some(ref name) = self.client_name {
+            check_display_text(&format!("{at}.client_name"), name, MAX_CLIENT_NAME_CHARS)?;
+        }
+        for (key, value) in [
+            ("client_uri", &self.client_uri),
+            ("logo_uri", &self.logo_uri),
+        ] {
+            if let Some(uri) = value
+                && !is_placeholder(uri)
+                && !is_https_url(uri)
+            {
+                bail!("{at}.{key} must be an https:// URL without userinfo or fragment");
+            }
+        }
+        Ok(())
+    }
+
+    /// The `client_name` the document carries.
+    pub fn effective_client_name(&self, server_info: &super::McpServerInfoConfig) -> String {
+        [
+            self.client_name.as_deref(),
+            server_info.title.as_deref(),
+            server_info.name.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|name| !name.is_empty() && name.chars().count() <= MAX_CLIENT_NAME_CHARS)
+        .unwrap_or(DEFAULT_CLIENT_NAME)
+        .to_owned()
+    }
+
+    /// The `client_uri` the document carries, if any.
+    pub fn effective_client_uri(&self, server_info: &super::McpServerInfoConfig) -> Option<String> {
+        self.client_uri.clone().or_else(|| {
+            server_info
+                .website_url
+                .clone()
+                .filter(|uri| is_https_url(uri))
+        })
+    }
+}
+
+/// An absolute `https://` URL with a host and no userinfo or fragment.
+fn is_https_url(uri: &str) -> bool {
+    url::Url::parse(uri).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.host_str().is_some_and(|h| !h.is_empty())
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.fragment().is_none()
+    })
 }
 
 /// Where interactive sign-in state lives (`interactive.store`).
@@ -1206,6 +1357,7 @@ impl InteractiveLoginConfig {
             )?;
         }
         self.validate_dynamic_client_registration(prefix)?;
+        self.client_metadata_document.validate(prefix)?;
         if let Some(ref store) = self.store {
             match (store.kind, &store.dir) {
                 (InteractiveStoreKind::File, Some(dir)) if dir.trim().is_empty() => {
@@ -1799,6 +1951,67 @@ impl AuthorizationServerConfig {
     pub fn login_callback_url(&self) -> String {
         format!("{}/oauth/callback", self.issuer.trim_end_matches('/'))
     }
+
+    /// The URL of the gateway's own Client ID Metadata Document while it
+    /// is the login client id: a login IdP without `client_id`, the
+    /// document enabled and an `https://` issuer. `None` otherwise.
+    pub fn client_metadata_document_url(&self) -> Option<String> {
+        let (_, login) = self.login_idp()?;
+        if login.client_id.is_some()
+            || !self.interactive_settings().client_metadata_document.enabled
+            || !is_https_url(&self.issuer)
+        {
+            return None;
+        }
+        Some(format!(
+            "{}{CLIENT_METADATA_DOCUMENT_PATH}",
+            self.issuer.trim_end_matches('/')
+        ))
+    }
+
+    /// The gateway's client id at the login IdP: the pre-registered
+    /// `login.client_id`, else the URL of its Client ID Metadata Document.
+    pub fn login_client_id(&self) -> Option<String> {
+        let (_, login) = self.login_idp()?;
+        login
+            .client_id
+            .clone()
+            .or_else(|| self.client_metadata_document_url())
+    }
+
+    /// A login block without `client_id` signs in with the metadata
+    /// document, so the document must be servable and the IdP's discovery
+    /// document must be read to learn whether the IdP accepts it.
+    pub(crate) fn validate_login_client_id(&self, prefix: &str) -> Result<()> {
+        let Some((idp, login)) = self.login_idp() else {
+            return Ok(());
+        };
+        if login.client_id.is_some() {
+            return Ok(());
+        }
+        let at = format!("{prefix}.trusted_idps[`{}`].login", idp.issuer);
+        if !self.interactive_settings().client_metadata_document.enabled {
+            bail!(
+                "{at}.client_id is required while {prefix}.interactive.client_metadata_document \
+                 is disabled"
+            );
+        }
+        if !is_https_url(&self.issuer) {
+            bail!(
+                "{at}.client_id is required unless {prefix}.issuer is https://: a Client ID \
+                 Metadata Document URL must be https"
+            );
+        }
+        if login.endpoints_configured() {
+            bail!(
+                "{at}.client_id is required while every IdP endpoint is configured: the gateway \
+                 signs in with its Client ID Metadata Document only when the IdP's discovery \
+                 document advertises client_id_metadata_document_supported, so leave an \
+                 endpoint to discovery or set client_id"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// What `mcpg config check` reports about interactive sign-in: one line
@@ -1811,17 +2024,29 @@ pub fn interactive_login_summary(config: &AppConfig) -> Vec<String> {
         return Vec::new();
     };
     let settings = authz.interactive_settings();
+    let client = match (&login.client_id, authz.client_metadata_document_url()) {
+        (Some(client_id), _) => format!("client `{client_id}`"),
+        (None, Some(url)) => format!("Client ID Metadata Document `{url}`"),
+        (None, None) => "no client id".to_owned(),
+    };
     let mut lines = vec![
         format!(
-            "interactive sign-in through {} (client `{}`); needs a license with the \
+            "interactive sign-in through {} ({client}); needs a license with the \
              `sso.interactive_login` feature",
-            idp.issuer, login.client_id
+            idp.issuer
         ),
         format!(
             "register this sign-in redirect URI at the IdP: {}",
             authz.login_callback_url()
         ),
     ];
+    if login.client_id.is_none() {
+        lines.push(
+            "the IdP must advertise client_id_metadata_document_supported: true in its \
+             discovery document; it reads the redirect URI from the metadata document"
+                .to_owned(),
+        );
+    }
     if login.endpoints_configured() {
         lines.push(format!(
             "IdP endpoints: authorization {}, token {}, revocation {}",

@@ -1991,6 +1991,42 @@
       },
       "type": "object"
     },
+    "ClientMetadataDocumentConfig": {
+      "additionalProperties": false,
+      "description": "The gateway's own OAuth Client ID Metadata Document (`interactive.client_metadata_document`, `draft-ietf-oauth-client-id-metadata-document`), served at `GET /oauth/client-metadata.json` on the issuer's origin. Its URL is the gateway's client id at a login IdP that has no `login.client_id`: the IdP fetches the document and reads the client's name, redirect URI and authentication method from it. The document lists the one redirect URI the gateway sends, `{issuer}/oauth/callback`; `token_endpoint_auth_method` is `private_key_jwt` with the public key of `login.private_key` inline as `jwks`, else `none`. It is served only while it is the client id in use (else 404). A pre-registered `login.client_id` always wins, so enabling this changes no configuration that has one.",
+      "properties": {
+        "client_name": {
+          "default": null,
+          "description": "`client_name`, shown by the IdP on its sign-in and consent pages (1–80 characters). Defaults to `mcp.server_info.title`, else `mcp.server_info.name`, else `MCPG gateway`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_uri": {
+          "default": null,
+          "description": "`client_uri`, an `https://` page about the gateway. Defaults to `mcp.server_info.website_url` when that is `https://`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": true,
+          "description": "Serve the document and sign in with its URL as the client id when `login.client_id` is unset. Off, `login.client_id` is required.",
+          "type": "boolean"
+        },
+        "logo_uri": {
+          "default": null,
+          "description": "`logo_uri`, an `https://` image the IdP may show.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "CloudConfig": {
       "additionalProperties": false,
       "description": "`cloud:` — present only on managed-fleet (mcpg.cloud) instances. Absent for self-host; every field defaults so a bare `cloud: {}` is inert.",
@@ -2574,7 +2610,7 @@
         },
         "max_entries": {
           "default": 10000,
-          "description": "Maximum number of `(identity, plugin, target)` entries kept in the L1 cache. LRU eviction past this. Default 10000 — at ~500 bytes per entry that's ~5MB worst case.",
+          "description": "Maximum number of `(identity, plugin, target, per-call config)` entries kept in the L1 cache. LRU eviction past this. Default 10000 — at ~500 bytes per entry that's ~5MB worst case.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -5162,6 +5198,20 @@
           "minimum": 0,
           "type": "integer"
         },
+        "client_metadata_document": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ClientMetadataDocumentConfig"
+            }
+          ],
+          "default": {
+            "client_name": null,
+            "client_uri": null,
+            "enabled": true,
+            "logo_uri": null
+          },
+          "description": "The gateway's own Client ID Metadata Document, which identifies it as an OAuth client at a login IdP that has no pre-registered `trusted_idps[].login.client_id`."
+        },
         "consent": {
           "allOf": [
             {
@@ -7534,7 +7584,7 @@
     },
     "RealtimeAdmissionConfig": {
       "additionalProperties": false,
-      "description": "`mcp.realtime.admission`.\n\nThe gateway calls `tool` as the caller, through the whole tool-call path (policy, gates, the backend), with these arguments:\n\n- `op`: `admit` (a caller opens realtime delivery), `renew` (it still holds it) or `release` (it let go; best effort). - `lease_id`: one id per held delivery, the same in all three calls and on every replica. A poll lease is one per principal, event, arguments and MCP client name, so two clients of one principal hold two leases. - `kind`: `events` or `resource`. - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or `subscribe` for a resource. - `event`: `{name, arguments}` for events; `resource`: `{uri}` for a resource. - `client`: `{name, version}` of the MCP client, when it named itself.\n\nThe tool answers with an object that has a boolean `allow`. With `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten the renew interval. With `allow: false`, `error: {code, message, data}` reaches the caller: a numeric `code` is the JSON-RPC error code and `data` (or `details`) its data; any other `code` gives `-32025` (ResourceExhausted) with the whole `error` object as data.\n\nThe tool is internal: `tools/list` does not show it and a caller's own `tools/call` of it is refused.",
+      "description": "`mcp.realtime.admission`.\n\nThe gateway calls `tool` as the caller, through the whole tool-call path (policy, gates, the backend), with these arguments:\n\n- `op`: `admit` (a caller opens realtime delivery), `renew` (it still holds it) or `release` (it let go; best effort). - `lease_id`: one id per held delivery, the same in all three calls and on every replica. A poll lease is one per principal, event, arguments and MCP client name and title, so two clients of one principal hold two leases, and so do two instances of one client with two titles. - `kind`: `events` or `resource`. - `delivery`: `stream`, `poll` or `webhook` for events; `listen` or `subscribe` for a resource. - `event`: `{name, arguments}` for events; `resource`: `{uri}` for a resource. - `client`: `{name, version}` of the MCP client, when it named itself.\n\nThe tool answers with an object that has a boolean `allow`. With `allow: true`, `renew_after_seconds` (or `renewAfterSeconds`) may shorten the renew interval. With `allow: false`, `error: {code, message, data}` reaches the caller: a numeric `code` is the JSON-RPC error code and `data` (or `details`) its data; any other `code` gives `-32025` (ResourceExhausted) with the whole `error` object as data.\n\nThe tool is internal: `tools/list` does not show it and a caller's own `tools/call` of it is refused.",
       "properties": {
         "on_error": {
           "allOf": [
@@ -9446,15 +9496,19 @@
             }
           ],
           "default": null,
-          "description": "How the gateway authenticates at the IdP token endpoint: `client_secret_basic`, `client_secret_post` or `private_key_jwt`. Defaults to `private_key_jwt` when `private_key` is set and to `client_secret_basic` when `client_secret` is set. The gateway is always a confidential client here, so a stolen IdP refresh token is useless without this credential."
+          "description": "How the gateway authenticates at the IdP token endpoint: `client_secret_basic`, `client_secret_post` or `private_key_jwt`. Defaults to `private_key_jwt` when `private_key` is set and to `client_secret_basic` when `client_secret` is set. A pre-registered client is always confidential, so a stolen IdP refresh token is useless without this credential. Without `client_id` only `private_key_jwt` applies (the document publishes the public key); with no `private_key` there the gateway is a public client (`token_endpoint_auth_method: none`) that relies on PKCE alone."
         },
         "client_id": {
-          "description": "The client identifier the IdP issued to the gateway (1–255 characters).",
-          "type": "string"
+          "default": null,
+          "description": "The client identifier the IdP issued to the gateway (1–255 characters): a pre-registered client, which the gateway always prefers. Unset, the gateway's client id is the URL of its own Client ID Metadata Document (`interactive.client_metadata_document`), `{authorization_server.issuer}/oauth/client-metadata.json`, and a sign-in proceeds only while the IdP's discovery document advertises `client_id_metadata_document_supported: true`. That needs an `https://` issuer, the document enabled and at least one endpoint left to discovery.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "client_secret": {
           "default": null,
-          "description": "Shared secret for the two secret methods, at least 16 bytes. Supply via `${secret.NAME}` or `${env.X}`. Set this or `private_key`, not both.",
+          "description": "Shared secret for the two secret methods, at least 16 bytes. Supply via `${secret.NAME}` or `${env.X}`. Set this or `private_key`, not both. Needs `client_id`: a metadata document cannot carry a shared secret.",
           "type": [
             "string",
             "null"
@@ -9543,9 +9597,6 @@
           ]
         }
       },
-      "required": [
-        "client_id"
-      ],
       "type": "object"
     },
     "TrustedKeyConfig": {

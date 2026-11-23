@@ -383,9 +383,19 @@ fn as_client(identity: RequestIdentity, name: &str, version: &str) -> RequestCon
     let mut ctx = ctx(identity);
     ctx.client = Some(mcpg_plugin_protocol::ClientInfo {
         name: name.to_owned(),
+        title: None,
         version: Some(version.to_owned()),
     });
     ctx
+}
+
+/// The client info of a client named `name`, titled `title`.
+fn client_info(name: &str, title: Option<&str>) -> mcpg_plugin_protocol::ClientInfo {
+    mcpg_plugin_protocol::ClientInfo {
+        name: name.to_owned(),
+        title: title.map(str::to_owned),
+        version: Some("1.0.0".to_owned()),
+    }
 }
 
 #[test]
@@ -396,26 +406,86 @@ fn the_lease_id_is_per_client_name_and_stable_without_one() {
         crate::runtime::events::test_support::keys(),
     );
     let arguments = Map::new();
+    let a_info = client_info("client-a", None);
     let none = leases.lease_id("p", "orders.created", &arguments, None);
     assert_eq!(
         none,
         leases.lease_id("p", "orders.created", &arguments, None),
         "a caller without client info keeps one id"
     );
-    let a = leases.lease_id("p", "orders.created", &arguments, Some("client-a"));
-    let b = leases.lease_id("p", "orders.created", &arguments, Some("client-b"));
+    let a = leases.lease_id("p", "orders.created", &arguments, Some(&a_info));
+    let b = leases.lease_id(
+        "p",
+        "orders.created",
+        &arguments,
+        Some(&client_info("client-b", None)),
+    );
     assert_ne!(a, b, "two clients of one principal hold two leases");
     assert_ne!(a, none);
     assert_ne!(b, none);
     assert_eq!(
         a,
-        leases.lease_id("p", "orders.created", &arguments, Some("client-a"))
+        leases.lease_id("p", "orders.created", &arguments, Some(&a_info))
     );
     assert_ne!(
         a,
-        leases.lease_id("q", "orders.created", &arguments, Some("client-a")),
+        leases.lease_id("q", "orders.created", &arguments, Some(&a_info)),
         "the principal stays in the id"
     );
+}
+
+/// The id hashes [principal, event, arguments] for a caller that names no
+/// client, adds the name for a client without a title, and adds the name
+/// and the title for a titled one. The version is never part of it.
+#[test]
+fn the_lease_id_adds_the_client_title_when_there_is_one() {
+    use serde_json::json;
+    let keys = crate::runtime::events::test_support::keys();
+    let leases = LeaseStore::new(
+        Arc::new(crate::builtins::cluster_primitives::MemoryKv::new()),
+        None,
+        Arc::clone(&keys),
+    );
+    let arguments = Map::from_iter([("region".to_owned(), json!("eu"))]);
+    let hashed = |parts: Value| {
+        keys.key_hash(
+            "poll-lease",
+            &mcpg_mcp_wire::shared::canonical::canonical_value_bytes(&parts),
+        )
+    };
+    let id = |client: Option<&mcpg_plugin_protocol::ClientInfo>| {
+        leases.lease_id("p", "orders.created", &arguments, client)
+    };
+
+    assert_eq!(
+        id(None),
+        hashed(json!(["p", "orders.created", { "region": "eu" }]))
+    );
+    assert_eq!(
+        id(Some(&client_info("agentd", None))),
+        hashed(json!(["p", "orders.created", { "region": "eu" }, "agentd"]))
+    );
+    let replica_1 = id(Some(&client_info("agentd", Some("replica-1"))));
+    assert_eq!(
+        replica_1,
+        hashed(json!([
+            "p",
+            "orders.created",
+            { "region": "eu" },
+            "agentd",
+            "replica-1"
+        ]))
+    );
+    assert_ne!(
+        replica_1,
+        id(Some(&client_info("agentd", Some("replica-2")))),
+        "two instances of one client hold two leases"
+    );
+    assert_ne!(replica_1, id(Some(&client_info("agentd", None))));
+
+    let mut upgraded = client_info("agentd", Some("replica-1"));
+    upgraded.version = Some("2.0.0".to_owned());
+    assert_eq!(replica_1, id(Some(&upgraded)), "the version is not keyed");
 }
 
 #[tokio::test]
@@ -450,9 +520,12 @@ async fn two_clients_of_one_principal_hold_two_leases_under_one_cap() {
     let stores = core.stores().unwrap();
     let principal = verified("alice").synthetic_principal_key().unwrap();
     let lease = |client: &str| {
-        stores
-            .leases
-            .lease_id(&principal, "orders.created", &Map::new(), Some(client))
+        stores.leases.lease_id(
+            &principal,
+            "orders.created",
+            &Map::new(),
+            Some(&client_info(client, None)),
+        )
     };
     for client in ["client-a", "client-b"] {
         let held = stores.leases.get(&lease(client)).await.unwrap();

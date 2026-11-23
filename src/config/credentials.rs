@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CredentialsConfig {
-    /// Maximum number of `(identity, plugin, target)` entries kept
-    /// in the L1 cache. LRU eviction past this. Default 10000 —
+    /// Maximum number of `(identity, plugin, target, per-call config)`
+    /// entries kept in the L1 cache. LRU eviction past this. Default 10000 —
     /// at ~500 bytes per entry that's ~5MB worst case.
     #[serde(default = "default_credential_cache_max_entries")]
     pub max_entries: usize,

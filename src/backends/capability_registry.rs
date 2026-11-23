@@ -866,6 +866,36 @@ impl CapabilityRegistry {
             .map(|b| b.route.clone())
     }
 
+    /// Check the `Mcp-Param-{Name}` headers of a call to `name` against the
+    /// `x-mcp-header` annotations of the `inputSchema` `tools/list`
+    /// publishes for it, resolved as [`Self::tool_route`] resolves the
+    /// route. `headers` holds each header as its lower-case name after the
+    /// prefix and its raw value. An unknown tool passes: the caller
+    /// answers it as unknown.
+    pub fn check_tool_param_headers(
+        &self,
+        name: &str,
+        arguments: &Value,
+        headers: &[(String, String)],
+    ) -> Result<(), String> {
+        let check = |binding: &RegisteredTool| {
+            crate::protocol::v_2026_07_28::wire::validate_annotated_param_headers(
+                &binding.descriptor.input_schema,
+                arguments,
+                headers,
+            )
+        };
+        if let Some(binding) = self.tools.iter().find(|b| b.descriptor.name == name) {
+            return check(binding);
+        }
+        self.federated
+            .load()
+            .tools
+            .iter()
+            .find(|b| b.descriptor.name == name)
+            .map_or(Ok(()), check)
+    }
+
     /// Resolve the effective `TaskSupport` for a tool.
     /// Returns `None` if the tool is not found.
     /// Per MCP spec, absent `execution.taskSupport` defaults to `Forbidden`.

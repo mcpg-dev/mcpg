@@ -108,9 +108,10 @@ pub use guardrails::{GuardrailHookConfig, GuardrailOnError, GuardrailsConfig};
 pub use health_check::HealthCheckConfig;
 pub use inspector::InspectorSidecarConfig;
 pub use interactive_login::{
-    ClientConsent, ClientGrantType, InteractiveLoginConfig, InteractiveStoreConfig,
-    InteractiveStoreKind, LoginAssertionAudience, LoginClientAuth, LoginSigningAlg,
-    RedirectUriPolicy, StateKeyConfig, TrustedIdpLoginConfig, interactive_login_summary,
+    ClientConsent, ClientGrantType, ClientMetadataDocumentConfig, InteractiveLoginConfig,
+    InteractiveStoreConfig, InteractiveStoreKind, LoginAssertionAudience, LoginClientAuth,
+    LoginSigningAlg, RedirectUriPolicy, StateKeyConfig, TrustedIdpLoginConfig,
+    interactive_login_summary,
 };
 pub use license::LicenseConfig;
 pub use mcp::{McpCapabilitiesConfig, McpConfig, McpConfigurationsConfig, McpServerInfoConfig};

@@ -151,6 +151,7 @@ fn alice_as(client: &str) -> RequestContext {
     let mut ctx = alice();
     ctx.client = Some(mcpg_plugin_protocol::ClientInfo {
         name: client.to_owned(),
+        title: None,
         version: Some("1.0.0".to_owned()),
     });
     ctx
@@ -190,9 +191,15 @@ async fn each_client_of_one_principal_is_admitted_to_a_poll_lease_of_its_own() {
     let ids: std::collections::BTreeSet<String> = ["client-a", "client-b"]
         .into_iter()
         .map(|client| {
-            stores
-                .leases
-                .lease_id(&principal, "orders.created", &Map::new(), Some(client))
+            stores.leases.lease_id(
+                &principal,
+                "orders.created",
+                &Map::new(),
+                Some(&mcpg_plugin_protocol::ClientInfo {
+                    name: client.to_owned(),
+                    ..Default::default()
+                }),
+            )
         })
         .collect();
     assert_eq!(ids.len(), 2, "two lease ids");

@@ -84,6 +84,7 @@ pub fn trust_ceiling_remedy(ceiling: TrustLevelConfig) -> &'static str {
 /// One operator-facing message per finding.
 pub fn access_posture_warnings(config: &AppConfig) -> Vec<String> {
     let mut warnings = event_rule_warnings(config);
+    warnings.extend(registry_name_warning(config));
     let access = &config.governance.access;
     let Some(ref authz) = access.authorization_server else {
         return warnings;
@@ -257,8 +258,23 @@ fn interactive_login_warnings(
                 .join(", ")
         ));
     }
+    let login_client_id = authz.login_client_id().unwrap_or_default();
     for (path, auth) in &idp_users {
-        warnings.extend(issuer_provider_mismatches(config, login, path, auth));
+        warnings.extend(issuer_provider_mismatches(
+            config,
+            login,
+            &login_client_id,
+            path,
+            auth,
+        ));
+    }
+    if login.client_id.is_none() && login.private_key.is_none() {
+        warnings.push(format!(
+            "{at} has no client_id and no private_key: the gateway signs in with its Client ID \
+             Metadata Document as a public client (token_endpoint_auth_method none), so a stolen \
+             IdP refresh token works without any gateway credential. Set private_key to \
+             authenticate with private_key_jwt"
+        ));
     }
     if !login.scopes.iter().any(|s| s == "offline_access") {
         warnings.push(format!(
@@ -316,6 +332,7 @@ fn interactive_login_warnings(
 fn issuer_provider_mismatches(
     config: &AppConfig,
     login: &super::TrustedIdpLoginConfig,
+    login_client_id: &str,
     path: &str,
     auth: &super::federation::AuthConfig,
 ) -> Vec<String> {
@@ -349,15 +366,15 @@ fn issuer_provider_mismatches(
     let resolved = |value: &str| !value.contains("${");
     if let Some(client_id) = provider.get("client_id").and_then(|v| v.as_str())
         && resolved(client_id)
-        && resolved(&login.client_id)
-        && client_id != login.client_id
+        && !login_client_id.is_empty()
+        && resolved(login_client_id)
+        && client_id != login_client_id
     {
         warnings.push(format!(
             "{path} presents the stored IdP sign-in through plugin `{plugin}` provider \
-             `{target}`, whose client_id `{client_id}` is not the login client `{}`: the IdP \
-             binds the sign-in to the client it was issued to, so every exchange is refused. \
-             Use the login client for the issuer",
-            login.client_id
+             `{target}`, whose client_id `{client_id}` is not the login client \
+             `{login_client_id}`: the IdP binds the sign-in to the client it was issued to, so \
+             every exchange is refused. Use the login client for the issuer"
         ));
     }
     if let (Some(token_url), Some(endpoint)) = (
@@ -386,6 +403,22 @@ fn url_origin(url: &str) -> Option<String> {
         Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
         None => format!("{}://{host}", parsed.scheme()),
     })
+}
+
+/// A set `mcp.registry.name` that the Server Card schema refuses, which
+/// validation accepts so that existing configs still boot: the card names
+/// the default instead.
+fn registry_name_warning(config: &AppConfig) -> Option<String> {
+    let name = config.mcp.registry.name.as_str();
+    if name.is_empty() || super::registry::is_server_card_name(name) {
+        return None;
+    }
+    Some(format!(
+        "mcp.registry.name `{name}` is not a Server Card name (3 to 200 characters matching \
+         ^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$), so the Server Card uses `{}`. Set a name such as \
+         `com.acme/gateway`",
+        super::registry::DEFAULT_SERVER_CARD_NAME
+    ))
 }
 
 /// `event_name` rules that govern nothing, because no event type of that
@@ -622,6 +655,24 @@ governance:
              event_prefix: \"orders.\" }}\n"
         );
         assert!(access_posture_warnings(&config(&imported)).is_empty());
+    }
+
+    /// A registry name that boots but that the Server Card refuses warns
+    /// and names the default the card uses; an unset name does not.
+    #[test]
+    fn a_registry_name_the_server_card_refuses_warns() {
+        let named = |name: &str| {
+            access_posture_warnings(&config(&format!(
+                "mcp:\n  registry:\n    enabled: true\n    name: \"{name}\"\n"
+            )))
+        };
+        let warnings = named("com acme/gateway");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("mcp.registry.name"), "{}", warnings[0]);
+        assert!(warnings[0].contains("dev.mcpg/gateway"), "{}", warnings[0]);
+        assert_eq!(named("com.acme/gw/v2").len(), 1);
+        assert!(named("com.acme/gateway").is_empty());
+        assert!(access_posture_warnings(&config(ANONYMOUS_QUICKSTART)).is_empty());
     }
 
     /// An EMA gateway that serves anonymous `server/discover` never hands a

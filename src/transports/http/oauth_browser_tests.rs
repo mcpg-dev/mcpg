@@ -1695,3 +1695,70 @@ async fn a_held_authorization_server_surface_stops_every_oauth_endpoint() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+// ── the gateway's Client ID Metadata Document ────────────────────────
+
+/// The authorization server of [`authorization_server`] whose login block
+/// has no pre-registered client, so the gateway signs in with its
+/// metadata document.
+fn signing_in_with_document(issuer: &str) -> serde_json::Value {
+    let mut server = authorization_server(issuer, serde_json::json!({}));
+    let login = server["trusted_idps"][0]["login"]
+        .as_object_mut()
+        .expect("login");
+    login.remove("client_id");
+    login.remove("client_secret");
+    login.remove("revocation_endpoint");
+    server
+}
+
+#[tokio::test]
+async fn the_client_metadata_document_is_served_from_the_issuer_origin() {
+    let app = gateway(Some(signing_in_with_document(ISSUER)));
+    let response = send(&app, get("/oauth/client-metadata.json")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header_value(&response, "cache-control"),
+        Some("public, max-age=300")
+    );
+    assert!(
+        header_value(&response, "content-type").is_some_and(|t| t.starts_with("application/json"))
+    );
+    assert!(header_value(&response, "location").is_none());
+    let document = body_json(response).await;
+    assert_eq!(
+        document["client_id"],
+        "https://gw.test/oauth/client-metadata.json"
+    );
+    assert_eq!(
+        document["redirect_uris"],
+        serde_json::json!(["https://gw.test/oauth/callback"])
+    );
+    assert_eq!(document["client_name"], "MCPG gateway");
+    assert_eq!(
+        document["grant_types"],
+        serde_json::json!(["authorization_code", "refresh_token"])
+    );
+    assert_eq!(document["response_types"], serde_json::json!(["code"]));
+    assert_eq!(document["token_endpoint_auth_method"], "none");
+}
+
+/// No document while it is not the client id: no authorization server (no
+/// public URL), no login IdP, or a pre-registered login client.
+#[tokio::test]
+async fn the_client_metadata_document_is_404_while_it_is_not_the_client_id() {
+    let mut without_login = authorization_server(ISSUER, serde_json::json!({}));
+    without_login["trusted_idps"][0]
+        .as_object_mut()
+        .expect("IdP")
+        .remove("login");
+    without_login
+        .as_object_mut()
+        .expect("server")
+        .remove("interactive");
+    without_login["clients"] = serde_json::json!([]);
+    for app in [gateway(None), gateway(Some(without_login)), signing_in()] {
+        let response = send(&app, get("/oauth/client-metadata.json")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}

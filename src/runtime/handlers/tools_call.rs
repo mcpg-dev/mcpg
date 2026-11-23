@@ -10,6 +10,40 @@ use futures::FutureExt as _;
 use serde_json::Value;
 
 impl GatewayRuntime {
+    /// The `HeaderMismatch` answer (HTTP 400, `-32020`) to a `tools/call`
+    /// of `name` with `arguments` whose `Mcp-Param-{Name}` headers do not
+    /// mirror the arguments the tool's published `inputSchema` annotates.
+    /// `None` when they do, without routing headers, and for a tool that is
+    /// unknown to the caller or hidden from it: those keep their own answers,
+    /// so this one never tells a hidden tool apart.
+    pub(crate) fn tools_call_param_header_mismatch(
+        &self,
+        request_id: &Value,
+        name: &str,
+        arguments: Option<&Value>,
+        request_context: &RequestContext,
+    ) -> Option<ProtocolHttpResponse> {
+        let headers = request_context.param_headers.as_deref()?;
+        if self.is_admission_tool(name) && !request_context.realtime_admission {
+            return None;
+        }
+        let route = self.capability_registry.tool_route(name)?;
+        let message = self
+            .capability_registry
+            .check_tool_param_headers(name, arguments.unwrap_or(&Value::Null), headers)
+            .err()?;
+        if !self.surface_is_visible(request_context, name, PolicyRoute::for_tool(&route)) {
+            return None;
+        }
+        Some(protocol_http_error(
+            400,
+            Some(request_id.clone()),
+            crate::protocol::HEADER_MISMATCH_CODE,
+            message,
+            None,
+        ))
+    }
+
     /// Run `tools/call` through the full pipeline. With
     /// `materialize_as_task` the call is accepted as a SEP-2663 task: the
     /// answer is `resultType:"task"`, and the backend runs in the
@@ -55,6 +89,15 @@ impl GatewayRuntime {
                         ),
                         None,
                     );
+                }
+
+                if let Some(refused) = self.tools_call_param_header_mismatch(
+                    &request_id,
+                    &params.name,
+                    params.arguments.as_ref(),
+                    request_context,
+                ) {
+                    return refused;
                 }
 
                 // Only a route the gateway runs itself resolves expressions;

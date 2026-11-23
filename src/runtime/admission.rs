@@ -420,6 +420,7 @@ mod tests {
     fn the_arguments_name_the_op_the_lease_the_target_and_the_client() {
         let client = mcpg_plugin_protocol::ClientInfo {
             name: "claude-code".into(),
+            title: None,
             version: Some("2.1".into()),
         };
         let event = AdmissionLease {
