@@ -1978,7 +1978,7 @@ fn tool_param_headers_follow_the_published_schema() {
     // A header for an argument no annotation names is not checked.
     assert!(check("orders.lookup", &native, &[("tenant", "acme"), ("id", "8")]).is_ok());
     let missing = check("orders.lookup", &native, &[]).unwrap_err();
-    assert!(missing.contains("Mcp-Param-tenant"), "{missing}");
+    assert!(missing.contains("Mcp-Param-Tenant"), "{missing}");
     assert!(check("orders.lookup", &native, &[("tenant", "other")]).is_err());
     // No value for the annotated argument: no header expected.
     assert!(check("orders.lookup", &serde_json::json!({ "id": 7 }), &[]).is_ok());
