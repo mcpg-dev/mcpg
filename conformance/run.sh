@@ -7,7 +7,7 @@
 #
 # Env:
 #   CONFORMANCE_VERSION  npm tag of the suite to use
-#                        (default: 0.2.0-alpha.9 — knows the 2026-07-28 spec id)
+#                        (default: 0.2.0-alpha.12 — knows the 2026-07-28 spec id)
 #   MCPG_CONFIG          path to MCPG config yaml
 #                        (default: ./config-everything.yaml — the full fixture
 #                        catalog every tools-call/resources-read/prompts-get
@@ -43,7 +43,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 VERSION="${1:-2026-07-28}"
 # The suite has to know the `2026-07-28` spec id (0.2.0-alpha.5 and later).
-CONFORMANCE_VERSION="${CONFORMANCE_VERSION:-0.2.0-alpha.9}"
+CONFORMANCE_VERSION="${CONFORMANCE_VERSION:-0.2.0-alpha.12}"
 # Default to the FULL fixture catalog: config-baseline.yaml defines no
 # tools/resources/prompts, so it fails every tools-call/resources-read/
 # prompts-get scenario by design (it's a lifecycle-only smoke). Direct
